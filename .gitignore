@@ -1,0 +1,40 @@
+# Environment & secrets — NEVER commit these
+.env
+*.env
+.env.*
+
+# Database (contains user private keys)
+bot_data.db
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Android signing key — NEVER commit this
+*.jks
+*.keystore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db

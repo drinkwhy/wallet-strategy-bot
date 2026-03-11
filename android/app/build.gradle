@@ -1,0 +1,35 @@
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 34
+    defaultConfig {
+        applicationId "com.soltrader.app"
+        minSdkVersion 21
+        targetSdkVersion 34
+        versionCode 1
+        versionName "1.0.0"
+    }
+    signingConfigs {
+        release {
+            storeFile     file('../soltrader-keystore.jks')
+            storePassword System.getenv("KEYSTORE_PASSWORD") ?: "changeme"
+            keyAlias      "soltrader"
+            keyPassword   System.getenv("KEY_PASSWORD") ?: "changeme"
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled   true
+            signingConfig   signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'com.google.androidbrowserhelper:androidbrowserhelper:2.5.0'
+}
