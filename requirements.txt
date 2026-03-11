@@ -1,8 +1,8 @@
-flask
-requests
-python-dotenv
-solders
-base58
-cryptography
-bcrypt
-stripe
+flask>=3.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+solders>=0.21.0
+base58>=2.1.1
+cryptography>=42.0.0
+bcrypt>=4.1.0
+stripe>=8.0.0
