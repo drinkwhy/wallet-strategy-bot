@@ -1295,4 +1295,5 @@ if __name__ == "__main__":
     print(f"\n  SolTrader Platform → http://localhost:5000")
     print(f"  Admin account: {ADMIN_EMAIL}")
     print(f"  Database: {DB}\n")
-    app.run(debug=False, host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
