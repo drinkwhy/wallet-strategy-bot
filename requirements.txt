@@ -1,0 +1,8 @@
+flask
+requests
+python-dotenv
+solders
+base58
+cryptography
+bcrypt
+stripe
