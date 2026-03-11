@@ -489,7 +489,7 @@ def assetlinks():
         "target": {
             "namespace": "android_app",
             "package_name": "com.soltrader.app",
-            "sha256_cert_fingerprints": ["REPLACE_WITH_YOUR_KEYSTORE_SHA256"]
+            "sha256_cert_fingerprints": ["B3:4E:0E:5F:A7:5D:DD:C8:A9:4F:75:68:54:73:EA:C2:80:CB:61:26:6F:05:0A:68:7B:DC:F2:A7:B8:16:DA:61"]
         }
     }]), mimetype="application/json")
 
