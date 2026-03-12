@@ -443,6 +443,42 @@ def global_scanner():
 
 threading.Thread(target=global_scanner, daemon=True).start()
 
+def auto_restart_bots():
+    """Restart bots that were running before a server restart."""
+    time.sleep(5)  # wait for app to fully initialize
+    try:
+        with db() as conn:
+            rows = conn.execute("""
+                SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
+                       w.encrypted_key, u.plan
+                FROM bot_settings bs
+                JOIN wallets w ON w.user_id = bs.user_id
+                JOIN users u ON u.id = bs.user_id
+                WHERE bs.is_running = 1
+            """).fetchall()
+        for row in rows:
+            uid = row["user_id"]
+            try:
+                kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
+                settings = dict(PRESETS.get(row["preset"], PRESETS["steady"]))
+                max_sol = PLAN_LIMITS.get(row["plan"], PLAN_LIMITS["trial"])["max_buy_sol"]
+                settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
+                bot = BotInstance(uid, kp, settings,
+                    run_mode=row["run_mode"],
+                    run_duration_min=row["run_duration_min"],
+                    profit_target_sol=row["profit_target_sol"])
+                user_bots[uid] = bot
+                t = threading.Thread(target=bot.run, daemon=True)
+                t.start()
+                bot.thread = t
+            except Exception as e:
+                with db() as conn:
+                    conn.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=?", (uid,))
+    except Exception:
+        pass
+
+threading.Thread(target=auto_restart_bots, daemon=True).start()
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = SECRET_KEY
