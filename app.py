@@ -9,6 +9,9 @@ Required .env variables:
 """
 
 import os, sqlite3, threading, time, base64, json, requests, base58, secrets, hashlib
+import smtplib, string
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, redirect, url_for, session, jsonify, Response
@@ -32,6 +35,12 @@ STRIPE_PRICE_PRO   = os.getenv("STRIPE_PRICE_PRO", "")
 ADMIN_EMAIL        = os.getenv("ADMIN_EMAIL", "admin@admin.com")
 PERF_FEE_BASIC     = 0.15   # 15% of profits
 PERF_FEE_PRO       = 0.10   # 10% of profits
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+SMTP_HOST          = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER          = os.getenv("SMTP_USER", "")
+SMTP_PASS          = os.getenv("SMTP_PASS", "")
+REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
@@ -77,6 +86,18 @@ def init_db():
             trial_ends TEXT,
             stripe_customer_id TEXT,
             stripe_subscription_id TEXT,
+            referral_code TEXT UNIQUE,
+            referred_by INTEGER,
+            referral_earnings_sol REAL DEFAULT 0,
+            telegram_chat_id TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            commission_sol REAL DEFAULT 0,
+            paid INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS wallets (
@@ -110,6 +131,111 @@ def init_db():
         """)
 
 init_db()
+
+# migrate existing DB — add new columns if missing
+def migrate_db():
+    with db() as conn:
+        for col, default in [
+            ("referral_code", "NULL"),
+            ("referred_by",   "NULL"),
+            ("referral_earnings_sol", "0"),
+            ("telegram_chat_id", "NULL"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {default}")
+            except:
+                pass
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER, referred_id INTEGER,
+                commission_sol REAL DEFAULT 0, paid INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')))""")
+        except:
+            pass
+migrate_db()
+
+def make_referral_code():
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+
+# ── Telegram alerts ────────────────────────────────────────────────────────────
+def send_telegram(chat_id, msg):
+    if not TELEGRAM_TOKEN or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5
+        )
+    except:
+        pass
+
+# ── Email notifications ────────────────────────────────────────────────────────
+def send_email(to_email, subject, body_html):
+    if not SMTP_USER or not SMTP_PASS:
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = f"SolTrader <{SMTP_USER}>"
+        msg["To"]      = to_email
+        msg.attach(MIMEText(body_html, "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, to_email, msg.as_string())
+    except Exception as e:
+        print(f"Email error: {e}")
+
+def send_daily_summaries():
+    """Send daily profit/loss summary emails to all users at midnight UTC."""
+    while True:
+        now = datetime.utcnow()
+        # sleep until next midnight
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        time.sleep((next_midnight - now).total_seconds())
+        try:
+            with db() as conn:
+                users = conn.execute("SELECT id, email FROM users").fetchall()
+            for u in users:
+                uid = u["id"]
+                with db() as conn:
+                    trades = conn.execute("""
+                        SELECT action, pnl_sol, name, timestamp FROM trades
+                        WHERE user_id=? AND timestamp >= datetime('now','-1 day')
+                        ORDER BY timestamp DESC
+                    """, (uid,)).fetchall()
+                if not trades:
+                    continue
+                total_pnl = sum(t["pnl_sol"] or 0 for t in trades)
+                wins   = sum(1 for t in trades if (t["pnl_sol"] or 0) > 0)
+                losses = sum(1 for t in trades if (t["pnl_sol"] or 0) < 0)
+                rows = "".join(
+                    f"<tr><td>{t['name']}</td><td>{t['action']}</td>"
+                    f"<td style='color:{'#14c784' if (t['pnl_sol'] or 0)>=0 else '#f23645'}'>"
+                    f"{(t['pnl_sol'] or 0):+.4f} SOL</td></tr>"
+                    for t in trades
+                )
+                body = f"""
+                <div style='font-family:sans-serif;background:#0a0a1a;color:#fff;padding:24px;border-radius:12px;max-width:600px'>
+                <h2 style='color:#14c784'>SolTrader Daily Summary</h2>
+                <p>{now.strftime('%B %d, %Y')}</p>
+                <div style='background:#14141e;border-radius:8px;padding:16px;margin:16px 0'>
+                  <h3>Total P&L: <span style='color:{"#14c784" if total_pnl>=0 else "#f23645"}'>{total_pnl:+.4f} SOL</span></h3>
+                  <p>✅ Wins: {wins} &nbsp;&nbsp; ❌ Losses: {losses}</p>
+                </div>
+                <table width='100%' style='border-collapse:collapse'>
+                <tr style='color:#888'><th align='left'>Token</th><th align='left'>Action</th><th align='left'>P&L</th></tr>
+                {rows}
+                </table>
+                <p style='color:#888;margin-top:24px'>Keep trading — <a href='https://soltrader-production.up.railway.app/dashboard' style='color:#14c784'>View Dashboard</a></p>
+                </div>"""
+                send_email(u["email"], f"SolTrader Daily Report — {total_pnl:+.4f} SOL", body)
+        except Exception as e:
+            print(f"Daily summary error: {e}")
+
+threading.Thread(target=send_daily_summaries, daemon=True).start()
 
 # ── Encryption ─────────────────────────────────────────────────────────────────
 def encrypt_key(private_key_b58: str) -> str:
@@ -261,6 +387,15 @@ class BotInstance:
             }
             self.log_msg(f"BUY {name} @ ${price:.8f} | solscan.io/tx/{sig}")
             self.refresh_balance()
+            # Telegram alert
+            try:
+                with db() as conn:
+                    u = conn.execute("SELECT telegram_chat_id FROM users WHERE id=?", (self.user_id,)).fetchone()
+                if u and u["telegram_chat_id"]:
+                    send_telegram(u["telegram_chat_id"],
+                        f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {s['max_buy_sol']} SOL\n🔗 solscan.io/tx/{sig}")
+            except:
+                pass
 
     def sell(self, mint, pct, reason):
         pos = self.positions.get(mint)
@@ -291,6 +426,18 @@ class BotInstance:
                     self.stats["wins"] += 1
                 else:
                     self.stats["losses"] += 1
+                # Telegram alert
+                try:
+                    with db() as conn:
+                        u = conn.execute("SELECT telegram_chat_id FROM users WHERE id=?", (self.user_id,)).fetchone()
+                    if u and u["telegram_chat_id"]:
+                        emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                        send_telegram(u["telegram_chat_id"],
+                            f"{emoji} <b>SELL</b> {pos['name']} {int(pct*100)}%\n"
+                            f"📈 {pnl_pct:+.1f}% | {pnl_sol:+.4f} SOL\n"
+                            f"📝 {reason}")
+                except:
+                    pass
                 with db() as conn:
                     conn.execute(
                         "INSERT INTO trades (user_id,mint,name,action,price,pnl_sol) VALUES (?,?,?,?,?,?)",
@@ -737,16 +884,28 @@ def signup():
         elif len(password) < 8:
             error = "Password must be at least 8 characters"
         else:
-            hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+            hashed     = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
             trial_ends = (datetime.utcnow() + timedelta(days=7)).isoformat()
+            ref_code   = make_referral_code()
+            ref_by     = None
+            # check if came via referral link
+            ref_param = request.args.get("ref") or request.form.get("ref", "")
+            if ref_param:
+                with db() as conn:
+                    referrer = conn.execute("SELECT id FROM users WHERE referral_code=?", (ref_param,)).fetchone()
+                    if referrer:
+                        ref_by = referrer["id"]
             try:
                 with db() as conn:
                     conn.execute(
-                        "INSERT INTO users (email,password_hash,plan,trial_ends) VALUES (?,?,?,?)",
-                        (email, hashed, "trial", trial_ends)
+                        "INSERT INTO users (email,password_hash,plan,trial_ends,referral_code,referred_by) VALUES (?,?,?,?,?,?)",
+                        (email, hashed, "trial", trial_ends, ref_code, ref_by)
                     )
                     user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
                     conn.execute("INSERT INTO bot_settings (user_id) VALUES (?)", (user["id"],))
+                    if ref_by:
+                        conn.execute("INSERT INTO referrals (referrer_id,referred_id) VALUES (?,?)",
+                                     (ref_by, user["id"]))
                 session["user_id"] = user["id"]
                 session["email"]   = email
                 return redirect(url_for("setup"))
@@ -931,6 +1090,33 @@ def api_settings():
         bot.run_duration_min = duration
         bot.profit_target    = profit
     return jsonify({"ok":True})
+
+@app.route("/api/telegram", methods=["POST"])
+@login_required
+def api_telegram():
+    uid     = session["user_id"]
+    chat_id = (request.json or {}).get("chat_id", "").strip()
+    with db() as conn:
+        conn.execute("UPDATE users SET telegram_chat_id=? WHERE id=?", (chat_id or None, uid))
+    if chat_id:
+        send_telegram(chat_id, "✅ <b>SolTrader</b> connected! You'll receive alerts when your bot buys and sells.")
+    return jsonify({"ok": True})
+
+@app.route("/ref/<code>")
+def referral_link(code):
+    return redirect(url_for("signup") + f"?ref={code}")
+
+@app.route("/api/referral")
+@login_required
+def api_referral():
+    uid = session["user_id"]
+    with db() as conn:
+        u = conn.execute("SELECT referral_code, referral_earnings_sol FROM users WHERE id=?", (uid,)).fetchone()
+        count = conn.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,)).fetchone()["c"]
+    code = u["referral_code"] or ""
+    link = f"https://soltrader-production.up.railway.app/ref/{code}"
+    return jsonify({"ok": True, "code": code, "link": link,
+                    "referrals": count, "earnings_sol": u["referral_earnings_sol"] or 0})
 
 # ── Stripe ─────────────────────────────────────────────────────────────────────
 @app.route("/subscribe/<plan>")
