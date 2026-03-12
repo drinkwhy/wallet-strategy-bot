@@ -506,6 +506,71 @@ self.addEventListener('fetch', e => {
 """
     return Response(sw, mimetype="application/javascript")
 
+@app.route("/privacy")
+def privacy():
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy Policy – SolTrader</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:800px;margin:40px auto;padding:0 24px;color:#1a1a2e;line-height:1.7}
+h1{color:#0a0a1a;border-bottom:2px solid #14c784;padding-bottom:12px}
+h2{color:#0a0a1a;margin-top:32px}
+a{color:#14c784}
+.updated{color:#888;font-size:14px}
+</style></head><body>
+<h1>Privacy Policy</h1>
+<p class="updated">Last updated: March 12, 2026</p>
+
+<h2>1. Introduction</h2>
+<p>SolTrader ("we", "us", or "our") operates the SolTrader platform, available at soltrader-production.up.railway.app and through our Android application. This Privacy Policy explains how we collect, use, and protect your information.</p>
+
+<h2>2. Information We Collect</h2>
+<p><strong>Account Information:</strong> Email address and hashed password when you register.</p>
+<p><strong>Wallet Information:</strong> Your Solana private key, which is encrypted with AES-256 encryption before storage. We never store your key in plain text.</p>
+<p><strong>Trading Data:</strong> Trade history, profit/loss records, and bot activity logs associated with your account.</p>
+<p><strong>Usage Data:</strong> Standard server logs including IP address, browser type, and pages visited.</p>
+
+<h2>3. How We Use Your Information</h2>
+<ul>
+<li>To operate and maintain your trading bot account</li>
+<li>To execute trades on your behalf on the Solana blockchain</li>
+<li>To process subscription payments via Stripe</li>
+<li>To calculate and collect performance fees</li>
+<li>To send account-related notifications</li>
+</ul>
+
+<h2>4. Non-Custodial Wallet</h2>
+<p>SolTrader is a non-custodial platform. Your private key is encrypted and stored solely to execute trades you authorize. You retain full ownership of your wallet and funds at all times. You may delete your private key from our system at any time by contacting us.</p>
+
+<h2>5. Data Sharing</h2>
+<p>We do not sell your personal data. We share data only with:</p>
+<ul>
+<li><strong>Stripe</strong> – for payment processing (subject to Stripe's Privacy Policy)</li>
+<li><strong>Helius</strong> – Solana RPC provider for blockchain interactions</li>
+<li>Law enforcement when required by law</li>
+</ul>
+
+<h2>6. Data Security</h2>
+<p>Private keys are encrypted using Fernet (AES-128-CBC). Passwords are hashed using bcrypt. We use HTTPS for all data transmission.</p>
+
+<h2>7. Data Retention</h2>
+<p>We retain your data for as long as your account is active. You may request deletion of your account and all associated data by emailing us.</p>
+
+<h2>8. Your Rights</h2>
+<p>You have the right to access, correct, or delete your personal data. Contact us at <a href="mailto:founder@drinkwhy.com">founder@drinkwhy.com</a> for any requests.</p>
+
+<h2>9. Children's Privacy</h2>
+<p>SolTrader is not intended for users under 18 years of age. We do not knowingly collect data from minors.</p>
+
+<h2>10. Changes to This Policy</h2>
+<p>We may update this policy periodically. Continued use of the platform after changes constitutes acceptance.</p>
+
+<h2>11. Contact</h2>
+<p>For privacy-related questions: <a href="mailto:founder@drinkwhy.com">founder@drinkwhy.com</a></p>
+
+<p><a href="/">&larr; Back to SolTrader</a></p>
+</body></html>"""
+
 # ── Auth routes ────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
