@@ -384,6 +384,111 @@ class BotInstance:
         self.log_msg(f"Performance fee logged: {fee_sol:.4f} SOL ({int(pct*100)}% of {pnl:.4f} SOL profit)")
 
 # ── Shared DexScreener scanner ─────────────────────────────────────────────────
+# ── Momentum tracking ──────────────────────────────────────────────────────────
+# Stores recent volume snapshots per token to detect momentum spikes
+_volume_history = {}   # mint -> [(timestamp, vol), ...]
+
+def get_momentum_score(mint, current_vol):
+    """Returns momentum score 0-100. >60 = strong signal."""
+    now = time.time()
+    hist = _volume_history.get(mint, [])
+    # prune entries older than 5 minutes
+    hist = [(t, v) for t, v in hist if now - t < 300]
+    hist.append((now, current_vol))
+    _volume_history[mint] = hist
+    if len(hist) < 2:
+        return 0
+    oldest_vol = hist[0][1]
+    if oldest_vol <= 0:
+        return 0
+    growth = (current_vol - oldest_vol) / oldest_vol * 100
+    return min(int(growth), 100)
+
+# ── Known profitable whale wallets to track ────────────────────────────────────
+WHALE_WALLETS = [
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",  # known Solana alpha wallet
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",  # top SOL trader
+    "Hx6LbkMHe69DBeXDM9RMqMJG41J9YGfxsGFm8BhcPXb",  # meme coin sniper
+    "5tzFkiKscXHK5ZXCGbGuykB2NZuNQn8aVJHsZcFKpNGe",  # dex whale
+]
+_whale_seen = set()
+
+def check_whale_wallets():
+    """Poll recent transactions of whale wallets and copy their buys."""
+    while True:
+        try:
+            active_bots = [b for b in user_bots.values() if b.running]
+            if not active_bots:
+                time.sleep(30)
+                continue
+            for wallet in WHALE_WALLETS:
+                try:
+                    r = requests.post(HELIUS_RPC, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getSignaturesForAddress",
+                        "params": [wallet, {"limit": 5}]
+                    }, timeout=8)
+                    sigs = r.json().get("result", [])
+                    for sig_info in sigs:
+                        sig = sig_info.get("signature")
+                        if not sig or sig in _whale_seen:
+                            continue
+                        _whale_seen.add(sig)
+                        # get transaction details
+                        tx_r = requests.post(HELIUS_RPC, json={
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "getTransaction",
+                            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                        }, timeout=8)
+                        tx = tx_r.json().get("result")
+                        if not tx:
+                            continue
+                        # look for token transfers (buys) in post token balances
+                        pre  = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances",  [])}
+                        post = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("postTokenBalances", [])}
+                        for idx, pb in post.items():
+                            mint = pb.get("mint")
+                            if not mint or mint == SOL_MINT:
+                                continue
+                            pre_amt  = float((pre.get(idx)  or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
+                            post_amt = float(pb.get("uiTokenAmount", {}).get("uiAmount") or 0)
+                            if post_amt > pre_amt * 1.5 and post_amt > 0:
+                                # whale bought this token — get price info and signal bots
+                                try:
+                                    pairs = requests.get(
+                                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                        headers=HEADERS, timeout=5
+                                    ).json().get("pairs")
+                                    if not pairs:
+                                        continue
+                                    p = pairs[0]
+                                    price  = float(p.get("priceUsd") or 0)
+                                    mc     = p.get("marketCap", 0) or 0
+                                    vol    = (p.get("volume") or {}).get("h24", 0) or 0
+                                    liq    = (p.get("liquidity") or {}).get("usd", 0) or 0
+                                    name   = p.get("baseToken", {}).get("name", "Unknown")
+                                    created_at = p.get("pairCreatedAt")
+                                    age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
+                                    if not price:
+                                        continue
+                                    for bot in list(user_bots.values()):
+                                        if bot.running and mint not in bot.positions:
+                                            bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
+                                            try:
+                                                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, 0)
+                                            except:
+                                                pass
+                                except:
+                                    pass
+                except:
+                    pass
+            time.sleep(20)
+        except Exception as e:
+            print(f"Whale tracker error: {e}")
+            time.sleep(30)
+
+threading.Thread(target=check_whale_wallets, daemon=True).start()
+
 def global_scanner():
     while True:
         try:
@@ -412,25 +517,34 @@ def global_scanner():
                     p = pairs[0]
                     created_at = p.get("pairCreatedAt")
                     age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
+                    vol    = (p.get("volume") or {}).get("h24", 0) or 0
+                    change = (p.get("priceChange") or {}).get("h1", 0) or 0
+                    momentum = get_momentum_score(mint, vol)
                     info = {
-                        "name":   p.get("baseToken",{}).get("name","Unknown"),
-                        "symbol": p.get("baseToken",{}).get("symbol","?"),
-                        "price":  float(p.get("priceUsd") or 0),
-                        "mc":     p.get("marketCap",0) or 0,
-                        "vol":    (p.get("volume") or {}).get("h24",0) or 0,
-                        "liq":    (p.get("liquidity") or {}).get("usd",0) or 0,
-                        "age_min":age_min,
-                        "change": (p.get("priceChange") or {}).get("h1",0) or 0,
+                        "name":     p.get("baseToken",{}).get("name","Unknown"),
+                        "symbol":   p.get("baseToken",{}).get("symbol","?"),
+                        "price":    float(p.get("priceUsd") or 0),
+                        "mc":       p.get("marketCap",0) or 0,
+                        "vol":      vol,
+                        "liq":      (p.get("liquidity") or {}).get("usd",0) or 0,
+                        "age_min":  age_min,
+                        "change":   change,
+                        "momentum": momentum,
                     }
                     if not info["price"]:
                         continue
                     for bot in list(user_bots.values()):
                         if bot.running:
                             try:
+                                # boost signal on high momentum tokens
+                                effective_change = info["change"]
+                                if momentum >= 60:
+                                    bot.log_msg(f"⚡ MOMENTUM SPIKE: {info['name']} score={momentum}")
+                                    effective_change = max(effective_change, 25)
                                 bot.evaluate_signal(
                                     mint, info["name"], info["price"],
                                     info["mc"], info["vol"], info["liq"],
-                                    info["age_min"], info["change"]
+                                    info["age_min"], effective_change
                                 )
                             except:
                                 pass
