@@ -10,6 +10,7 @@ Required .env variables:
 
 import os, sqlite3, threading, time, base64, json, requests, base58, secrets, hashlib
 import string
+from collections import deque
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, redirect, url_for, session, jsonify, Response
@@ -243,8 +244,43 @@ def decrypt_key(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
 
 # ── Per-user bot instances ─────────────────────────────────────────────────────
-user_bots   = {}
-seen_tokens = set()
+user_bots    = {}
+seen_tokens  = set()
+market_feed  = deque(maxlen=100)   # live token stream for market board
+
+def ai_score(info):
+    """Score a token 0-100 based on multiple signals."""
+    score = 0
+    vol   = info.get("vol", 0)
+    liq   = info.get("liq", 0)
+    mc    = info.get("mc", 0)
+    age   = info.get("age_min", 9999)
+    chg   = info.get("change", 0)
+    mom   = info.get("momentum", 0)
+    # Volume score (0-25)
+    if vol > 100000: score += 25
+    elif vol > 50000: score += 18
+    elif vol > 10000: score += 10
+    elif vol > 1000:  score += 5
+    # Liquidity score (0-20)
+    if liq > 50000: score += 20
+    elif liq > 20000: score += 14
+    elif liq > 5000:  score += 8
+    elif liq > 1000:  score += 3
+    # Age score — fresh tokens score higher (0-20)
+    if age < 5:    score += 20
+    elif age < 15: score += 14
+    elif age < 30: score += 8
+    elif age < 60: score += 3
+    # Price change (0-20)
+    if chg > 100: score += 20
+    elif chg > 50: score += 15
+    elif chg > 20: score += 10
+    elif chg > 5:  score += 5
+    elif chg < -20: score -= 10
+    # Momentum (0-15)
+    score += int(mom * 0.15)
+    return max(0, min(100, score))
 
 class BotInstance:
     def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol):
@@ -678,6 +714,10 @@ def global_scanner():
                     }
                     if not info["price"]:
                         continue
+                    info["mint"] = mint
+                    info["score"] = ai_score(info)
+                    info["ts"] = int(time.time())
+                    market_feed.appendleft(info)
                     for bot in list(user_bots.values()):
                         if bot.running:
                             try:
@@ -1089,6 +1129,46 @@ def api_settings():
         bot.profit_target    = profit
     return jsonify({"ok":True})
 
+@app.route("/api/market-feed")
+@login_required
+def api_market_feed():
+    """SSE stream of live market tokens."""
+    def generate():
+        last = 0
+        while True:
+            tokens = [t for t in market_feed if t.get("ts", 0) > last]
+            if tokens:
+                last = tokens[0].get("ts", last)
+                yield f"data: {json.dumps(tokens[:20])}\n\n"
+            time.sleep(3)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/api/manual-buy", methods=["POST"])
+@login_required
+def api_manual_buy():
+    uid  = session["user_id"]
+    mint = (request.json or {}).get("mint", "")
+    name = (request.json or {}).get("name", "Unknown")
+    if not mint:
+        return jsonify({"ok": False, "msg": "No mint provided"})
+    bot = user_bots.get(uid)
+    if not bot or not bot.running:
+        return jsonify({"ok": False, "msg": "Bot not running — start bot first"})
+    if mint in bot.positions:
+        return jsonify({"ok": False, "msg": "Already in position"})
+    # get current price
+    try:
+        pairs = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                             headers=HEADERS, timeout=5).json().get("pairs")
+        price = float(pairs[0].get("priceUsd") or 0) if pairs else 0
+    except:
+        price = 0
+    if not price:
+        return jsonify({"ok": False, "msg": "Could not fetch price"})
+    threading.Thread(target=bot.buy, args=(mint, name, price), daemon=True).start()
+    return jsonify({"ok": True, "msg": f"Manual buy triggered for {name}"})
+
 @app.route("/api/telegram", methods=["POST"])
 @login_required
 def api_telegram():
@@ -1481,6 +1561,61 @@ function toggleStop(v){
 
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
 DASHBOARD_HTML = _CSS + """
+<style>
+/* Market board styles */
+.market-board{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-top:12px}
+.mcard{background:var(--bg2);border:1px solid var(--bdr);border-radius:10px;padding:12px;cursor:pointer;position:relative;transition:all .2s;overflow:hidden}
+.mcard:hover{border-color:var(--grn);transform:translateY(-2px);box-shadow:0 8px 24px rgba(20,199,132,.15)}
+.mcard::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--grn),#7b61ff)}
+.mcard-name{font-weight:700;font-size:13px;color:var(--t1);margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mcard-sym{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
+.mcard-price{font-family:'SF Mono','Courier New',monospace;font-size:11px;color:var(--t2);margin:6px 0}
+.mcard-row{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
+.mcard-chg{font-size:12px;font-weight:700}
+.score-bar{height:4px;border-radius:2px;margin-top:8px;background:var(--bg3)}
+.score-fill{height:100%;border-radius:2px;transition:width .5s}
+.score-label{font-size:10px;color:var(--t3);margin-top:3px;display:flex;justify-content:space-between}
+.new-badge{position:absolute;top:8px;right:8px;background:var(--grn);color:#000;font-size:9px;font-weight:800;padding:2px 6px;border-radius:4px;letter-spacing:.5px}
+/* Hover tooltip */
+.tooltip{display:none;position:fixed;z-index:9999;background:#0d1117;border:1px solid var(--grn);border-radius:14px;padding:20px;width:320px;box-shadow:0 20px 60px rgba(0,0,0,.8)}
+.tooltip.show{display:block}
+.tt-title{font-size:18px;font-weight:800;color:var(--t1);margin-bottom:4px}
+.tt-sym{font-size:11px;color:var(--grn);text-transform:uppercase;letter-spacing:1px}
+.tt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+.tt-stat{background:var(--bg3);border-radius:8px;padding:10px}
+.tt-stat-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.tt-stat-val{font-size:15px;font-weight:700;color:var(--t1)}
+.ai-score-wrap{margin:12px 0;background:var(--bg3);border-radius:10px;padding:14px}
+.ai-score-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.ai-score-label{font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
+.ai-score-num{font-size:24px;font-weight:900}
+.ai-bar{height:8px;border-radius:4px;background:var(--bg2);overflow:hidden}
+.ai-fill{height:100%;border-radius:4px;transition:width .6s}
+.ai-verdict{font-size:11px;margin-top:6px;font-weight:600}
+.tt-btns{display:flex;gap:8px;margin-top:14px}
+.tt-btn{flex:1;padding:10px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;border:none;transition:all .2s}
+.tt-buy{background:var(--grn);color:#000}
+.tt-buy:hover{background:#0fa86a}
+.tt-chart{background:var(--bg3);color:var(--t1);border:1px solid var(--bdr)}
+.tt-chart:hover{border-color:var(--grn)}
+/* Ticker tape */
+.ticker{background:var(--bg2);border-bottom:1px solid var(--bdr);padding:8px 0;overflow:hidden;white-space:nowrap}
+.ticker-inner{display:inline-flex;gap:32px;animation:scroll 40s linear infinite}
+@keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.tick-item{font-size:12px;color:var(--t2);display:flex;gap:8px;align-items:center}
+.tick-name{font-weight:600;color:var(--t1)}
+/* Layout */
+.dash-grid{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
+@media(max-width:900px){.dash-grid{grid-template-columns:1fr}}
+.live-dot{width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:6px;animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+.market-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.token-count{font-size:12px;color:var(--t3)}
+.filter-row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.filter-btn{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:5px 12px;border-radius:20px;font-size:11px;cursor:pointer;transition:all .2s}
+.filter-btn.active{background:var(--grn);color:#000;border-color:var(--grn);font-weight:700}
+</style>
+
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
@@ -1491,98 +1626,303 @@ DASHBOARD_HTML = _CSS + """
   </div>
 </nav>
 
-<div class="wrap">
-  <!-- Header -->
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;flex-wrap:wrap;gap:12px">
-    <div>
-      <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);margin-bottom:3px">{{PLAN}}</div>
-      <div style="font-size:11px;color:var(--t3)">Wallet: <span class="c-blue" style="font-family:'SF Mono','Courier New',monospace;font-size:11px">{{WALLET}}</span></div>
-    </div>
-    <div class="status">
-      <div class="sdot sdot-off" id="sdot"></div>
-      <span class="stxt" id="stxt">Initializing…</span>
-    </div>
-  </div>
+<!-- Ticker tape -->
+<div class="ticker" id="ticker"><div class="ticker-inner" id="ticker-inner">Loading market data…</div></div>
 
-  <!-- Stats -->
-  <div class="stats">
+<!-- Hover Tooltip -->
+<div class="tooltip" id="tooltip">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start">
+    <div>
+      <div class="tt-title" id="tt-name">—</div>
+      <div class="tt-sym" id="tt-sym">—</div>
+    </div>
+    <button onclick="closeTooltip()" style="background:none;border:none;color:var(--t3);font-size:18px;cursor:pointer">✕</button>
+  </div>
+  <div class="tt-grid">
+    <div class="tt-stat"><div class="tt-stat-label">Price</div><div class="tt-stat-val" id="tt-price">—</div></div>
+    <div class="tt-stat"><div class="tt-stat-label">1h Change</div><div class="tt-stat-val" id="tt-chg">—</div></div>
+    <div class="tt-stat"><div class="tt-stat-label">Market Cap</div><div class="tt-stat-val" id="tt-mc">—</div></div>
+    <div class="tt-stat"><div class="tt-stat-label">Liquidity</div><div class="tt-stat-val" id="tt-liq">—</div></div>
+    <div class="tt-stat"><div class="tt-stat-label">Volume 24h</div><div class="tt-stat-val" id="tt-vol">—</div></div>
+    <div class="tt-stat"><div class="tt-stat-label">Age</div><div class="tt-stat-val" id="tt-age">—</div></div>
+  </div>
+  <div class="ai-score-wrap">
+    <div class="ai-score-header">
+      <div class="ai-score-label">AI Signal Score</div>
+      <div class="ai-score-num" id="tt-score">0</div>
+    </div>
+    <div class="ai-bar"><div class="ai-fill" id="tt-score-bar" style="width:0%"></div></div>
+    <div class="ai-verdict" id="tt-verdict">—</div>
+  </div>
+  <div class="tt-btns">
+    <button class="tt-btn tt-buy" id="tt-buy-btn" onclick="manualBuy()">⚡ AI Buy Now</button>
+    <button class="tt-btn tt-chart" onclick="openChart()">📊 Chart</button>
+  </div>
+</div>
+<div id="tooltip-overlay" style="display:none;position:fixed;inset:0;z-index:9998" onclick="closeTooltip()"></div>
+
+<div class="wrap">
+  <!-- Stats row -->
+  <div class="stats" style="margin-bottom:16px">
     <div class="stat"><div class="slabel">SOL Balance</div><div class="sval" id="balance">—</div><div class="ssub">available</div></div>
     <div class="stat"><div class="slabel">Open Positions</div><div class="sval c-gold" id="pos-count">0</div></div>
-    <div class="stat"><div class="slabel">Wins</div><div class="sval c-grn" id="wins">0</div><div class="ssub">closed profitable</div></div>
-    <div class="stat"><div class="slabel">Losses</div><div class="sval c-red" id="losses">0</div><div class="ssub">closed at loss</div></div>
-    <div class="stat"><div class="slabel">Session P&amp;L</div><div class="sval" id="pnl">+0.0000</div><div class="ssub">SOL this session</div></div>
+    <div class="stat"><div class="slabel">Wins</div><div class="sval c-grn" id="wins">0</div></div>
+    <div class="stat"><div class="slabel">Losses</div><div class="sval c-red" id="losses">0</div></div>
+    <div class="stat"><div class="slabel">Session P&amp;L</div><div class="sval" id="pnl">+0.0000</div><div class="ssub">SOL</div></div>
   </div>
 
-  <!-- Controls -->
-  <div class="panel">
-    <div class="sec-label">Bot Controls</div>
-    <div class="row">
-      <button class="btn btn-success" id="toggle-btn" onclick="toggleBot()">▶ Start Bot</button>
-      <button class="btn btn-ghost" onclick="cashout()">↓ Cashout All Positions</button>
+  <div class="dash-grid">
+    <!-- Left panel: controls + positions + log -->
+    <div>
+      <div class="panel" style="margin-bottom:12px">
+        <div class="sec-label">Bot Controls</div>
+        <div class="row" style="margin-bottom:12px">
+          <button class="btn btn-success" id="toggle-btn" onclick="toggleBot()">▶ Start Bot</button>
+          <button class="btn btn-ghost" onclick="cashout()">↓ Cashout All</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="sdot sdot-off" id="sdot"></div>
+          <span class="stxt" id="stxt" style="font-size:13px">Initializing…</span>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:12px">
+        <div class="sec-label">Strategy</div>
+        <div class="fgroup" style="margin-bottom:8px">
+          <label class="flabel">Preset</label>
+          <select class="finput" id="s-preset">
+            <option value="steady">Steady Profit</option>
+            <option value="max">Max Profit</option>
+          </select>
+        </div>
+        <div class="fgroup" style="margin-bottom:8px">
+          <label class="flabel">Run Mode</label>
+          <select class="finput" id="s-mode" onchange="toggleStop(this.value)">
+            <option value="indefinite">Run Indefinitely</option>
+            <option value="duration">Run for Duration</option>
+            <option value="profit">Stop at Profit Target</option>
+          </select>
+        </div>
+        <div id="f-dur" style="display:none" class="fgroup" style="margin-bottom:8px">
+          <label class="flabel">Duration (minutes)</label>
+          <input class="finput" type="number" id="s-dur" placeholder="e.g. 60" min="1">
+        </div>
+        <div id="f-pft" style="display:none" class="fgroup" style="margin-bottom:8px">
+          <label class="flabel">Profit Target (SOL)</label>
+          <input class="finput" type="number" id="s-pft" placeholder="e.g. 0.5" step="0.01">
+        </div>
+        <button class="btn btn-primary" onclick="saveSettings()" style="width:100%;margin-top:4px">Save Settings</button>
+      </div>
+
+      <div class="panel" style="margin-bottom:12px">
+        <div class="sec-label">Open Positions</div>
+        <div id="pos-tbl"><div style="font-size:13px;color:var(--t3)">No open positions</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="sec-label">Activity Log</div>
+        <div id="log" style="max-height:260px;overflow-y:auto"></div>
+      </div>
     </div>
-  </div>
 
-  <!-- Strategy -->
-  <div class="panel">
-    <div class="sec-label">Strategy Settings</div>
-    <div class="field-row">
-      <div class="fgroup">
-        <label class="flabel">Preset</label>
-        <select class="finput" id="s-preset">
-          <option value="steady">Steady Profit</option>
-          <option value="max">Max Profit</option>
-        </select>
-      </div>
-      <div class="fgroup">
-        <label class="flabel">Stop Condition</label>
-        <select class="finput" id="s-mode" onchange="toggleStop(this.value)">
-          <option value="indefinite">Run indefinitely</option>
-          <option value="duration">After duration</option>
-          <option value="profit">At profit target</option>
-        </select>
-      </div>
-      <div class="fgroup" id="f-dur" style="display:none">
-        <label class="flabel">Minutes</label>
-        <input class="finput" type="number" id="s-dur" style="width:80px" placeholder="60">
-      </div>
-      <div class="fgroup" id="f-pft" style="display:none">
-        <label class="flabel">SOL Target</label>
-        <input class="finput" type="number" id="s-pft" step="0.01" style="width:80px" placeholder="0.5">
-      </div>
-      <div class="fgroup" style="align-self:flex-end">
-        <button class="btn btn-ghost" onclick="saveSettings()">Apply</button>
+    <!-- Right panel: live market board -->
+    <div>
+      <div class="panel">
+        <div class="market-header">
+          <div>
+            <span class="live-dot"></span>
+            <span style="font-weight:700;font-size:15px">Live Market Feed</span>
+            <span class="token-count" id="token-count" style="margin-left:8px">0 tokens</span>
+          </div>
+          <div style="font-size:11px;color:var(--t3)">Hover a card to analyze · Click to buy</div>
+        </div>
+        <div class="filter-row">
+          <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
+          <button class="filter-btn" onclick="setFilter('hot',this)">🔥 Hot (score 70+)</button>
+          <button class="filter-btn" onclick="setFilter('new',this)">🆕 New (&lt;15min)</button>
+          <button class="filter-btn" onclick="setFilter('whale',this)">🐋 Whale Picks</button>
+        </div>
+        <div class="market-board" id="market-board">
+          <div style="color:var(--t3);font-size:13px;grid-column:1/-1;padding:20px 0;text-align:center">
+            Waiting for market data… Start the bot to enable scanning.
+          </div>
+        </div>
       </div>
     </div>
-  </div>
-
-  <!-- Positions -->
-  <div class="panel">
-    <div class="sec-label">Open Positions</div>
-    <div id="pos-tbl"><div style="font-size:13px;color:var(--t3);padding:8px 0">No open positions</div></div>
-  </div>
-
-  <!-- Activity Log -->
-  <div class="log" id="log-wrap">
-    <div class="sec-label" style="margin-bottom:10px">Activity Log</div>
-    <div id="log"></div>
-  </div>
-
-  <!-- Upgrade row -->
-  <div style="display:flex;gap:12px;justify-content:center;margin-top:20px;flex-wrap:wrap">
-    <a href="/subscribe/basic" class="btn btn-ghost">Basic Plan — $29/mo</a>
-    <a href="/subscribe/pro"   class="btn btn-primary">Upgrade to Pro — $49/mo</a>
   </div>
 </div>
 
 <script>
 let running = false;
-function toggleStop(v){
+let activeFilter = 'all';
+let allTokens = [];
+let selectedToken = null;
+
+// ── Filters ──────────────────────────────────────────────────────────────────
+function setFilter(f, btn) {
+  activeFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderBoard();
+}
+
+function applyFilter(tokens) {
+  if (activeFilter === 'hot')   return tokens.filter(t => t.score >= 70);
+  if (activeFilter === 'new')   return tokens.filter(t => t.age_min < 15);
+  if (activeFilter === 'whale') return tokens.filter(t => t.whale);
+  return tokens;
+}
+
+// ── Market board rendering ───────────────────────────────────────────────────
+function fmtNum(n) {
+  if (!n) return '$0';
+  if (n >= 1e6) return '$' + (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return '$' + (n/1e3).toFixed(0) + 'K';
+  return '$' + n.toFixed(0);
+}
+
+function scoreColor(s) {
+  if (s >= 70) return '#14c784';
+  if (s >= 45) return '#f5a623';
+  return '#f23645';
+}
+
+function renderBoard() {
+  const filtered = applyFilter(allTokens);
+  document.getElementById('token-count').textContent = filtered.length + ' tokens';
+  if (!filtered.length) {
+    document.getElementById('market-board').innerHTML =
+      '<div style="color:var(--t3);font-size:13px;grid-column:1/-1;padding:20px 0;text-align:center">No tokens match filter</div>';
+    return;
+  }
+  const html = filtered.slice(0, 40).map((t, i) => {
+    const chg = t.change || 0;
+    const chgCol = chg >= 0 ? '#14c784' : '#f23645';
+    const chgTxt = (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%';
+    const sc = t.score || 0;
+    const isNew = (t.age_min || 99) < 10;
+    return `<div class="mcard" onmouseenter="showTooltip(event,${i})" onclick="showTooltip(event,${i})">
+      ${isNew ? '<div class="new-badge">NEW</div>' : ''}
+      <div class="mcard-name">${t.name||'Unknown'}</div>
+      <div class="mcard-sym">${t.symbol||''} · ${(t.age_min||0).toFixed(0)}m old</div>
+      <div class="mcard-price">$${t.price ? t.price.toFixed(8) : '—'}</div>
+      <div class="mcard-row">
+        <span class="mcard-chg" style="color:${chgCol}">${chgTxt}</span>
+        <span style="font-size:10px;color:var(--t3)">${fmtNum(t.mc)}</span>
+      </div>
+      <div class="score-bar"><div class="score-fill" style="width:${sc}%;background:${scoreColor(sc)}"></div></div>
+      <div class="score-label"><span>AI Score</span><span style="color:${scoreColor(sc)};font-weight:700">${sc}</span></div>
+    </div>`;
+  }).join('');
+  document.getElementById('market-board').innerHTML = html;
+}
+
+// ── Tooltip ──────────────────────────────────────────────────────────────────
+function showTooltip(e, idx) {
+  e.stopPropagation();
+  const filtered = applyFilter(allTokens);
+  const t = filtered[idx];
+  if (!t) return;
+  selectedToken = t;
+  document.getElementById('tt-name').textContent    = t.name || 'Unknown';
+  document.getElementById('tt-sym').textContent     = (t.symbol || '') + ' / SOL';
+  document.getElementById('tt-price').textContent   = t.price ? '$' + t.price.toFixed(8) : '—';
+  const chg = t.change || 0;
+  const chgEl = document.getElementById('tt-chg');
+  chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+  chgEl.style.color = chg >= 0 ? '#14c784' : '#f23645';
+  document.getElementById('tt-mc').textContent      = fmtNum(t.mc);
+  document.getElementById('tt-liq').textContent     = fmtNum(t.liq);
+  document.getElementById('tt-vol').textContent     = fmtNum(t.vol);
+  document.getElementById('tt-age').textContent     = (t.age_min || 0).toFixed(1) + ' min';
+  const sc = t.score || 0;
+  document.getElementById('tt-score').textContent   = sc;
+  document.getElementById('tt-score').style.color   = scoreColor(sc);
+  document.getElementById('tt-score-bar').style.width     = sc + '%';
+  document.getElementById('tt-score-bar').style.background = scoreColor(sc);
+  let verdict = '';
+  if (sc >= 80)      verdict = '🔥 Strong Buy Signal';
+  else if (sc >= 60) verdict = '✅ Moderate Buy Signal';
+  else if (sc >= 40) verdict = '⚠️ Weak Signal — Caution';
+  else               verdict = '❌ Low Confidence — Skip';
+  document.getElementById('tt-verdict').textContent = verdict;
+  document.getElementById('tt-verdict').style.color = scoreColor(sc);
+  // Position tooltip near cursor
+  const tt = document.getElementById('tooltip');
+  tt.classList.add('show');
+  document.getElementById('tooltip-overlay').style.display = 'block';
+  const x = Math.min(e.clientX + 16, window.innerWidth - 340);
+  const y = Math.min(e.clientY - 20, window.innerHeight - 520);
+  tt.style.left = x + 'px';
+  tt.style.top  = Math.max(10, y) + 'px';
+}
+
+function closeTooltip() {
+  document.getElementById('tooltip').classList.remove('show');
+  document.getElementById('tooltip-overlay').style.display = 'none';
+  selectedToken = null;
+}
+
+function openChart() {
+  if (selectedToken) window.open('https://dexscreener.com/solana/' + selectedToken.mint, '_blank');
+}
+
+async function manualBuy() {
+  if (!selectedToken) return;
+  const btn = document.getElementById('tt-buy-btn');
+  btn.textContent = 'Buying…';
+  btn.disabled = true;
+  const res = await fetch('/api/manual-buy', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({mint: selectedToken.mint, name: selectedToken.name})
+  }).then(r=>r.json()).catch(()=>({ok:false,msg:'Request failed'}));
+  btn.textContent = res.ok ? '✅ Order Sent!' : '❌ ' + res.msg;
+  setTimeout(() => { btn.textContent = '⚡ AI Buy Now'; btn.disabled = false; }, 3000);
+  if (res.ok) setTimeout(refresh, 2000);
+}
+
+// ── SSE market feed ──────────────────────────────────────────────────────────
+function startFeed() {
+  const es = new EventSource('/api/market-feed');
+  es.onmessage = function(e) {
+    try {
+      const newTokens = JSON.parse(e.data);
+      // merge, avoid duplicates
+      const mints = new Set(allTokens.map(t => t.mint));
+      newTokens.forEach(t => { if (!mints.has(t.mint)) allTokens.unshift(t); });
+      if (allTokens.length > 100) allTokens = allTokens.slice(0, 100);
+      renderBoard();
+      updateTicker();
+    } catch(err) {}
+  };
+  es.onerror = function() { setTimeout(startFeed, 5000); es.close(); };
+}
+
+// ── Ticker tape ──────────────────────────────────────────────────────────────
+function updateTicker() {
+  const items = allTokens.slice(0, 20).map(t => {
+    const chg = t.change || 0;
+    const col = chg >= 0 ? '#14c784' : '#f23645';
+    return `<span class="tick-item">
+      <span class="tick-name">${t.symbol||t.name||'?'}</span>
+      <span style="font-family:monospace;font-size:11px">$${t.price?.toFixed(6)||'—'}</span>
+      <span style="color:${col};font-weight:700">${chg>=0?'+':''}${chg.toFixed(1)}%</span>
+    </span>`;
+  });
+  // duplicate for seamless loop
+  const html = [...items, ...items].join('');
+  document.getElementById('ticker-inner').innerHTML = html;
+}
+
+// ── Bot state refresh ────────────────────────────────────────────────────────
+function toggleStop(v) {
   document.getElementById('f-dur').style.display = v==='duration' ? 'block' : 'none';
   document.getElementById('f-pft').style.display = v==='profit'   ? 'block' : 'none';
 }
-async function refresh(){
+async function refresh() {
   const d = await fetch('/api/state').then(r=>r.json()).catch(()=>null);
-  if(!d) return;
+  if (!d) return;
   running = d.running;
   document.getElementById('balance').textContent   = d.balance.toFixed(4);
   document.getElementById('pos-count').textContent = d.positions.length;
@@ -1593,59 +1933,57 @@ async function refresh(){
   pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
   pnlEl.className   = 'sval ' + (pnl>=0 ? 'c-grn' : 'c-red');
   const dot=document.getElementById('sdot'), txt=document.getElementById('stxt'), btn=document.getElementById('toggle-btn');
-  if(running){
+  if (running) {
     dot.className='sdot sdot-on'; txt.textContent='Bot Running';
     btn.textContent='⏸ Stop Bot'; btn.className='btn btn-danger';
   } else {
     dot.className='sdot sdot-off'; txt.textContent='Bot Stopped';
     btn.textContent='▶ Start Bot'; btn.className='btn btn-success';
   }
-  if(d.positions.length){
+  if (d.positions.length) {
     const rows = d.positions.map(p => {
       const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
       return `<tr>
-        <td style="font-weight:500">${p.name}${p.tp1_hit ? '<span class="badge bg-grn" style="margin-left:6px">TP1</span>' : ''}</td>
-        <td style="font-family:monospace;font-size:11.5px">$${p.entry_price?.toFixed(8)??'—'}</td>
-        <td style="font-family:monospace;font-size:11.5px">$${p.current_price?.toFixed(8)??'—'}</td>
+        <td style="font-weight:600">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px">TP1</span>':''}</td>
         <td class="${cls}" style="font-weight:600">${p.pnl}</td>
-        <td class="c-muted">${p.age_min}m</td>
         <td><a href="https://dexscreener.com/solana/${p.address}" target="_blank" class="badge bg-blue">Chart</a></td>
       </tr>`;
     }).join('');
     document.getElementById('pos-tbl').innerHTML =
-      `<table class="tbl"><thead><tr><th>Token</th><th>Entry</th><th>Current</th><th>P&amp;L</th><th>Age</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+      `<table class="tbl"><thead><tr><th>Token</th><th>P&L</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
   } else {
-    document.getElementById('pos-tbl').innerHTML = '<div style="font-size:13px;color:var(--t3);padding:8px 0">No open positions</div>';
+    document.getElementById('pos-tbl').innerHTML = '<div style="font-size:13px;color:var(--t3)">No open positions</div>';
   }
   document.getElementById('log').innerHTML = d.log.map(l => {
-    const c = l.includes('BUY') ? 'lbuy' : (l.includes('SELL')||l.includes('CASHOUT')) ? 'lsell' : l.includes('SIGNAL') ? 'lsig' : '';
+    const c = l.includes('BUY') ? 'lbuy' : (l.includes('SELL')||l.includes('CASHOUT')) ? 'lsell' :
+              l.includes('WHALE') ? 'lsig' : l.includes('MOMENTUM') ? 'lsig' : '';
     return `<div class="lline ${c}">${l}</div>`;
   }).join('');
 }
-async function toggleBot(){
+async function toggleBot() {
   await fetch(running ? '/api/stop' : '/api/start', {method:'POST'});
   setTimeout(refresh, 500);
 }
-async function cashout(){
-  if(!confirm('Sell all open positions at market price?')) return;
+async function cashout() {
+  if (!confirm('Sell all open positions at market price?')) return;
   await fetch('/api/cashout', {method:'POST'});
   setTimeout(refresh, 1000);
 }
-async function saveSettings(){
-  const res = await fetch('/api/settings', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
+async function saveSettings() {
+  await fetch('/api/settings', {
+    method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      preset:              document.getElementById('s-preset').value,
-      run_mode:            document.getElementById('s-mode').value,
-      run_duration_min:    document.getElementById('s-dur').value || 0,
-      profit_target_sol:   document.getElementById('s-pft').value || 0,
+      preset: document.getElementById('s-preset').value,
+      run_mode: document.getElementById('s-mode').value,
+      run_duration_min: document.getElementById('s-dur')?.value || 0,
+      profit_target_sol: document.getElementById('s-pft')?.value || 0,
     })
   });
-  if((await res.json()).ok) setTimeout(refresh, 300);
+  setTimeout(refresh, 300);
 }
 refresh();
 setInterval(refresh, 5000);
+startFeed();
 </script>
 """
 
