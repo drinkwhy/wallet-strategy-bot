@@ -1562,21 +1562,12 @@ function toggleStop(v){
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
 DASHBOARD_HTML = _CSS + """
 <style>
-/* Market board styles */
-.market-board{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-top:12px}
-.mcard{background:var(--bg2);border:1px solid var(--bdr);border-radius:10px;padding:12px;cursor:pointer;position:relative;transition:all .2s;overflow:hidden}
-.mcard:hover{border-color:var(--grn);transform:translateY(-2px);box-shadow:0 8px 24px rgba(20,199,132,.15)}
-.mcard::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--grn),#7b61ff)}
-.mcard-name{font-weight:700;font-size:13px;color:var(--t1);margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mcard-sym{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
-.mcard-price{font-family:'SF Mono','Courier New',monospace;font-size:11px;color:var(--t2);margin:6px 0}
-.mcard-row{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
-.mcard-chg{font-size:12px;font-weight:700}
-.score-bar{height:4px;border-radius:2px;margin-top:8px;background:var(--bg3)}
-.score-fill{height:100%;border-radius:2px;transition:width .5s}
-.score-label{font-size:10px;color:var(--t3);margin-top:3px;display:flex;justify-content:space-between}
-.new-badge{position:absolute;top:8px;right:8px;background:var(--grn);color:#000;font-size:9px;font-weight:800;padding:2px 6px;border-radius:4px;letter-spacing:.5px}
-/* Hover tooltip */
+/* Chart container */
+.chart-wrap{position:relative;width:100%;background:#0d1117;border-radius:10px;overflow:hidden}
+#market-chart{display:block;width:100%;cursor:crosshair}
+.chart-legend{display:flex;gap:16px;margin-top:8px;font-size:11px;color:var(--t3)}
+.leg-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+/* Click tooltip */
 .tooltip{display:none;position:fixed;z-index:9999;background:#0d1117;border:1px solid var(--grn);border-radius:14px;padding:20px;width:320px;box-shadow:0 20px 60px rgba(0,0,0,.8)}
 .tooltip.show{display:block}
 .tt-title{font-size:18px;font-weight:800;color:var(--t1);margin-bottom:4px}
@@ -1734,7 +1725,7 @@ DASHBOARD_HTML = _CSS + """
             <span style="font-weight:700;font-size:15px">Live Market Feed</span>
             <span class="token-count" id="token-count" style="margin-left:8px">0 tokens</span>
           </div>
-          <div style="font-size:11px;color:var(--t3)">Hover a card to analyze · Click to buy</div>
+          <div style="font-size:11px;color:var(--t3)">Click a dot to analyze · ⚡ buy</div>
         </div>
         <div class="filter-row">
           <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
@@ -1742,10 +1733,14 @@ DASHBOARD_HTML = _CSS + """
           <button class="filter-btn" onclick="setFilter('new',this)">🆕 New (&lt;15min)</button>
           <button class="filter-btn" onclick="setFilter('whale',this)">🐋 Whale Picks</button>
         </div>
-        <div class="market-board" id="market-board">
-          <div style="color:var(--t3);font-size:13px;grid-column:1/-1;padding:20px 0;text-align:center">
-            Waiting for market data… Start the bot to enable scanning.
-          </div>
+        <div class="chart-wrap">
+          <canvas id="market-chart" height="420"></canvas>
+        </div>
+        <div class="chart-legend">
+          <span><span class="leg-dot" style="background:#14c784"></span>AI Score 70+ (Hot)</span>
+          <span><span class="leg-dot" style="background:#f5a623"></span>Score 45–69</span>
+          <span><span class="leg-dot" style="background:#f23645"></span>Score &lt;45</span>
+          <span style="margin-left:auto">Dot size = volume</span>
         </div>
       </div>
     </div>
@@ -1757,13 +1752,15 @@ let running = false;
 let activeFilter = 'all';
 let allTokens = [];
 let selectedToken = null;
+let hoveredIdx = -1;
+let chartCanvas, chartCtx, chartDisplayTokens = [];
 
 // ── Filters ──────────────────────────────────────────────────────────────────
 function setFilter(f, btn) {
   activeFilter = f;
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  renderBoard();
+  renderChart();
 }
 
 function applyFilter(tokens) {
@@ -1773,7 +1770,7 @@ function applyFilter(tokens) {
   return tokens;
 }
 
-// ── Market board rendering ───────────────────────────────────────────────────
+// ── Utilities ────────────────────────────────────────────────────────────────
 function fmtNum(n) {
   if (!n) return '$0';
   if (n >= 1e6) return '$' + (n/1e6).toFixed(1) + 'M';
@@ -1787,41 +1784,190 @@ function scoreColor(s) {
   return '#f23645';
 }
 
-function renderBoard() {
+function logP(p) { return p > 0 ? Math.log10(p) : -10; }
+
+// ── Scatter Chart ─────────────────────────────────────────────────────────────
+function getPad() { return { top: 30, right: 24, bottom: 52, left: 74 }; }
+
+function renderChart() {
+  if (!chartCanvas) return;
   const filtered = applyFilter(allTokens);
+  chartDisplayTokens = filtered.slice(0, 100);
   document.getElementById('token-count').textContent = filtered.length + ' tokens';
-  if (!filtered.length) {
-    document.getElementById('market-board').innerHTML =
-      '<div style="color:var(--t3);font-size:13px;grid-column:1/-1;padding:20px 0;text-align:center">No tokens match filter</div>';
+
+  const pad = getPad();
+  const W = chartCanvas.width, H = chartCanvas.height;
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  chartCtx.clearRect(0, 0, W, H);
+  chartCtx.fillStyle = '#0d1117';
+  chartCtx.fillRect(0, 0, W, H);
+
+  if (!chartDisplayTokens.length) {
+    chartCtx.fillStyle = '#444';
+    chartCtx.font = '13px monospace';
+    chartCtx.textAlign = 'center';
+    chartCtx.fillText('Waiting for market data… Start the bot to enable scanning.', W/2, H/2);
     return;
   }
-  const html = filtered.slice(0, 40).map((t, i) => {
-    const chg = t.change || 0;
-    const chgCol = chg >= 0 ? '#14c784' : '#f23645';
-    const chgTxt = (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%';
-    const sc = t.score || 0;
-    const isNew = (t.age_min || 99) < 10;
-    return `<div class="mcard" onmouseenter="showTooltip(event,${i})" onclick="showTooltip(event,${i})">
-      ${isNew ? '<div class="new-badge">NEW</div>' : ''}
-      <div class="mcard-name">${t.name||'Unknown'}</div>
-      <div class="mcard-sym">${t.symbol||''} · ${(t.age_min||0).toFixed(0)}m old</div>
-      <div class="mcard-price">$${t.price ? t.price.toFixed(8) : '—'}</div>
-      <div class="mcard-row">
-        <span class="mcard-chg" style="color:${chgCol}">${chgTxt}</span>
-        <span style="font-size:10px;color:var(--t3)">${fmtNum(t.mc)}</span>
-      </div>
-      <div class="score-bar"><div class="score-fill" style="width:${sc}%;background:${scoreColor(sc)}"></div></div>
-      <div class="score-label"><span>AI Score</span><span style="color:${scoreColor(sc)};font-weight:700">${sc}</span></div>
-    </div>`;
-  }).join('');
-  document.getElementById('market-board').innerHTML = html;
+
+  // Ranges
+  const ages   = chartDisplayTokens.map(t => t.age_min || 0);
+  const prices = chartDisplayTokens.map(t => t.price || 0).filter(p => p > 0);
+  const maxAge = Math.max(...ages, 60);
+  const minP   = prices.length ? Math.min(...prices) : 1e-9;
+  const maxP   = prices.length ? Math.max(...prices) : 1;
+  const logMin = logP(minP) - 0.3;
+  const logMax = logP(maxP) + 0.3;
+  const vols   = chartDisplayTokens.map(t => t.vol || 0);
+  const maxVol = Math.max(...vols, 1);
+
+  function toX(age)   { return pad.left + (age / maxAge) * plotW; }
+  function toY(price) {
+    if (!price || price <= 0) return pad.top + plotH;
+    return pad.top + plotH - ((logP(price) - logMin) / (logMax - logMin)) * plotH;
+  }
+
+  // Grid
+  chartCtx.strokeStyle = '#1a1f2e';
+  chartCtx.lineWidth = 1;
+  for (let a = 0; a <= maxAge; a += 10) {
+    const x = toX(a);
+    chartCtx.beginPath(); chartCtx.moveTo(x, pad.top); chartCtx.lineTo(x, pad.top + plotH); chartCtx.stroke();
+  }
+  const logSteps = [];
+  for (let l = Math.floor(logMin); l <= Math.ceil(logMax); l++) logSteps.push(l);
+  logSteps.forEach(l => {
+    const y = pad.top + plotH - ((l - logMin) / (logMax - logMin)) * plotH;
+    if (y >= pad.top && y <= pad.top + plotH) {
+      chartCtx.beginPath(); chartCtx.moveTo(pad.left, y); chartCtx.lineTo(pad.left + plotW, y); chartCtx.stroke();
+    }
+  });
+
+  // Axes
+  chartCtx.strokeStyle = '#2a2d3e';
+  chartCtx.lineWidth = 2;
+  chartCtx.beginPath();
+  chartCtx.moveTo(pad.left, pad.top);
+  chartCtx.lineTo(pad.left, pad.top + plotH);
+  chartCtx.lineTo(pad.left + plotW, pad.top + plotH);
+  chartCtx.stroke();
+
+  // X labels
+  chartCtx.fillStyle = '#555';
+  chartCtx.font = '11px monospace';
+  chartCtx.textAlign = 'center';
+  for (let a = 0; a <= maxAge; a += 10) chartCtx.fillText(a + 'm', toX(a), pad.top + plotH + 17);
+  chartCtx.fillStyle = '#666';
+  chartCtx.fillText('Time on Market (minutes)', pad.left + plotW / 2, H - 6);
+
+  // Y labels
+  chartCtx.textAlign = 'right';
+  logSteps.forEach(l => {
+    const y = pad.top + plotH - ((l - logMin) / (logMax - logMin)) * plotH;
+    if (y >= pad.top && y <= pad.top + plotH) {
+      const v = Math.pow(10, l);
+      const lbl = v < 0.0001 ? v.toExponential(0) : v < 0.01 ? v.toFixed(4) : v < 1 ? v.toFixed(2) : v.toFixed(0);
+      chartCtx.fillStyle = '#555';
+      chartCtx.font = '10px monospace';
+      chartCtx.fillText('$' + lbl, pad.left - 6, y + 4);
+    }
+  });
+  chartCtx.save();
+  chartCtx.translate(12, pad.top + plotH / 2);
+  chartCtx.rotate(-Math.PI / 2);
+  chartCtx.textAlign = 'center';
+  chartCtx.fillStyle = '#666';
+  chartCtx.font = '11px monospace';
+  chartCtx.fillText('Price (USD, log)', 0, 0);
+  chartCtx.restore();
+
+  // Dots
+  chartDisplayTokens.forEach((t, i) => {
+    const x   = toX(t.age_min || 0);
+    const y   = toY(t.price   || 0);
+    const sc  = t.score || 0;
+    const vol = t.vol   || 0;
+    const r   = 5 + Math.min(10, (vol / maxVol) * 10);
+    const isHov = hoveredIdx === i;
+    const color = scoreColor(sc);
+
+    if (sc >= 70) { chartCtx.shadowBlur = 14; chartCtx.shadowColor = '#14c784'; }
+    chartCtx.beginPath();
+    chartCtx.arc(x, y, isHov ? r + 3 : r, 0, Math.PI * 2);
+    chartCtx.fillStyle = isHov ? '#fff' : color + 'cc';
+    chartCtx.fill();
+    chartCtx.shadowBlur = 0;
+    chartCtx.strokeStyle = isHov ? color : color + '66';
+    chartCtx.lineWidth = isHov ? 2 : 1;
+    chartCtx.stroke();
+
+    if (isHov) {
+      const lbl = (t.symbol || t.name || '?').slice(0, 12);
+      chartCtx.font = 'bold 12px monospace';
+      chartCtx.fillStyle = '#fff';
+      chartCtx.textAlign = 'center';
+      chartCtx.fillText(lbl, x, y - r - 6);
+    }
+  });
 }
 
-// ── Tooltip ──────────────────────────────────────────────────────────────────
+function initChart() {
+  chartCanvas = document.getElementById('market-chart');
+  chartCtx    = chartCanvas.getContext('2d');
+
+  function resize() {
+    chartCanvas.width  = chartCanvas.parentElement.clientWidth;
+    chartCanvas.height = 420;
+    renderChart();
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  chartCanvas.addEventListener('mousemove', function(e) {
+    const rect = chartCanvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (chartCanvas.width  / rect.width);
+    const my = (e.clientY - rect.top)  * (chartCanvas.height / rect.height);
+    const pad = getPad();
+    const plotW = chartCanvas.width  - pad.left - pad.right;
+    const plotH = chartCanvas.height - pad.top  - pad.bottom;
+    const ages  = chartDisplayTokens.map(t => t.age_min || 0);
+    const prices= chartDisplayTokens.map(t => t.price   || 0).filter(p => p > 0);
+    const maxAge= Math.max(...ages, 60);
+    const minP  = prices.length ? Math.min(...prices) : 1e-9;
+    const maxP  = prices.length ? Math.max(...prices) : 1;
+    const logMin= logP(minP) - 0.3, logMax = logP(maxP) + 0.3;
+    function toX(a) { return pad.left + (a / maxAge) * plotW; }
+    function toY(p) { return !p||p<=0 ? pad.top+plotH : pad.top+plotH-((logP(p)-logMin)/(logMax-logMin))*plotH; }
+    let found = -1;
+    for (let i = 0; i < chartDisplayTokens.length; i++) {
+      const t  = chartDisplayTokens[i];
+      const dx = mx - toX(t.age_min || 0);
+      const dy = my - toY(t.price   || 0);
+      if (Math.hypot(dx, dy) < 14) { found = i; break; }
+    }
+    if (found !== hoveredIdx) {
+      hoveredIdx = found;
+      chartCanvas.style.cursor = found >= 0 ? 'pointer' : 'crosshair';
+      renderChart();
+    }
+  });
+
+  chartCanvas.addEventListener('click', function(e) {
+    if (hoveredIdx >= 0) showTooltip(e, hoveredIdx);
+  });
+
+  chartCanvas.addEventListener('mouseleave', function() {
+    hoveredIdx = -1;
+    renderChart();
+  });
+}
+
+// ── Tooltip (click-only) ──────────────────────────────────────────────────────
 function showTooltip(e, idx) {
   e.stopPropagation();
-  const filtered = applyFilter(allTokens);
-  const t = filtered[idx];
+  const t = chartDisplayTokens[idx];
   if (!t) return;
   selectedToken = t;
   document.getElementById('tt-name').textContent    = t.name || 'Unknown';
@@ -1888,11 +2034,10 @@ function startFeed() {
   es.onmessage = function(e) {
     try {
       const newTokens = JSON.parse(e.data);
-      // merge, avoid duplicates
       const mints = new Set(allTokens.map(t => t.mint));
       newTokens.forEach(t => { if (!mints.has(t.mint)) allTokens.unshift(t); });
       if (allTokens.length > 100) allTokens = allTokens.slice(0, 100);
-      renderBoard();
+      renderChart();
       updateTicker();
     } catch(err) {}
   };
@@ -1983,6 +2128,7 @@ async function saveSettings() {
 }
 refresh();
 setInterval(refresh, 5000);
+initChart();
 startFeed();
 </script>
 """
