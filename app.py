@@ -9,9 +9,7 @@ Required .env variables:
 """
 
 import os, sqlite3, threading, time, base64, json, requests, base58, secrets, hashlib
-import smtplib, string
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import string
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, redirect, url_for, session, jsonify, Response
@@ -36,10 +34,8 @@ ADMIN_EMAIL        = os.getenv("ADMIN_EMAIL", "admin@admin.com")
 PERF_FEE_BASIC     = 0.15   # 15% of profits
 PERF_FEE_PRO       = 0.10   # 10% of profits
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
-SMTP_HOST          = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER          = os.getenv("SMTP_USER", "")
-SMTP_PASS          = os.getenv("SMTP_PASS", "")
+SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
+SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
 REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
 
 fernet        = Fernet(FERNET_KEY)
@@ -171,20 +167,22 @@ def send_telegram(chat_id, msg):
     except:
         pass
 
-# ── Email notifications ────────────────────────────────────────────────────────
+# ── Email notifications (SendGrid) ────────────────────────────────────────────
 def send_email(to_email, subject, body_html):
-    if not SMTP_USER or not SMTP_PASS:
+    if not SENDGRID_API_KEY:
         return
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = f"SolTrader <{SMTP_USER}>"
-        msg["To"]      = to_email
-        msg.attach(MIMEText(body_html, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(SMTP_USER, to_email, msg.as_string())
+        requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "personalizations": [{"to": [{"email": to_email}]}],
+                "from": {"email": SMTP_FROM, "name": "SolTrader"},
+                "subject": subject,
+                "content": [{"type": "text/html", "value": body_html}]
+            },
+            timeout=10
+        )
     except Exception as e:
         print(f"Email error: {e}")
 
