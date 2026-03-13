@@ -85,7 +85,7 @@ PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
 
 # ── Database ───────────────────────────────────────────────────────────────────
-DB = "bot_data.db"
+DB = os.getenv("DB_PATH", "/data/bot_data.db")
 
 def db():
     c = sqlite3.connect(DB)
