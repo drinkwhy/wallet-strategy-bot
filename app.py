@@ -569,19 +569,36 @@ class BotInstance:
         return res.get("result") if "result" in res else None
 
     def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
-        r = requests.get(
-            f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}"
-            f"&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-            timeout=10
-        ).json()
-        return None if "error" in r else r
+        # Try primary then fallback endpoint
+        urls = [
+            f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+            f"https://lite-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+        ]
+        for url in urls:
+            for attempt in range(3):
+                try:
+                    r = requests.get(url, timeout=12).json()
+                    return None if "error" in r else r
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(2)
+                    else:
+                        self.log_msg(f"Jupiter quote failed ({url.split('/')[2]}): {e}")
+        return None
 
     def jupiter_swap(self, quote):
-        r = requests.post("https://quote-api.jup.ag/v6/swap", json={
-            "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
-            "prioritizationFeeLamports":int(self.settings.get("priority_fee",10000)),
-        }, timeout=10).json()
-        return r.get("swapTransaction")
+        endpoints = ["https://quote-api.jup.ag/v6/swap", "https://lite-api.jup.ag/v6/swap"]
+        for url in endpoints:
+            try:
+                r = requests.post(url, json={
+                    "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
+                    "prioritizationFeeLamports":int(self.settings.get("priority_fee",10000)),
+                }, timeout=12).json()
+                if r.get("swapTransaction"):
+                    return r["swapTransaction"]
+            except Exception as e:
+                self.log_msg(f"Jupiter swap failed ({url.split('/')[2]}): {e}")
+        return None
 
     def get_token_balance(self, mint):
         r = requests.post(HELIUS_RPC, json={
