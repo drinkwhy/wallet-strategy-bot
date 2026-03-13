@@ -899,6 +899,7 @@ _whale_seen = set()
 
 def check_whale_wallets():
     """Poll recent transactions of whale wallets and copy their buys."""
+    time.sleep(15)  # let app fully start first
     while True:
         try:
             active_bots = [b for b in user_bots.values() if b.running]
@@ -974,6 +975,7 @@ def check_whale_wallets():
 threading.Thread(target=check_whale_wallets, daemon=True).start()
 
 def global_scanner():
+    time.sleep(10)  # let app fully start first
     while True:
         try:
             r = requests.get(
