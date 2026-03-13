@@ -1,6 +1,3 @@
-from gevent import monkey
-if not monkey.is_module_patched("socket"):
-    monkey.patch_all(thread=False)
 """
 SaaS Trading Bot Platform — SolTrader
 Run: python app.py
@@ -1626,17 +1623,10 @@ def api_settings():
 @app.route("/api/market-feed")
 @login_required
 def api_market_feed():
-    """SSE stream of live market tokens."""
-    def generate():
-        last = 0
-        while True:
-            tokens = [t for t in market_feed if t.get("ts", 0) > last]
-            if tokens:
-                last = tokens[0].get("ts", last)
-                yield f"data: {json.dumps(tokens[:20])}\n\n"
-            time.sleep(3)
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    """Polling endpoint — returns latest market tokens as JSON."""
+    since = int(request.args.get("since", 0))
+    tokens = [t for t in market_feed if t.get("ts", 0) > since]
+    return jsonify(tokens[:30])
 
 @app.route("/api/manual-buy", methods=["POST"])
 @login_required
@@ -2647,21 +2637,22 @@ async function manualBuy() {
   if (res.ok) setTimeout(refresh, 2000);
 }
 
-// ── SSE market feed ──────────────────────────────────────────────────────────
-function startFeed() {
-  const es = new EventSource('/api/market-feed');
-  es.onmessage = function(e) {
-    try {
-      const newTokens = JSON.parse(e.data);
+// ── Polling market feed ───────────────────────────────────────────────────────
+let feedSince = 0;
+async function pollFeed() {
+  try {
+    const tokens = await fetch('/api/market-feed?since=' + feedSince).then(r=>r.json());
+    if (tokens && tokens.length) {
       const mints = new Set(allTokens.map(t => t.mint));
-      newTokens.forEach(t => { if (!mints.has(t.mint)) allTokens.unshift(t); });
+      tokens.forEach(t => { if (!mints.has(t.mint)) allTokens.unshift(t); });
       if (allTokens.length > 100) allTokens = allTokens.slice(0, 100);
+      feedSince = Math.max(...tokens.map(t => t.ts || 0), feedSince);
       renderChart();
       updateTicker();
-    } catch(err) {}
-  };
-  es.onerror = function() { setTimeout(startFeed, 5000); es.close(); };
+    }
+  } catch(err) {}
 }
+function startFeed() { pollFeed(); setInterval(pollFeed, 4000); }
 
 // ── Ticker tape ──────────────────────────────────────────────────────────────
 function updateTicker() {
