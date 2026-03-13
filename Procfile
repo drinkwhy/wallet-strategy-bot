@@ -1,1 +1,1 @@
-web: gunicorn app:app --bind 0.0.0.0:5000 --workers 1 --timeout 120 --keep-alive 5 --worker-connections 100
+web: gunicorn app:app --bind 0.0.0.0:5000 --workers 2 --worker-class gevent --timeout 300 --keep-alive 5
