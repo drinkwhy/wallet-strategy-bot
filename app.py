@@ -92,7 +92,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
 def db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor, sslmode="require")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     conn.autocommit = False
     return conn
 
@@ -1397,6 +1397,9 @@ def dashboard():
         bsettings = cur.fetchone()
     finally:
         conn.close()
+    if not user:
+        session.clear()
+        return redirect(url_for("login"))
     if not wallet:
         return redirect(url_for("setup"))
     plan_info = PLAN_LIMITS.get(user["plan"], PLAN_LIMITS["trial"])
