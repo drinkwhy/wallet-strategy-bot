@@ -1768,12 +1768,12 @@ def admin():
             .replace("{{USER_ROWS}}", "".join(
                 f"<tr><td>{u['email']}</td><td>{u['plan']}</td>"
                 f"<td>{'<span class=\"badge bg-grn\">Running</span>' if user_bots.get(u['id']) and user_bots[u['id']].running else '<span class=\"badge bg-muted\">Idle</span>'}</td>"
-                f"<td>{u['created_at'][:10]}</td></tr>"
+                f"<td>{str(u['created_at'])[:10]}</td></tr>"
                 for u in users
             ))
             .replace("{{FEE_ROWS}}", "".join(
                 f"<tr><td>{f['user_id']}</td><td>{f['pnl_sol']:.4f}</td>"
-                f"<td class=\"c-gold\">{f['fee_sol']:.4f}</td><td>{f['created_at'][:10]}</td></tr>"
+                f"<td class=\"c-gold\">{f['fee_sol']:.4f}</td><td>{str(f['created_at'])[:10]}</td></tr>"
                 for f in fees
             ) or "<tr><td colspan='4' style='color:var(--t3);padding:16px 10px'>No fees recorded yet</td></tr>"),
         mimetype="text/html"
