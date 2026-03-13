@@ -45,6 +45,9 @@ SOL_MINT      = "So11111111111111111111111111111111111111112"
 PUMP_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 HEADERS       = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
+RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+PUMP_FUN    = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
 PLAN_LIMITS = {
     "basic": {"max_buy_sol": 0.1,  "label": "Basic Plan — $29/mo"},
     "pro":   {"max_buy_sol": 1.0,  "label": "Pro Plan — $49/mo"},
@@ -52,17 +55,34 @@ PLAN_LIMITS = {
 }
 
 PRESETS = {
-    "steady": {
-        "label":"Steady Profit","max_buy_sol":0.03,"tp1_mult":1.5,"tp2_mult":3.0,
-        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":30,"time_stop_min":30,
-        "min_liq":10000,"min_mc":5000,"max_mc":100000,"priority_fee":10000,"anti_rug":True,
+    "safe": {
+        "label":"Safe — Low Risk / Consistent",
+        "description":"Small positions, tight stops. Capital preservation first.",
+        "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":2.0,
+        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":20,"time_stop_min":20,
+        "min_liq":25000,"min_mc":10000,"max_mc":80000,"priority_fee":10000,
+        "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
     },
-    "max": {
-        "label":"Max Profit","max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
-        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":15,"time_stop_min":60,
-        "min_liq":5000,"min_mc":2000,"max_mc":200000,"priority_fee":100000,"anti_rug":True,
+    "balanced": {
+        "label":"Balanced — Medium Risk / Steady Profit",
+        "description":"Moderate positions, balanced take-profits. Best for most markets.",
+        "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":3.0,
+        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":30,"time_stop_min":30,
+        "min_liq":10000,"min_mc":5000,"max_mc":150000,"priority_fee":30000,
+        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+    },
+    "degen": {
+        "label":"Degen — High Risk / Max Profit",
+        "description":"Larger positions, wide stops. For hot markets only.",
+        "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
+        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":10,"time_stop_min":60,
+        "min_liq":5000,"min_mc":2000,"max_mc":250000,"priority_fee":100000,
+        "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
     },
 }
+# keep backward compat
+PRESETS["steady"] = PRESETS["balanced"]
+PRESETS["max"]    = PRESETS["degen"]
 
 # ── Database ───────────────────────────────────────────────────────────────────
 DB = "bot_data.db"
@@ -125,6 +145,19 @@ def init_db():
             charged INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS dev_blacklist (
+            dev_wallet TEXT PRIMARY KEY,
+            reason TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS filter_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mint TEXT, name TEXT,
+            passed INTEGER DEFAULT 0,
+            reason TEXT,
+            score INTEGER DEFAULT 0,
+            ts TEXT DEFAULT (datetime('now'))
+        );
         """)
 
 init_db()
@@ -150,6 +183,31 @@ def migrate_db():
                 created_at TEXT DEFAULT (datetime('now')))""")
         except:
             pass
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS dev_blacklist (
+                dev_wallet TEXT PRIMARY KEY,
+                reason TEXT,
+                created_at TEXT DEFAULT (datetime('now')))""")
+        except:
+            pass
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS filter_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mint TEXT, name TEXT,
+                passed INTEGER DEFAULT 0,
+                reason TEXT,
+                score INTEGER DEFAULT 0,
+                ts TEXT DEFAULT (datetime('now')))""")
+        except:
+            pass
+        for col, default in [
+            ("drawdown_limit_sol", "0.5"),
+            ("max_correlated", "3"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE bot_settings ADD COLUMN {col} REAL DEFAULT {default}")
+            except:
+                pass
 migrate_db()
 
 def make_referral_code():
@@ -282,6 +340,84 @@ def ai_score(info):
     score += int(mom * 0.15)
     return max(0, min(100, score))
 
+def check_holder_concentration(mint):
+    """Returns True if top holders don't own >50% of supply."""
+    try:
+        r = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,
+            "method":"getTokenLargestAccounts",
+            "params":[mint]
+        }, timeout=6).json()
+        accounts = r.get("result",{}).get("value",[])
+        if not accounts: return True
+        total = sum(float(a.get("uiAmount") or 0) for a in accounts)
+        top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
+        if total <= 0: return True
+        return (top5 / total) < 0.50
+    except:
+        return True
+
+def check_social_signals(info):
+    """Return bonus score if token has social links."""
+    bonus = 0
+    urls = str(info).lower()
+    if "t.me" in urls or "telegram" in urls: bonus += 5
+    if "twitter" in urls or "x.com" in urls: bonus += 5
+    return bonus
+
+def dynamic_slippage_bps(liq_usd):
+    """Returns slippage in bps based on pool liquidity."""
+    if liq_usd > 100000: return 300
+    if liq_usd > 50000:  return 800
+    if liq_usd > 10000:  return 1500
+    return 2500
+
+def check_dev_blacklist(dev_wallet):
+    if not dev_wallet: return True
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM dev_blacklist WHERE dev_wallet=?", (dev_wallet,)).fetchone()
+    return row is None
+
+def blacklist_dev(dev_wallet, reason="rugged"):
+    try:
+        with db() as conn:
+            conn.execute("INSERT OR IGNORE INTO dev_blacklist (dev_wallet,reason) VALUES (?,?)", (dev_wallet,reason))
+    except: pass
+
+def get_market_stats():
+    """Aggregate recent trade stats for AI settings suggestion."""
+    try:
+        with db() as conn:
+            trades = conn.execute("""
+                SELECT pnl_sol, action, timestamp FROM trades
+                WHERE timestamp >= datetime('now','-24 hours')
+            """).fetchall()
+        if not trades: return {}
+        wins   = [t for t in trades if (t["pnl_sol"] or 0) > 0]
+        losses = [t for t in trades if (t["pnl_sol"] or 0) < 0]
+        win_rate = len(wins) / len(trades) if trades else 0
+        avg_win  = sum(t["pnl_sol"] for t in wins)   / max(len(wins),1)
+        avg_loss = sum(t["pnl_sol"] for t in losses) / max(len(losses),1)
+        return {
+            "total_trades": len(trades),
+            "win_rate": round(win_rate * 100, 1),
+            "avg_win_sol": round(avg_win, 4),
+            "avg_loss_sol": round(avg_loss, 4),
+        }
+    except: return {}
+
+def ai_suggest_settings(stats):
+    """Given market stats, return suggested preset name + rationale."""
+    if not stats:
+        return {"preset":"balanced","reason":"Not enough data yet — using balanced defaults."}
+    wr = stats.get("win_rate", 50)
+    if wr >= 60:
+        return {"preset":"degen","reason":f"Win rate is {wr}% — market is hot. Degen mode for max returns."}
+    elif wr >= 45:
+        return {"preset":"balanced","reason":f"Win rate is {wr}% — steady market. Balanced preset recommended."}
+    else:
+        return {"preset":"safe","reason":f"Win rate is {wr}% — choppy market. Safe preset to protect capital."}
+
 class BotInstance:
     def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol):
         self.user_id          = user_id
@@ -299,6 +435,8 @@ class BotInstance:
         self.run_duration_min = run_duration_min
         self.profit_target    = profit_target_sol
         self.started_at       = time.time()
+        self.session_drawdown = 0.0
+        self.filter_log       = deque(maxlen=50)   # real-time filter results for UI
 
     def log_msg(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -306,6 +444,22 @@ class BotInstance:
         if len(self.log) > 200:
             self.log.pop()
         print(f"[U{self.user_id}] {msg}")
+
+    def log_filter(self, name, mint, passed, reason, score=0):
+        entry = {
+            "name": name, "mint": mint, "passed": passed,
+            "reason": reason, "score": score,
+            "ts": time.strftime("%H:%M:%S")
+        }
+        self.filter_log.appendleft(entry)
+        # also save to DB
+        try:
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO filter_log (mint,name,passed,reason,score) VALUES (?,?,?,?,?)",
+                    (mint, name, int(passed), reason, score)
+                )
+        except: pass
 
     def should_stop(self):
         if self.run_mode == "duration" and self.run_duration_min > 0:
@@ -340,10 +494,10 @@ class BotInstance:
         res = r.json()
         return res.get("result") if "result" in res else None
 
-    def jupiter_quote(self, input_mint, output_mint, amount):
+    def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
         r = requests.get(
             f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}"
-            f"&outputMint={output_mint}&amount={amount}&slippageBps=1500",
+            f"&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
             timeout=10
         ).json()
         return None if "error" in r else r
@@ -397,39 +551,64 @@ class BotInstance:
         except:
             return True
 
-    def buy(self, mint, name, price):
+    def buy(self, mint, name, price, liq=0, dev_wallet=None):
         s = self.settings
+        # Drawdown limit
+        if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
+            self.log_filter(name, mint, False, f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)")
+            return
+        # Correlated position limit
+        if len(self.positions) >= s.get("max_correlated", 5):
+            self.log_filter(name, mint, False, f"Max correlated positions ({len(self.positions)})")
+            return
         if self.sol_balance < s["max_buy_sol"] + 0.01:
-            self.log_msg(f"Low balance ({self.sol_balance:.4f} SOL) — skip {name}")
+            self.log_filter(name, mint, False, f"Low balance ({self.sol_balance:.4f} SOL)")
             return
         if mint in self.positions:
             return
+        # Anti-rug / mint auth check
         if s.get("anti_rug") and not self.is_safe_token(mint):
+            self.log_filter(name, mint, False, "RUG RISK — mint/freeze auth active")
             self.log_msg(f"RUG RISK — skip {name}")
             return
-        quote = self.jupiter_quote(SOL_MINT, mint, int(s["max_buy_sol"]*1e9))
+        # Dev blacklist
+        if dev_wallet and not check_dev_blacklist(dev_wallet):
+            self.log_filter(name, mint, False, f"Dev blacklisted ({dev_wallet[:8]}...)")
+            return
+        # Holder concentration
+        if s.get("check_holders") and not check_holder_concentration(mint):
+            self.log_filter(name, mint, False, "Top 5 holders own >50% of supply")
+            self.log_msg(f"HOLDER RISK — skip {name}")
+            return
+        # Dynamic slippage
+        slippage = dynamic_slippage_bps(liq)
+        quote = self.jupiter_quote(SOL_MINT, mint, int(s["max_buy_sol"]*1e9), slippage)
         if not quote:
+            self.log_filter(name, mint, False, "No Jupiter quote available")
             return
         swap_tx = self.jupiter_swap(quote)
         if not swap_tx:
+            self.log_filter(name, mint, False, "Jupiter swap build failed")
             return
         sig = self.sign_and_send(swap_tx)
         if sig:
             self.positions[mint] = {
                 "name":name,"entry_price":price,"peak_price":price,
                 "timestamp":time.time(),"tp1_hit":False,"entry_sol":s["max_buy_sol"],
+                "dev_wallet": dev_wallet,
             }
-            self.log_msg(f"BUY {name} @ ${price:.8f} | solscan.io/tx/{sig}")
+            self.log_filter(name, mint, True, f"BUY @ ${price:.8f} | slip={slippage}bps", score=0)
+            self.log_msg(f"BUY {name} @ ${price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
-            # Telegram alert
             try:
                 with db() as conn:
                     u = conn.execute("SELECT telegram_chat_id FROM users WHERE id=?", (self.user_id,)).fetchone()
                 if u and u["telegram_chat_id"]:
                     send_telegram(u["telegram_chat_id"],
                         f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {s['max_buy_sol']} SOL\n🔗 solscan.io/tx/{sig}")
-            except:
-                pass
+            except: pass
+        else:
+            self.log_filter(name, mint, False, "Transaction failed to send")
 
     def sell(self, mint, pct, reason):
         pos = self.positions.get(mint)
@@ -456,6 +635,13 @@ class BotInstance:
                 pnl_sol = pos["entry_sol"] * pct * (pnl_pct / 100)
                 self.log_msg(f"SELL {pos['name']} {int(pct*100)}% — {reason} | {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
                 self.stats["total_pnl_sol"] += pnl_sol
+                if pnl_sol < 0:
+                    self.session_drawdown += abs(pnl_sol)
+                # blacklist dev if rugged (big loss, fast)
+                pos_age = (time.time() - pos.get("timestamp", time.time())) / 60
+                if pnl_sol < -0.05 and pos_age < 5 and pos.get("dev_wallet"):
+                    blacklist_dev(pos["dev_wallet"], "auto-rug-detected")
+                    self.log_msg(f"⛔ Dev blacklisted: {pos['dev_wallet'][:8]}...")
                 if pnl_pct >= 0:
                     self.stats["wins"] += 1
                 else:
@@ -523,7 +709,8 @@ class BotInstance:
         if change < 0:
             return
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Vol:${vol:,.0f} Liq:${liq:,.0f} | Age:{age_min:.0f}m +{change:.0f}%")
-        self.buy(mint, name, price)
+        self.log_filter(name, mint, True, f"Signal passed all filters | score={self.settings.get('_last_score',0)}")
+        self.buy(mint, name, price, liq=liq, dev_wallet=None)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -569,21 +756,25 @@ class BotInstance:
 # Stores recent volume snapshots per token to detect momentum spikes
 _volume_history = {}   # mint -> [(timestamp, vol), ...]
 
-def get_momentum_score(mint, current_vol):
-    """Returns momentum score 0-100. >60 = strong signal."""
+def volume_velocity(mint, current_vol):
+    """Returns volume acceleration score 0-100. Measures rate of volume growth."""
     now = time.time()
     hist = _volume_history.get(mint, [])
-    # prune entries older than 5 minutes
     hist = [(t, v) for t, v in hist if now - t < 300]
     hist.append((now, current_vol))
     _volume_history[mint] = hist
-    if len(hist) < 2:
-        return 0
-    oldest_vol = hist[0][1]
-    if oldest_vol <= 0:
-        return 0
-    growth = (current_vol - oldest_vol) / oldest_vol * 100
-    return min(int(growth), 100)
+    if len(hist) < 3: return 0
+    # compare last third vs first third
+    third = max(1, len(hist)//3)
+    early_avg = sum(v for _,v in hist[:third]) / third
+    late_avg  = sum(v for _,v in hist[-third:]) / third
+    if early_avg <= 0: return 0
+    accel = (late_avg - early_avg) / early_avg * 100
+    return min(int(accel), 100)
+
+# backward compat alias
+def get_momentum_score(mint, current_vol):
+    return volume_velocity(mint, current_vol)
 
 # ── Known profitable whale wallets to track ────────────────────────────────────
 WHALE_WALLETS = [
@@ -700,7 +891,7 @@ def global_scanner():
                     age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
                     vol    = (p.get("volume") or {}).get("h24", 0) or 0
                     change = (p.get("priceChange") or {}).get("h1", 0) or 0
-                    momentum = get_momentum_score(mint, vol)
+                    momentum = volume_velocity(mint, vol)
                     info = {
                         "name":     p.get("baseToken",{}).get("name","Unknown"),
                         "symbol":   p.get("baseToken",{}).get("symbol","?"),
@@ -711,11 +902,13 @@ def global_scanner():
                         "age_min":  age_min,
                         "change":   change,
                         "momentum": momentum,
+                        "social":   check_social_signals(p),
                     }
                     if not info["price"]:
                         continue
                     info["mint"] = mint
                     info["score"] = ai_score(info)
+                    info["score"] = min(100, info["score"] + check_social_signals(str(p)))
                     info["ts"] = int(time.time())
                     market_feed.appendleft(info)
                     for bot in list(user_bots.values()):
@@ -724,7 +917,7 @@ def global_scanner():
                                 # boost signal on high momentum tokens
                                 effective_change = info["change"]
                                 if momentum >= 60:
-                                    bot.log_msg(f"⚡ MOMENTUM SPIKE: {info['name']} score={momentum}")
+                                    bot.log_msg(f"⚡ MOMENTUM SPIKE: {info['name']} score={momentum} (velocity)")
                                     effective_change = max(effective_change, 25)
                                 bot.evaluate_signal(
                                     mint, info["name"], info["price"],
@@ -741,6 +934,108 @@ def global_scanner():
             time.sleep(10)
 
 threading.Thread(target=global_scanner, daemon=True).start()
+
+# ── Helius websocket pool sniping ──────────────────────────────────────────────
+def helius_pool_sniper():
+    """Listen for new Raydium/Pump.fun pool creation via Helius logs subscription."""
+    import json as _json
+    ws_url = HELIUS_RPC.replace("https://", "wss://").replace("http://", "ws://")
+    # Extract API key from RPC URL if present
+    api_key = ""
+    if "api-key=" in HELIUS_RPC:
+        api_key = HELIUS_RPC.split("api-key=")[-1]
+    elif "?" in HELIUS_RPC:
+        api_key = HELIUS_RPC.split("?")[-1].replace("api-key=","")
+
+    while True:
+        try:
+            import websocket as ws_lib
+            wss = f"wss://atlas-mainnet.helius-rpc.com/?api-key={api_key}" if api_key else ws_url
+
+            def on_open(ws):
+                # Subscribe to logs mentioning Raydium AMM (new pool creation)
+                sub = _json.dumps({
+                    "jsonrpc":"2.0","id":1,"method":"logsSubscribe",
+                    "params":[
+                        {"mentions": [RAYDIUM_AMM]},
+                        {"commitment": "confirmed"}
+                    ]
+                })
+                ws.send(sub)
+                print("[Sniper] Subscribed to Raydium pool creation logs")
+
+            def on_message(ws, message):
+                try:
+                    data = _json.loads(message)
+                    result = data.get("params",{}).get("result",{})
+                    value  = result.get("value",{})
+                    logs   = value.get("logs",[])
+                    sig    = value.get("signature","")
+                    # Check if this is a new pool init
+                    if any("initialize" in l.lower() or "initializemint" in l.lower() for l in logs):
+                        # Extract mint from account keys (simplified)
+                        tx_r = requests.post(HELIUS_RPC, json={
+                            "jsonrpc":"2.0","id":1,"method":"getTransaction",
+                            "params":[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]
+                        }, timeout=8)
+                        tx = tx_r.json().get("result")
+                        if not tx: return
+                        # Get new token mints from post balances
+                        post_bals = (tx.get("meta") or {}).get("postTokenBalances",[])
+                        for pb in post_bals:
+                            mint = pb.get("mint","")
+                            if not mint or mint == SOL_MINT or mint in seen_tokens:
+                                continue
+                            seen_tokens.add(mint)
+                            # Fetch info and add to market feed immediately
+                            try:
+                                pairs = requests.get(
+                                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                    headers=HEADERS, timeout=5
+                                ).json().get("pairs")
+                                if not pairs: return
+                                p = pairs[0]
+                                created_at = p.get("pairCreatedAt")
+                                age_min = (time.time()*1000 - created_at)/60000 if created_at else 0
+                                vol    = (p.get("volume") or {}).get("h24",0) or 0
+                                change = (p.get("priceChange") or {}).get("h1",0) or 0
+                                liq    = (p.get("liquidity") or {}).get("usd",0) or 0
+                                info = {
+                                    "name":   p.get("baseToken",{}).get("name","Unknown"),
+                                    "symbol": p.get("baseToken",{}).get("symbol","?"),
+                                    "price":  float(p.get("priceUsd") or 0),
+                                    "mc":     p.get("marketCap",0) or 0,
+                                    "vol":    vol,"liq":liq,"age_min":age_min,
+                                    "change": change,"momentum":0,"mint":mint,
+                                    "sniped": True,  # flag as websocket-sniped
+                                }
+                                info["score"] = ai_score(info)
+                                info["ts"]    = int(time.time())
+                                market_feed.appendleft(info)
+                                for bot in list(user_bots.values()):
+                                    if bot.running:
+                                        bot.log_msg(f"⚡ SNIPE CANDIDATE: {info['name']} (on-chain detect)")
+                                        try:
+                                            bot.evaluate_signal(mint,info["name"],info["price"],
+                                                info["mc"],info["vol"],liq,age_min,change)
+                                        except: pass
+                            except: pass
+                except: pass
+
+            def on_error(ws, err): print(f"[Sniper] WS error: {err}")
+            def on_close(ws, *a): print("[Sniper] WS closed — reconnecting...")
+
+            ws_app = ws_lib.WebSocketApp(wss, on_open=on_open, on_message=on_message,
+                                          on_error=on_error, on_close=on_close)
+            ws_app.run_forever(ping_interval=30, ping_timeout=10)
+        except ImportError:
+            print("[Sniper] websocket-client not installed — skipping WS sniper")
+            break
+        except Exception as e:
+            print(f"[Sniper] reconnecting in 10s: {e}")
+            time.sleep(10)
+
+threading.Thread(target=helius_pool_sniper, daemon=True).start()
 
 def auto_restart_bots():
     """Restart bots that were running before a server restart."""
@@ -759,7 +1054,7 @@ def auto_restart_bots():
             uid = row["user_id"]
             try:
                 kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
-                settings = dict(PRESETS.get(row["preset"], PRESETS["steady"]))
+                settings = dict(PRESETS.get(row["preset"], PRESETS["balanced"]))
                 max_sol = PLAN_LIMITS.get(row["plan"], PLAN_LIMITS["trial"])["max_buy_sol"]
                 settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
                 bot = BotInstance(uid, kp, settings,
@@ -1044,11 +1339,12 @@ def api_state():
                 "tp1_hit":       p["tp1_hit"],
             })
     return jsonify({
-        "running":   bot.running if bot else False,
-        "balance":   round(bot.sol_balance, 4) if bot else 0,
-        "positions": pos_list,
-        "log":       bot.log[:60] if bot else [],
-        "stats":     bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0},
+        "running":    bot.running if bot else False,
+        "balance":    round(bot.sol_balance, 4) if bot else 0,
+        "positions":  pos_list,
+        "log":        bot.log[:60] if bot else [],
+        "stats":      bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0},
+        "filter_log": list(bot.filter_log)[:10] if bot else [],
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -1068,8 +1364,8 @@ def api_start():
         if datetime.utcnow() > trial_ends:
             return jsonify({"ok":False,"msg":"Trial expired — please subscribe"})
     kp       = Keypair.from_bytes(base58.b58decode(decrypt_key(w["encrypted_key"])))
-    preset   = bs["preset"] if bs else "steady"
-    settings = dict(PRESETS.get(preset, PRESETS["steady"]))
+    preset   = bs["preset"] if bs else "balanced"
+    settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
     max_sol  = PLAN_LIMITS.get(u["plan"],PLAN_LIMITS["trial"])["max_buy_sol"]
     settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
@@ -1112,7 +1408,7 @@ def api_cashout():
 def api_settings():
     uid  = session["user_id"]
     data = request.json
-    preset   = data.get("preset","steady")
+    preset   = data.get("preset","balanced")
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
@@ -1166,7 +1462,7 @@ def api_manual_buy():
         price = 0
     if not price:
         return jsonify({"ok": False, "msg": "Could not fetch price"})
-    threading.Thread(target=bot.buy, args=(mint, name, price), daemon=True).start()
+    threading.Thread(target=bot.buy, args=(mint, name, price), kwargs={"liq": 0, "dev_wallet": None}, daemon=True).start()
     return jsonify({"ok": True, "msg": f"Manual buy triggered for {name}"})
 
 @app.route("/api/telegram", methods=["POST"])
@@ -1183,6 +1479,63 @@ def api_telegram():
 @app.route("/ref/<code>")
 def referral_link(code):
     return redirect(url_for("signup") + f"?ref={code}")
+
+@app.route("/api/filter-log")
+@login_required
+def api_filter_log():
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+    if bot:
+        return jsonify(list(bot.filter_log))
+    # fallback to DB
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM filter_log ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/admin/suggest-settings")
+@admin_required
+def api_suggest_settings():
+    stats = get_market_stats()
+    suggestion = ai_suggest_settings(stats)
+    return jsonify({"stats": stats, "suggestion": suggestion})
+
+@app.route("/api/admin/blacklist-dev", methods=["POST"])
+@admin_required
+def api_blacklist_dev():
+    dw = request.json.get("dev_wallet","").strip()
+    if dw:
+        blacklist_dev(dw, "manual-admin")
+        return jsonify({"ok": True})
+    return jsonify({"ok": False})
+
+@app.route("/api/admin/dev-blacklist")
+@admin_required
+def api_dev_blacklist():
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM dev_blacklist ORDER BY created_at DESC LIMIT 50").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/admin/override-preset", methods=["POST"])
+@admin_required
+def api_override_preset():
+    data   = request.json or {}
+    preset = data.get("preset","balanced")
+    if preset in PRESETS:
+        # merge incoming settings into PRESETS dict in memory
+        for k, v in data.items():
+            if k != "preset":
+                PRESETS[preset][k] = v
+        # propagate to running bots on this preset
+        with db() as conn:
+            rows = conn.execute("SELECT user_id FROM bot_settings WHERE preset=? AND is_running=1", (preset,)).fetchall()
+        for row in rows:
+            bot = user_bots.get(row["user_id"])
+            if bot:
+                bot.settings.update(PRESETS[preset])
+        return jsonify({"ok": True})
+    return jsonify({"ok": False})
 
 @app.route("/api/referral")
 @login_required
@@ -1271,9 +1624,10 @@ _CSS = """<meta charset="UTF-8"><meta name="viewport" content="width=device-widt
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#07101E;--surf:#0C1829;--card:#101F32;--b1:#1A2E45;--b2:#1E3450;
+  --bg2:#0C1829;--bg3:#101F32;--bdr:#1A2E45;
   --t1:#E2E8F0;--t2:#94A3B8;--t3:#475569;
   --blue:#2563EB;--blue2:#3B82F6;--blue3:#1D4ED8;
-  --grn:#059669;--grn2:#10B981;--red:#DC2626;--red2:#EF4444;--gold:#D97706;--gold2:#F59E0B;
+  --grn:#14c784;--grn2:#10B981;--red:#DC2626;--red2:#EF4444;--gold:#D97706;--gold2:#F59E0B;
 }
 html,body{min-height:100vh}
 body{background:var(--bg);color:var(--t1);font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
@@ -1605,6 +1959,18 @@ DASHBOARD_HTML = _CSS + """
 .filter-row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .filter-btn{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:5px 12px;border-radius:20px;font-size:11px;cursor:pointer;transition:all .2s}
 .filter-btn.active{background:var(--grn);color:#000;border-color:var(--grn);font-weight:700}
+.preset-card{background:var(--bg3);border:2px solid var(--bdr);border-radius:10px;padding:10px;text-align:center;cursor:pointer;transition:all .2s}
+.preset-card:hover{border-color:var(--grn)}
+.preset-card.active{border-color:var(--grn);background:rgba(20,199,132,.08)}
+.pc-icon{font-size:20px;margin-bottom:4px}
+.pc-name{font-size:12px;font-weight:700;color:var(--t1)}
+.pc-desc{font-size:10px;color:var(--t3);margin-top:2px}
+/* Filter pipeline */
+.fp-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bdr);font-size:12px}
+.fp-pass{color:#14c784;font-weight:700;min-width:16px}
+.fp-fail{color:#f23645;font-weight:700;min-width:16px}
+.fp-name{font-weight:600;color:var(--t1);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fp-reason{font-size:10px;color:var(--t3);text-align:right}
 </style>
 
 <nav class="nav">
@@ -1681,10 +2047,24 @@ DASHBOARD_HTML = _CSS + """
         <div class="sec-label">Strategy</div>
         <div class="fgroup" style="margin-bottom:8px">
           <label class="flabel">Preset</label>
-          <select class="finput" id="s-preset">
-            <option value="steady">Steady Profit</option>
-            <option value="max">Max Profit</option>
-          </select>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:12px" id="preset-grid">
+            <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
+              <div class="pc-icon">🛡️</div>
+              <div class="pc-name">Safe</div>
+              <div class="pc-desc">Low risk</div>
+            </div>
+            <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
+              <div class="pc-icon">⚖️</div>
+              <div class="pc-name">Balanced</div>
+              <div class="pc-desc">Steady profit</div>
+            </div>
+            <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
+              <div class="pc-icon">🔥</div>
+              <div class="pc-name">Degen</div>
+              <div class="pc-desc">Max profit</div>
+            </div>
+          </div>
+          <input type="hidden" id="s-preset" value="balanced">
         </div>
         <div class="fgroup" style="margin-bottom:8px">
           <label class="flabel">Run Mode</label>
@@ -1713,6 +2093,11 @@ DASHBOARD_HTML = _CSS + """
       <div class="panel">
         <div class="sec-label">Activity Log</div>
         <div id="log" style="max-height:260px;overflow-y:auto"></div>
+      </div>
+
+      <div class="panel" style="margin-top:12px">
+        <div class="sec-label">Filter Pipeline <span style="font-size:10px;color:var(--t3);font-weight:400">— real-time token screening</span></div>
+        <div id="filter-pipe"><div style="font-size:12px;color:var(--t3)">Start the bot to see token filtering…</div></div>
       </div>
     </div>
 
@@ -2060,6 +2445,23 @@ function updateTicker() {
   document.getElementById('ticker-inner').innerHTML = html;
 }
 
+function selectPreset(name) {
+  document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
+  document.getElementById('pc-' + name).classList.add('active');
+  document.getElementById('s-preset').value = name;
+}
+
+function updateFilterPipe(filterLog) {
+  if (!filterLog || !filterLog.length) return;
+  const html = filterLog.map(f => `
+    <div class="fp-item">
+      <span class="${f.passed ? 'fp-pass' : 'fp-fail'}">${f.passed ? '✓' : '✗'}</span>
+      <span class="fp-name">${f.name || '?'}</span>
+      <span class="fp-reason">${f.reason || ''}</span>
+    </div>`).join('');
+  document.getElementById('filter-pipe').innerHTML = html;
+}
+
 // ── Bot state refresh ────────────────────────────────────────────────────────
 function toggleStop(v) {
   document.getElementById('f-dur').style.display = v==='duration' ? 'block' : 'none';
@@ -2104,6 +2506,7 @@ async function refresh() {
               l.includes('WHALE') ? 'lsig' : l.includes('MOMENTUM') ? 'lsig' : '';
     return `<div class="lline ${c}">${l}</div>`;
   }).join('');
+  if (d.filter_log) updateFilterPipe(d.filter_log);
 }
 async function toggleBot() {
   await fetch(running ? '/api/stop' : '/api/start', {method:'POST'});
@@ -2135,6 +2538,18 @@ startFeed();
 
 # ── Admin Page ─────────────────────────────────────────────────────────────────
 ADMIN_HTML = _CSS + """
+<style>
+.ai-suggest{background:linear-gradient(135deg,rgba(20,199,132,.12),rgba(123,97,255,.08));border:1px solid rgba(20,199,132,.3);border-radius:12px;padding:20px;margin-bottom:20px}
+.ai-suggest h3{color:#14c784;margin:0 0 8px}
+.ai-suggest p{margin:0 0 12px;color:var(--t2);font-size:13px}
+.setting-row{display:grid;grid-template-columns:1fr 140px 80px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--bdr)}
+.setting-row:last-child{border-bottom:none}
+.setting-label{font-size:13px;color:var(--t2)}
+.setting-desc{font-size:10px;color:var(--t3);margin-top:2px}
+.setting-input{background:var(--bg3);border:1px solid var(--bdr);color:var(--t1);padding:6px 10px;border-radius:6px;font-size:12px;width:100%;font-family:monospace}
+.setting-unit{font-size:11px;color:var(--t3)}
+</style>
+
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
@@ -2147,31 +2562,249 @@ ADMIN_HTML = _CSS + """
 <div class="wrap">
   <div style="margin-bottom:24px">
     <div class="page-title">Admin Panel</div>
-    <div style="font-size:13px;color:var(--t2);margin-top:4px">Platform overview, user management, and performance fee tracking</div>
   </div>
 
+  <!-- AI Suggestion Box -->
+  <div class="ai-suggest" id="ai-box">
+    <h3>🤖 AI Market Analysis</h3>
+    <p id="ai-reason">Loading market analysis…</p>
+    <div id="ai-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px"></div>
+    <button class="btn btn-primary" onclick="applyAISuggestion()" id="ai-apply-btn">Apply AI Recommendation</button>
+  </div>
+
+  <!-- Platform Stats -->
   <div class="stats" style="margin-bottom:24px">
     <div class="stat"><div class="slabel">Total Users</div><div class="sval">{{USERS}}</div></div>
     <div class="stat"><div class="slabel">Active Bots</div><div class="sval c-grn">{{ACTIVE}}</div></div>
     <div class="stat"><div class="slabel">Perf Fees Owed</div><div class="sval c-gold">{{FEE_SOL}} SOL</div></div>
   </div>
 
-  <div class="panel" style="margin-bottom:16px">
-    <div class="sec-label">Registered Users</div>
-    <table class="tbl">
-      <thead><tr><th>Email</th><th>Plan</th><th>Bot Status</th><th>Joined</th></tr></thead>
-      <tbody>{{USER_ROWS}}</tbody>
-    </table>
-  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <!-- Global Preset Tuner -->
+    <div class="panel">
+      <div class="sec-label">Global Preset Overrides <span style="font-size:10px;color:var(--t3);font-weight:400">— affects all users on this preset</span></div>
 
-  <div class="panel">
-    <div class="sec-label">Performance Fees Log</div>
-    <table class="tbl">
-      <thead><tr><th>User ID</th><th>Session PnL (SOL)</th><th>Fee Owed (SOL)</th><th>Date</th></tr></thead>
-      <tbody>{{FEE_ROWS}}</tbody>
-    </table>
+      <div style="margin:12px 0">
+        <label class="flabel">Preset to Edit</label>
+        <select class="finput" id="edit-preset" onchange="loadPreset(this.value)">
+          <option value="safe">Safe</option>
+          <option value="balanced" selected>Balanced</option>
+          <option value="degen">Degen</option>
+        </select>
+      </div>
+
+      <div id="preset-settings">
+        <div class="setting-row">
+          <div><div class="setting-label">Max Buy (SOL)</div><div class="setting-desc">SOL spent per trade</div></div>
+          <input class="setting-input" id="s-max-buy" type="number" step="0.01" value="0.04">
+          <div class="setting-unit">SOL</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Take Profit 1</div><div class="setting-desc">Sell 50% at this multiplier</div></div>
+          <input class="setting-input" id="s-tp1" type="number" step="0.1" value="1.5">
+          <div class="setting-unit">×</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Take Profit 2</div><div class="setting-desc">Sell rest at this multiplier</div></div>
+          <input class="setting-input" id="s-tp2" type="number" step="0.1" value="3.0">
+          <div class="setting-unit">×</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Exit if drops below this ratio</div></div>
+          <input class="setting-input" id="s-sl" type="number" step="0.05" value="0.75">
+          <div class="setting-unit">×</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Trailing Stop</div><div class="setting-desc">% drop from peak to exit</div></div>
+          <input class="setting-input" id="s-trail" type="number" step="0.05" value="0.20">
+          <div class="setting-unit">%</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Skip tokens older than this</div></div>
+          <input class="setting-input" id="s-age" type="number" step="1" value="30">
+          <div class="setting-unit">min</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Time Stop</div><div class="setting-desc">Exit if not profitable after</div></div>
+          <input class="setting-input" id="s-tstop" type="number" step="1" value="30">
+          <div class="setting-unit">min</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Skip pools below this</div></div>
+          <input class="setting-input" id="s-liq" type="number" step="1000" value="10000">
+          <div class="setting-unit">USD</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Min Market Cap</div><div class="setting-desc">Skip tokens below this MC</div></div>
+          <input class="setting-input" id="s-minmc" type="number" step="1000" value="5000">
+          <div class="setting-unit">USD</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Max Market Cap</div><div class="setting-desc">Skip tokens above this MC</div></div>
+          <input class="setting-input" id="s-maxmc" type="number" step="10000" value="150000">
+          <div class="setting-unit">USD</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Lamports to outbid bots</div></div>
+          <input class="setting-input" id="s-prio" type="number" step="10000" value="30000">
+          <div class="setting-unit">λ</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Drawdown Limit</div><div class="setting-desc">Stop bot after losing this</div></div>
+          <input class="setting-input" id="s-dd" type="number" step="0.1" value="0.5">
+          <div class="setting-unit">SOL</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Max Positions</div><div class="setting-desc">Max simultaneous trades</div></div>
+          <input class="setting-input" id="s-maxpos" type="number" step="1" value="3">
+          <div class="setting-unit">#</div>
+        </div>
+      </div>
+      <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="savePreset()">💾 Save Preset Override</button>
+    </div>
+
+    <!-- Users + Dev Blacklist -->
+    <div>
+      <div class="panel" style="margin-bottom:16px">
+        <div class="sec-label">Registered Users</div>
+        <table class="tbl">
+          <thead><tr><th>Email</th><th>Plan</th><th>Bot</th><th>Joined</th></tr></thead>
+          <tbody>{{USER_ROWS}}</tbody>
+        </table>
+      </div>
+
+      <div class="panel" style="margin-bottom:16px">
+        <div class="sec-label">Dev Blacklist <span style="font-size:10px;color:var(--t3);font-weight:400">— auto-populated on rug detection</span></div>
+        <div id="blacklist-tbl"><div style="font-size:13px;color:var(--t3)">Loading…</div></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <input class="finput" id="bl-wallet" placeholder="Paste dev wallet address" style="flex:1">
+          <button class="btn btn-danger" onclick="addBlacklist()">Block</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="sec-label">Performance Fees</div>
+        <table class="tbl">
+          <thead><tr><th>User ID</th><th>Session PnL</th><th>Fee Owed</th><th>Date</th></tr></thead>
+          <tbody>{{FEE_ROWS}}</tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
+
+<script>
+const PRESET_DEFAULTS = {
+  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:20,tstop:20,liq:25000,minmc:10000,maxmc:80000,prio:10000,dd:0.3,maxpos:2},
+  balanced: {buy:0.04,tp1:1.5,tp2:3.0,sl:0.75,trail:0.20,age:30,tstop:30,liq:10000,minmc:5000,maxmc:150000,prio:30000,dd:0.5,maxpos:3},
+  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:10,tstop:60,liq:5000,minmc:2000,maxmc:250000,prio:100000,dd:1.0,maxpos:5},
+};
+let aiSuggestion = null;
+
+function loadPreset(name) {
+  const p = PRESET_DEFAULTS[name];
+  if (!p) return;
+  document.getElementById('s-max-buy').value = p.buy;
+  document.getElementById('s-tp1').value     = p.tp1;
+  document.getElementById('s-tp2').value     = p.tp2;
+  document.getElementById('s-sl').value      = p.sl;
+  document.getElementById('s-trail').value   = p.trail;
+  document.getElementById('s-age').value     = p.age;
+  document.getElementById('s-tstop').value   = p.tstop;
+  document.getElementById('s-liq').value     = p.liq;
+  document.getElementById('s-minmc').value   = p.minmc;
+  document.getElementById('s-maxmc').value   = p.maxmc;
+  document.getElementById('s-prio').value    = p.prio;
+  document.getElementById('s-dd').value      = p.dd;
+  document.getElementById('s-maxpos').value  = p.maxpos;
+}
+
+async function savePreset() {
+  const preset = document.getElementById('edit-preset').value;
+  const settings = {
+    preset,
+    max_buy_sol:      parseFloat(document.getElementById('s-max-buy').value),
+    tp1_mult:         parseFloat(document.getElementById('s-tp1').value),
+    tp2_mult:         parseFloat(document.getElementById('s-tp2').value),
+    stop_loss:        parseFloat(document.getElementById('s-sl').value),
+    trail_pct:        parseFloat(document.getElementById('s-trail').value),
+    max_age_min:      parseInt(document.getElementById('s-age').value),
+    time_stop_min:    parseInt(document.getElementById('s-tstop').value),
+    min_liq:          parseFloat(document.getElementById('s-liq').value),
+    min_mc:           parseFloat(document.getElementById('s-minmc').value),
+    max_mc:           parseFloat(document.getElementById('s-maxmc').value),
+    priority_fee:     parseInt(document.getElementById('s-prio').value),
+    drawdown_limit_sol: parseFloat(document.getElementById('s-dd').value),
+    max_correlated:   parseInt(document.getElementById('s-maxpos').value),
+  };
+  const r = await fetch('/api/admin/override-preset', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(settings)
+  }).then(r=>r.json()).catch(()=>({ok:false}));
+  alert(r.ok ? '✅ Preset saved and applied to active bots!' : '❌ Save failed');
+}
+
+async function loadAI() {
+  const r = await fetch('/api/admin/suggest-settings').then(r=>r.json()).catch(()=>null);
+  if (!r) return;
+  aiSuggestion = r.suggestion;
+  document.getElementById('ai-reason').textContent = r.suggestion.reason;
+  const s = r.stats;
+  if (s && s.total_trades) {
+    document.getElementById('ai-stats').innerHTML = `
+      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:20px;font-weight:800;color:var(--t1)">${s.total_trades}</div>
+        <div style="font-size:10px;color:var(--t3)">Trades (24h)</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:20px;font-weight:800;color:#14c784">${s.win_rate}%</div>
+        <div style="font-size:10px;color:var(--t3)">Win Rate</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:20px;font-weight:800;color:#14c784">+${s.avg_win_sol}</div>
+        <div style="font-size:10px;color:var(--t3)">Avg Win (SOL)</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
+        <div style="font-size:20px;font-weight:800;color:#f23645">${s.avg_loss_sol}</div>
+        <div style="font-size:10px;color:var(--t3)">Avg Loss (SOL)</div>
+      </div>`;
+  }
+}
+
+function applyAISuggestion() {
+  if (!aiSuggestion) return;
+  document.getElementById('edit-preset').value = aiSuggestion.preset;
+  loadPreset(aiSuggestion.preset);
+  alert('✅ AI-recommended settings loaded. Review and click Save to apply.');
+}
+
+async function addBlacklist() {
+  const w = document.getElementById('bl-wallet').value.trim();
+  if (!w) return;
+  const r = await fetch('/api/admin/blacklist-dev', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({dev_wallet:w})
+  }).then(r=>r.json()).catch(()=>({ok:false}));
+  if (r.ok) { document.getElementById('bl-wallet').value=''; loadBlacklist(); }
+}
+
+async function loadBlacklist() {
+  const r = await fetch('/api/admin/dev-blacklist').then(r=>r.json()).catch(()=>[]);
+  if (!r.length) {
+    document.getElementById('blacklist-tbl').innerHTML = '<div style="font-size:12px;color:var(--t3)">No blacklisted wallets yet</div>';
+    return;
+  }
+  document.getElementById('blacklist-tbl').innerHTML = r.map(w =>
+    `<div style="font-size:11px;color:var(--t2);padding:4px 0;border-bottom:1px solid var(--bdr);font-family:monospace">
+      ${w.dev_wallet} <span style="color:var(--t3)">— ${w.reason}</span>
+    </div>`
+  ).join('');
+}
+
+loadPreset('balanced');
+loadAI();
+loadBlacklist();
+</script>
 """
 
 if __name__ == "__main__":
