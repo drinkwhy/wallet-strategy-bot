@@ -34,6 +34,7 @@ STRIPE_SECRET      = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_PRICE_BASIC = os.getenv("STRIPE_PRICE_BASIC", "")
 STRIPE_PRICE_PRO   = os.getenv("STRIPE_PRICE_PRO", "")
 ADMIN_EMAIL        = os.getenv("ADMIN_EMAIL", "admin@admin.com")
+ADMIN_EMAILS       = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", ADMIN_EMAIL).split(",") if e.strip()}
 PERF_FEE_BASIC     = 0.15   # 15% of profits
 PERF_FEE_PRO       = 0.10   # 10% of profits
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -1209,7 +1210,7 @@ def login_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if session.get("email") != ADMIN_EMAIL:
+        if session.get("email","").lower() not in ADMIN_EMAILS:
             return redirect(url_for("dashboard"))
         return f(*args, **kwargs)
     return decorated
