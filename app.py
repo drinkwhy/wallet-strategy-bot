@@ -2686,8 +2686,14 @@ function toggleStop(v) {
   document.getElementById('f-pft').style.display = v==='profit'   ? 'block' : 'none';
 }
 async function refresh() {
-  const d = await fetch('/api/state').then(r=>r.json()).catch(()=>null);
-  if (!d) return;
+  const d = await fetch('/api/state').then(r=>{
+    if (r.status===401||r.status===302) { window.location='/login'; return null; }
+    return r.json();
+  }).catch(()=>null);
+  if (!d) {
+    document.getElementById('stxt').textContent = 'Connection error — retrying…';
+    return;
+  }
   running = d.running;
   document.getElementById('balance').textContent   = d.balance.toFixed(4);
   document.getElementById('pos-count').textContent = d.positions.length;
@@ -2727,8 +2733,12 @@ async function refresh() {
   if (d.filter_log) updateFilterPipe(d.filter_log);
 }
 async function toggleBot() {
-  await fetch(running ? '/api/stop' : '/api/start', {method:'POST'});
-  setTimeout(refresh, 500);
+  const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'})
+    .then(r=>r.json()).catch(()=>null);
+  if (res && !res.ok && res.msg) {
+    document.getElementById('stxt').textContent = '⚠️ ' + res.msg;
+  }
+  setTimeout(refresh, 1000);
 }
 async function cashout() {
   if (!confirm('Sell all open positions at market price?')) return;
