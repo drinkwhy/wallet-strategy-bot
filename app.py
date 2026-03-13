@@ -1149,7 +1149,8 @@ def helius_pool_sniper():
             print(f"[Sniper] reconnecting in 10s: {e}")
             time.sleep(10)
 
-threading.Thread(target=helius_pool_sniper, daemon=True).start()
+# helius_pool_sniper requires Helius Business plan ($99/mo) — disabled until upgraded
+# threading.Thread(target=helius_pool_sniper, daemon=True).start()
 
 def auto_restart_bots():
     """Restart bots that were running before a server restart."""
