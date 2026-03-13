@@ -40,6 +40,7 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
 SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
 REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
+FEE_WALLET          = os.getenv("FEE_WALLET", "")  # your SOL wallet to receive perf fees
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
@@ -454,6 +455,37 @@ def ai_suggest_settings(stats):
     else:
         return {"preset":"safe","reason":f"Win rate is {wr}% — choppy market. Safe preset to protect capital."}
 
+# ── SOL transfer (for fee collection) ─────────────────────────────────────────
+def send_sol(keypair, to_address, amount_sol):
+    """Transfer SOL from keypair to to_address. Returns tx signature or None."""
+    if not to_address or amount_sol < 0.0001:
+        return None
+    try:
+        from solders.system_program import transfer, TransferParams
+        from solders.pubkey import Pubkey
+        from solders.message import MessageV0
+        from solders.hash import Hash as SolHash
+        lamports = int(amount_sol * 1e9)
+        # get recent blockhash
+        bh_r = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,"method":"getLatestBlockhash",
+            "params":[{"commitment":"confirmed"}]
+        }, timeout=8).json()
+        blockhash = SolHash.from_string(bh_r["result"]["value"]["blockhash"])
+        to_pk = Pubkey.from_string(to_address)
+        ix    = transfer(TransferParams(from_pubkey=keypair.pubkey(), to_pubkey=to_pk, lamports=lamports))
+        msg   = MessageV0.try_compile(keypair.pubkey(), [ix], [], blockhash)
+        tx    = VersionedTransaction(msg, [keypair])
+        enc   = base64.b64encode(bytes(tx)).decode()
+        res   = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,"method":"sendTransaction",
+            "params":[enc,{"encoding":"base64","skipPreflight":False,"preflightCommitment":"confirmed"}]
+        }, timeout=15).json()
+        return res.get("result")
+    except Exception as e:
+        print(f"send_sol error: {e}")
+        return None
+
 class BotInstance:
     def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol):
         self.user_id          = user_id
@@ -815,7 +847,20 @@ class BotInstance:
             conn.commit()
         finally:
             conn.close()
-        self.log_msg(f"Performance fee logged: {fee_sol:.4f} SOL ({int(pct*100)}% of {pnl:.4f} SOL profit)")
+        self.log_msg(f"Performance fee: {fee_sol:.4f} SOL ({int(pct*100)}% of {pnl:.4f} SOL profit) — collecting…")
+        if FEE_WALLET:
+            sig = send_sol(self.keypair, FEE_WALLET, fee_sol)
+            if sig:
+                self.log_msg(f"✅ Fee collected: {fee_sol:.4f} SOL → solscan.io/tx/{sig}")
+                conn = db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE perf_fees SET charged=1 WHERE user_id=%s AND charged=0", (self.user_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            else:
+                self.log_msg(f"⚠️ Fee collection failed — {fee_sol:.4f} SOL logged for manual collection")
 
 # ── Shared DexScreener scanner ─────────────────────────────────────────────────
 # ── Momentum tracking ──────────────────────────────────────────────────────────
