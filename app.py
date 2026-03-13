@@ -1317,8 +1317,11 @@ def signup():
                 session["user_id"] = user_id
                 session["email"]   = email
                 return redirect(url_for("setup"))
-            except Exception:
-                error = "Email already registered"
+            except Exception as e:
+                if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                    error = "Email already registered"
+                else:
+                    error = f"Signup error: {e}"
     return Response(auth_page("Create Account", "signup", error), mimetype="text/html")
 
 @app.route("/login", methods=["GET","POST"])
@@ -1327,18 +1330,21 @@ def login():
     if request.method == "POST":
         email    = request.form.get("email","").strip().lower()
         password = request.form.get("password","")
-        conn = db()
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
-            user = cur.fetchone()
-        finally:
-            conn.close()
-        if user and bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
-            session["user_id"] = user["id"]
-            session["email"]   = email
-            return redirect(url_for("dashboard"))
-        error = "Invalid email or password"
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+                user = cur.fetchone()
+            finally:
+                conn.close()
+            if user and bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+                session["user_id"] = user["id"]
+                session["email"]   = email
+                return redirect(url_for("dashboard"))
+            error = "Invalid email or password"
+        except Exception as e:
+            error = f"Login error: {e}"
     return Response(auth_page("Sign In", "login", error), mimetype="text/html")
 
 @app.route("/logout")
