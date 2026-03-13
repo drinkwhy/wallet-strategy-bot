@@ -8,7 +8,9 @@ Required .env variables:
   STRIPE_SECRET_KEY, STRIPE_PRICE_BASIC, STRIPE_PRICE_PRO, ADMIN_EMAIL
 """
 
-import os, sqlite3, threading, time, base64, json, requests, base58, secrets, hashlib
+import os, threading, time, base64, json, requests, base58, secrets, hashlib
+import psycopg2
+import psycopg2.extras
 import string
 from collections import deque
 from datetime import datetime, timedelta
@@ -85,18 +87,20 @@ PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
 
 # ── Database ───────────────────────────────────────────────────────────────────
-DB = os.getenv("DB_PATH", "/data/bot_data.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
+    return conn
 
 def init_db():
-    with db() as c:
-        c.executescript("""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             plan TEXT DEFAULT 'trial',
@@ -107,21 +111,24 @@ def init_db():
             referred_by INTEGER,
             referral_earnings_sol REAL DEFAULT 0,
             telegram_chat_id TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             referrer_id INTEGER,
             referred_id INTEGER,
             commission_sol REAL DEFAULT 0,
             paid INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS wallets (
             user_id INTEGER PRIMARY KEY,
             encrypted_key TEXT NOT NULL,
             public_key TEXT NOT NULL
-        );
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_settings (
             user_id INTEGER PRIMARY KEY,
             preset TEXT DEFAULT 'steady',
@@ -129,85 +136,76 @@ def init_db():
             run_mode TEXT DEFAULT 'indefinite',
             run_duration_min INTEGER DEFAULT 0,
             profit_target_sol REAL DEFAULT 0,
-            is_running INTEGER DEFAULT 0
-        );
+            is_running INTEGER DEFAULT 0,
+            drawdown_limit_sol REAL DEFAULT 0.5,
+            max_correlated INTEGER DEFAULT 3
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             mint TEXT, name TEXT, action TEXT,
             price REAL, pnl_sol REAL,
-            timestamp TEXT DEFAULT (datetime('now'))
-        );
+            timestamp TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS perf_fees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             user_id INTEGER,
             pnl_sol REAL, fee_sol REAL, fee_usd REAL,
             charged INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS dev_blacklist (
             dev_wallet TEXT PRIMARY KEY,
             reason TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        );
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS filter_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             mint TEXT, name TEXT,
             passed INTEGER DEFAULT 0,
             reason TEXT,
             score INTEGER DEFAULT 0,
-            ts TEXT DEFAULT (datetime('now'))
-        );
-        """)
+            ts TIMESTAMP DEFAULT NOW()
+        )""")
+        conn.commit()
+    finally:
+        conn.close()
 
 init_db()
 
 # migrate existing DB — add new columns if missing
 def migrate_db():
-    with db() as conn:
-        for col, default in [
-            ("referral_code", "NULL"),
-            ("referred_by",   "NULL"),
-            ("referral_earnings_sol", "0"),
-            ("telegram_chat_id", "NULL"),
-        ]:
+    conn = db()
+    try:
+        cur = conn.cursor()
+        migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings_sol REAL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
+        ]
+        for m in migrations:
             try:
-                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {default}")
-            except:
-                pass
+                cur.execute(m)
+            except Exception:
+                conn.rollback()
         try:
-            conn.execute("""CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cur.execute("""CREATE TABLE IF NOT EXISTS referrals (
+                id SERIAL PRIMARY KEY,
                 referrer_id INTEGER, referred_id INTEGER,
                 commission_sol REAL DEFAULT 0, paid INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now')))""")
-        except:
-            pass
-        try:
-            conn.execute("""CREATE TABLE IF NOT EXISTS dev_blacklist (
-                dev_wallet TEXT PRIMARY KEY,
-                reason TEXT,
-                created_at TEXT DEFAULT (datetime('now')))""")
-        except:
-            pass
-        try:
-            conn.execute("""CREATE TABLE IF NOT EXISTS filter_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mint TEXT, name TEXT,
-                passed INTEGER DEFAULT 0,
-                reason TEXT,
-                score INTEGER DEFAULT 0,
-                ts TEXT DEFAULT (datetime('now')))""")
-        except:
-            pass
-        for col, default in [
-            ("drawdown_limit_sol", "0.5"),
-            ("max_correlated", "3"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE bot_settings ADD COLUMN {col} REAL DEFAULT {default}")
-            except:
-                pass
+                created_at TIMESTAMP DEFAULT NOW())""")
+        except Exception:
+            conn.rollback()
+        conn.commit()
+    finally:
+        conn.close()
 migrate_db()
 
 def make_referral_code():
@@ -253,16 +251,26 @@ def send_daily_summaries():
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
         try:
-            with db() as conn:
-                users = conn.execute("SELECT id, email FROM users").fetchall()
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id, email FROM users")
+                users = cur.fetchall()
+            finally:
+                conn.close()
             for u in users:
                 uid = u["id"]
-                with db() as conn:
-                    trades = conn.execute("""
+                conn = db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
                         SELECT action, pnl_sol, name, timestamp FROM trades
-                        WHERE user_id=? AND timestamp >= datetime('now','-1 day')
+                        WHERE user_id=%s AND timestamp >= NOW() - INTERVAL '1 day'
                         ORDER BY timestamp DESC
-                    """, (uid,)).fetchall()
+                    """, (uid,))
+                    trades = cur.fetchall()
+                finally:
+                    conn.close()
                 if not trades:
                     continue
                 total_pnl = sum(t["pnl_sol"] or 0 for t in trades)
@@ -374,24 +382,39 @@ def dynamic_slippage_bps(liq_usd):
 
 def check_dev_blacklist(dev_wallet):
     if not dev_wallet: return True
-    with db() as conn:
-        row = conn.execute("SELECT 1 FROM dev_blacklist WHERE dev_wallet=?", (dev_wallet,)).fetchone()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM dev_blacklist WHERE dev_wallet=%s", (dev_wallet,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
     return row is None
 
 def blacklist_dev(dev_wallet, reason="rugged"):
     try:
-        with db() as conn:
-            conn.execute("INSERT OR IGNORE INTO dev_blacklist (dev_wallet,reason) VALUES (?,?)", (dev_wallet,reason))
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO dev_blacklist (dev_wallet,reason) VALUES (%s,%s) ON CONFLICT DO NOTHING", (dev_wallet, reason))
+            conn.commit()
+        finally:
+            conn.close()
     except: pass
 
 def get_market_stats():
     """Aggregate recent trade stats for AI settings suggestion."""
     try:
-        with db() as conn:
-            trades = conn.execute("""
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
                 SELECT pnl_sol, action, timestamp FROM trades
-                WHERE timestamp >= datetime('now','-24 hours')
-            """).fetchall()
+                WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            """)
+            trades = cur.fetchall()
+        finally:
+            conn.close()
         if not trades: return {}
         wins   = [t for t in trades if (t["pnl_sol"] or 0) > 0]
         losses = [t for t in trades if (t["pnl_sol"] or 0) < 0]
@@ -454,11 +477,16 @@ class BotInstance:
         self.filter_log.appendleft(entry)
         # also save to DB
         try:
-            with db() as conn:
-                conn.execute(
-                    "INSERT INTO filter_log (mint,name,passed,reason,score) VALUES (?,?,?,?,?)",
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO filter_log (mint,name,passed,reason,score) VALUES (%s,%s,%s,%s,%s)",
                     (mint, name, int(passed), reason, score)
                 )
+                conn.commit()
+            finally:
+                conn.close()
         except: pass
 
     def should_stop(self):
@@ -601,8 +629,13 @@ class BotInstance:
             self.log_msg(f"BUY {name} @ ${price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
-                with db() as conn:
-                    u = conn.execute("SELECT telegram_chat_id FROM users WHERE id=?", (self.user_id,)).fetchone()
+                conn = db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT telegram_chat_id FROM users WHERE id=%s", (self.user_id,))
+                    u = cur.fetchone()
+                finally:
+                    conn.close()
                 if u and u["telegram_chat_id"]:
                     send_telegram(u["telegram_chat_id"],
                         f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {s['max_buy_sol']} SOL\n🔗 solscan.io/tx/{sig}")
@@ -648,8 +681,13 @@ class BotInstance:
                     self.stats["losses"] += 1
                 # Telegram alert
                 try:
-                    with db() as conn:
-                        u = conn.execute("SELECT telegram_chat_id FROM users WHERE id=?", (self.user_id,)).fetchone()
+                    conn = db()
+                    try:
+                        _cur = conn.cursor()
+                        _cur.execute("SELECT telegram_chat_id FROM users WHERE id=%s", (self.user_id,))
+                        u = _cur.fetchone()
+                    finally:
+                        conn.close()
                     if u and u["telegram_chat_id"]:
                         emoji = "🟢" if pnl_pct >= 0 else "🔴"
                         send_telegram(u["telegram_chat_id"],
@@ -658,11 +696,16 @@ class BotInstance:
                             f"📝 {reason}")
                 except:
                     pass
-                with db() as conn:
-                    conn.execute(
-                        "INSERT INTO trades (user_id,mint,name,action,price,pnl_sol) VALUES (?,?,?,?,?,?)",
+                conn = db()
+                try:
+                    _cur = conn.cursor()
+                    _cur.execute(
+                        "INSERT INTO trades (user_id,mint,name,action,price,pnl_sol) VALUES (%s,%s,%s,%s,%s,%s)",
                         (self.user_id, mint, pos["name"], f"SELL-{reason}", cur, pnl_sol)
                     )
+                    conn.commit()
+                finally:
+                    conn.close()
                 if pct >= 1.0:
                     del self.positions[mint]
                 else:
@@ -739,16 +782,26 @@ class BotInstance:
         pnl = self.stats["total_pnl_sol"]
         if pnl <= 0:
             return
-        with db() as conn:
-            row = conn.execute("SELECT plan FROM users WHERE id=?", (self.user_id,)).fetchone()
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT plan FROM users WHERE id=%s", (self.user_id,))
+            row = cur.fetchone()
             plan = row["plan"] if row else "basic"
+        finally:
+            conn.close()
         pct = PERF_FEE_PRO if plan == "pro" else PERF_FEE_BASIC
         fee_sol = pnl * pct
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO perf_fees (user_id,pnl_sol,fee_sol) VALUES (?,?,?)",
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO perf_fees (user_id,pnl_sol,fee_sol) VALUES (%s,%s,%s)",
                 (self.user_id, pnl, fee_sol)
             )
+            conn.commit()
+        finally:
+            conn.close()
         self.log_msg(f"Performance fee logged: {fee_sol:.4f} SOL ({int(pct*100)}% of {pnl:.4f} SOL profit)")
 
 # ── Shared DexScreener scanner ─────────────────────────────────────────────────
@@ -1041,15 +1094,20 @@ def auto_restart_bots():
     """Restart bots that were running before a server restart."""
     time.sleep(5)  # wait for app to fully initialize
     try:
-        with db() as conn:
-            rows = conn.execute("""
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
                 SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
                        w.encrypted_key, u.plan
                 FROM bot_settings bs
                 JOIN wallets w ON w.user_id = bs.user_id
                 JOIN users u ON u.id = bs.user_id
                 WHERE bs.is_running = 1
-            """).fetchall()
+            """)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
         for row in rows:
             uid = row["user_id"]
             try:
@@ -1066,8 +1124,13 @@ def auto_restart_bots():
                 t.start()
                 bot.thread = t
             except Exception as e:
-                with db() as conn:
-                    conn.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=?", (uid,))
+                conn = db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
+                    conn.commit()
+                finally:
+                    conn.close()
     except Exception:
         pass
 
@@ -1224,25 +1287,35 @@ def signup():
             # check if came via referral link
             ref_param = request.args.get("ref") or request.form.get("ref", "")
             if ref_param:
-                with db() as conn:
-                    referrer = conn.execute("SELECT id FROM users WHERE referral_code=?", (ref_param,)).fetchone()
+                conn = db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT id FROM users WHERE referral_code=%s", (ref_param,))
+                    referrer = cur.fetchone()
                     if referrer:
                         ref_by = referrer["id"]
+                finally:
+                    conn.close()
             try:
-                with db() as conn:
-                    conn.execute(
-                        "INSERT INTO users (email,password_hash,plan,trial_ends,referral_code,referred_by) VALUES (?,?,?,?,?,?)",
-                        (email, hashed, "trial", trial_ends, ref_code, ref_by)
+                conn = db()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "INSERT INTO users (email, password_hash, plan, trial_ends, referral_code, referred_by) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                        (email, hashed, 'trial', trial_ends, ref_code, ref_by)
                     )
-                    user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-                    conn.execute("INSERT INTO bot_settings (user_id) VALUES (?)", (user["id"],))
+                    user_id = cur.fetchone()["id"]
+                    cur.execute("INSERT INTO bot_settings (user_id) VALUES (%s)", (user_id,))
                     if ref_by:
-                        conn.execute("INSERT INTO referrals (referrer_id,referred_id) VALUES (?,?)",
-                                     (ref_by, user["id"]))
-                session["user_id"] = user["id"]
+                        cur.execute("INSERT INTO referrals (referrer_id,referred_id) VALUES (%s,%s)",
+                                     (ref_by, user_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+                session["user_id"] = user_id
                 session["email"]   = email
                 return redirect(url_for("setup"))
-            except sqlite3.IntegrityError:
+            except Exception:
                 error = "Email already registered"
     return Response(auth_page("Create Account", "signup", error), mimetype="text/html")
 
@@ -1252,8 +1325,13 @@ def login():
     if request.method == "POST":
         email    = request.form.get("email","").strip().lower()
         password = request.form.get("password","")
-        with db() as conn:
-            user = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+            user = cur.fetchone()
+        finally:
+            conn.close()
         if user and bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
             session["user_id"] = user["id"]
             session["email"]   = email
@@ -1282,16 +1360,20 @@ def setup():
             kp  = Keypair.from_bytes(base58.b58decode(private_key))
             pub = str(kp.pubkey())
             enc = encrypt_key(private_key)
-            with db() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO wallets (user_id,encrypted_key,public_key) VALUES (?,?,?)",
-                    (uid, enc, pub)
-                )
-                conn.execute("""
-                    INSERT OR REPLACE INTO bot_settings
-                    (user_id,preset,run_mode,run_duration_min,profit_target_sol)
-                    VALUES (?,?,?,?,?)
-                """, (uid, preset, run_mode, duration, profit))
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute("""INSERT INTO wallets (user_id, encrypted_key, public_key) VALUES (%s,%s,%s)
+                    ON CONFLICT (user_id) DO UPDATE SET encrypted_key=EXCLUDED.encrypted_key, public_key=EXCLUDED.public_key""",
+                    (uid, enc, pub))
+                cur.execute("""INSERT INTO bot_settings (user_id, preset, run_mode, run_duration_min, profit_target_sol, is_running)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (user_id) DO UPDATE SET preset=EXCLUDED.preset, run_mode=EXCLUDED.run_mode,
+                    run_duration_min=EXCLUDED.run_duration_min, profit_target_sol=EXCLUDED.profit_target_sol, is_running=EXCLUDED.is_running""",
+                    (uid, preset, run_mode, duration, profit, 0))
+                conn.commit()
+            finally:
+                conn.close()
             return redirect(url_for("dashboard"))
         except Exception as e:
             error = f"Invalid private key: {e}"
@@ -1302,10 +1384,17 @@ def setup():
 @login_required
 def dashboard():
     uid = session["user_id"]
-    with db() as conn:
-        user      = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-        wallet    = conn.execute("SELECT * FROM wallets WHERE user_id=?", (uid,)).fetchone()
-        bsettings = conn.execute("SELECT * FROM bot_settings WHERE user_id=?", (uid,)).fetchone()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
+        user = cur.fetchone()
+        cur.execute("SELECT * FROM wallets WHERE user_id=%s", (uid,))
+        wallet = cur.fetchone()
+        cur.execute("SELECT * FROM bot_settings WHERE user_id=%s", (uid,))
+        bsettings = cur.fetchone()
+    finally:
+        conn.close()
     if not wallet:
         return redirect(url_for("setup"))
     plan_info = PLAN_LIMITS.get(user["plan"], PLAN_LIMITS["trial"])
@@ -1353,10 +1442,17 @@ def api_start():
     uid = session["user_id"]
     if uid in user_bots and user_bots[uid].running:
         return jsonify({"ok":False,"msg":"Already running"})
-    with db() as conn:
-        w  = conn.execute("SELECT * FROM wallets WHERE user_id=?", (uid,)).fetchone()
-        bs = conn.execute("SELECT * FROM bot_settings WHERE user_id=?", (uid,)).fetchone()
-        u  = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM wallets WHERE user_id=%s", (uid,))
+        w = cur.fetchone()
+        cur.execute("SELECT * FROM bot_settings WHERE user_id=%s", (uid,))
+        bs = cur.fetchone()
+        cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
+        u = cur.fetchone()
+    finally:
+        conn.close()
     if not w:
         return jsonify({"ok":False,"msg":"Wallet not configured"})
     if u["plan"] == "trial":
@@ -1378,8 +1474,13 @@ def api_start():
     t = threading.Thread(target=bot.run, daemon=True)
     t.start()
     bot.thread = t
-    with db() as conn:
-        conn.execute("UPDATE bot_settings SET is_running=1 WHERE user_id=?", (uid,))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE bot_settings SET is_running=1 WHERE user_id=%s", (uid,))
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify({"ok":True})
 
 @app.route("/api/stop", methods=["POST"])
@@ -1390,8 +1491,13 @@ def api_stop():
     if bot:
         bot.running = False
         bot.record_perf_fee()
-        with db() as conn:
-            conn.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=?", (uid,))
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
+            conn.commit()
+        finally:
+            conn.close()
     return jsonify({"ok":True})
 
 @app.route("/api/cashout", methods=["POST"])
@@ -1412,11 +1518,16 @@ def api_settings():
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
-    with db() as conn:
-        conn.execute("""
-            UPDATE bot_settings SET preset=?,run_mode=?,run_duration_min=?,profit_target_sol=?
-            WHERE user_id=?
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s
+            WHERE user_id=%s
         """, (preset, run_mode, duration, profit, uid))
+        conn.commit()
+    finally:
+        conn.close()
     bot = user_bots.get(uid)
     if bot:
         bot.settings.update(PRESETS.get(preset, bot.settings))
@@ -1470,8 +1581,13 @@ def api_manual_buy():
 def api_telegram():
     uid     = session["user_id"]
     chat_id = (request.json or {}).get("chat_id", "").strip()
-    with db() as conn:
-        conn.execute("UPDATE users SET telegram_chat_id=? WHERE id=?", (chat_id or None, uid))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET telegram_chat_id=%s WHERE id=%s", (chat_id or None, uid))
+        conn.commit()
+    finally:
+        conn.close()
     if chat_id:
         send_telegram(chat_id, "✅ <b>SolTrader</b> connected! You'll receive alerts when your bot buys and sells.")
     return jsonify({"ok": True})
@@ -1488,10 +1604,13 @@ def api_filter_log():
     if bot:
         return jsonify(list(bot.filter_log))
     # fallback to DB
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM filter_log ORDER BY id DESC LIMIT 30"
-        ).fetchall()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM filter_log ORDER BY id DESC LIMIT 30")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
     return jsonify([dict(r) for r in rows])
 
 @app.route("/api/admin/suggest-settings")
@@ -1513,8 +1632,13 @@ def api_blacklist_dev():
 @app.route("/api/admin/dev-blacklist")
 @admin_required
 def api_dev_blacklist():
-    with db() as conn:
-        rows = conn.execute("SELECT * FROM dev_blacklist ORDER BY created_at DESC LIMIT 50").fetchall()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM dev_blacklist ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
     return jsonify([dict(r) for r in rows])
 
 @app.route("/api/admin/override-preset", methods=["POST"])
@@ -1528,8 +1652,13 @@ def api_override_preset():
             if k != "preset":
                 PRESETS[preset][k] = v
         # propagate to running bots on this preset
-        with db() as conn:
-            rows = conn.execute("SELECT user_id FROM bot_settings WHERE preset=? AND is_running=1", (preset,)).fetchall()
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM bot_settings WHERE preset=%s AND is_running=1", (preset,))
+            rows = cur.fetchall()
+        finally:
+            conn.close()
         for row in rows:
             bot = user_bots.get(row["user_id"])
             if bot:
@@ -1541,9 +1670,15 @@ def api_override_preset():
 @login_required
 def api_referral():
     uid = session["user_id"]
-    with db() as conn:
-        u = conn.execute("SELECT referral_code, referral_earnings_sol FROM users WHERE id=?", (uid,)).fetchone()
-        count = conn.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,)).fetchone()["c"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT referral_code, referral_earnings_sol FROM users WHERE id=%s", (uid,))
+        u = cur.fetchone()
+        cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=%s", (uid,))
+        count = cur.fetchone()["c"]
+    finally:
+        conn.close()
     code = u["referral_code"] or ""
     link = f"https://soltrader-production.up.railway.app/ref/{code}"
     return jsonify({"ok": True, "code": code, "link": link,
@@ -1576,8 +1711,13 @@ def subscribe(plan):
 def subscribe_success():
     uid  = session["user_id"]
     plan = request.args.get("plan","basic")
-    with db() as conn:
-        conn.execute("UPDATE users SET plan=? WHERE id=?", (plan, uid))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET plan=%s WHERE id=%s", (plan, uid))
+        conn.commit()
+    finally:
+        conn.close()
     return redirect(url_for("dashboard"))
 
 # ── Admin ──────────────────────────────────────────────────────────────────────
@@ -1585,10 +1725,17 @@ def subscribe_success():
 @login_required
 @admin_required
 def admin():
-    with db() as conn:
-        users  = conn.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
-        trades = conn.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 100").fetchall()
-        fees   = conn.execute("SELECT * FROM perf_fees ORDER BY created_at DESC").fetchall()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users ORDER BY created_at DESC")
+        users = cur.fetchall()
+        cur.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 100")
+        trades = cur.fetchall()
+        cur.execute("SELECT * FROM perf_fees ORDER BY created_at DESC")
+        fees = cur.fetchall()
+    finally:
+        conn.close()
     active        = sum(1 for b in user_bots.values() if b.running)
     total_fee_sol = sum(f["fee_sol"] for f in fees)
     return Response(
@@ -2810,6 +2957,6 @@ loadBlacklist();
 if __name__ == "__main__":
     print(f"\n  SolTrader Platform → http://localhost:5000")
     print(f"  Admin account: {ADMIN_EMAIL}")
-    print(f"  Database: {DB}\n")
+    print(f"  Database: {DATABASE_URL}\n")
     port = int(os.getenv("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
