@@ -1,3 +1,4 @@
+from gevent import monkey; monkey.patch_all(thread=False)
 """
 SaaS Trading Bot Platform — SolTrader
 Run: python app.py
