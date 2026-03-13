@@ -1,4 +1,6 @@
-from gevent import monkey; monkey.patch_all(thread=False)
+from gevent import monkey
+if not monkey.is_module_patched("socket"):
+    monkey.patch_all(thread=False)
 """
 SaaS Trading Bot Platform — SolTrader
 Run: python app.py
