@@ -185,10 +185,21 @@ def migrate_db():
     try:
         cur = conn.cursor()
         migrations = [
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'trial'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings_sol REAL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS preset TEXT DEFAULT 'steady'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS custom_settings TEXT",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS run_mode TEXT DEFAULT 'indefinite'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS run_duration_min INTEGER DEFAULT 0",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS profit_target_sol REAL DEFAULT 0",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS is_running INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
         ]
