@@ -890,12 +890,13 @@ def get_momentum_score(mint, current_vol):
 
 # ── Known profitable whale wallets to track ────────────────────────────────────
 WHALE_WALLETS = [
-    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",  # known Solana alpha wallet
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",  # top SOL trader
-    "Hx6LbkMHe69DBeXDM9RMqMJG41J9YGfxsGFm8BhcPXb",  # meme coin sniper
+    "GSTnwUkbsGqXbBHzA8sHsm7FijhKb4CDGS1zAxZAVwsV",  # pump.fun top sniper
+    "HVWBLYoq5Nvh8vqKnFDqbGAXkLCKiMoRcVGR4JEGMEX",  # meme coin sniper
+    "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m33NDcj8ppump",  # active degen wallet
     "5tzFkiKscXHK5ZXCGbGuykB2NZuNQn8aVJHsZcFKpNGe",  # dex whale
 ]
-_whale_seen = set()
+_whale_seen  = set()
+_whale_mints = {}   # mint -> last_seen timestamp (dedup per token)
 
 def check_whale_wallets():
     """Poll recent transactions of whale wallets and copy their buys."""
@@ -956,6 +957,18 @@ def check_whale_wallets():
                                     age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
                                     if not price:
                                         continue
+                                    # pre-filter: skip old/huge/stable tokens
+                                    if age_min > 60:
+                                        continue
+                                    if mc > 500_000:
+                                        continue
+                                    if liq < 3000:
+                                        continue
+                                    # dedup: skip if we signalled this mint in last 5 min
+                                    now = time.time()
+                                    if now - _whale_mints.get(mint, 0) < 300:
+                                        continue
+                                    _whale_mints[mint] = now
                                     for bot in list(user_bots.values()):
                                         if bot.running and mint not in bot.positions:
                                             bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
