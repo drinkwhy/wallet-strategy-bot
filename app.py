@@ -1731,12 +1731,14 @@ def ensure_background_workers_started():
 
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
+from werkzeug.middleware.proxy_fix import ProxyFix
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
+    SESSION_COOKIE_SECURE=False,   # Railway terminates TLS at proxy — app sees HTTP
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
 try:
