@@ -3082,7 +3082,19 @@ DASHBOARD_HTML = _CSS + """
 .filter-btn.active{background:var(--grn);color:#000;border-color:var(--grn);font-weight:700}
 .preset-card{background:var(--bg3);border:2px solid var(--bdr);border-radius:10px;padding:10px;text-align:center;cursor:pointer;transition:all .2s}
 .preset-card:hover{border-color:var(--grn)}
-.preset-card.active{border-color:var(--grn);background:rgba(20,199,132,.08)}
+@keyframes presetPulse{0%,100%{box-shadow:0 0 0 0 rgba(20,199,132,.5)}60%{box-shadow:0 0 0 7px rgba(20,199,132,0)}}
+.preset-card.active{border-color:var(--grn);background:rgba(20,199,132,.08);animation:presetPulse 2s ease-in-out infinite}
+/* Toast */
+@keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#0d1117;border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:30px;font-size:13px;font-weight:600;z-index:99999;pointer-events:none;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1;animation:toastIn .3s ease}
+/* Top growth list */
+.growth-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:7px;cursor:pointer;transition:background .15s;font-size:12px}
+.growth-row:hover,.growth-row.growth-active{background:rgba(20,199,132,.08)}
+.growth-row.growth-active .growth-name{color:var(--grn)}
+.growth-rank{font-size:10px;color:var(--t3);min-width:18px;text-align:right}
+.growth-name{font-weight:700;color:var(--t1);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.growth-chg{font-weight:700;font-size:12px}
 .pc-icon{font-size:20px;margin-bottom:4px}
 .pc-name{font-size:12px;font-weight:700;color:var(--t1)}
 .pc-desc{font-size:10px;color:var(--t3);margin-top:2px}
@@ -3151,6 +3163,7 @@ DASHBOARD_HTML = _CSS + """
 </div>
 <div id="tooltip-overlay" style="display:none;position:fixed;inset:0;z-index:9998" onclick="closeTooltip()"></div>
 
+<div id="toast" class="toast"></div>
 <div class="wrap">
 
   <!-- Feature status bar -->
@@ -3290,6 +3303,7 @@ DASHBOARD_HTML = _CSS + """
 
         <!-- Candlestick view -->
         <div id="chart-candle-view" style="display:none">
+          <!-- Controls row -->
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
             <select id="candle-token-sel" class="finput" style="flex:1;min-width:120px;padding:5px 8px;font-size:12px" onchange="onTokenSelChange()">
               <option value="">— select token —</option>
@@ -3304,12 +3318,24 @@ DASHBOARD_HTML = _CSS + """
               <button class="ctf-btn"        id="ctf-15" onclick="setTf(15,this)">15m</button>
             </div>
           </div>
-          <div class="chart-wrap">
-            <canvas id="candle-chart" height="400"></canvas>
-          </div>
-          <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:var(--t3)">
-            <span id="candle-ohlc-label">—</span>
-            <span id="candle-refresh-label">auto-refresh 30s</span>
+          <!-- Main area: chart + top-20 sidebar -->
+          <div style="display:grid;grid-template-columns:1fr 140px;gap:10px;align-items:start">
+            <div>
+              <div class="chart-wrap">
+                <canvas id="candle-chart" height="360"></canvas>
+              </div>
+              <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:var(--t3)">
+                <span id="candle-ohlc-label">—</span>
+                <span id="candle-refresh-label">auto-refresh 30s</span>
+              </div>
+            </div>
+            <!-- Top 20 growth sidebar -->
+            <div style="background:var(--bg3);border:1px solid var(--bdr);border-radius:10px;padding:8px">
+              <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);margin-bottom:6px;padding:0 4px">Top 20 Growth</div>
+              <div id="top-growth-list" style="max-height:360px;overflow-y:auto">
+                <div style="font-size:11px;color:var(--t3);padding:6px">Scanning…</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -3574,11 +3600,19 @@ function switchToCandle(mint, name) {
       sel.appendChild(o);
     }
   });
-  if (chartMint) sel.value = chartMint;
+  if (chartMint) {
+    sel.value = chartMint;
+  } else {
+    // auto-select top growth token
+    const top = [...allTokens].filter(t=>(t.change1h||t.priceChange1h||t.chg||0)>0)
+      .sort((a,b)=>growthScore(b)-growthScore(a))[0];
+    if (top) { chartMint = top.mint; chartMintName = top.symbol||top.name||''; sel.value = chartMint; }
+  }
+  updateTopGrowth();
   initCandleCanvas();
   fetchAndRenderCandles();
   if (candleTimer) clearInterval(candleTimer);
-  candleTimer = setInterval(fetchAndRenderCandles, 30000);
+  candleTimer = setInterval(() => { fetchAndRenderCandles(); updateTopGrowth(); }, 30000);
 }
 
 function onTokenSelChange() {
@@ -3796,6 +3830,7 @@ async function pollFeed() {
       feedSince = Math.max(...tokens.map(t => t.ts || 0), feedSince);
       renderChart();
       updateTicker();
+      updateTopGrowth();
     }
   } catch(err) {}
 }
@@ -3950,8 +3985,18 @@ async function cashout() {
   await fetch('/api/cashout', {method:'POST'});
   setTimeout(refresh, 1000);
 }
+function showToast(msg, ok=true) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.borderColor = ok ? 'var(--grn)' : '#f23645';
+  el.style.color       = ok ? 'var(--grn)' : '#f23645';
+  el.classList.add('show');
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), 3000);
+}
+
 async function saveSettings() {
-  await fetch('/api/settings', {
+  const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       preset: document.getElementById('s-preset').value,
@@ -3959,8 +4004,43 @@ async function saveSettings() {
       run_duration_min: document.getElementById('s-dur')?.value || 0,
       profit_target_sol: document.getElementById('s-pft')?.value || 0,
     })
-  });
+  }).then(r=>r.json()).catch(()=>null);
+  if (res && res.ok !== false) {
+    showToast('✓ Settings saved');
+  } else {
+    showToast('⚠ Save failed — try again', false);
+  }
   setTimeout(refresh, 300);
+}
+
+// ── Top 20 Growth sidebar ────────────────────────────────────────────────────
+function growthScore(t) {
+  const chg = t.change1h || t.priceChange1h || t.chg || 0;
+  const vol  = t.vol || 1;
+  return chg * Math.log10(Math.max(vol, 10));
+}
+
+function updateTopGrowth() {
+  const list = document.getElementById('top-growth-list');
+  if (!list) return;
+  const sorted = [...allTokens]
+    .filter(t => (t.change1h || t.priceChange1h || t.chg || 0) > 0)
+    .sort((a,b) => growthScore(b) - growthScore(a))
+    .slice(0, 20);
+  if (!sorted.length) {
+    list.innerHTML = '<div style="font-size:11px;color:var(--t3);padding:6px">No data yet</div>';
+    return;
+  }
+  list.innerHTML = sorted.map((t, i) => {
+    const chg  = (t.change1h || t.priceChange1h || t.chg || 0).toFixed(1);
+    const name = (t.symbol || t.name || '').slice(0, 9);
+    const isActive = t.mint === chartMint;
+    return `<div class="growth-row${isActive?' growth-active':''}" onclick="switchToCandle('${t.mint}','${name}')">
+      <span class="growth-rank">#${i+1}</span>
+      <span class="growth-name">${name}</span>
+      <span class="growth-chg" style="color:#14c784">+${chg}%</span>
+    </div>`;
+  }).join('');
 }
 refresh();
 setInterval(refresh, 5000);
