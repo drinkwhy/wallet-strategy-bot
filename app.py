@@ -2340,6 +2340,65 @@ def api_chart(mint):
             candles[b]["c"] = price
     return jsonify(sorted(candles.values(), key=lambda x: x["t"]))
 
+@app.route("/api/wallet-tree/<mint>")
+@login_required
+def api_wallet_tree(mint):
+    """Fetch recent swap txns for a mint from Helius and return wallet tree data."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed  = urlparse(HELIUS_RPC)
+        api_key = parse_qs(parsed.query).get("api-key", [""])[0] or HELIUS_RPC.split("/")[-1]
+        url  = f"https://api.helius.xyz/v0/addresses/{mint}/transactions"
+        resp = requests.get(url, params={"api-key": api_key, "limit": 50, "type": "SWAP"}, timeout=10)
+        txns = resp.json() if resp.ok else []
+        if not isinstance(txns, list):
+            txns = []
+        buy_wallets  = {}
+        sell_wallets = {}
+        for tx in txns:
+            if not isinstance(tx, dict):
+                continue
+            fee_payer = tx.get("feePayer", "")
+            if not fee_payer:
+                continue
+            swap = (tx.get("events") or {}).get("swap") or {}
+            if not swap:
+                continue
+            token_outputs = swap.get("tokenOutputs") or []
+            token_inputs  = swap.get("tokenInputs")  or []
+            native_input  = swap.get("nativeInput")  or {}
+            native_output = swap.get("nativeOutput") or {}
+            is_buy  = any(t.get("mint") == mint for t in token_outputs)
+            is_sell = any(t.get("mint") == mint for t in token_inputs)
+            if is_buy:
+                amt = native_input.get("amount", 0) or 0
+                buy_wallets[fee_payer]  = buy_wallets.get(fee_payer,  0) + amt
+            elif is_sell:
+                amt = native_output.get("amount", 0) or 0
+                sell_wallets[fee_payer] = sell_wallets.get(fee_payer, 0) + amt
+        nodes = [{"id": "root", "label": "TOKEN", "type": "token"}]
+        edges = []
+        if buy_wallets:
+            nodes.append({"id": "buys", "label": f"BUYS ({len(buy_wallets)})", "type": "group_buy"})
+            edges.append({"from": "root", "to": "buys"})
+            for w, amt in sorted(buy_wallets.items(), key=lambda x: -x[1])[:12]:
+                nid = "b_" + w
+                nodes.append({"id": nid, "label": w[:4]+"…"+w[-4:], "type": "buy",
+                               "sol": round(amt / 1e9, 4), "wallet": w})
+                edges.append({"from": "buys", "to": nid})
+        if sell_wallets:
+            nodes.append({"id": "sells", "label": f"SELLS ({len(sell_wallets)})", "type": "group_sell"})
+            edges.append({"from": "root", "to": "sells"})
+            for w, amt in sorted(sell_wallets.items(), key=lambda x: -x[1])[:12]:
+                nid = "s_" + w
+                nodes.append({"id": nid, "label": w[:4]+"…"+w[-4:], "type": "sell",
+                               "sol": round(amt / 1e9, 4), "wallet": w})
+                edges.append({"from": "sells", "to": nid})
+        return jsonify({"nodes": nodes, "edges": edges,
+                        "total_buys": len(buy_wallets), "total_sells": len(sell_wallets)})
+    except Exception as e:
+        return jsonify({"nodes": [], "edges": [], "error": str(e)})
+
 @app.route("/api/market-feed")
 @login_required
 def api_market_feed():
@@ -3125,166 +3184,127 @@ function toggleStop(v){
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
 DASHBOARD_HTML = _CSS + """
 <style>
-/* Chart container */
-.chart-wrap{position:relative;width:100%;background:#0d1117;border-radius:10px;overflow:hidden}
-#market-chart{display:block;width:100%;cursor:crosshair}
-.chart-legend{display:flex;gap:16px;margin-top:8px;font-size:11px;color:var(--t3)}
-.leg-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
-/* Click tooltip */
-.tooltip{display:none;position:fixed;z-index:9999;background:#0d1117;border:1px solid var(--grn);border-radius:14px;padding:20px;width:320px;box-shadow:0 20px 60px rgba(0,0,0,.8)}
-.tooltip.show{display:block}
-.tt-title{font-size:18px;font-weight:800;color:var(--t1);margin-bottom:4px}
-.tt-sym{font-size:11px;color:var(--grn);text-transform:uppercase;letter-spacing:1px}
-.tt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
-.tt-stat{background:var(--bg3);border-radius:8px;padding:10px}
-.tt-stat-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
-.tt-stat-val{font-size:15px;font-weight:700;color:var(--t1)}
-.ai-score-wrap{margin:12px 0;background:var(--bg3);border-radius:10px;padding:14px}
-.ai-score-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.ai-score-label{font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px}
-.ai-score-num{font-size:24px;font-weight:900}
-.ai-bar{height:8px;border-radius:4px;background:var(--bg2);overflow:hidden}
-.ai-fill{height:100%;border-radius:4px;transition:width .6s}
-.ai-verdict{font-size:11px;margin-top:6px;font-weight:600}
-.tt-btns{display:flex;gap:8px;margin-top:14px}
-.tt-btn{flex:1;padding:10px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;border:none;transition:all .2s}
-.tt-buy{background:var(--grn);color:#000}
-.tt-buy:hover{background:#0fa86a}
-.tt-chart{background:var(--bg3);color:var(--t1);border:1px solid var(--bdr)}
-.tt-chart:hover{border-color:var(--grn)}
-/* Ticker tape */
-.ticker{background:var(--bg2);border-bottom:1px solid var(--bdr);padding:8px 0;overflow:hidden;white-space:nowrap}
-.ticker-inner{display:inline-flex;gap:32px;animation:scroll 40s linear infinite}
-@keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-.tick-item{font-size:12px;color:var(--t2);display:flex;gap:8px;align-items:center}
-.tick-name{font-weight:600;color:var(--t1)}
-/* Layout */
-.dash-grid{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
-@media(max-width:900px){.dash-grid{grid-template-columns:1fr}}
-.live-dot{width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:6px;animation:pulse 1.5s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
-.market-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-.token-count{font-size:12px;color:var(--t3)}
-.filter-row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-.filter-btn{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:5px 12px;border-radius:20px;font-size:11px;cursor:pointer;transition:all .2s}
-.filter-btn.active{background:var(--grn);color:#000;border-color:var(--grn);font-weight:700}
-.preset-card{background:var(--bg3);border:2px solid var(--bdr);border-radius:10px;padding:10px;text-align:center;cursor:pointer;transition:all .2s}
+/* DEX Screener inspired */
+.dex-wrap{overflow-x:auto}
+.dex-tbl{width:100%;border-collapse:collapse;font-size:12px}
+.dex-tbl th{padding:7px 9px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--b1);cursor:pointer;white-space:nowrap;user-select:none;background:var(--surf)}
+.dex-tbl th:hover{color:var(--t1)}
+.dex-tbl td{padding:6px 9px;border-bottom:1px solid rgba(26,46,69,.25);white-space:nowrap;vertical-align:middle}
+.dex-row{cursor:pointer;transition:background .1s}.dex-row:hover td{background:rgba(255,255,255,.02)}
+.dex-row.selected td{background:rgba(20,199,132,.05)}
+.tok-icon{width:24px;height:24px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0;margin-right:7px}
+.tok-name{font-weight:700;color:var(--t1);font-size:12px}.tok-sym{font-size:10px;color:var(--t3)}
+.chg-pos{color:#14c784;font-weight:700;font-family:monospace}
+.chg-neg{color:#f23645;font-weight:700;font-family:monospace}
+.chg-0{color:var(--t3);font-family:monospace}
+.price-val{font-family:'SF Mono',monospace;font-size:12px;color:var(--t1)}
+.num-val{font-family:monospace;font-size:11px;color:var(--t2)}
+.score-mini{display:inline-block;width:36px;height:4px;border-radius:2px;background:var(--b1);position:relative;vertical-align:middle}
+.score-fill{height:100%;border-radius:2px;position:absolute;left:0;top:0}
+.buy-btn-mini{background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.35);color:#14c784;padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;transition:all .15s}
+.buy-btn-mini:hover{background:var(--grn);color:#000}
+/* Wallet Tree */
+.tree-panel{background:var(--card);border:1px solid var(--b1);border-radius:10px;padding:14px;margin-top:12px}
+.tree-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.tree-token-name{font-size:15px;font-weight:800;color:var(--t1)}
+.tree-stat-buy{color:#14c784;font-weight:700;font-size:12px}
+.tree-stat-sell{color:#f23645;font-weight:700;font-size:12px}
+#tree-canvas{display:block;width:100%;border-radius:8px;background:#070d17}
+.tree-list{margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px;max-height:160px;overflow-y:auto}
+.tree-wallet-row{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;font-size:10px;font-family:monospace;background:rgba(255,255,255,.02);border:1px solid transparent;cursor:pointer}
+.tree-wallet-row:hover{opacity:.8}
+.tree-wallet-row.is-buy{border-color:rgba(20,199,132,.2)}
+.tree-wallet-row.is-sell{border-color:rgba(242,54,69,.2)}
+.tree-wallet-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.tree-wallet-addr{color:var(--t2);flex:1;overflow:hidden;text-overflow:ellipsis}
+.tree-wallet-sol{color:var(--t3);white-space:nowrap}
+/* Scanner controls */
+.scan-ctrl{display:flex;gap:7px;margin-bottom:9px;align-items:center;flex-wrap:wrap}
+.scan-search{flex:1;min-width:100px;background:var(--surf);border:1px solid var(--b1);color:var(--t1);border-radius:7px;padding:6px 12px;font-size:12px;font-family:inherit}
+.scan-search:focus{outline:none;border-color:var(--grn)}
+.sort-pill{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
+.sort-pill.active{background:rgba(20,199,132,.12);border-color:var(--grn);color:var(--grn)}
+/* Preset cards */
+.preset-card{background:var(--bg3);border:2px solid var(--bdr);border-radius:10px;padding:9px;text-align:center;cursor:pointer;transition:all .2s}
 .preset-card:hover{border-color:var(--grn)}
 @keyframes presetPulse{0%,100%{box-shadow:0 0 0 0 rgba(20,199,132,.5)}60%{box-shadow:0 0 0 7px rgba(20,199,132,0)}}
 .preset-card.active{border-color:var(--grn);background:rgba(20,199,132,.08);animation:presetPulse 2s ease-in-out infinite}
-/* Toast */
-@keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#0d1117;border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:30px;font-size:13px;font-weight:600;z-index:99999;pointer-events:none;opacity:0;transition:opacity .3s}
-.toast.show{opacity:1;animation:toastIn .3s ease}
-/* Top growth list */
-.growth-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:7px;cursor:pointer;transition:background .15s;font-size:12px}
-.growth-row:hover,.growth-row.growth-active{background:rgba(20,199,132,.08)}
-.growth-row.growth-active .growth-name{color:var(--grn)}
-.growth-rank{font-size:10px;color:var(--t3);min-width:18px;text-align:right}
-.growth-name{font-weight:700;color:var(--t1);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.growth-chg{font-weight:700;font-size:12px}
-.pc-icon{font-size:20px;margin-bottom:4px}
-.pc-name{font-size:12px;font-weight:700;color:var(--t1)}
-.pc-desc{font-size:10px;color:var(--t3);margin-top:2px}
-/* Filter pipeline */
-.fp-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bdr);font-size:12px}
-.fp-pass{color:#14c784;font-weight:700;min-width:16px}
-.fp-fail{color:#f23645;font-weight:700;min-width:16px}
-.fp-name{font-weight:600;color:var(--t1);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.fp-reason{font-size:10px;color:var(--t3);text-align:right}
 /* Feature badges */
 .feat-badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;white-space:nowrap}
-@keyframes featPulse{0%,100%{opacity:1}50%{opacity:.6}}
-.feat-pulse{animation:featPulse 2s ease-in-out infinite}
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
-/* Activity log bottom bar */
-#activity-bar{position:fixed;bottom:0;left:0;right:0;height:200px;background:#0d1117;border-top:1px solid #1e293b;display:flex;flex-direction:column;z-index:1000;transition:height .25s ease}
-/* Chart tabs */
-.chart-tab{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:5px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
-.chart-tab.active{background:var(--grn);color:#000;border-color:var(--grn)}
-.ctype-btn,.ctf-btn{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
-.ctype-btn.active{background:rgba(20,199,132,.15);border-color:var(--grn);color:var(--grn)}
-.ctf-btn.active{background:rgba(37,99,235,.15);border-color:var(--blue2);color:var(--blue2)}
+@keyframes featPulse{0%,100%{opacity:1}50%{opacity:.6}}.feat-pulse{animation:featPulse 2s ease-in-out infinite}
+/* Toast */
+@keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.toast{position:fixed;bottom:220px;left:50%;transform:translateX(-50%);background:#0d1117;border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:30px;font-size:13px;font-weight:600;z-index:99999;pointer-events:none;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1;animation:toastIn .3s ease}
+/* Ticker */
+.ticker{background:rgba(20,199,132,.03);border-bottom:1px solid rgba(20,199,132,.12);padding:7px 0;overflow:hidden;white-space:nowrap}
+.ticker-inner{display:inline-flex;gap:32px;animation:scroll 50s linear infinite}
+@keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.tick-item{font-size:12px;color:var(--t2);display:flex;gap:8px;align-items:center}.tick-name{font-weight:700;color:var(--t1)}
+/* Layout */
+.dash-grid{display:grid;grid-template-columns:300px 1fr;gap:14px;align-items:start}
+@media(max-width:860px){.dash-grid{grid-template-columns:1fr}}
+/* Filter pipeline */
+.fp-item{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--bdr);font-size:11px}
+.fp-pass{color:#14c784;font-weight:700;min-width:14px}.fp-fail{color:#f23645;font-weight:700;min-width:14px}
+.fp-name{font-weight:600;color:var(--t1);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fp-reason{font-size:10px;color:var(--t3);text-align:right}
+/* Activity bar */
+#activity-bar{position:fixed;bottom:0;left:0;right:0;height:200px;background:#070d17;border-top:1px solid rgba(20,199,132,.2);display:flex;flex-direction:column;z-index:1000;transition:height .25s ease}
 </style>
 
-<nav class="nav">
-  <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
+<nav class="nav" style="background:rgba(4,10,20,.97);border-bottom:1px solid rgba(20,199,132,.15)">
+  <a href="/" class="logo">
+    <div class="logo-mark" style="background:linear-gradient(135deg,#14c784,#0fa86a)">S</div>
+    <span style="color:#14c784">Sol</span><span>Trader</span>
+  </a>
   <div class="nav-r">
-    <span style="font-size:11px;color:var(--t3);background:var(--bg3);padding:3px 10px;border-radius:20px;border:1px solid var(--bdr)">{{PLAN_LABEL}}</span>
+    <span style="font-size:11px;color:var(--t3);background:rgba(20,199,132,.08);padding:3px 10px;border-radius:20px;border:1px solid rgba(20,199,132,.2)">{{PLAN_LABEL}}</span>
     <span style="font-size:12px;color:var(--t3)">{{EMAIL}}</span>
-    <a href="/setup">Settings</a>
+    <a href="/setup" style="color:var(--t2)!important">Settings</a>
     {{UPGRADE_BTN}}
     <a href="/logout" style="color:var(--t3)!important">Sign Out</a>
   </div>
 </nav>
 
-<!-- Ticker tape -->
-<div class="ticker" id="ticker"><div class="ticker-inner" id="ticker-inner">Loading market data…</div></div>
-
-<!-- Hover Tooltip -->
-<div class="tooltip" id="tooltip">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start">
-    <div>
-      <div class="tt-title" id="tt-name">—</div>
-      <div class="tt-sym" id="tt-sym">—</div>
-    </div>
-    <button onclick="closeTooltip()" style="background:none;border:none;color:var(--t3);font-size:18px;cursor:pointer">✕</button>
-  </div>
-  <div class="tt-grid">
-    <div class="tt-stat"><div class="tt-stat-label">Price</div><div class="tt-stat-val" id="tt-price">—</div></div>
-    <div class="tt-stat"><div class="tt-stat-label">1h Change</div><div class="tt-stat-val" id="tt-chg">—</div></div>
-    <div class="tt-stat"><div class="tt-stat-label">Market Cap</div><div class="tt-stat-val" id="tt-mc">—</div></div>
-    <div class="tt-stat"><div class="tt-stat-label">Liquidity</div><div class="tt-stat-val" id="tt-liq">—</div></div>
-    <div class="tt-stat"><div class="tt-stat-label">Volume 24h</div><div class="tt-stat-val" id="tt-vol">—</div></div>
-    <div class="tt-stat"><div class="tt-stat-label">Age</div><div class="tt-stat-val" id="tt-age">—</div></div>
-  </div>
-  <div class="ai-score-wrap">
-    <div class="ai-score-header">
-      <div class="ai-score-label">AI Signal Score</div>
-      <div class="ai-score-num" id="tt-score">0</div>
-    </div>
-    <div class="ai-bar"><div class="ai-fill" id="tt-score-bar" style="width:0%"></div></div>
-    <div class="ai-verdict" id="tt-verdict">—</div>
-  </div>
-  <div class="tt-btns">
-    <button class="tt-btn tt-buy" id="tt-buy-btn" onclick="manualBuy()">⚡ AI Buy Now</button>
-    <button class="tt-btn tt-chart" onclick="openChart()">📊 Chart</button>
-  </div>
-</div>
-<div id="tooltip-overlay" style="display:none;position:fixed;inset:0;z-index:9998" onclick="closeTooltip()"></div>
-
+<div class="ticker"><div class="ticker-inner" id="ticker-inner">Loading market data…</div></div>
 <div id="toast" class="toast"></div>
-<div class="wrap">
 
-  <!-- Feature status bar -->
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center">
-    <span style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-right:4px">Active</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">⚡ Helius Sender</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">🎯 Jito Tips</span>
-    <span class="feat-badge feat-pulse" style="background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);color:#f59e0b">🔔 CEX Listing Sniper</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">🐋 Whale Tracker</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">🛡️ Rug Detection</span>
+<div class="wrap" style="max-width:1400px">
+
+  <!-- Feature badges -->
+  <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
+    <span style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-right:2px">Active</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">⚡ Helius Sender</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">🎯 Jito Tips</span>
+    <span class="feat-badge feat-pulse" style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);color:#f59e0b">🔔 CEX Sniper</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">🐋 Whale Tracker</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">🛡️ Rug Detection</span>
     <span id="listing-count-badge" style="margin-left:auto;font-size:11px;color:var(--t3)">0 listings caught</span>
   </div>
 
   <!-- Stats row -->
-  <div class="stats" style="margin-bottom:16px">
+  <div class="stats" style="margin-bottom:14px">
     <div class="stat"><div class="slabel">SOL Balance</div><div class="sval" id="balance">—</div><div class="ssub">available</div></div>
     <div class="stat"><div class="slabel">Open Positions</div><div class="sval c-gold" id="pos-count">0</div></div>
     <div class="stat"><div class="slabel">Wins</div><div class="sval c-grn" id="wins">0</div></div>
     <div class="stat"><div class="slabel">Losses</div><div class="sval c-red" id="losses">0</div></div>
     <div class="stat"><div class="slabel">Session P&amp;L</div><div class="sval" id="pnl">+0.0000</div><div class="ssub">SOL</div></div>
-    <div class="stat" style="background:rgba(245,158,11,.06);border-color:rgba(245,158,11,.2)"><div class="slabel" style="color:#f59e0b">Listings Caught</div><div class="sval" id="listing-stat" style="color:#f59e0b">0</div><div class="ssub">this session</div></div>
+    <div class="stat" style="background:rgba(245,158,11,.05);border-color:rgba(245,158,11,.2)">
+      <div class="slabel" style="color:#f59e0b">Listings Caught</div>
+      <div class="sval" id="listing-stat" style="color:#f59e0b">0</div>
+    </div>
   </div>
 
   <div class="dash-grid">
-    <!-- Left panel: controls + positions + log -->
+
+    <!-- LEFT PANEL -->
     <div>
-      <div class="panel" style="margin-bottom:12px">
+      <div class="panel" style="margin-bottom:10px;border-left:3px solid #14c784">
         <div class="sec-label">Bot Controls</div>
-        <div class="row" style="margin-bottom:12px">
-          <button class="btn btn-success" id="toggle-btn" onclick="toggleBot()">▶ Start Bot</button>
-          <button class="btn btn-ghost" onclick="cashout()">↓ Cashout All</button>
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn btn-success" id="toggle-btn" onclick="toggleBot()" style="flex:1">▶ Start Bot</button>
+          <button class="btn btn-ghost" onclick="cashout()">↓ Cashout</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
           <div class="sdot sdot-off" id="sdot"></div>
@@ -3292,33 +3312,32 @@ DASHBOARD_HTML = _CSS + """
         </div>
       </div>
 
-      <div class="panel" style="margin-bottom:12px">
+      <div class="panel" style="margin-bottom:10px">
+        <div class="sec-label">Open Positions</div>
+        <div id="pos-tbl"><div style="font-size:12px;color:var(--t3)">No open positions</div></div>
+      </div>
+
+      <div class="panel" style="margin-bottom:10px">
         <div class="sec-label">Strategy</div>
-        <div class="fgroup" style="margin-bottom:8px">
-          <label class="flabel">Preset</label>
-          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:12px" id="preset-grid">
-            <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
-              <div class="pc-icon">🛡️</div>
-              <div class="pc-name">Safe</div>
-              <div class="pc-desc">0.02 SOL/trade</div>
-              <div class="pc-desc" style="color:#14c784;margin-top:3px;font-size:9px">+Listing Sniper</div>
-            </div>
-            <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
-              <div class="pc-icon">⚖️</div>
-              <div class="pc-name">Balanced</div>
-              <div class="pc-desc">0.04 SOL/trade</div>
-              <div class="pc-desc" style="color:#14c784;margin-top:3px;font-size:9px">+Listing Sniper</div>
-            </div>
-            <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
-              <div class="pc-icon">🔥</div>
-              <div class="pc-name">Degen</div>
-              <div class="pc-desc">0.10 SOL/trade</div>
-              <div class="pc-desc" style="color:#14c784;margin-top:3px;font-size:9px">+Listing Sniper</div>
-            </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:10px" id="preset-grid">
+          <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
+            <div style="font-size:17px;margin-bottom:2px">🛡️</div>
+            <div style="font-size:11px;font-weight:700;color:var(--t1)">Safe</div>
+            <div style="font-size:9px;color:var(--t3)">0.02 SOL</div>
           </div>
-          <input type="hidden" id="s-preset" value="balanced">
+          <div class="preset-card" id="pc-balanced" onclick="selectPreset('balanced')">
+            <div style="font-size:17px;margin-bottom:2px">⚖️</div>
+            <div style="font-size:11px;font-weight:700;color:var(--t1)">Balanced</div>
+            <div style="font-size:9px;color:var(--t3)">0.04 SOL</div>
+          </div>
+          <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
+            <div style="font-size:17px;margin-bottom:2px">🔥</div>
+            <div style="font-size:11px;font-weight:700;color:var(--t1)">Degen</div>
+            <div style="font-size:9px;color:var(--t3)">0.10 SOL</div>
+          </div>
         </div>
-        <div class="fgroup" style="margin-bottom:8px">
+        <input type="hidden" id="s-preset" value="{{PRESET}}">
+        <div class="fgroup" style="margin-bottom:6px">
           <label class="flabel">Run Mode</label>
           <select class="finput" id="s-mode" onchange="toggleStop(this.value)">
             <option value="indefinite">Run Indefinitely</option>
@@ -3326,719 +3345,501 @@ DASHBOARD_HTML = _CSS + """
             <option value="profit">Stop at Profit Target</option>
           </select>
         </div>
-        <div id="f-dur" style="display:none" class="fgroup" style="margin-bottom:8px">
+        <div id="f-dur" style="display:none" class="fgroup">
           <label class="flabel">Duration (minutes)</label>
           <input class="finput" type="number" id="s-dur" placeholder="e.g. 60" min="1">
         </div>
-        <div id="f-pft" style="display:none" class="fgroup" style="margin-bottom:8px">
+        <div id="f-pft" style="display:none" class="fgroup">
           <label class="flabel">Profit Target (SOL)</label>
           <input class="finput" type="number" id="s-pft" placeholder="e.g. 0.5" step="0.01">
         </div>
-        <button class="btn btn-primary" onclick="saveSettings()" style="width:100%;margin-top:4px">Save Settings</button>
+        <button class="btn btn-primary btn-full" onclick="saveSettings()" style="margin-top:6px">Save Settings</button>
       </div>
 
-      <div class="panel" style="margin-bottom:12px">
-        <div class="sec-label">Open Positions</div>
-        <div id="pos-tbl"><div style="font-size:13px;color:var(--t3)">No open positions</div></div>
+      <div class="panel" style="margin-bottom:10px">
+        <div class="sec-label">Filter Pipeline <span style="font-size:10px;color:var(--t3);font-weight:400">— real-time screening</span></div>
+        <div id="filter-pipe"><div style="font-size:11px;color:var(--t3)">Start bot to see screening…</div></div>
       </div>
 
-      <div class="panel" style="margin-top:0">
-        <div class="sec-label">Filter Pipeline <span style="font-size:10px;color:var(--t3);font-weight:400">— real-time token screening</span></div>
-        <div id="filter-pipe"><div style="font-size:12px;color:var(--t3)">Start the bot to see token filtering…</div></div>
-      </div>
-
-      <div class="panel" style="margin-top:12px;border-left:3px solid #f59e0b">
-        <div class="sec-label" style="color:#f59e0b">🔔 CEX Listing Sniper <span style="font-size:10px;color:var(--t3);font-weight:400">— monitoring Binance, Coinbase, OKX, Kraken, Bybit, KuCoin, Gate.io</span></div>
+      <div class="panel" style="border-left:3px solid #f59e0b">
+        <div class="sec-label" style="color:#f59e0b">🔔 CEX Listing Sniper
+          <span style="font-size:9px;color:var(--t3);font-weight:400"> Binance · Coinbase · OKX · Kraken · Bybit · KuCoin · Gate</span>
+        </div>
         <div id="listing-feed" style="max-height:160px;overflow-y:auto">
-          <div style="font-size:12px;color:var(--t3)">Monitoring exchanges… alerts appear here when new listings are detected.</div>
+          <div style="font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
         </div>
       </div>
     </div>
 
-    <!-- Right panel: live market board + candlestick -->
+    <!-- RIGHT PANEL -->
     <div>
-      <div class="panel">
-        <!-- Tab bar -->
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <div style="display:flex;gap:6px">
-            <button id="tab-scatter" class="chart-tab active" onclick="switchToScatter()">📊 Market</button>
-            <button id="tab-candle"  class="chart-tab"        onclick="switchToCandle(chartMint, chartMintName)">🕯️ Candlestick</button>
+      <!-- DEX-style Live Scanner -->
+      <div class="panel" id="scanner-panel">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div style="font-size:13px;font-weight:700;color:var(--t1)">
+            <span class="live-dot" style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:6px;animation:blink 2s infinite;vertical-align:middle"></span>
+            Live Scanner
           </div>
-          <span id="token-count" style="font-size:12px;color:var(--t3)">0 tokens</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="token-count" style="font-size:11px;color:var(--t3)">0 tokens</span>
+            <a href="#" onclick="event.preventDefault();openDexScreener()" style="font-size:11px;color:var(--blue2)">↗ DexScreener</a>
+          </div>
         </div>
+        <div class="scan-ctrl">
+          <input class="scan-search" id="scan-search" placeholder="🔍 Search token name or symbol…" oninput="renderTokenRows()">
+          <button class="sort-pill active" id="pill-score" onclick="setSortCol('score',this)">🔥 Score</button>
+          <button class="sort-pill" id="pill-vol"   onclick="setSortCol('vol',this)">Volume</button>
+          <button class="sort-pill" id="pill-chg"   onclick="setSortCol('chg',this)">1h %</button>
+          <button class="sort-pill" id="pill-age"   onclick="setSortCol('age',this)">New</button>
+        </div>
+        <div class="dex-wrap">
+          <table class="dex-tbl">
+            <thead><tr>
+              <th style="width:30px">#</th>
+              <th>Token</th>
+              <th>Price</th>
+              <th>1h %</th>
+              <th>Volume</th>
+              <th>Mkt Cap</th>
+              <th>Liq</th>
+              <th>Age</th>
+              <th>Score</th>
+              <th style="width:58px"></th>
+            </tr></thead>
+          </table>
+          <div id="token-rows" style="max-height:440px;overflow-y:auto">
+            <div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">Start the bot to begin live scanning…</div>
+          </div>
+        </div>
+      </div>
 
-        <!-- Scatter view -->
-        <div id="chart-scatter-view">
-          <div class="filter-row">
-            <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
-            <button class="filter-btn" onclick="setFilter('hot',this)">🔥 Hot (70+)</button>
-            <button class="filter-btn" onclick="setFilter('new',this)">🆕 New (&lt;15m)</button>
-            <button class="filter-btn" onclick="setFilter('whale',this)">🐋 Whale</button>
+      <!-- Wallet Tree panel (shown on row click) -->
+      <div class="tree-panel" id="tree-panel" style="display:none">
+        <div class="tree-header">
+          <div>
+            <div class="tree-token-name" id="tree-tok-name">—</div>
+            <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-top:2px" id="tree-tok-mint">—</div>
           </div>
-          <div class="chart-wrap">
-            <canvas id="market-chart" height="400"></canvas>
-          </div>
-          <div class="chart-legend">
-            <span><span class="leg-dot" style="background:#14c784"></span>Score 70+</span>
-            <span><span class="leg-dot" style="background:#f5a623"></span>45–69</span>
-            <span><span class="leg-dot" style="background:#f23645"></span>&lt;45</span>
-            <span style="margin-left:auto;font-size:11px;color:var(--t3)">Click dot → candlestick</span>
+          <div style="display:flex;align-items:center;gap:14px">
+            <span class="tree-stat-buy" id="tree-buy-count">— buys</span>
+            <span style="color:var(--t3)">|</span>
+            <span class="tree-stat-sell" id="tree-sell-count">— sells</span>
+            <a id="tree-dex-link" href="#" target="_blank"
+               style="font-size:11px;color:var(--blue2)">↗ DexScreener</a>
+            <button onclick="closeTree()" style="background:none;border:1px solid var(--bdr);color:var(--t3);padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer">✕ Close</button>
           </div>
         </div>
-
-        <!-- Candlestick view -->
-        <div id="chart-candle-view" style="display:none">
-          <!-- Controls row -->
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-            <select id="candle-token-sel" class="finput" style="flex:1;min-width:120px;padding:5px 8px;font-size:12px" onchange="onTokenSelChange()">
-              <option value="">— select token —</option>
-            </select>
-            <div style="display:flex;gap:4px">
-              <button class="ctype-btn active" id="ctype-candle" onclick="setCandleType('candle',this)">Candles</button>
-              <button class="ctype-btn"        id="ctype-ha"     onclick="setCandleType('ha',this)">Heikin Ashi</button>
-            </div>
-            <div style="display:flex;gap:4px">
-              <button class="ctf-btn active" id="ctf-1"  onclick="setTf(1,this)">1m</button>
-              <button class="ctf-btn"        id="ctf-5"  onclick="setTf(5,this)">5m</button>
-              <button class="ctf-btn"        id="ctf-15" onclick="setTf(15,this)">15m</button>
-            </div>
-          </div>
-          <!-- Main area: chart + top-20 sidebar -->
-          <div style="display:grid;grid-template-columns:1fr 140px;gap:10px;align-items:start">
-            <div>
-              <div class="chart-wrap">
-                <canvas id="candle-chart" height="360"></canvas>
-              </div>
-              <div style="display:flex;justify-content:space-between;margin-top:5px;font-size:10px;color:var(--t3)">
-                <span id="candle-ohlc-label">—</span>
-                <span id="candle-refresh-label">auto-refresh 30s</span>
-              </div>
-            </div>
-            <!-- Top 20 growth sidebar -->
-            <div style="background:var(--bg3);border:1px solid var(--bdr);border-radius:10px;padding:8px">
-              <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);margin-bottom:6px;padding:0 4px">Top 20 Growth</div>
-              <div id="top-growth-list" style="max-height:360px;overflow-y:auto">
-                <div style="font-size:11px;color:var(--t3);padding:6px">Scanning…</div>
-              </div>
-            </div>
+        <div style="position:relative">
+          <canvas id="tree-canvas" height="360"></canvas>
+          <div id="tree-loading" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;background:rgba(7,13,23,.85);border-radius:8px;font-size:13px;color:var(--t3);flex-direction:column;gap:8px">
+            <div>Fetching wallet data from Helius…</div>
+            <div style="font-size:11px;color:var(--t3);opacity:.6">Analysing swap transactions</div>
           </div>
         </div>
+        <div id="tree-list" class="tree-list"></div>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Activity log — fixed bottom bar -->
+<!-- Activity bar — fixed bottom -->
 <div id="activity-bar">
-  <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 16px 4px;border-bottom:1px solid #1e293b;flex-shrink:0">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:5px 16px 3px;border-bottom:1px solid rgba(20,199,132,.15);flex-shrink:0">
     <div style="display:flex;align-items:center;gap:10px">
-      <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3)">Activity Log</span>
+      <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#14c784">Activity Log</span>
       <span id="log-count" style="font-size:10px;color:var(--t3)"></span>
     </div>
     <div style="display:flex;align-items:center;gap:8px">
-      <span id="log-live-dot" style="width:6px;height:6px;border-radius:50%;background:var(--grn);display:inline-block;animation:pulse 1.5s ease-in-out infinite"></span>
-      <button onclick="toggleLogBar()" style="background:none;border:none;color:var(--t3);font-size:12px;cursor:pointer;padding:2px 6px;border-radius:4px" id="log-toggle-btn">▼ collapse</button>
+      <span style="width:6px;height:6px;border-radius:50%;background:#14c784;display:inline-block;animation:blink 2s infinite"></span>
+      <button onclick="toggleLogBar()" id="log-toggle-btn" style="background:none;border:none;color:var(--t3);font-size:11px;cursor:pointer;padding:2px 6px">▼ collapse</button>
     </div>
   </div>
   <div id="log" style="flex:1;overflow-y:auto;display:flex;flex-direction:column-reverse;padding:4px 0"></div>
 </div>
 
-<script>
-// add bottom padding so content doesn't hide behind the log bar
-document.querySelector('.wrap').style.paddingBottom = '200px';
+<style>
+.lline{font-size:12px;padding:3px 16px;border-bottom:1px solid rgba(255,255,255,.03);color:#64748b;font-family:'SF Mono','Courier New',monospace;line-height:1.65}
+.lline:hover{background:rgba(255,255,255,.02)}
+.lbuy{color:#4ade80!important;font-weight:600}.lsell{color:#f87171!important;font-weight:600}
+.lsig{color:#fbbf24!important;font-weight:600}.linfo{color:#60a5fa!important}.lscan{color:#818cf8}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
 
-let logBarExpanded = true;
+<script>
+document.querySelector('.wrap').style.paddingBottom = '214px';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let running = false, allTokens = [], sortCol = 'score', feedSince = 0;
+let selectedMint = null, logBarExpanded = true;
+let treeCanvas = null, treeCtx = null;
+
+// ── Activity bar ──────────────────────────────────────────────────────────────
 function toggleLogBar() {
   const bar = document.getElementById('activity-bar');
   const btn = document.getElementById('log-toggle-btn');
   logBarExpanded = !logBarExpanded;
-  bar.style.height = logBarExpanded ? '200px' : '36px';
+  bar.style.height = logBarExpanded ? '200px' : '34px';
   btn.textContent  = logBarExpanded ? '▼ collapse' : '▲ expand';
 }
 
-let running = false;
-let activeFilter = 'all';
-let allTokens = [];
-let selectedToken = null;
-let hoveredIdx = -1;
-let chartCanvas, chartCtx, chartDisplayTokens = [];
-// Candlestick state
-let chartMode = 'scatter';
-let candleType = 'candle';
-let candleTf   = 1;
-let chartMint  = null;
-let chartMintName = '';
-let ohlcData   = [];
-let candleCanvas, candleCtx;
-let candleTimer = null;
-
-// ── Filters ──────────────────────────────────────────────────────────────────
-function setFilter(f, btn) {
-  activeFilter = f;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderChart();
-}
-
-function applyFilter(tokens) {
-  if (activeFilter === 'hot')   return tokens.filter(t => t.score >= 70);
-  if (activeFilter === 'new')   return tokens.filter(t => t.age_min < 15);
-  if (activeFilter === 'whale') return tokens.filter(t => t.whale);
-  return tokens;
-}
-
-// ── Utilities ────────────────────────────────────────────────────────────────
-function fmtNum(n) {
-  if (!n) return '$0';
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function fmtK(n) {
+  if (!n) return '—';
+  if (n >= 1e9) return '$' + (n/1e9).toFixed(1) + 'B';
   if (n >= 1e6) return '$' + (n/1e6).toFixed(1) + 'M';
   if (n >= 1e3) return '$' + (n/1e3).toFixed(0) + 'K';
   return '$' + n.toFixed(0);
 }
+function fmtPrice(p) {
+  if (!p) return '—';
+  if (p < 0.000001) return '$' + p.toExponential(2);
+  if (p < 0.0001)   return '$' + p.toFixed(8);
+  if (p < 0.01)     return '$' + p.toFixed(6);
+  if (p < 1)        return '$' + p.toFixed(4);
+  return '$' + p.toFixed(2);
+}
+function fmtAge(m) { return m < 60 ? m.toFixed(0) + 'm' : (m/60).toFixed(1) + 'h'; }
+function chgClass(v) { return v > 0 ? 'chg-pos' : v < 0 ? 'chg-neg' : 'chg-0'; }
+function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
+function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
+function tokColor(name) {
+  const h = [...(name||'?')].reduce((a,c) => a + c.charCodeAt(0), 0);
+  return ['#14c784','#3b82f6','#f59e0b','#a855f7','#06b6d4','#f43f5e','#84cc16','#f97316'][h % 8];
+}
+function openDexScreener() { window.open('https://dexscreener.com/solana', '_blank'); }
 
-function scoreColor(s) {
-  if (s >= 70) return '#14c784';
-  if (s >= 45) return '#f5a623';
-  return '#f23645';
+// ── Sort & render token rows ──────────────────────────────────────────────────
+function setSortCol(col, btn) {
+  sortCol = col;
+  document.querySelectorAll('.sort-pill').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderTokenRows();
 }
 
-function logP(p) { return p > 0 ? Math.log10(p) : -10; }
+function getSortedTokens() {
+  const q = (document.getElementById('scan-search')?.value || '').toLowerCase();
+  let tokens = allTokens.filter(t =>
+    !q || (t.name||'').toLowerCase().includes(q) || (t.symbol||'').toLowerCase().includes(q)
+  );
+  return [...tokens].sort((a, b) => {
+    if (sortCol === 'score') return (b.score||0) - (a.score||0);
+    if (sortCol === 'vol')   return (b.vol||0)   - (a.vol||0);
+    if (sortCol === 'chg')   return (b.change||0) - (a.change||0);
+    if (sortCol === 'age')   return (a.age_min||0) - (b.age_min||0);
+    return 0;
+  }).slice(0, 80);
+}
 
-// ── Scatter Chart ─────────────────────────────────────────────────────────────
-function getPad() { return { top: 30, right: 24, bottom: 52, left: 74 }; }
-
-function renderChart() {
-  if (!chartCanvas) return;
-  const filtered = applyFilter(allTokens);
-  chartDisplayTokens = filtered.slice(0, 100);
-  document.getElementById('token-count').textContent = filtered.length + ' tokens';
-
-  const pad = getPad();
-  const W = chartCanvas.width, H = chartCanvas.height;
-  const plotW = W - pad.left - pad.right;
-  const plotH = H - pad.top - pad.bottom;
-
-  chartCtx.clearRect(0, 0, W, H);
-  chartCtx.fillStyle = '#0d1117';
-  chartCtx.fillRect(0, 0, W, H);
-
-  if (!chartDisplayTokens.length) {
-    chartCtx.fillStyle = '#444';
-    chartCtx.font = '13px monospace';
-    chartCtx.textAlign = 'center';
-    chartCtx.fillText('Waiting for market data… Start the bot to enable scanning.', W/2, H/2);
+function renderTokenRows() {
+  const tokens = getSortedTokens();
+  document.getElementById('token-count').textContent = tokens.length + ' tokens';
+  const container = document.getElementById('token-rows');
+  if (!tokens.length) {
+    container.innerHTML = '<div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">No tokens yet — start the bot to begin scanning</div>';
     return;
   }
-
-  // Ranges
-  const ages   = chartDisplayTokens.map(t => t.age_min || 0);
-  const prices = chartDisplayTokens.map(t => t.price || 0).filter(p => p > 0);
-  const maxAge = Math.max(...ages, 60);
-  const minP   = prices.length ? Math.min(...prices) : 1e-9;
-  const maxP   = prices.length ? Math.max(...prices) : 1;
-  const logMin = logP(minP) - 0.3;
-  const logMax = logP(maxP) + 0.3;
-  const vols   = chartDisplayTokens.map(t => t.vol || 0);
-  const maxVol = Math.max(...vols, 1);
-
-  function toX(age)   { return pad.left + (age / maxAge) * plotW; }
-  function toY(price) {
-    if (!price || price <= 0) return pad.top + plotH;
-    return pad.top + plotH - ((logP(price) - logMin) / (logMax - logMin)) * plotH;
-  }
-
-  // Grid
-  chartCtx.strokeStyle = '#1a1f2e';
-  chartCtx.lineWidth = 1;
-  for (let a = 0; a <= maxAge; a += 10) {
-    const x = toX(a);
-    chartCtx.beginPath(); chartCtx.moveTo(x, pad.top); chartCtx.lineTo(x, pad.top + plotH); chartCtx.stroke();
-  }
-  const logSteps = [];
-  for (let l = Math.floor(logMin); l <= Math.ceil(logMax); l++) logSteps.push(l);
-  logSteps.forEach(l => {
-    const y = pad.top + plotH - ((l - logMin) / (logMax - logMin)) * plotH;
-    if (y >= pad.top && y <= pad.top + plotH) {
-      chartCtx.beginPath(); chartCtx.moveTo(pad.left, y); chartCtx.lineTo(pad.left + plotW, y); chartCtx.stroke();
-    }
-  });
-
-  // Axes
-  chartCtx.strokeStyle = '#2a2d3e';
-  chartCtx.lineWidth = 2;
-  chartCtx.beginPath();
-  chartCtx.moveTo(pad.left, pad.top);
-  chartCtx.lineTo(pad.left, pad.top + plotH);
-  chartCtx.lineTo(pad.left + plotW, pad.top + plotH);
-  chartCtx.stroke();
-
-  // X labels
-  chartCtx.fillStyle = '#555';
-  chartCtx.font = '11px monospace';
-  chartCtx.textAlign = 'center';
-  for (let a = 0; a <= maxAge; a += 10) chartCtx.fillText(a + 'm', toX(a), pad.top + plotH + 17);
-  chartCtx.fillStyle = '#666';
-  chartCtx.fillText('Time on Market (minutes)', pad.left + plotW / 2, H - 6);
-
-  // Y labels
-  chartCtx.textAlign = 'right';
-  logSteps.forEach(l => {
-    const y = pad.top + plotH - ((l - logMin) / (logMax - logMin)) * plotH;
-    if (y >= pad.top && y <= pad.top + plotH) {
-      const v = Math.pow(10, l);
-      const lbl = v < 0.0001 ? v.toExponential(0) : v < 0.01 ? v.toFixed(4) : v < 1 ? v.toFixed(2) : v.toFixed(0);
-      chartCtx.fillStyle = '#555';
-      chartCtx.font = '10px monospace';
-      chartCtx.fillText('$' + lbl, pad.left - 6, y + 4);
-    }
-  });
-  chartCtx.save();
-  chartCtx.translate(12, pad.top + plotH / 2);
-  chartCtx.rotate(-Math.PI / 2);
-  chartCtx.textAlign = 'center';
-  chartCtx.fillStyle = '#666';
-  chartCtx.font = '11px monospace';
-  chartCtx.fillText('Price (USD, log)', 0, 0);
-  chartCtx.restore();
-
-  // Dots
-  chartDisplayTokens.forEach((t, i) => {
-    const x   = toX(t.age_min || 0);
-    const y   = toY(t.price   || 0);
-    const sc  = t.score || 0;
-    const vol = t.vol   || 0;
-    const r   = 5 + Math.min(10, (vol / maxVol) * 10);
-    const isHov = hoveredIdx === i;
-    const color = scoreColor(sc);
-
-    if (sc >= 70) { chartCtx.shadowBlur = 14; chartCtx.shadowColor = '#14c784'; }
-    chartCtx.beginPath();
-    chartCtx.arc(x, y, isHov ? r + 3 : r, 0, Math.PI * 2);
-    chartCtx.fillStyle = isHov ? '#fff' : color + 'cc';
-    chartCtx.fill();
-    chartCtx.shadowBlur = 0;
-    chartCtx.strokeStyle = isHov ? color : color + '66';
-    chartCtx.lineWidth = isHov ? 2 : 1;
-    chartCtx.stroke();
-
-    if (isHov) {
-      const lbl = (t.symbol || t.name || '?').slice(0, 12);
-      chartCtx.font = 'bold 12px monospace';
-      chartCtx.fillStyle = '#fff';
-      chartCtx.textAlign = 'center';
-      chartCtx.fillText(lbl, x, y - r - 6);
-    }
-  });
+  container.innerHTML = tokens.map((t, i) => {
+    const chg = t.change || 0;
+    const sc  = t.score  || 0;
+    const col = tokColor(t.name || '?');
+    const sym = (t.symbol || t.name || '?').slice(0, 7);
+    const isSel = t.mint === selectedMint;
+    const nameSafe = (t.name||'').replace(/'/g, '');
+    return `<table style="width:100%;border-collapse:collapse"><tbody>
+      <tr class="dex-row${isSel?' selected':''}" onclick="openWalletTree('${t.mint}','${nameSafe}')">
+        <td style="width:30px;color:var(--t3);font-size:10px;font-family:monospace">${i+1}</td>
+        <td>
+          <div style="display:flex;align-items:center">
+            <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
+            <div>
+              <div class="tok-name">${t.name||sym}${sc>=80?' 🔥':''}</div>
+              <div class="tok-sym">${sym}${t.whale?' 🐋':''}</div>
+            </div>
+          </div>
+        </td>
+        <td><span class="price-val">${fmtPrice(t.price)}</span></td>
+        <td><span class="${chgClass(chg)}">${chgStr(chg)}</span></td>
+        <td><span class="num-val">${fmtK(t.vol)}</span></td>
+        <td><span class="num-val">${fmtK(t.mc)}</span></td>
+        <td><span class="num-val">${fmtK(t.liq)}</span></td>
+        <td><span class="num-val">${fmtAge(t.age_min||0)}</span></td>
+        <td>
+          <div style="display:flex;align-items:center;gap:5px">
+            <div class="score-mini"><div class="score-fill" style="width:${sc}%;background:${scoreColor(sc)}"></div></div>
+            <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
+          </div>
+        </td>
+        <td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy('${t.mint}','${nameSafe}',this)">⚡ Buy</button></td>
+      </tr>
+    </tbody></table>`;
+  }).join('');
 }
 
-function initChart() {
-  chartCanvas = document.getElementById('market-chart');
-  chartCtx    = chartCanvas.getContext('2d');
-
-  function resize() {
-    chartCanvas.width  = chartCanvas.parentElement.clientWidth;
-    chartCanvas.height = 420;
-    renderChart();
-  }
-  resize();
-  window.addEventListener('resize', resize);
-
-  chartCanvas.addEventListener('mousemove', function(e) {
-    const rect = chartCanvas.getBoundingClientRect();
-    const mx = (e.clientX - rect.left) * (chartCanvas.width  / rect.width);
-    const my = (e.clientY - rect.top)  * (chartCanvas.height / rect.height);
-    const pad = getPad();
-    const plotW = chartCanvas.width  - pad.left - pad.right;
-    const plotH = chartCanvas.height - pad.top  - pad.bottom;
-    const ages  = chartDisplayTokens.map(t => t.age_min || 0);
-    const prices= chartDisplayTokens.map(t => t.price   || 0).filter(p => p > 0);
-    const maxAge= Math.max(...ages, 60);
-    const minP  = prices.length ? Math.min(...prices) : 1e-9;
-    const maxP  = prices.length ? Math.max(...prices) : 1;
-    const logMin= logP(minP) - 0.3, logMax = logP(maxP) + 0.3;
-    function toX(a) { return pad.left + (a / maxAge) * plotW; }
-    function toY(p) { return !p||p<=0 ? pad.top+plotH : pad.top+plotH-((logP(p)-logMin)/(logMax-logMin))*plotH; }
-    let found = -1;
-    for (let i = 0; i < chartDisplayTokens.length; i++) {
-      const t  = chartDisplayTokens[i];
-      const dx = mx - toX(t.age_min || 0);
-      const dy = my - toY(t.price   || 0);
-      if (Math.hypot(dx, dy) < 14) { found = i; break; }
-    }
-    if (found !== hoveredIdx) {
-      hoveredIdx = found;
-      chartCanvas.style.cursor = found >= 0 ? 'pointer' : 'crosshair';
-      renderChart();
-    }
-  });
-
-  chartCanvas.addEventListener('click', function(e) {
-    if (hoveredIdx >= 0) {
-      showTooltip(e, hoveredIdx);
-      const t = chartDisplayTokens[hoveredIdx];
-      if (t && t.mint) switchToCandle(t.mint, t.symbol || t.name || '');
-    }
-  });
-
-  chartCanvas.addEventListener('mouseleave', function() {
-    hoveredIdx = -1;
-    renderChart();
-  });
-}
-
-// ── Candlestick chart ────────────────────────────────────────────────────────
-function switchToScatter() {
-  chartMode = 'scatter';
-  document.getElementById('chart-scatter-view').style.display = '';
-  document.getElementById('chart-candle-view').style.display  = 'none';
-  document.getElementById('tab-scatter').classList.add('active');
-  document.getElementById('tab-candle').classList.remove('active');
-  renderChart();
-}
-
-function switchToCandle(mint, name) {
-  if (mint) { chartMint = mint; chartMintName = name || mint.slice(0,8)+'…'; }
-  chartMode = 'candle';
-  document.getElementById('chart-scatter-view').style.display = 'none';
-  document.getElementById('chart-candle-view').style.display  = '';
-  document.getElementById('tab-scatter').classList.remove('active');
-  document.getElementById('tab-candle').classList.add('active');
-  // populate selector
-  const sel = document.getElementById('candle-token-sel');
-  const existing = [...sel.options].map(o => o.value);
-  allTokens.forEach(t => {
-    if (!existing.includes(t.mint)) {
-      const o = document.createElement('option');
-      o.value = t.mint; o.textContent = (t.symbol || t.name || t.mint.slice(0,8));
-      sel.appendChild(o);
-    }
-  });
-  if (chartMint) {
-    sel.value = chartMint;
-  } else {
-    // auto-select top growth token
-    const top = [...allTokens].filter(t=>(t.change1h||t.priceChange1h||t.chg||0)>0)
-      .sort((a,b)=>growthScore(b)-growthScore(a))[0];
-    if (top) { chartMint = top.mint; chartMintName = top.symbol||top.name||''; sel.value = chartMint; }
-  }
-  updateTopGrowth();
-  initCandleCanvas();
-  fetchAndRenderCandles();
-  if (candleTimer) clearInterval(candleTimer);
-  candleTimer = setInterval(() => { fetchAndRenderCandles(); updateTopGrowth(); }, 30000);
-}
-
-function onTokenSelChange() {
-  const sel = document.getElementById('candle-token-sel');
-  chartMint = sel.value;
-  chartMintName = sel.options[sel.selectedIndex]?.textContent || '';
-  fetchAndRenderCandles();
-}
-
-function setCandleType(t, btn) {
-  candleType = t;
-  document.querySelectorAll('.ctype-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderCandles();
-}
-
-function setTf(tf, btn) {
-  candleTf = tf;
-  document.querySelectorAll('.ctf-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  fetchAndRenderCandles();
-}
-
-function initCandleCanvas() {
-  if (candleCanvas) return;
-  candleCanvas = document.getElementById('candle-chart');
-  candleCtx    = candleCanvas.getContext('2d');
-  function resizeCandle() {
-    candleCanvas.width  = candleCanvas.parentElement.clientWidth;
-    candleCanvas.height = 400;
-    renderCandles();
-  }
-  resizeCandle();
-  window.addEventListener('resize', resizeCandle);
-}
-
-async function fetchAndRenderCandles() {
-  if (!chartMint) { renderCandles(); return; }
-  try {
-    const data = await fetch('/api/chart/' + chartMint + '?tf=' + candleTf).then(r => r.json());
-    ohlcData = data || [];
-    document.getElementById('candle-refresh-label').textContent = 'updated ' + new Date().toLocaleTimeString();
-  } catch(e) {}
-  renderCandles();
-}
-
-function toHeikinAshi(ohlc) {
-  return ohlc.map((c, i, arr) => {
-    const haC = (c.o + c.h + c.l + c.c) / 4;
-    const haO = i === 0 ? (c.o + c.c) / 2 : (arr[i-1]._haO + arr[i-1]._haC) / 2;
-    const haH = Math.max(c.h, haO, haC);
-    const haL = Math.min(c.l, haO, haC);
-    c._haO = haO; c._haC = haC;
-    return { t: c.t, o: haO, h: haH, l: haL, c: haC };
-  });
-}
-
-function renderCandles() {
-  if (!candleCanvas) return;
-  initCandleCanvas();
-  const raw  = ohlcData;
-  const data = candleType === 'ha' ? toHeikinAshi([...raw]) : raw;
-  const W = candleCanvas.width, H = candleCanvas.height;
-  const ctx = candleCtx;
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#0d1117';
-  ctx.fillRect(0, 0, W, H);
-
-  if (!data.length) {
-    ctx.fillStyle = '#444'; ctx.font = '13px monospace'; ctx.textAlign = 'center';
-    ctx.fillText(!chartMint ? 'Click a dot on Market tab to open chart' : 'Collecting price data… check back in a few minutes', W/2, H/2);
-    return;
-  }
-
-  const pad = { top: 24, bottom: 28, left: 68, right: 12 };
-  const plotW = W - pad.left - pad.right;
-  const plotH = H - pad.top  - pad.bottom;
-  const highs = data.map(c => c.h), lows = data.map(c => c.l);
-  const maxP  = Math.max(...highs), minP = Math.min(...lows);
-  const range = maxP - minP || maxP * 0.02;
-  const toY   = p => pad.top + plotH - ((p - minP) / range) * plotH;
-  const cw    = Math.max(2, Math.min(16, (plotW / data.length) - 2));
-  const toX   = i => pad.left + (i + 0.5) * (plotW / data.length);
-
-  // Grid lines
-  ctx.strokeStyle = '#1a1f2e'; ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = pad.top + (plotH / 4) * i;
-    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
-    const price = maxP - (range / 4) * i;
-    const lbl   = price < 0.00001 ? price.toExponential(2) : price < 0.001 ? price.toFixed(6) : price < 0.1 ? price.toFixed(4) : price.toFixed(2);
-    ctx.fillStyle = '#555'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
-    ctx.fillText('$'+lbl, pad.left - 5, y + 4);
-  }
-
-  // Candles
-  let lastC = null;
-  data.forEach((c, i) => {
-    const x      = toX(i);
-    const isUp   = c.c >= c.o;
-    const color  = isUp ? '#14c784' : '#f23645';
-    const bodyT  = toY(Math.max(c.o, c.c));
-    const bodyB  = toY(Math.min(c.o, c.c));
-    const bodyH  = Math.max(1, bodyB - bodyT);
-    // Wick
-    ctx.strokeStyle = color; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(x, toY(c.h)); ctx.lineTo(x, toY(c.l)); ctx.stroke();
-    // Body
-    if (candleType === 'ha' || isUp) {
-      ctx.fillStyle = color; ctx.fillRect(x - cw/2, bodyT, cw, bodyH);
-    } else {
-      ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-      ctx.strokeRect(x - cw/2, bodyT, cw, bodyH);
-    }
-    if (i === data.length - 1) lastC = c;
-  });
-
-  // X-axis time labels
-  ctx.fillStyle = '#555'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
-  const step = Math.max(1, Math.floor(data.length / 6));
-  data.forEach((c, i) => {
-    if (i % step !== 0) return;
-    const d = new Date(c.t * 1000);
-    ctx.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'), toX(i), pad.top + plotH + 16);
-  });
-
-  // Current price label on right axis
-  if (lastC) {
-    const y   = toY(lastC.c);
-    const isUp = lastC.c >= lastC.o;
-    ctx.fillStyle = isUp ? '#14c784' : '#f23645';
-    ctx.fillRect(pad.left + plotW, y - 9, W - pad.left - plotW, 18);
-    ctx.fillStyle = '#000'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
-    const lbl = lastC.c < 0.0001 ? lastC.c.toExponential(2) : lastC.c < 0.01 ? lastC.c.toFixed(6) : lastC.c.toFixed(4);
-    ctx.fillText('$'+lbl, pad.left + plotW + 3, y + 4);
-    // OHLC label
-    document.getElementById('candle-ohlc-label').textContent =
-      `O:$${lastC.o.toFixed(6)}  H:$${lastC.h.toFixed(6)}  L:$${lastC.l.toFixed(6)}  C:$${lastC.c.toFixed(6)}`;
-  }
-}
-
-// ── Tooltip (click-only) ──────────────────────────────────────────────────────
-function showTooltip(e, idx) {
-  e.stopPropagation();
-  const t = chartDisplayTokens[idx];
-  if (!t) return;
-  selectedToken = t;
-  document.getElementById('tt-name').textContent    = t.name || 'Unknown';
-  document.getElementById('tt-sym').textContent     = (t.symbol || '') + ' / SOL';
-  document.getElementById('tt-price').textContent   = t.price ? '$' + t.price.toFixed(8) : '—';
-  const chg = t.change || 0;
-  const chgEl = document.getElementById('tt-chg');
-  chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
-  chgEl.style.color = chg >= 0 ? '#14c784' : '#f23645';
-  document.getElementById('tt-mc').textContent      = fmtNum(t.mc);
-  document.getElementById('tt-liq').textContent     = fmtNum(t.liq);
-  document.getElementById('tt-vol').textContent     = fmtNum(t.vol);
-  document.getElementById('tt-age').textContent     = (t.age_min || 0).toFixed(1) + ' min';
-  const sc = t.score || 0;
-  document.getElementById('tt-score').textContent   = sc;
-  document.getElementById('tt-score').style.color   = scoreColor(sc);
-  document.getElementById('tt-score-bar').style.width     = sc + '%';
-  document.getElementById('tt-score-bar').style.background = scoreColor(sc);
-  let verdict = '';
-  if (sc >= 80)      verdict = '🔥 Strong Buy Signal';
-  else if (sc >= 60) verdict = '✅ Moderate Buy Signal';
-  else if (sc >= 40) verdict = '⚠️ Weak Signal — Caution';
-  else               verdict = '❌ Low Confidence — Skip';
-  document.getElementById('tt-verdict').textContent = verdict;
-  document.getElementById('tt-verdict').style.color = scoreColor(sc);
-  // Position tooltip near cursor
-  const tt = document.getElementById('tooltip');
-  tt.classList.add('show');
-  document.getElementById('tooltip-overlay').style.display = 'block';
-  const x = Math.min(e.clientX + 16, window.innerWidth - 340);
-  const y = Math.min(e.clientY - 20, window.innerHeight - 520);
-  tt.style.left = x + 'px';
-  tt.style.top  = Math.max(10, y) + 'px';
-}
-
-function closeTooltip() {
-  document.getElementById('tooltip').classList.remove('show');
-  document.getElementById('tooltip-overlay').style.display = 'none';
-  selectedToken = null;
-}
-
-function openChart() {
-  if (selectedToken) window.open('https://dexscreener.com/solana/' + selectedToken.mint, '_blank');
-}
-
-async function manualBuy() {
-  if (!selectedToken) return;
-  const btn = document.getElementById('tt-buy-btn');
-  btn.textContent = 'Buying…';
-  btn.disabled = true;
+// ── Quick buy ─────────────────────────────────────────────────────────────────
+async function quickBuy(mint, name, btn) {
+  const orig = btn.textContent;
+  btn.textContent = '…'; btn.disabled = true;
   const res = await fetch('/api/manual-buy', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({mint: selectedToken.mint, name: selectedToken.name})
-  }).then(r=>r.json()).catch(()=>({ok:false,msg:'Request failed'}));
-  btn.textContent = res.ok ? '✅ Order Sent!' : '❌ ' + res.msg;
-  setTimeout(() => { btn.textContent = '⚡ AI Buy Now'; btn.disabled = false; }, 3000);
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mint, name})
+  }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
+  btn.textContent = res.ok ? '✅' : '❌';
+  showToast(res.ok ? '⚡ Buy order sent!' : '⚠ ' + (res.msg||'Buy failed'), res.ok);
+  setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
   if (res.ok) setTimeout(refresh, 2000);
 }
 
-// ── Polling market feed ───────────────────────────────────────────────────────
-let feedSince = 0;
+// ── Wallet Tree ───────────────────────────────────────────────────────────────
+async function openWalletTree(mint, name) {
+  selectedMint = mint;
+  renderTokenRows();
+  const panel = document.getElementById('tree-panel');
+  panel.style.display = '';
+  document.getElementById('tree-tok-name').textContent = name || mint.slice(0,14)+'…';
+  document.getElementById('tree-tok-mint').textContent = mint;
+  document.getElementById('tree-buy-count').textContent  = '…';
+  document.getElementById('tree-sell-count').textContent = '…';
+  const dexLink = document.getElementById('tree-dex-link');
+  if (dexLink) dexLink.href = 'https://dexscreener.com/solana/' + mint;
+
+  if (!treeCanvas) {
+    treeCanvas = document.getElementById('tree-canvas');
+    treeCtx    = treeCanvas.getContext('2d');
+  }
+  treeCanvas.width  = treeCanvas.parentElement.clientWidth;
+  treeCanvas.height = 360;
+  const loading = document.getElementById('tree-loading');
+  loading.style.display = 'flex';
+  drawTreeBg();
+
+  try {
+    const data = await fetch('/api/wallet-tree/' + mint).then(r => r.json());
+    loading.style.display = 'none';
+    const buys  = data.nodes.filter(n => n.type === 'buy').length;
+    const sells = data.nodes.filter(n => n.type === 'sell').length;
+    document.getElementById('tree-buy-count').textContent  = buys  + ' buys';
+    document.getElementById('tree-sell-count').textContent = sells + ' sells';
+    drawWalletTree(data.nodes, data.edges, name || mint.slice(0,8));
+    renderTreeList(data.nodes);
+  } catch(e) {
+    loading.style.display = 'none';
+    drawTreeMsg('Failed to load — token may be too new');
+  }
+  panel.scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+function closeTree() {
+  selectedMint = null;
+  document.getElementById('tree-panel').style.display = 'none';
+  renderTokenRows();
+}
+
+function drawTreeBg() {
+  if (!treeCanvas) return;
+  treeCtx.fillStyle = '#070d17';
+  treeCtx.fillRect(0, 0, treeCanvas.width, treeCanvas.height);
+}
+
+function drawTreeMsg(msg) {
+  const W = treeCanvas.width, H = treeCanvas.height;
+  treeCtx.fillStyle = '#070d17'; treeCtx.fillRect(0,0,W,H);
+  treeCtx.fillStyle = '#4b5563'; treeCtx.font = '13px monospace'; treeCtx.textAlign = 'center';
+  treeCtx.fillText(msg, W/2, H/2 - 8);
+  treeCtx.fillStyle = '#374151'; treeCtx.font = '11px monospace';
+  treeCtx.fillText('(try again in a few minutes)', W/2, H/2 + 14);
+}
+
+function drawWalletTree(nodes, edges, tokenName) {
+  const W = treeCanvas.width, H = treeCanvas.height;
+  const ctx = treeCtx;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = '#070d17'; ctx.fillRect(0,0,W,H);
+
+  if (!nodes || nodes.length <= 1) { drawTreeMsg('No swap transactions found yet'); return; }
+
+  const positions = {};
+  const buyGroup  = nodes.find(n => n.id === 'buys');
+  const sellGroup = nodes.find(n => n.id === 'sells');
+  const buyWals   = nodes.filter(n => n.type === 'buy');
+  const sellWals  = nodes.filter(n => n.type === 'sell');
+
+  // Root
+  positions['root'] = {x: W/2, y: 56};
+  // Groups
+  if (buyGroup && sellGroup)   { positions['buys'] = {x:W*0.27, y:140}; positions['sells'] = {x:W*0.73, y:140}; }
+  else if (buyGroup)             positions['buys']  = {x:W/2, y:140};
+  else if (sellGroup)            positions['sells'] = {x:W/2, y:140};
+
+  function spreadWallets(wals, groupId, yBase) {
+    const gp = positions[groupId];
+    if (!gp || !wals.length) return;
+    const cols = Math.min(wals.length, 5);
+    const colW = Math.min(88, (W * 0.44) / Math.max(cols, 1));
+    wals.forEach((n, i) => {
+      positions[n.id] = {
+        x: gp.x - (cols-1)*colW/2 + (i % cols)*colW,
+        y: yBase + Math.floor(i / cols) * 78
+      };
+    });
+  }
+  spreadWallets(buyWals,  'buys',  230);
+  spreadWallets(sellWals, 'sells', 230);
+
+  // Draw grid lines (subtle)
+  ctx.strokeStyle = '#0f1a28'; ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 60) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 60) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+  // Draw edges
+  edges.forEach(e => {
+    const f = positions[e.from], t = positions[e.to];
+    if (!f || !t) return;
+    const toNode = nodes.find(n => n.id === e.to);
+    const isSell = toNode && (toNode.type === 'sell' || toNode.id === 'sells');
+    const grd = ctx.createLinearGradient(f.x, f.y, t.x, t.y);
+    grd.addColorStop(0, isSell ? 'rgba(242,54,69,.0)' : 'rgba(20,199,132,.0)');
+    grd.addColorStop(1, isSell ? 'rgba(242,54,69,.4)' : 'rgba(20,199,132,.4)');
+    ctx.strokeStyle = grd; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(f.x, f.y);
+    const cy = (f.y + t.y) / 2;
+    ctx.bezierCurveTo(f.x, cy, t.x, cy, t.x, t.y);
+    ctx.stroke();
+  });
+
+  // Draw nodes
+  nodes.forEach(n => {
+    const pos = positions[n.id];
+    if (!pos) return;
+    const isRoot  = n.id === 'root';
+    const isGroup = n.type === 'group_buy' || n.type === 'group_sell';
+    const isBuy   = n.type === 'buy'  || n.id === 'buys';
+    const isSell  = n.type === 'sell' || n.id === 'sells';
+    const r     = isRoot ? 26 : isGroup ? 18 : 15;
+    const color = isRoot ? '#f59e0b' : isBuy ? '#14c784' : '#f23645';
+
+    ctx.shadowBlur = isRoot ? 22 : 10; ctx.shadowColor = color;
+    ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
+    ctx.fillStyle = color + '18'; ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = isRoot ? 2.5 : 1.8; ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle = color; ctx.textAlign = 'center';
+    ctx.font = isRoot ? 'bold 9px monospace' : isGroup ? 'bold 8px monospace' : '8px monospace';
+    const label = isRoot ? tokenName.slice(0,9) : (n.label||'').slice(0,9);
+    ctx.fillText(label, pos.x, pos.y + 3);
+
+    if (n.sol > 0) {
+      ctx.fillStyle = '#94a3b8'; ctx.font = '7px monospace';
+      ctx.fillText(n.sol.toFixed(3)+'◎', pos.x, pos.y + r + 9);
+    }
+  });
+}
+
+function renderTreeList(nodes) {
+  const all = [
+    ...nodes.filter(n => n.type === 'buy').map(n => ({...n, side:'buy'})),
+    ...nodes.filter(n => n.type === 'sell').map(n => ({...n, side:'sell'}))
+  ];
+  document.getElementById('tree-list').innerHTML = all.map(n => `
+    <div class="tree-wallet-row is-${n.side}" onclick="window.open('https://solscan.io/account/${n.wallet||''}','_blank')" title="${n.wallet||''}">
+      <div class="tree-wallet-dot" style="background:${n.side==='buy'?'#14c784':'#f23645'}"></div>
+      <div class="tree-wallet-addr">${n.label||'?'}</div>
+      <div class="tree-wallet-sol">${(n.sol||0).toFixed(4)}◎</div>
+    </div>`).join('');
+}
+
+// ── Market feed polling ───────────────────────────────────────────────────────
 async function pollFeed() {
   try {
-    const tokens = await fetch('/api/market-feed?since=' + feedSince).then(r=>r.json());
+    const tokens = await fetch('/api/market-feed?since=' + feedSince).then(r => r.json());
     if (tokens && tokens.length) {
       const mints = new Set(allTokens.map(t => t.mint));
       tokens.forEach(t => { if (!mints.has(t.mint)) allTokens.unshift(t); });
       if (allTokens.length > 100) allTokens = allTokens.slice(0, 100);
-      feedSince = Math.max(...tokens.map(t => t.ts || 0), feedSince);
-      renderChart();
+      feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
+      renderTokenRows();
       updateTicker();
-      updateTopGrowth();
     }
-  } catch(err) {}
+  } catch(e) {}
 }
-function startFeed() { pollFeed(); setInterval(pollFeed, 4000); }
 
-// ── CEX Listing alerts ────────────────────────────────────────────────────────
-const seenListings = new Set();
-let listingCatchCount = 0;
-async function pollListings() {
-  try {
-    const alerts = await fetch('/api/listing-alerts').then(r=>r.json());
-    if (!alerts || !alerts.length) return;
-    const feed = document.getElementById('listing-feed');
-    let added = false;
-    alerts.forEach(a => {
-      const key = a.exchange + a.symbol;
-      if (seenListings.has(key)) return;
-      seenListings.add(key);
-      listingCatchCount++;
-      const row = document.createElement('div');
-      row.style.cssText = 'padding:8px 10px;border-bottom:1px solid #1e293b;font-size:12px;animation:fadeIn .4s';
-      row.innerHTML = `
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <span><span style="color:#f59e0b;font-weight:700;font-size:11px;text-transform:uppercase">${a.exchange}</span>
-          &nbsp;<b style="color:var(--t1)">${a.symbol}</b>
-          <span style="color:var(--t3);font-size:11px"> — ${a.name}</span></span>
-          <span style="color:var(--t3);font-size:10px">${new Date(a.ts*1000).toLocaleTimeString()}</span>
-        </div>
-        <div style="margin-top:3px;font-size:11px">
-          <span style="color:var(--t3)">$${a.price < 0.001 ? a.price.toExponential(2) : a.price.toFixed(6)}</span>
-          <span style="color:var(--t3)"> &bull; Liq $${(a.liq/1000).toFixed(0)}K</span>
-          <span style="color:#14c784;font-weight:600;margin-left:8px">⚡ Buying via Jito Sender</span>
-          <span style="color:#f59e0b;float:right;font-size:10px">TP +40%</span>
-        </div>`;
-      if (feed.children[0] && feed.children[0].textContent.includes('Monitoring')) feed.innerHTML = '';
-      feed.insertBefore(row, feed.firstChild);
-      added = true;
-    });
-    if (added) {
-      document.getElementById('listing-stat').textContent = listingCatchCount;
-      document.getElementById('listing-count-badge').textContent = listingCatchCount + ' listing' + (listingCatchCount===1?'':'s') + ' caught';
-      const panel = feed.closest('.panel');
-      if (panel) { panel.style.borderLeftColor='#22c55e'; setTimeout(()=>panel.style.borderLeftColor='#f59e0b',2000); }
-    }
-  } catch(err) {}
-}
-setInterval(pollListings, 6000);
-pollListings();
-
-// ── Ticker tape ──────────────────────────────────────────────────────────────
+// ── Ticker ────────────────────────────────────────────────────────────────────
 function updateTicker() {
   const items = allTokens.slice(0, 20).map(t => {
     const chg = t.change || 0;
     const col = chg >= 0 ? '#14c784' : '#f23645';
     return `<span class="tick-item">
       <span class="tick-name">${t.symbol||t.name||'?'}</span>
-      <span style="font-family:monospace;font-size:11px">$${t.price?.toFixed(6)||'—'}</span>
-      <span style="color:${col};font-weight:700">${chg>=0?'+':''}${chg.toFixed(1)}%</span>
+      <span style="font-family:monospace;font-size:11px">${fmtPrice(t.price)}</span>
+      <span style="color:${col};font-weight:700">${chgStr(chg)}</span>
     </span>`;
   });
-  // duplicate for seamless loop
   const html = [...items, ...items].join('');
-  document.getElementById('ticker-inner').innerHTML = html;
+  document.getElementById('ticker-inner').innerHTML = html || 'Loading market data…';
 }
 
+// ── CEX Listing alerts ────────────────────────────────────────────────────────
+const seenListings = new Set();
+let listingCatchCount = 0;
+async function pollListings() {
+  try {
+    const alerts = await fetch('/api/listing-alerts').then(r => r.json());
+    if (!alerts || !alerts.length) return;
+    const feed = document.getElementById('listing-feed');
+    let added = false;
+    alerts.forEach(a => {
+      const key = a.exchange + a.symbol;
+      if (seenListings.has(key)) return;
+      seenListings.add(key); listingCatchCount++;
+      const row = document.createElement('div');
+      row.style.cssText = 'padding:7px 10px;border-bottom:1px solid rgba(245,158,11,.12);font-size:11px';
+      row.innerHTML = `<div style="display:flex;justify-content:space-between">
+        <span><b style="color:#f59e0b;font-size:10px">${a.exchange}</b> &nbsp;<b style="color:var(--t1)">${a.symbol}</b> <span style="color:var(--t3)">${a.name}</span></span>
+        <span style="color:var(--t3);font-size:10px">${new Date(a.ts*1000).toLocaleTimeString()}</span>
+      </div><div style="color:#14c784;font-weight:600;font-size:10px;margin-top:2px">⚡ Buying via Jito — TP +40%</div>`;
+      if (feed.children[0]?.textContent.includes('Monitoring')) feed.innerHTML = '';
+      feed.insertBefore(row, feed.firstChild);
+      added = true;
+    });
+    if (added) {
+      document.getElementById('listing-stat').textContent = listingCatchCount;
+      document.getElementById('listing-count-badge').textContent = listingCatchCount + ' listing' + (listingCatchCount===1?'':'s') + ' caught';
+    }
+  } catch(e) {}
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+function toggleStop(v) {
+  document.getElementById('f-dur').style.display = v==='duration' ? 'block':'none';
+  document.getElementById('f-pft').style.display = v==='profit'   ? 'block':'none';
+}
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
-  document.getElementById('pc-' + name).classList.add('active');
+  const el = document.getElementById('pc-' + name);
+  if (el) el.classList.add('active');
   document.getElementById('s-preset').value = name;
 }
-
-function updateFilterPipe(filterLog) {
-  if (!filterLog || !filterLog.length) return;
-  const html = filterLog.map(f => `
-    <div class="fp-item">
-      <span class="${f.passed ? 'fp-pass' : 'fp-fail'}">${f.passed ? '✓' : '✗'}</span>
-      <span class="fp-name">${f.name || '?'}</span>
-      <span class="fp-reason">${f.reason || ''}</span>
-    </div>`).join('');
-  document.getElementById('filter-pipe').innerHTML = html;
+async function saveSettings() {
+  const res = await fetch('/api/settings', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      preset:            document.getElementById('s-preset').value,
+      run_mode:          document.getElementById('s-mode').value,
+      run_duration_min:  document.getElementById('s-dur')?.value || 0,
+      profit_target_sol: document.getElementById('s-pft')?.value || 0,
+    })
+  }).then(r => r.json()).catch(() => null);
+  showToast(res && res.ok !== false ? '✓ Settings saved' : '⚠ Save failed', res && res.ok !== false);
+  setTimeout(refresh, 300);
 }
 
-// ── Bot state refresh ────────────────────────────────────────────────────────
-function toggleStop(v) {
-  document.getElementById('f-dur').style.display = v==='duration' ? 'block' : 'none';
-  document.getElementById('f-pft').style.display = v==='profit'   ? 'block' : 'none';
-}
+// ── Bot state refresh ─────────────────────────────────────────────────────────
 async function refresh() {
-  const d = await fetch('/api/state').then(r=>{
-    if (r.status===401||r.status===302) { window.location='/login'; return null; }
+  const d = await fetch('/api/state').then(r => {
+    if (r.status === 401 || r.status === 302) { window.location = '/login'; return null; }
     return r.json();
-  }).catch(()=>null);
-  if (!d) {
-    document.getElementById('stxt').textContent = 'Connection error — retrying…';
-    return;
-  }
+  }).catch(() => null);
+  if (!d) { document.getElementById('stxt').textContent = 'Connection error — retrying…'; return; }
   running = d.running;
   document.getElementById('balance').textContent   = d.balance.toFixed(4);
   document.getElementById('pos-count').textContent = d.positions.length;
@@ -4047,29 +3848,22 @@ async function refresh() {
   const pnl = d.stats.total_pnl_sol;
   const pnlEl = document.getElementById('pnl');
   pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
-  pnlEl.className   = 'sval ' + (pnl>=0 ? 'c-grn' : 'c-red');
-  const dot=document.getElementById('sdot'), txt=document.getElementById('stxt'), btn=document.getElementById('toggle-btn');
-  if (running) {
-    dot.className='sdot sdot-on'; txt.textContent='Bot Running';
-    btn.textContent='⏸ Stop Bot'; btn.className='btn btn-danger';
-  } else {
-    dot.className='sdot sdot-off'; txt.textContent='Bot Stopped';
-    btn.textContent='▶ Start Bot'; btn.className='btn btn-success';
-  }
-  if (d.positions.length) {
-    const rows = d.positions.map(p => {
-      const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
-      return `<tr>
-        <td style="font-weight:600">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px">TP1</span>':''}</td>
-        <td class="${cls}" style="font-weight:600">${p.pnl}</td>
-        <td><a href="https://dexscreener.com/solana/${p.address}" target="_blank" class="badge bg-blue">Chart</a></td>
-      </tr>`;
-    }).join('');
-    document.getElementById('pos-tbl').innerHTML =
-      `<table class="tbl"><thead><tr><th>Token</th><th>P&L</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-  } else {
-    document.getElementById('pos-tbl').innerHTML = '<div style="font-size:13px;color:var(--t3)">No open positions</div>';
-  }
+  pnlEl.className   = 'sval ' + (pnl>=0?'c-grn':'c-red');
+  const dot = document.getElementById('sdot'), txt = document.getElementById('stxt'), btn = document.getElementById('toggle-btn');
+  if (running) { dot.className='sdot sdot-on'; txt.textContent='Bot Running'; btn.textContent='⏸ Stop Bot'; btn.className='btn btn-danger'; }
+  else          { dot.className='sdot sdot-off'; txt.textContent='Bot Stopped'; btn.textContent='▶ Start Bot'; btn.className='btn btn-success'; }
+
+  document.getElementById('pos-tbl').innerHTML = d.positions.length
+    ? d.positions.map(p => {
+        const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
+        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
+          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
+          <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
+          <a href="https://dexscreener.com/solana/${p.address}" target="_blank" style="font-size:10px;color:var(--blue2)">↗</a>
+        </div>`;
+      }).join('')
+    : '<div style="font-size:12px;color:var(--t3)">No open positions</div>';
+
   const logs = d.log || [];
   document.getElementById('log-count').textContent = logs.length + ' entries';
   document.getElementById('log').innerHTML = logs.map(l => {
@@ -4079,23 +3873,23 @@ async function refresh() {
     else if (l.includes('WHALE')||l.includes('COPY'))   c = 'lsig';
     else if (l.includes('SNIPE')||l.includes('LISTING'))c = 'lsig';
     else if (l.includes('SCAN')||l.includes('CHECK'))   c = 'lscan';
-    else if (l.includes('Bot started')||l.includes('stopped')||l.includes('ERROR')||l.includes('WARN')) c = 'linfo';
+    else if (l.includes('Bot ')||l.includes('ERROR')||l.includes('WARN')) c = 'linfo';
     return `<div class="lline ${c}">${l}</div>`;
   }).join('');
-  if (d.filter_log) updateFilterPipe(d.filter_log);
+  if (d.filter_log) {
+    document.getElementById('filter-pipe').innerHTML = d.filter_log.map(f => `
+      <div class="fp-item">
+        <span class="${f.passed?'fp-pass':'fp-fail'}">${f.passed?'✓':'✗'}</span>
+        <span class="fp-name">${f.name||'?'}</span>
+        <span class="fp-reason">${f.reason||''}</span>
+      </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning…</div>';
+  }
 }
+
 async function toggleBot() {
-  const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'})
-    .then(r=>r.json()).catch(()=>null);
-  if (!res) {
-    document.getElementById('stxt').textContent = '⚠️ Server error — check Railway logs';
-    return;
-  }
-  if (!res.ok && res.msg) {
-    document.getElementById('stxt').textContent = '⚠️ ' + res.msg;
-    document.getElementById('stxt').style.color = '#f23645';
-    return;
-  }
+  const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>null);
+  if (!res) { document.getElementById('stxt').textContent = '⚠️ Server error'; return; }
+  if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '⚠️ ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
   setTimeout(refresh, 800);
 }
@@ -4114,57 +3908,17 @@ function showToast(msg, ok=true) {
   el._timer = setTimeout(() => el.classList.remove('show'), 3000);
 }
 
-async function saveSettings() {
-  const res = await fetch('/api/settings', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      preset: document.getElementById('s-preset').value,
-      run_mode: document.getElementById('s-mode').value,
-      run_duration_min: document.getElementById('s-dur')?.value || 0,
-      profit_target_sol: document.getElementById('s-pft')?.value || 0,
-    })
-  }).then(r=>r.json()).catch(()=>null);
-  if (res && res.ok !== false) {
-    showToast('✓ Settings saved');
-  } else {
-    showToast('⚠ Save failed — try again', false);
+// ── Init ──────────────────────────────────────────────────────────────────────
+(function() { selectPreset('{{PRESET}}' || 'balanced'); })();
+window.addEventListener('resize', () => {
+  if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
+    treeCanvas.width = treeCanvas.parentElement.clientWidth;
   }
-  setTimeout(refresh, 300);
-}
-
-// ── Top 20 Growth sidebar ────────────────────────────────────────────────────
-function growthScore(t) {
-  const chg = t.change1h || t.priceChange1h || t.chg || 0;
-  const vol  = t.vol || 1;
-  return chg * Math.log10(Math.max(vol, 10));
-}
-
-function updateTopGrowth() {
-  const list = document.getElementById('top-growth-list');
-  if (!list) return;
-  const sorted = [...allTokens]
-    .filter(t => (t.change1h || t.priceChange1h || t.chg || 0) > 0)
-    .sort((a,b) => growthScore(b) - growthScore(a))
-    .slice(0, 20);
-  if (!sorted.length) {
-    list.innerHTML = '<div style="font-size:11px;color:var(--t3);padding:6px">No data yet</div>';
-    return;
-  }
-  list.innerHTML = sorted.map((t, i) => {
-    const chg  = (t.change1h || t.priceChange1h || t.chg || 0).toFixed(1);
-    const name = (t.symbol || t.name || '').slice(0, 9);
-    const isActive = t.mint === chartMint;
-    return `<div class="growth-row${isActive?' growth-active':''}" onclick="switchToCandle('${t.mint}','${name}')">
-      <span class="growth-rank">#${i+1}</span>
-      <span class="growth-name">${name}</span>
-      <span class="growth-chg" style="color:#14c784">+${chg}%</span>
-    </div>`;
-  }).join('');
-}
+});
 refresh();
 setInterval(refresh, 5000);
-initChart();
-startFeed();
+pollFeed(); setInterval(pollFeed, 4000);
+pollListings(); setInterval(pollListings, 6000);
 </script>
 """
 
