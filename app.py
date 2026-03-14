@@ -1748,12 +1748,6 @@ except Exception as _e:
 @app.before_request
 def _before_request_security():
     ensure_background_workers_started()
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.endpoint != "stripe_webhook":
-        origin = request.headers.get("Origin") or request.headers.get("Referer")
-        if origin:
-            allowed = request.host_url.rstrip("/")
-            if not origin.startswith(allowed):
-                return Response("Forbidden", status=403)
 
 
 @app.after_request
