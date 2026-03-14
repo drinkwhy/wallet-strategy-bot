@@ -1317,6 +1317,7 @@ def global_scanner():
                     info["score"] = min(100, info["score"] + check_social_signals(str(p)))
                     info["ts"] = int(time.time())
                     market_feed.appendleft(info)
+                    record_price(mint, info.get("price", 0))
                     for bot in list(user_bots.values()):
                         if bot.running:
                             try:
@@ -2233,6 +2234,25 @@ def api_settings():
         bot.profit_target    = profit
     return jsonify({"ok":True})
 
+@app.route("/api/chart/<mint>")
+@login_required
+def api_chart(mint):
+    tf_min    = max(1, int(request.args.get("tf", 1)))
+    samples   = _price_history.get(mint, [])
+    if not samples:
+        return jsonify([])
+    bucket_sec = tf_min * 60
+    candles    = {}
+    for ts, price in samples:
+        b = int(ts // bucket_sec) * bucket_sec
+        if b not in candles:
+            candles[b] = {"t": b, "o": price, "h": price, "l": price, "c": price}
+        else:
+            candles[b]["h"] = max(candles[b]["h"], price)
+            candles[b]["l"] = min(candles[b]["l"], price)
+            candles[b]["c"] = price
+    return jsonify(sorted(candles.values(), key=lambda x: x["t"]))
+
 @app.route("/api/market-feed")
 @login_required
 def api_market_feed():
@@ -2302,6 +2322,18 @@ def api_filter_log():
     finally:
         conn.close()
     return jsonify([dict(r) for r in rows])
+
+# Price history for candlestick chart — mint → [(unix_ts, price), ...]
+_price_history = {}
+_PRICE_HISTORY_MAX = 300
+
+def record_price(mint, price):
+    if not mint or not price or price <= 0:
+        return
+    h = _price_history.setdefault(mint, [])
+    h.append((time.time(), price))
+    if len(h) > _PRICE_HISTORY_MAX:
+        del h[0]
 
 # Recent listing alerts (for UI feed) — keep last 50 in memory
 _recent_listing_alerts = []
@@ -3065,6 +3097,12 @@ DASHBOARD_HTML = _CSS + """
 @keyframes featPulse{0%,100%{opacity:1}50%{opacity:.6}}
 .feat-pulse{animation:featPulse 2s ease-in-out infinite}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+/* Chart tabs */
+.chart-tab{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:5px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
+.chart-tab.active{background:var(--grn);color:#000;border-color:var(--grn)}
+.ctype-btn,.ctf-btn{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
+.ctype-btn.active{background:rgba(20,199,132,.15);border-color:var(--grn);color:var(--grn)}
+.ctf-btn.active{background:rgba(37,99,235,.15);border-color:var(--blue2);color:var(--blue2)}
 </style>
 
 <nav class="nav">
@@ -3219,31 +3257,60 @@ DASHBOARD_HTML = _CSS + """
       </div>
     </div>
 
-    <!-- Right panel: live market board -->
+    <!-- Right panel: live market board + candlestick -->
     <div>
       <div class="panel">
-        <div class="market-header">
-          <div>
-            <span class="live-dot"></span>
-            <span style="font-weight:700;font-size:15px">Live Market Feed</span>
-            <span class="token-count" id="token-count" style="margin-left:8px">0 tokens</span>
+        <!-- Tab bar -->
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div style="display:flex;gap:6px">
+            <button id="tab-scatter" class="chart-tab active" onclick="switchToScatter()">📊 Market</button>
+            <button id="tab-candle"  class="chart-tab"        onclick="switchToCandle(chartMint, chartMintName)">🕯️ Candlestick</button>
           </div>
-          <div style="font-size:11px;color:var(--t3)">Click a dot to analyze · ⚡ buy</div>
+          <span id="token-count" style="font-size:12px;color:var(--t3)">0 tokens</span>
         </div>
-        <div class="filter-row">
-          <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
-          <button class="filter-btn" onclick="setFilter('hot',this)">🔥 Hot (score 70+)</button>
-          <button class="filter-btn" onclick="setFilter('new',this)">🆕 New (&lt;15min)</button>
-          <button class="filter-btn" onclick="setFilter('whale',this)">🐋 Whale Picks</button>
+
+        <!-- Scatter view -->
+        <div id="chart-scatter-view">
+          <div class="filter-row">
+            <button class="filter-btn active" onclick="setFilter('all',this)">All</button>
+            <button class="filter-btn" onclick="setFilter('hot',this)">🔥 Hot (70+)</button>
+            <button class="filter-btn" onclick="setFilter('new',this)">🆕 New (&lt;15m)</button>
+            <button class="filter-btn" onclick="setFilter('whale',this)">🐋 Whale</button>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="market-chart" height="400"></canvas>
+          </div>
+          <div class="chart-legend">
+            <span><span class="leg-dot" style="background:#14c784"></span>Score 70+</span>
+            <span><span class="leg-dot" style="background:#f5a623"></span>45–69</span>
+            <span><span class="leg-dot" style="background:#f23645"></span>&lt;45</span>
+            <span style="margin-left:auto;font-size:11px;color:var(--t3)">Click dot → candlestick</span>
+          </div>
         </div>
-        <div class="chart-wrap">
-          <canvas id="market-chart" height="420"></canvas>
-        </div>
-        <div class="chart-legend">
-          <span><span class="leg-dot" style="background:#14c784"></span>AI Score 70+ (Hot)</span>
-          <span><span class="leg-dot" style="background:#f5a623"></span>Score 45–69</span>
-          <span><span class="leg-dot" style="background:#f23645"></span>Score &lt;45</span>
-          <span style="margin-left:auto">Dot size = volume</span>
+
+        <!-- Candlestick view -->
+        <div id="chart-candle-view" style="display:none">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+            <select id="candle-token-sel" class="finput" style="flex:1;min-width:120px;padding:5px 8px;font-size:12px" onchange="onTokenSelChange()">
+              <option value="">— select token —</option>
+            </select>
+            <div style="display:flex;gap:4px">
+              <button class="ctype-btn active" id="ctype-candle" onclick="setCandleType('candle',this)">Candles</button>
+              <button class="ctype-btn"        id="ctype-ha"     onclick="setCandleType('ha',this)">Heikin Ashi</button>
+            </div>
+            <div style="display:flex;gap:4px">
+              <button class="ctf-btn active" id="ctf-1"  onclick="setTf(1,this)">1m</button>
+              <button class="ctf-btn"        id="ctf-5"  onclick="setTf(5,this)">5m</button>
+              <button class="ctf-btn"        id="ctf-15" onclick="setTf(15,this)">15m</button>
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="candle-chart" height="400"></canvas>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:var(--t3)">
+            <span id="candle-ohlc-label">—</span>
+            <span id="candle-refresh-label">auto-refresh 30s</span>
+          </div>
         </div>
       </div>
     </div>
@@ -3257,6 +3324,15 @@ let allTokens = [];
 let selectedToken = null;
 let hoveredIdx = -1;
 let chartCanvas, chartCtx, chartDisplayTokens = [];
+// Candlestick state
+let chartMode = 'scatter';
+let candleType = 'candle';
+let candleTf   = 1;
+let chartMint  = null;
+let chartMintName = '';
+let ohlcData   = [];
+let candleCanvas, candleCtx;
+let candleTimer = null;
 
 // ── Filters ──────────────────────────────────────────────────────────────────
 function setFilter(f, btn) {
@@ -3458,13 +3534,190 @@ function initChart() {
   });
 
   chartCanvas.addEventListener('click', function(e) {
-    if (hoveredIdx >= 0) showTooltip(e, hoveredIdx);
+    if (hoveredIdx >= 0) {
+      showTooltip(e, hoveredIdx);
+      const t = chartDisplayTokens[hoveredIdx];
+      if (t && t.mint) switchToCandle(t.mint, t.symbol || t.name || '');
+    }
   });
 
   chartCanvas.addEventListener('mouseleave', function() {
     hoveredIdx = -1;
     renderChart();
   });
+}
+
+// ── Candlestick chart ────────────────────────────────────────────────────────
+function switchToScatter() {
+  chartMode = 'scatter';
+  document.getElementById('chart-scatter-view').style.display = '';
+  document.getElementById('chart-candle-view').style.display  = 'none';
+  document.getElementById('tab-scatter').classList.add('active');
+  document.getElementById('tab-candle').classList.remove('active');
+  renderChart();
+}
+
+function switchToCandle(mint, name) {
+  if (mint) { chartMint = mint; chartMintName = name || mint.slice(0,8)+'…'; }
+  chartMode = 'candle';
+  document.getElementById('chart-scatter-view').style.display = 'none';
+  document.getElementById('chart-candle-view').style.display  = '';
+  document.getElementById('tab-scatter').classList.remove('active');
+  document.getElementById('tab-candle').classList.add('active');
+  // populate selector
+  const sel = document.getElementById('candle-token-sel');
+  const existing = [...sel.options].map(o => o.value);
+  allTokens.forEach(t => {
+    if (!existing.includes(t.mint)) {
+      const o = document.createElement('option');
+      o.value = t.mint; o.textContent = (t.symbol || t.name || t.mint.slice(0,8));
+      sel.appendChild(o);
+    }
+  });
+  if (chartMint) sel.value = chartMint;
+  initCandleCanvas();
+  fetchAndRenderCandles();
+  if (candleTimer) clearInterval(candleTimer);
+  candleTimer = setInterval(fetchAndRenderCandles, 30000);
+}
+
+function onTokenSelChange() {
+  const sel = document.getElementById('candle-token-sel');
+  chartMint = sel.value;
+  chartMintName = sel.options[sel.selectedIndex]?.textContent || '';
+  fetchAndRenderCandles();
+}
+
+function setCandleType(t, btn) {
+  candleType = t;
+  document.querySelectorAll('.ctype-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderCandles();
+}
+
+function setTf(tf, btn) {
+  candleTf = tf;
+  document.querySelectorAll('.ctf-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  fetchAndRenderCandles();
+}
+
+function initCandleCanvas() {
+  if (candleCanvas) return;
+  candleCanvas = document.getElementById('candle-chart');
+  candleCtx    = candleCanvas.getContext('2d');
+  function resizeCandle() {
+    candleCanvas.width  = candleCanvas.parentElement.clientWidth;
+    candleCanvas.height = 400;
+    renderCandles();
+  }
+  resizeCandle();
+  window.addEventListener('resize', resizeCandle);
+}
+
+async function fetchAndRenderCandles() {
+  if (!chartMint) { renderCandles(); return; }
+  try {
+    const data = await fetch('/api/chart/' + chartMint + '?tf=' + candleTf).then(r => r.json());
+    ohlcData = data || [];
+    document.getElementById('candle-refresh-label').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch(e) {}
+  renderCandles();
+}
+
+function toHeikinAshi(ohlc) {
+  return ohlc.map((c, i, arr) => {
+    const haC = (c.o + c.h + c.l + c.c) / 4;
+    const haO = i === 0 ? (c.o + c.c) / 2 : (arr[i-1]._haO + arr[i-1]._haC) / 2;
+    const haH = Math.max(c.h, haO, haC);
+    const haL = Math.min(c.l, haO, haC);
+    c._haO = haO; c._haC = haC;
+    return { t: c.t, o: haO, h: haH, l: haL, c: haC };
+  });
+}
+
+function renderCandles() {
+  if (!candleCanvas) return;
+  initCandleCanvas();
+  const raw  = ohlcData;
+  const data = candleType === 'ha' ? toHeikinAshi([...raw]) : raw;
+  const W = candleCanvas.width, H = candleCanvas.height;
+  const ctx = candleCtx;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!data.length) {
+    ctx.fillStyle = '#444'; ctx.font = '13px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(!chartMint ? 'Click a dot on Market tab to open chart' : 'Collecting price data… check back in a few minutes', W/2, H/2);
+    return;
+  }
+
+  const pad = { top: 24, bottom: 28, left: 68, right: 12 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top  - pad.bottom;
+  const highs = data.map(c => c.h), lows = data.map(c => c.l);
+  const maxP  = Math.max(...highs), minP = Math.min(...lows);
+  const range = maxP - minP || maxP * 0.02;
+  const toY   = p => pad.top + plotH - ((p - minP) / range) * plotH;
+  const cw    = Math.max(2, Math.min(16, (plotW / data.length) - 2));
+  const toX   = i => pad.left + (i + 0.5) * (plotW / data.length);
+
+  // Grid lines
+  ctx.strokeStyle = '#1a1f2e'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (plotH / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y); ctx.stroke();
+    const price = maxP - (range / 4) * i;
+    const lbl   = price < 0.00001 ? price.toExponential(2) : price < 0.001 ? price.toFixed(6) : price < 0.1 ? price.toFixed(4) : price.toFixed(2);
+    ctx.fillStyle = '#555'; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+    ctx.fillText('$'+lbl, pad.left - 5, y + 4);
+  }
+
+  // Candles
+  let lastC = null;
+  data.forEach((c, i) => {
+    const x      = toX(i);
+    const isUp   = c.c >= c.o;
+    const color  = isUp ? '#14c784' : '#f23645';
+    const bodyT  = toY(Math.max(c.o, c.c));
+    const bodyB  = toY(Math.min(c.o, c.c));
+    const bodyH  = Math.max(1, bodyB - bodyT);
+    // Wick
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, toY(c.h)); ctx.lineTo(x, toY(c.l)); ctx.stroke();
+    // Body
+    if (candleType === 'ha' || isUp) {
+      ctx.fillStyle = color; ctx.fillRect(x - cw/2, bodyT, cw, bodyH);
+    } else {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+      ctx.strokeRect(x - cw/2, bodyT, cw, bodyH);
+    }
+    if (i === data.length - 1) lastC = c;
+  });
+
+  // X-axis time labels
+  ctx.fillStyle = '#555'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+  const step = Math.max(1, Math.floor(data.length / 6));
+  data.forEach((c, i) => {
+    if (i % step !== 0) return;
+    const d = new Date(c.t * 1000);
+    ctx.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'), toX(i), pad.top + plotH + 16);
+  });
+
+  // Current price label on right axis
+  if (lastC) {
+    const y   = toY(lastC.c);
+    const isUp = lastC.c >= lastC.o;
+    ctx.fillStyle = isUp ? '#14c784' : '#f23645';
+    ctx.fillRect(pad.left + plotW, y - 9, W - pad.left - plotW, 18);
+    ctx.fillStyle = '#000'; ctx.font = 'bold 10px monospace'; ctx.textAlign = 'left';
+    const lbl = lastC.c < 0.0001 ? lastC.c.toExponential(2) : lastC.c < 0.01 ? lastC.c.toFixed(6) : lastC.c.toFixed(4);
+    ctx.fillText('$'+lbl, pad.left + plotW + 3, y + 4);
+    // OHLC label
+    document.getElementById('candle-ohlc-label').textContent =
+      `O:$${lastC.o.toFixed(6)}  H:$${lastC.h.toFixed(6)}  L:$${lastC.l.toFixed(6)}  C:$${lastC.c.toFixed(6)}`;
+  }
 }
 
 // ── Tooltip (click-only) ──────────────────────────────────────────────────────
