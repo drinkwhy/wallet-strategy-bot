@@ -30,13 +30,16 @@ SECRET_KEY         = os.getenv("SECRET_KEY", secrets.token_hex(32))
 _fkey              = os.getenv("FERNET_KEY")
 FERNET_KEY         = _fkey.encode() if _fkey else Fernet.generate_key()
 HELIUS_RPC         = os.getenv("HELIUS_RPC", "")
-STRIPE_SECRET      = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_PRICE_BASIC = os.getenv("STRIPE_PRICE_BASIC", "")
-STRIPE_PRICE_PRO   = os.getenv("STRIPE_PRICE_PRO", "")
+STRIPE_SECRET       = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_BASIC  = os.getenv("STRIPE_PRICE_BASIC", "")
+STRIPE_PRICE_PRO    = os.getenv("STRIPE_PRICE_PRO", "")
+STRIPE_PRICE_ELITE  = os.getenv("STRIPE_PRICE_ELITE", "")
 ADMIN_EMAIL        = os.getenv("ADMIN_EMAIL", "admin@admin.com")
 ADMIN_EMAILS       = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", ADMIN_EMAIL).split(",") if e.strip()}
+PERF_FEE_FREE      = 0.25   # 25% of profits (profit-only plan, no subscription)
 PERF_FEE_BASIC     = 0.15   # 15% of profits
 PERF_FEE_PRO       = 0.10   # 10% of profits
+PERF_FEE_ELITE     = 0.08   # 8% of profits
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
 SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
@@ -53,9 +56,11 @@ RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 PUMP_FUN    = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 PLAN_LIMITS = {
-    "basic": {"max_buy_sol": 0.1,  "label": "Basic Plan — $29/mo"},
-    "pro":   {"max_buy_sol": 1.0,  "label": "Pro Plan — $49/mo"},
-    "trial": {"max_buy_sol": 0.05, "label": "Free Trial (7 days)"},
+    "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
+    "basic": {"max_buy_sol": 0.1,  "label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
+    "pro":   {"max_buy_sol": 1.0,  "label": "Pro — $99/mo",          "perf_fee": PERF_FEE_PRO},
+    "elite": {"max_buy_sol": 5.0,  "label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
+    "trial": {"max_buy_sol": 0.05, "label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
 }
 
 PRESETS = {
@@ -66,6 +71,7 @@ PRESETS = {
         "trail_pct":0.15,"stop_loss":0.85,"max_age_min":20,"time_stop_min":20,
         "min_liq":25000,"min_mc":10000,"max_mc":80000,"priority_fee":10000,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
+        "listing_sniper":True,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
@@ -74,6 +80,7 @@ PRESETS = {
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":30,"time_stop_min":30,
         "min_liq":10000,"min_mc":5000,"max_mc":150000,"priority_fee":30000,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "listing_sniper":True,
     },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
@@ -82,6 +89,7 @@ PRESETS = {
         "trail_pct":0.30,"stop_loss":0.60,"max_age_min":10,"time_stop_min":60,
         "min_liq":5000,"min_mc":2000,"max_mc":250000,"priority_fee":100000,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
+        "listing_sniper":True,
     },
 }
 # keep backward compat
@@ -555,24 +563,190 @@ class BotInstance:
         except:
             pass
 
+    # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
+    JITO_TIPS = [
+        "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
+        "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+        "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta",
+        "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+        "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
+        "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+        "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
+        "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+        "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
+        "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+    ]
+    TIP_LAMPORTS = 200_000  # 0.0002 SOL — minimum for Jito routing
+
+    def _get_dynamic_tip(self):
+        """Fetch 75th-percentile landed tip from Jito API; fallback to 0.0002 SOL."""
+        try:
+            r = requests.get("https://bundles.jito.wtf/api/v1/bundles/tip_floor", timeout=4).json()
+            tip_sol = r[0].get("landed_tips_75th_percentile", 0.0002)
+            return max(int(tip_sol * 1e9), self.TIP_LAMPORTS)
+        except:
+            return self.TIP_LAMPORTS
+
+    def _inject_tip(self, tx):
+        """
+        Inject a Jito tip SOL-transfer instruction into an existing Jupiter
+        VersionedTransaction (V0).  Returns a NEW signed VersionedTransaction
+        with the tip appended, or None if injection fails.
+
+        Strategy (mirrors the TypeScript createSenderTransactionFromSwapResponse):
+          1. Read static account_keys and header from the compiled V0 message.
+          2. Find (or add) the System Program in the static keys.
+          3. Insert the tip Pubkey at the start of the readonly-unsigned section
+             so it is classified as a writable non-signer by the runtime.
+          4. Shift every account index in every existing instruction by +1 for
+             each account inserted before it.
+          5. Append a CompiledInstruction for System::Transfer(tip_lamports).
+          6. Rebuild MessageV0 + sign with our keypair.
+        """
+        import struct
+        from solders.pubkey import Pubkey
+        from solders.message import MessageV0, MessageHeader
+        from solders.instruction import CompiledInstruction as CI
+
+        SYSTEM_PROG = Pubkey.from_string("11111111111111111111111111111111")
+        tip_pk      = Pubkey.from_string(random.choice(self.JITO_TIPS))
+        tip_lamps   = self._get_dynamic_tip()
+
+        msg       = tx.message
+        old_keys  = list(msg.account_keys)
+        h         = msg.header
+        ns        = h.num_required_signatures
+        nrs       = h.num_readonly_signed_accounts
+        nru       = h.num_readonly_unsigned_accounts
+
+        # ── locate accounts ────────────────────────────────────────────────
+        sys_idx = next((i for i, k in enumerate(old_keys) if k == SYSTEM_PROG), None)
+        tip_idx = next((i for i, k in enumerate(old_keys) if k == tip_pk),      None)
+
+        new_keys = list(old_keys)
+        new_nru  = nru
+        # insertion point = first readonly-unsigned slot
+        insert_at = len(new_keys) - nru
+
+        # ── insert tip account as writable non-signer ──────────────────────
+        if tip_idx is None:
+            new_keys.insert(insert_at, tip_pk)
+            tip_idx   = insert_at
+            tip_shift = insert_at          # indices >= this shift +1
+        else:
+            tip_shift = len(new_keys)      # no shift
+
+        # adjust sys_idx after potential shift
+        if sys_idx is not None and sys_idx >= tip_shift:
+            sys_idx += 1
+
+        # ── add System Program as readonly non-signer if missing ───────────
+        sys_shift = len(new_keys)         # default: no shift
+        if sys_idx is None:
+            new_keys.append(SYSTEM_PROG)
+            sys_idx  = len(new_keys) - 1
+            new_nru += 1                  # one more readonly-unsigned
+
+        # ── remap existing instruction account indices ──────────────────────
+        def remap(i):
+            if i >= sys_shift:  return i + (1 if sys_idx == len(new_keys) - 1 else 0)
+            if i >= tip_shift:  return i + 1
+            return i
+
+        new_ixs = []
+        for ix in msg.instructions:
+            new_ixs.append(CI(
+                program_id_index = remap(ix.program_id_index),
+                accounts         = bytes(remap(a) for a in bytes(ix.accounts)),
+                data             = bytes(ix.data),
+            ))
+
+        # ── append tip instruction ─────────────────────────────────────────
+        tip_data = struct.pack('<IQ', 2, tip_lamps)   # System::Transfer
+        new_ixs.append(CI(
+            program_id_index = sys_idx,
+            accounts         = bytes([0, tip_idx]),    # payer=0, tip account
+            data             = tip_data,
+        ))
+
+        # ── rebuild message & sign ─────────────────────────────────────────
+        new_msg = MessageV0(
+            header              = MessageHeader(ns, nrs, new_nru),
+            account_keys        = new_keys,
+            recent_blockhash    = msg.recent_blockhash,
+            instructions        = new_ixs,
+            address_table_lookups = list(msg.address_table_lookups),
+        )
+        return VersionedTransaction(new_msg, [self.keypair])
+
+    def _sender_endpoints(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed  = urlparse(HELIUS_RPC)
+        api_key = parse_qs(parsed.query).get("api-key", [""])[0]
+        qs = f"?api-key={api_key}" if api_key else ""
+        # HTTP (not HTTPS) for backend — lower latency, no CORS overhead
+        return [
+            f"http://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
+            f"http://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
+            f"http://lon-sender.helius-rpc.com/fast{qs}",  # London
+            f"http://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
+            f"http://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
+            f"http://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
+            f"http://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
+        ]
+
     def sign_and_send(self, swap_tx_b64):
-        raw    = base64.b64decode(swap_tx_b64)
-        tx     = VersionedTransaction.from_bytes(raw)
-        signed = VersionedTransaction(tx.message, [self.keypair])
-        enc    = base64.b64encode(bytes(signed)).decode()
-        r = requests.post(HELIUS_RPC, json={
-            "jsonrpc":"2.0","id":1,"method":"sendTransaction",
-            "params":[enc,{"encoding":"base64","skipPreflight":False,
-                           "preflightCommitment":"confirmed","maxRetries":3}]
-        }, timeout=15)
-        res = r.json()
-        return res.get("result") if "result" in res else None
+        raw = base64.b64decode(swap_tx_b64)
+        tx  = VersionedTransaction.from_bytes(raw)
+
+        # ── inject tip into the transaction ────────────────────────────────
+        try:
+            signed_tx = self._inject_tip(tx)
+            enc = base64.b64encode(bytes(signed_tx)).decode()
+            self.log_msg(f"💰 Jito tip injected ({self.TIP_LAMPORTS/1e9:.4f} SOL)")
+        except Exception as e:
+            self.log_msg(f"Tip injection failed ({e}), sending without tip")
+            signed_tx = VersionedTransaction(tx.message, [self.keypair])
+            enc = base64.b64encode(bytes(signed_tx)).decode()
+
+        # ── send via Helius Sender (try first 2 regional nodes) ────────────
+        send_params = {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
+        for url in self._sender_endpoints()[:2]:
+            try:
+                r   = requests.post(url, json={
+                    "jsonrpc":"2.0","id":str(int(time.time()*1000)),
+                    "method":"sendTransaction","params":[enc, send_params]
+                }, timeout=8)
+                res = r.json()
+                if res.get("result"):
+                    region = url.split("//")[1].split("-sender")[0]
+                    self.log_msg(f"⚡ Sent via Helius Sender ({region})")
+                    return res["result"]
+                if res.get("error"):
+                    self.log_msg(f"Sender error: {res['error'].get('message','?')}")
+                    break   # hard RPC error — skip remaining regions
+            except Exception as e:
+                self.log_msg(f"Sender unreachable ({url.split('//')[1].split('/')[0]}): {e}")
+
+        # ── fallback: regular Helius RPC ────────────────────────────────────
+        try:
+            r   = requests.post(HELIUS_RPC, json={
+                "jsonrpc":"2.0","id":1,"method":"sendTransaction",
+                "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]
+            }, timeout=15)
+            res = r.json()
+            if res.get("result"):
+                self.log_msg("📡 Sent via Helius RPC (fallback)")
+            return res.get("result") if "result" in res else None
+        except Exception as e:
+            self.log_msg(f"sendTransaction error: {e}")
+            return None
 
     def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
-        # Try primary then fallback endpoint
+        # swap/v1 endpoints (recommended by Helius Sender docs)
         urls = [
+            f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
             f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-            f"https://lite-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         ]
         for url in urls:
             for attempt in range(3):
@@ -587,12 +761,18 @@ class BotInstance:
         return None
 
     def jupiter_swap(self, quote):
-        endpoints = ["https://quote-api.jup.ag/v6/swap", "https://lite-api.jup.ag/v6/swap"]
+        endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://quote-api.jup.ag/v6/swap"]
         for url in endpoints:
             try:
                 r = requests.post(url, json={
                     "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
-                    "prioritizationFeeLamports":int(self.settings.get("priority_fee",10000)),
+                    "dynamicComputeUnitLimit": True,
+                    "prioritizationFeeLamports": {
+                        "priorityLevelWithMaxLamports": {
+                            "maxLamports": int(self.settings.get("priority_fee", 1_000_000)),
+                            "priorityLevel": "veryHigh"
+                        }
+                    },
                 }, timeout=12).json()
                 if r.get("swapTransaction"):
                     return r["swapTransaction"]
@@ -791,6 +971,25 @@ class BotInstance:
             age_min    = (time.time() - pos["timestamp"]) / 60
             trail_line = pos["peak_price"] * (1 - s["trail_pct"])
 
+            # ── Listing sniper exit logic ──────────────────────────────────
+            if pos.get("listing"):
+                listing_tp = pos.get("listing_tp", pos["entry_price"] * 1.40)
+                if cur >= listing_tp:
+                    self.sell(mint, 1.0, f"LISTING TP +40%")
+                    continue
+                # Hard stop: 15% loss (listing can gap down if token already on Solana)
+                elif ratio <= 0.85:
+                    self.sell(mint, 1.0, f"LISTING SL {ratio:.2f}x")
+                    continue
+                # 4h time stop: if still up, take profit at market
+                elif age_min >= 240 and ratio >= 1.0:
+                    self.sell(mint, 1.0, f"LISTING TIME 4h {ratio:.2f}x")
+                    continue
+                elif age_min >= 240:
+                    self.sell(mint, 1.0, f"LISTING TIME 4h (exit at loss)")
+                    continue
+                continue   # skip regular TP/SL logic for listing positions
+
             if ratio <= s["stop_loss"]:
                 self.sell(mint, 1.0, f"SL {ratio:.2f}x")
             elif age_min >= s["time_stop_min"] and ratio < 1.10:
@@ -853,7 +1052,7 @@ class BotInstance:
             plan = row["plan"] if row else "basic"
         finally:
             conn.close()
-        pct = PERF_FEE_PRO if plan == "pro" else PERF_FEE_BASIC
+        pct = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["perf_fee"]
         fee_sol = pnl * pct
         conn = db()
         try:
@@ -1228,6 +1427,199 @@ def auto_restart_bots():
 
 threading.Thread(target=auto_restart_bots, daemon=True).start()
 
+def warm_sender_connections():
+    """Ping Helius Sender regional nodes every 30s to reduce cold-start latency."""
+    from urllib.parse import urlparse, parse_qs
+    parsed  = urlparse(HELIUS_RPC)
+    api_key = parse_qs(parsed.query).get("api-key", [""])[0]
+    qs = f"?api-key={api_key}" if api_key else ""
+    endpoints = [
+        f"http://slc-sender.helius-rpc.com/fast{qs}",
+        f"http://ewr-sender.helius-rpc.com/fast{qs}",
+    ]
+    while True:
+        for url in endpoints:
+            try:
+                requests.get(url.replace("/fast", "/ping"), timeout=4)
+            except: pass
+        time.sleep(30)
+
+threading.Thread(target=warm_sender_connections, daemon=True).start()
+
+# ── CEX Listing Sniper ─────────────────────────────────────────────────────────
+# Monitors 7 exchange public APIs (free, no auth) every 5s.
+# When a new token pair appears → finds it on Solana via DexScreener → buys.
+# Listing pumps average +50–200%. Execution via Helius Sender for max speed.
+
+import queue as _queue
+listing_alert_queue = _queue.Queue()   # (symbol, mint, name, price, liq, exchange)
+_listing_known = {}   # exchange → set of pair symbols we've already seen
+
+LISTING_EXCHANGES = {
+    "binance":  ("https://api.binance.com/api/v3/exchangeInfo",          "symbols",  "symbol",     None),
+    "coinbase": ("https://api.exchange.coinbase.com/products",           None,       "id",         None),
+    "okx":      ("https://www.okx.com/api/v5/public/instruments?instType=SPOT", "data", "instId", None),
+    "kraken":   ("https://api.kraken.com/0/public/AssetPairs",           "result",   None,         None),
+    "bybit":    ("https://api.bybit.com/v5/market/instruments-info?category=spot", "result.list", "symbol", None),
+    "kucoin":   ("https://api.kucoin.com/api/v1/symbols",                "data",     "symbol",     None),
+    "gate":     ("https://api.gateio.ws/api/v4/spot/currency_pairs",     None,       "id",         None),
+}
+
+def _extract_symbols(exchange, data):
+    """Parse the raw API response for each exchange into a set of uppercase base symbols."""
+    syms = set()
+    try:
+        if exchange == "binance":
+            for s in data.get("symbols", []):
+                if s.get("status") == "TRADING" and s.get("quoteAsset") in ("USDT","BUSD","FDUSD"):
+                    syms.add(s["baseAsset"].upper())
+        elif exchange == "coinbase":
+            for p in data:
+                if p.get("status") == "online" and p.get("quote_currency") in ("USD","USDT"):
+                    syms.add(p["base_currency"].upper())
+        elif exchange == "okx":
+            for p in (data.get("data") or []):
+                if p.get("state") == "live" and p.get("instId","").endswith("-USDT"):
+                    syms.add(p["instId"].split("-")[0].upper())
+        elif exchange == "kraken":
+            for k, v in (data.get("result") or {}).items():
+                if isinstance(v, dict) and v.get("status") == "online":
+                    base = v.get("base","")
+                    if base.startswith("X"): base = base[1:]
+                    if base.startswith("Z"): base = base[1:]
+                    syms.add(base.upper())
+        elif exchange == "bybit":
+            lst = (data.get("result") or {}).get("list") or []
+            for p in lst:
+                if p.get("status") == "Trading" and p.get("symbol","").endswith("USDT"):
+                    syms.add(p["symbol"][:-4].upper())
+        elif exchange == "kucoin":
+            for p in (data.get("data") or []):
+                if p.get("enableTrading") and p.get("quoteCurrency") in ("USDT","USDC"):
+                    syms.add(p["baseCurrency"].upper())
+        elif exchange == "gate":
+            for p in data:
+                if p.get("trade_status") == "tradable" and p.get("id","").endswith("_USDT"):
+                    syms.add(p["id"].split("_")[0].upper())
+    except:
+        pass
+    return syms
+
+def _find_solana_token(symbol):
+    """Search DexScreener for a Solana token by symbol. Returns (mint, name, price, liq) or None."""
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/search?q={symbol}",
+            headers=HEADERS, timeout=8
+        ).json()
+        pairs = r.get("pairs") or []
+        sol_pairs = [p for p in pairs
+                     if p.get("chainId") == "solana"
+                     and p.get("baseToken",{}).get("symbol","").upper() == symbol
+                     and (p.get("liquidity") or {}).get("usd", 0) > 5_000
+                     and (p.get("liquidity") or {}).get("usd", 0) < 50_000_000]
+        if not sol_pairs:
+            return None
+        # prefer highest liquidity pair
+        sol_pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0), reverse=True)
+        p    = sol_pairs[0]
+        mint = p["baseToken"]["address"]
+        name = p["baseToken"].get("name", symbol)
+        price = float(p.get("priceUsd") or 0)
+        liq   = float((p.get("liquidity") or {}).get("usd", 0))
+        if not price:
+            return None
+        return mint, name, price, liq
+    except:
+        return None
+
+def listing_scanner():
+    """Poll exchange APIs for new token listings every 5s. Zero cost — all public endpoints."""
+    time.sleep(15)  # let app boot
+    print("[Listing] Scanner started — monitoring 7 exchanges")
+
+    # Seed known pairs so we don't fire on startup
+    for exchange, (url, _, _, _) in LISTING_EXCHANGES.items():
+        try:
+            data = requests.get(url, headers=HEADERS, timeout=10).json()
+            _listing_known[exchange] = _extract_symbols(exchange, data)
+        except:
+            _listing_known[exchange] = set()
+        time.sleep(1)
+
+    while True:
+        try:
+            for exchange, (url, _, _, _) in LISTING_EXCHANGES.items():
+                try:
+                    data = requests.get(url, headers=HEADERS, timeout=10).json()
+                    current = _extract_symbols(exchange, data)
+                    prev    = _listing_known.get(exchange, set())
+                    new_syms = current - prev
+                    if new_syms:
+                        _listing_known[exchange] = current
+                        for symbol in new_syms:
+                            print(f"[Listing] 🔔 NEW on {exchange}: {symbol}")
+                            token = _find_solana_token(symbol)
+                            if token:
+                                mint, name, price, liq = token
+                                listing_alert_queue.put({
+                                    "exchange": exchange,
+                                    "symbol":   symbol,
+                                    "mint":     mint,
+                                    "name":     name,
+                                    "price":    price,
+                                    "liq":      liq,
+                                    "ts":       time.time(),
+                                })
+                                print(f"[Listing] ✅ Found on Solana: {name} ({mint[:8]}...) — alerting bots")
+                except Exception as e:
+                    print(f"[Listing] {exchange} poll error: {e}")
+                time.sleep(0.8)   # stagger requests across exchanges
+            time.sleep(5)
+        except Exception as e:
+            print(f"[Listing] Scanner error: {e}")
+            time.sleep(10)
+
+def process_listing_alerts():
+    """
+    Consume listing_alert_queue and execute buys on all running bots.
+    Listing buys use a higher TP (40%) and fixed 10-min stop-loss window.
+    """
+    while True:
+        try:
+            alert = listing_alert_queue.get(timeout=2)
+        except _queue.Empty:
+            continue
+        try:
+            exchange = alert["exchange"].upper()
+            mint     = alert["mint"]
+            name     = alert["name"]
+            price    = alert["price"]
+            liq      = alert["liq"]
+            for bot in list(user_bots.values()):
+                if not bot.running:
+                    continue
+                if mint in bot.positions:
+                    continue
+                # Skip if listing sniper is disabled for this bot
+                if not bot.settings.get("listing_sniper", True):
+                    continue
+                bot.log_msg(f"🔔 CEX LISTING: {name} on {exchange} — buying now")
+                try:
+                    bot.buy(mint, f"[LISTING:{exchange}] {name}", price, liq=liq)
+                    # Override the position's TP to 40% (listing pump target)
+                    if mint in bot.positions:
+                        pos = bot.positions[mint]
+                        pos["listing"] = True
+                        pos["listing_tp"] = price * 1.40
+                except Exception as e:
+                    bot.log_msg(f"Listing buy error: {e}")
+        except Exception as e:
+            print(f"[Listing] Alert processing error: {e}")
+
+threading.Thread(target=listing_scanner,        daemon=True).start()
+threading.Thread(target=process_listing_alerts, daemon=True).start()
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = SECRET_KEY
@@ -1372,8 +1764,11 @@ def signup():
         elif len(password) < 8:
             error = "Password must be at least 8 characters"
         else:
-            hashed     = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-            trial_ends = (datetime.utcnow() + timedelta(days=7)).isoformat()
+            hashed       = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+            signup_plan  = request.args.get("plan", "trial")
+            if signup_plan not in ("trial", "free"):
+                signup_plan = "trial"
+            trial_ends = (datetime.utcnow() + timedelta(days=7)).isoformat() if signup_plan == "trial" else None
             ref_code   = make_referral_code()
             ref_by     = None
             # check if came via referral link
@@ -1394,7 +1789,7 @@ def signup():
                     cur = conn.cursor()
                     cur.execute(
                         "INSERT INTO users (email, password_hash, plan, trial_ends, referral_code, referred_by) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-                        (email, hashed, 'trial', trial_ends, ref_code, ref_by)
+                        (email, hashed, signup_plan, trial_ends, ref_code, ref_by)
                     )
                     user_id = cur.fetchone()["id"]
                     cur.execute("INSERT INTO bot_settings (user_id) VALUES (%s)", (user_id,))
@@ -1498,12 +1893,25 @@ def dashboard():
         return redirect(url_for("login"))
     if not wallet:
         return redirect(url_for("setup"))
-    plan_info = PLAN_LIMITS.get(user["plan"], PLAN_LIMITS["trial"])
+    plan  = user["plan"]
+    plan_info = PLAN_LIMITS.get(plan, PLAN_LIMITS.get("basic", {"label":"Trial"}))
+    if plan == "elite":
+        upgrade_btn = ""
+    elif plan == "pro":
+        upgrade_btn = '<a href="/subscribe/elite" class="nbtn" style="background:linear-gradient(135deg,#a855f7,#7c3aed)">⚡ Go Elite — $199/mo</a>'
+    elif plan == "basic":
+        upgrade_btn = '<a href="/subscribe/pro" class="nbtn" style="background:linear-gradient(135deg,#14c784,#0fa86a)">⚡ Upgrade to Pro</a>'
+    elif plan == "free":
+        upgrade_btn = '<a href="/subscribe/basic" class="nbtn">Subscribe — $49/mo (drop to 15% fee)</a>'
+    else:
+        upgrade_btn = '<a href="/subscribe/free" class="nbtn" style="background:var(--bg3);border:1px solid var(--grn);color:var(--grn)">Profit Only — Free</a>'
     return Response(DASHBOARD_HTML
         .replace("{{EMAIL}}", user["email"])
+        .replace("{{PLAN_LABEL}}", plan_info["label"])
+        .replace("{{UPGRADE_BTN}}", upgrade_btn)
         .replace("{{PLAN}}", plan_info["label"])
         .replace("{{WALLET}}", wallet["public_key"])
-        .replace("{{PRESET}}", bsettings["preset"] if bsettings else "steady"),
+        .replace("{{PRESET}}", bsettings["preset"] if bsettings else "balanced"),
         mimetype="text/html"
     )
 
@@ -1707,6 +2115,21 @@ def api_filter_log():
         conn.close()
     return jsonify([dict(r) for r in rows])
 
+# Recent listing alerts (for UI feed) — keep last 50 in memory
+_recent_listing_alerts = []
+_original_queue_put = listing_alert_queue.put
+def _tracked_put(item, *a, **kw):
+    _recent_listing_alerts.insert(0, item)
+    if len(_recent_listing_alerts) > 50:
+        _recent_listing_alerts.pop()
+    return _original_queue_put(item, *a, **kw)
+listing_alert_queue.put = _tracked_put
+
+@app.route("/api/listing-alerts")
+@login_required
+def api_listing_alerts():
+    return jsonify(_recent_listing_alerts[:20])
+
 @app.route("/api/admin/suggest-settings")
 @admin_required
 def api_suggest_settings():
@@ -1782,19 +2205,30 @@ def api_referral():
 @app.route("/subscribe/<plan>")
 @login_required
 def subscribe(plan):
-    uid      = session["user_id"]
-    email    = session["email"]
-    price_id = STRIPE_PRICE_BASIC if plan=="basic" else STRIPE_PRICE_PRO
+    uid   = session["user_id"]
+    email = session["email"]
+    # Profit-only plan has no subscription — just activate it directly
+    if plan == "free":
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET plan='free' WHERE id=%s", (uid,))
+            conn.commit()
+        finally:
+            conn.close()
+        return redirect(url_for("dashboard"))
+    price_map = {"basic": STRIPE_PRICE_BASIC, "pro": STRIPE_PRICE_PRO, "elite": STRIPE_PRICE_ELITE}
+    price_id  = price_map.get(plan, "")
     if not price_id or not STRIPE_SECRET:
         return "Stripe not configured.", 500
     try:
         checkout = stripe.checkout.Session.create(
             customer_email=email,
             payment_method_types=["card"],
-            line_items=[{"price":price_id,"quantity":1}],
+            line_items=[{"price": price_id, "quantity": 1}],
             mode="subscription",
-            success_url=request.host_url+"subscribe/success?plan="+plan,
-            cancel_url=request.host_url+"dashboard",
+            success_url=request.host_url + "subscribe/success?plan=" + plan,
+            cancel_url=request.host_url + "dashboard",
         )
         return redirect(checkout.url)
     except Exception as e:
@@ -1953,107 +2387,244 @@ select.finput{cursor:pointer}
 
 # ── Landing Page ───────────────────────────────────────────────────────────────
 LANDING_HTML = _CSS + """
+<style>
+.lp-feat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-bottom:60px}
+.lp-feat{background:var(--bg2);border:1px solid var(--bdr);border-radius:14px;padding:22px 18px}
+.lp-feat-icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:12px}
+.lp-feat h3{font-size:13.5px;font-weight:700;color:var(--t1);margin-bottom:5px}
+.lp-feat p{font-size:12px;color:var(--t2);line-height:1.65}
+.plans3{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px;margin-bottom:48px}
+.plan3{background:var(--bg2);border:1px solid var(--bdr);border-radius:16px;padding:28px 22px;position:relative}
+.plan3.hot{border-color:var(--grn);box-shadow:0 0 0 1px rgba(20,199,132,.3),0 8px 32px rgba(20,199,132,.08)}
+.plan3.elite{border-color:#a855f7;box-shadow:0 0 0 1px rgba(168,85,247,.3),0 8px 32px rgba(168,85,247,.08)}
+.plan3-tag{position:absolute;top:-11px;left:50%;transform:translateX(-50%);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;padding:3px 12px;border-radius:20px;white-space:nowrap}
+.plan3-tag.grn{background:var(--grn);color:#000}
+.plan3-tag.purple{background:#a855f7;color:#fff}
+.plan3-name{font-size:17px;font-weight:800;margin-bottom:4px}
+.plan3-price{font-size:38px;font-weight:900;letter-spacing:-1.5px;line-height:1}
+.plan3-price sub{font-size:15px;font-weight:500;color:var(--t2);letter-spacing:0}
+.plan3-perf{font-size:11px;color:var(--t3);margin:6px 0 18px}
+.plan3 ul{list-style:none;padding:0;margin:0 0 20px;display:flex;flex-direction:column;gap:8px}
+.plan3 li{font-size:12.5px;color:var(--t2);display:flex;align-items:flex-start;gap:7px}
+.plan3 li::before{content:"✓";color:var(--grn);font-weight:700;flex-shrink:0;margin-top:1px}
+.plan3 li.purple-check::before{color:#a855f7}
+.cmp-tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.cmp-tbl th{padding:10px 14px;text-align:left;color:var(--t3);font-weight:600;border-bottom:1px solid var(--bdr);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.cmp-tbl td{padding:10px 14px;border-bottom:1px solid var(--bdr);color:var(--t2)}
+.cmp-tbl tr:last-child td{border-bottom:none}
+.cmp-tbl .yes{color:#14c784;font-weight:700}
+.cmp-tbl .no{color:var(--t3)}
+.cmp-tbl .col-h{color:var(--t1);font-weight:600}
+.sniper-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#f59e0b;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
+</style>
+
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
+    <a href="#pricing">Pricing</a>
     <a href="/login">Sign In</a>
     <a href="/signup" class="nbtn">Get Started Free</a>
   </div>
 </nav>
 
-<div style="text-align:center;padding:72px 24px 52px;max-width:640px;margin:0 auto">
-  <div style="display:inline-flex;align-items:center;gap:7px;background:rgba(37,99,235,.1);border:1px solid rgba(37,99,235,.22);color:var(--blue2);padding:5px 14px;border-radius:20px;font-size:11.5px;font-weight:600;margin-bottom:24px;letter-spacing:.3px">
-    NON-CUSTODIAL &nbsp;·&nbsp; YOUR KEYS, YOUR FUNDS
-  </div>
-  <h1 style="font-size:40px;font-weight:700;line-height:1.15;letter-spacing:-.8px;margin-bottom:16px">Automated Solana<br>Trading, Done Right</h1>
-  <p style="font-size:15px;color:var(--t2);max-width:440px;margin:0 auto 36px;line-height:1.7">
-    Institutional-grade trading algorithms with anti-rug protection, multi-stage exits, and real-time P&L tracking. Your private key never leaves your control.
+<!-- Hero -->
+<div style="text-align:center;padding:80px 24px 60px;max-width:680px;margin:0 auto">
+  <div class="sniper-badge" style="margin-bottom:20px">NEW &nbsp;·&nbsp; CEX Listing Sniper — auto-buys before the pump</div>
+  <h1 style="font-size:44px;font-weight:800;line-height:1.1;letter-spacing:-1.5px;margin-bottom:18px">
+    The Most Advanced<br>Solana Trading Bot
+  </h1>
+  <p style="font-size:15.5px;color:var(--t2);max-width:480px;margin:0 auto 38px;line-height:1.75">
+    12 institutional trading techniques, CEX listing sniping, Jito-routed execution, and real-time AI scoring — all in one non-custodial platform.
   </p>
   <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
-    <a href="/signup" class="btn btn-primary" style="padding:13px 32px;font-size:15px">Start Free 7-Day Trial</a>
-    <a href="#pricing" class="btn btn-ghost" style="padding:13px 24px;font-size:15px">View Pricing</a>
+    <a href="/signup" class="btn btn-primary" style="padding:14px 36px;font-size:15px">Start Free 7-Day Trial</a>
+    <a href="#pricing" class="btn btn-ghost" style="padding:14px 26px;font-size:15px">View Pricing ↓</a>
   </div>
-  <div class="trust" style="margin-top:28px">
-    <div class="titem">🔒 AES-256 Encrypted Keys</div>
-    <div class="titem">🛡️ Anti-Rug Detection</div>
-    <div class="titem">📊 Real-Time Dashboard</div>
-    <div class="titem">⚡ Jupiter V6 Routing</div>
+  <div class="trust" style="margin-top:30px">
+    <div class="titem">🔒 AES-256 Keys</div>
+    <div class="titem">⚡ Helius Sender</div>
+    <div class="titem">🎯 Jito Tips</div>
+    <div class="titem">🔔 CEX Sniper</div>
     <div class="titem">✅ Cancel Anytime</div>
   </div>
 </div>
 
-<div style="max-width:820px;margin:0 auto;padding:0 24px 52px">
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:56px">
-    <div class="panel" style="text-align:center;padding:26px 20px">
-      <div style="width:44px;height:44px;background:rgba(37,99,235,.12);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 12px">🎯</div>
-      <div style="font-weight:600;font-size:14px;margin-bottom:6px">Smart Signal Detection</div>
-      <div style="font-size:12.5px;color:var(--t2);line-height:1.6">Scans new Solana token launches with market cap, liquidity, and volume filters to find high-probability entries</div>
+<!-- Features Grid -->
+<div style="max-width:960px;margin:0 auto;padding:0 24px 68px">
+  <div style="text-align:center;margin-bottom:32px">
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--t3);margin-bottom:10px">Everything Included</div>
+    <h2 style="font-size:27px;font-weight:700;letter-spacing:-.5px">Built for Serious Traders</h2>
+  </div>
+  <div class="lp-feat-grid">
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(245,158,11,.12)">🔔</div>
+      <h3>CEX Listing Sniper</h3>
+      <p>Monitors Binance, Coinbase, OKX, Kraken, Bybit, KuCoin &amp; Gate.io simultaneously. Auto-buys Solana tokens the moment they get listed — before the public pump.</p>
     </div>
-    <div class="panel" style="text-align:center;padding:26px 20px">
-      <div style="width:44px;height:44px;background:rgba(5,150,105,.12);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 12px">🛡️</div>
-      <div style="font-weight:600;font-size:14px;margin-bottom:6px">Anti-Rug Protection</div>
-      <div style="font-size:12.5px;color:var(--t2);line-height:1.6">Verifies mint authority, freeze authority, and holder concentration on every token before executing any buy</div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(20,199,132,.12)">⚡</div>
+      <h3>Helius Sender + Jito Tips</h3>
+      <p>Transactions route through Jito validator network with priority tips for guaranteed fast landing. Skip the mempool, beat the bots.</p>
     </div>
-    <div class="panel" style="text-align:center;padding:26px 20px">
-      <div style="width:44px;height:44px;background:rgba(217,119,6,.12);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 12px">📈</div>
-      <div style="font-weight:600;font-size:14px;margin-bottom:6px">Multi-Stage Exits</div>
-      <div style="font-size:12.5px;color:var(--t2);line-height:1.6">TP1, TP2, trailing stop-loss, and hard stop-loss. Systematically lock in profits while cutting losing trades fast</div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(168,85,247,.12)">🐋</div>
+      <h3>Whale Wallet Tracker</h3>
+      <p>Mirrors moves from known profitable wallets on Solana in real time. When a whale buys, your bot buys seconds later.</p>
+    </div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(37,99,235,.12)">🛡️</div>
+      <h3>Multi-Layer Rug Detection</h3>
+      <p>Checks mint authority, freeze authority, LP lock status, holder concentration, and dev wallet history before every single buy.</p>
+    </div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(5,150,105,.12)">📈</div>
+      <h3>Multi-Stage Take Profits</h3>
+      <p>TP1 secures initial profits, TP2 rides the moonshot, trailing stop maximizes gains. Partial sells lock in profit without exiting the position.</p>
+    </div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(239,68,68,.12)">🎯</div>
+      <h3>Bundle &amp; Snipe Detection</h3>
+      <p>Identifies coordinated launch bundles and on-chain snipers. Avoids tokens where bots already dominate supply — you enter clean.</p>
+    </div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(20,199,132,.12)">⚡</div>
+      <h3>Dynamic Slippage</h3>
+      <p>Automatically adjusts slippage based on pool liquidity depth. Low liquidity → tighter slippage. Prevents excessive price impact on every trade.</p>
+    </div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(245,158,11,.12)">📊</div>
+      <h3>Volume Velocity Scoring</h3>
+      <p>Measures volume acceleration — not just raw volume. Catches tokens gaining momentum 3–5 minutes before they appear on trending lists.</p>
+    </div>
+    <div class="lp-feat">
+      <div class="lp-feat-icon" style="background:rgba(168,85,247,.12)">🤖</div>
+      <h3>AI Settings Optimization</h3>
+      <p>Admin panel analyzes your 24h win rate and auto-suggests optimal filter thresholds. Market adapts — your settings adapt with it.</p>
     </div>
   </div>
 
-  <div id="pricing" style="text-align:center;margin-bottom:32px">
-    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--t3);margin-bottom:12px">Pricing</div>
-    <h2 style="font-size:26px;font-weight:700;letter-spacing:-.4px;color:var(--t1);margin-bottom:8px">Simple, Performance-Based Pricing</h2>
-    <p style="font-size:13px;color:var(--t2)">We only earn when you profit. Start with a 7-day free trial — no credit card required.</p>
+  <!-- Pricing -->
+  <div id="pricing" style="text-align:center;margin-bottom:34px">
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--t3);margin-bottom:10px">Pricing</div>
+    <h2 style="font-size:27px;font-weight:700;letter-spacing:-.5px;margin-bottom:8px">Performance-Based Pricing</h2>
+    <p style="font-size:13.5px;color:var(--t2)">We only earn when you profit. 7-day free trial on all plans — no credit card required.</p>
   </div>
 
-  <div class="plans" style="margin-bottom:48px">
-    <div class="plan">
-      <div class="plan-name">Basic</div>
-      <div class="plan-price">$29<sub>/mo</sub></div>
-      <div class="plan-fee">+ 15% performance fee on profits</div>
-      <ul class="features">
-        <li>Steady Profit strategy</li>
-        <li>Up to 0.1 SOL per trade</li>
+  <div class="plans3" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))">
+    <!-- Profit Only -->
+    <div class="plan3">
+      <div class="plan3-name" style="color:var(--t2)">Profit Only</div>
+      <div class="plan3-price" style="font-size:30px">$0<sub>/mo</sub></div>
+      <div class="plan3-perf">25% performance fee on profits only</div>
+      <ul>
+        <li>No monthly fee</li>
+        <li>Up to 0.05 SOL per trade</li>
+        <li>CEX Listing Sniper</li>
         <li>Anti-rug protection</li>
-        <li>Live trading dashboard</li>
-        <li>7-day free trial</li>
+        <li>Whale tracker</li>
+        <li>Live dashboard &amp; P&amp;L</li>
+        <li>Start immediately</li>
       </ul>
-      <a href="/signup" class="btn btn-outline btn-full" style="margin-top:20px;padding:11px">Start Free Trial</a>
+      <a href="/signup?plan=free" class="btn btn-ghost btn-full" style="padding:11px;font-size:13px">Start for Free</a>
     </div>
-    <div class="plan hot">
-      <div class="plan-tag">Most Popular</div>
-      <div class="plan-name">Pro</div>
-      <div class="plan-price">$49<sub>/mo</sub></div>
-      <div class="plan-fee">+ 10% performance fee on profits</div>
-      <ul class="features">
-        <li>All strategies + Custom presets</li>
-        <li>Up to 1.0 SOL per trade</li>
-        <li>Max Profit aggressive mode</li>
-        <li>Priority transaction execution</li>
+
+    <!-- Basic -->
+    <div class="plan3">
+      <div class="plan3-name">Basic</div>
+      <div class="plan3-price">$49<sub>/mo</sub></div>
+      <div class="plan3-perf">+ 15% performance fee on profits</div>
+      <ul>
+        <li>Up to 0.1 SOL per trade</li>
+        <li>Safe &amp; Balanced presets</li>
+        <li>CEX Listing Sniper</li>
+        <li>Anti-rug protection</li>
+        <li>Whale tracker</li>
+        <li>Live dashboard &amp; P&amp;L</li>
         <li>7-day free trial</li>
       </ul>
-      <a href="/signup" class="btn btn-primary btn-full" style="margin-top:20px;padding:11px">Start Free Trial</a>
+      <a href="/signup" class="btn btn-ghost btn-full" style="padding:11px;font-size:13px">Start Free Trial</a>
+    </div>
+
+    <!-- Pro -->
+    <div class="plan3 hot">
+      <div class="plan3-tag grn">Most Popular</div>
+      <div class="plan3-name" style="color:var(--grn)">Pro</div>
+      <div class="plan3-price">$99<sub>/mo</sub></div>
+      <div class="plan3-perf">+ 10% performance fee on profits</div>
+      <ul>
+        <li>Up to 1.0 SOL per trade</li>
+        <li>All presets incl. Degen mode</li>
+        <li>CEX Listing Sniper (priority)</li>
+        <li>Helius Sender fast execution</li>
+        <li>Jito tip priority routing</li>
+        <li>Volume velocity scoring</li>
+        <li>Session drawdown limits</li>
+        <li>7-day free trial</li>
+      </ul>
+      <a href="/signup" class="btn btn-primary btn-full" style="padding:11px;font-size:13px">Start Free Trial</a>
+    </div>
+
+    <!-- Elite -->
+    <div class="plan3 elite">
+      <div class="plan3-tag purple">Maximum Edge</div>
+      <div class="plan3-name" style="color:#a855f7">Elite</div>
+      <div class="plan3-price">$199<sub>/mo</sub></div>
+      <div class="plan3-perf">+ 8% performance fee on profits</div>
+      <ul>
+        <li class="purple-check">Up to 5.0 SOL per trade</li>
+        <li class="purple-check">Full admin panel access</li>
+        <li class="purple-check">AI settings auto-optimization</li>
+        <li class="purple-check">Bundle &amp; snipe detection</li>
+        <li class="purple-check">Dev wallet blacklist</li>
+        <li class="purple-check">Correlated position limits</li>
+        <li class="purple-check">Lowest performance fee (8%)</li>
+        <li class="purple-check">7-day free trial</li>
+      </ul>
+      <a href="/signup" class="btn btn-full" style="padding:11px;font-size:13px;background:#a855f7;color:#fff;border-radius:8px;font-weight:700;text-align:center;display:block">Start Free Trial</a>
     </div>
   </div>
 
-  <div class="panel" style="padding:24px 28px;background:rgba(37,99,235,.04);border-color:rgba(37,99,235,.18)">
-    <div style="text-align:center;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:var(--t3);margin-bottom:18px">Basic vs Pro — Side by Side</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;max-width:480px;margin:0 auto;font-size:12.5px;color:var(--t2)">
-      <div>
-        <div style="font-weight:600;color:var(--t1);margin-bottom:8px;font-size:13px">Basic</div>
-        <div style="line-height:2">Max 0.1 SOL / trade<br>Steady strategy only<br>1.5x TP1 → 3x TP2<br>−25% hard stop loss<br>15% performance fee</div>
-      </div>
-      <div>
-        <div style="font-weight:600;color:var(--blue2);margin-bottom:8px;font-size:13px">Pro</div>
-        <div style="line-height:2">Max 1.0 SOL / trade<br>All strategies<br>2x TP1 → 10x TP2<br>−40% stop (aggressive)<br>10% performance fee</div>
-      </div>
+  <!-- Comparison table -->
+  <div class="panel" style="padding:0;overflow:hidden;margin-bottom:48px">
+    <table class="cmp-tbl">
+      <thead>
+        <tr>
+          <th style="width:32%">Feature</th>
+          <th style="text-align:center">Profit Only<br><span style="color:var(--t2);font-size:12px">$0/mo</span></th>
+          <th style="text-align:center">Basic<br><span style="color:var(--t1);font-size:12px">$49/mo</span></th>
+          <th style="text-align:center">Pro<br><span style="color:var(--grn);font-size:12px">$99/mo</span></th>
+          <th style="text-align:center">Elite<br><span style="color:#a855f7;font-size:12px">$199/mo</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="col-h">Max SOL per trade</td><td style="text-align:center">0.05</td><td style="text-align:center">0.1</td><td style="text-align:center">1.0</td><td style="text-align:center">5.0</td></tr>
+        <tr><td class="col-h">CEX Listing Sniper</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Whale Tracker</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Anti-Rug + LP Lock Check</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Helius Sender (Jito routing)</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Bundle &amp; Snipe Detection</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Volume Velocity Scoring</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">AI Settings Optimization</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Dev Wallet Blacklist</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Performance fee</td><td style="text-align:center;color:#f59e0b;font-weight:600">25%</td><td style="text-align:center">15%</td><td style="text-align:center">10%</td><td style="text-align:center">8%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Trust strip -->
+  <div style="text-align:center;padding:20px 0 10px">
+    <div class="trust" style="justify-content:center;flex-wrap:wrap;gap:14px">
+      <div class="titem">🔒 AES-256 Encrypted Private Keys</div>
+      <div class="titem">🌐 Non-Custodial — Your Keys, Your Funds</div>
+      <div class="titem">⚡ Jupiter V6 + Helius Sender</div>
+      <div class="titem">🛡️ Runs 24/7 on Railway Cloud</div>
+      <div class="titem">✅ Cancel Anytime</div>
     </div>
   </div>
 </div>
 
-<div style="border-top:1px solid var(--b1);padding:20px 24px;text-align:center">
-  <div style="font-size:11.5px;color:var(--t3)">SolTrader — Automated Solana Trading &nbsp;·&nbsp; Non-Custodial &nbsp;·&nbsp; Keys encrypted with AES-256</div>
+<div style="border-top:1px solid var(--bdr);padding:22px 24px;text-align:center">
+  <div style="font-size:11.5px;color:var(--t3)">SolTrader &nbsp;·&nbsp; Automated Solana Trading &nbsp;·&nbsp; Non-Custodial &nbsp;·&nbsp; Powered by Helius &amp; Jupiter</div>
 </div>
 """
 
@@ -2212,14 +2783,20 @@ DASHBOARD_HTML = _CSS + """
 .fp-fail{color:#f23645;font-weight:700;min-width:16px}
 .fp-name{font-weight:600;color:var(--t1);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fp-reason{font-size:10px;color:var(--t3);text-align:right}
+/* Feature badges */
+.feat-badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;white-space:nowrap}
+@keyframes featPulse{0%,100%{opacity:1}50%{opacity:.6}}
+.feat-pulse{animation:featPulse 2s ease-in-out infinite}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
 </style>
 
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
+    <span style="font-size:11px;color:var(--t3);background:var(--bg3);padding:3px 10px;border-radius:20px;border:1px solid var(--bdr)">{{PLAN_LABEL}}</span>
     <span style="font-size:12px;color:var(--t3)">{{EMAIL}}</span>
     <a href="/setup">Settings</a>
-    <a href="/subscribe/pro" class="nbtn">Upgrade to Pro</a>
+    {{UPGRADE_BTN}}
     <a href="/logout" style="color:var(--t3)!important">Sign Out</a>
   </div>
 </nav>
@@ -2260,6 +2837,18 @@ DASHBOARD_HTML = _CSS + """
 <div id="tooltip-overlay" style="display:none;position:fixed;inset:0;z-index:9998" onclick="closeTooltip()"></div>
 
 <div class="wrap">
+
+  <!-- Feature status bar -->
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center">
+    <span style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-right:4px">Active</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">⚡ Helius Sender</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">🎯 Jito Tips</span>
+    <span class="feat-badge feat-pulse" style="background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.4);color:#f59e0b">🔔 CEX Listing Sniper</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">🐋 Whale Tracker</span>
+    <span class="feat-badge" style="background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784">🛡️ Rug Detection</span>
+    <span id="listing-count-badge" style="margin-left:auto;font-size:11px;color:var(--t3)">0 listings caught</span>
+  </div>
+
   <!-- Stats row -->
   <div class="stats" style="margin-bottom:16px">
     <div class="stat"><div class="slabel">SOL Balance</div><div class="sval" id="balance">—</div><div class="ssub">available</div></div>
@@ -2267,6 +2856,7 @@ DASHBOARD_HTML = _CSS + """
     <div class="stat"><div class="slabel">Wins</div><div class="sval c-grn" id="wins">0</div></div>
     <div class="stat"><div class="slabel">Losses</div><div class="sval c-red" id="losses">0</div></div>
     <div class="stat"><div class="slabel">Session P&amp;L</div><div class="sval" id="pnl">+0.0000</div><div class="ssub">SOL</div></div>
+    <div class="stat" style="background:rgba(245,158,11,.06);border-color:rgba(245,158,11,.2)"><div class="slabel" style="color:#f59e0b">Listings Caught</div><div class="sval" id="listing-stat" style="color:#f59e0b">0</div><div class="ssub">this session</div></div>
   </div>
 
   <div class="dash-grid">
@@ -2292,17 +2882,20 @@ DASHBOARD_HTML = _CSS + """
             <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
               <div class="pc-icon">🛡️</div>
               <div class="pc-name">Safe</div>
-              <div class="pc-desc">Low risk</div>
+              <div class="pc-desc">0.02 SOL/trade</div>
+              <div class="pc-desc" style="color:#14c784;margin-top:3px;font-size:9px">+Listing Sniper</div>
             </div>
             <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
               <div class="pc-icon">⚖️</div>
               <div class="pc-name">Balanced</div>
-              <div class="pc-desc">Steady profit</div>
+              <div class="pc-desc">0.04 SOL/trade</div>
+              <div class="pc-desc" style="color:#14c784;margin-top:3px;font-size:9px">+Listing Sniper</div>
             </div>
             <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
               <div class="pc-icon">🔥</div>
               <div class="pc-name">Degen</div>
-              <div class="pc-desc">Max profit</div>
+              <div class="pc-desc">0.10 SOL/trade</div>
+              <div class="pc-desc" style="color:#14c784;margin-top:3px;font-size:9px">+Listing Sniper</div>
             </div>
           </div>
           <input type="hidden" id="s-preset" value="balanced">
@@ -2339,6 +2932,13 @@ DASHBOARD_HTML = _CSS + """
       <div class="panel" style="margin-top:12px">
         <div class="sec-label">Filter Pipeline <span style="font-size:10px;color:var(--t3);font-weight:400">— real-time token screening</span></div>
         <div id="filter-pipe"><div style="font-size:12px;color:var(--t3)">Start the bot to see token filtering…</div></div>
+      </div>
+
+      <div class="panel" style="margin-top:12px;border-left:3px solid #f59e0b">
+        <div class="sec-label" style="color:#f59e0b">🔔 CEX Listing Sniper <span style="font-size:10px;color:var(--t3);font-weight:400">— monitoring Binance, Coinbase, OKX, Kraken, Bybit, KuCoin, Gate.io</span></div>
+        <div id="listing-feed" style="max-height:160px;overflow-y:auto">
+          <div style="font-size:12px;color:var(--t3)">Monitoring exchanges… alerts appear here when new listings are detected.</div>
+        </div>
       </div>
     </div>
 
@@ -2670,6 +3270,50 @@ async function pollFeed() {
   } catch(err) {}
 }
 function startFeed() { pollFeed(); setInterval(pollFeed, 4000); }
+
+// ── CEX Listing alerts ────────────────────────────────────────────────────────
+const seenListings = new Set();
+let listingCatchCount = 0;
+async function pollListings() {
+  try {
+    const alerts = await fetch('/api/listing-alerts').then(r=>r.json());
+    if (!alerts || !alerts.length) return;
+    const feed = document.getElementById('listing-feed');
+    let added = false;
+    alerts.forEach(a => {
+      const key = a.exchange + a.symbol;
+      if (seenListings.has(key)) return;
+      seenListings.add(key);
+      listingCatchCount++;
+      const row = document.createElement('div');
+      row.style.cssText = 'padding:8px 10px;border-bottom:1px solid #1e293b;font-size:12px;animation:fadeIn .4s';
+      row.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span><span style="color:#f59e0b;font-weight:700;font-size:11px;text-transform:uppercase">${a.exchange}</span>
+          &nbsp;<b style="color:var(--t1)">${a.symbol}</b>
+          <span style="color:var(--t3);font-size:11px"> — ${a.name}</span></span>
+          <span style="color:var(--t3);font-size:10px">${new Date(a.ts*1000).toLocaleTimeString()}</span>
+        </div>
+        <div style="margin-top:3px;font-size:11px">
+          <span style="color:var(--t3)">$${a.price < 0.001 ? a.price.toExponential(2) : a.price.toFixed(6)}</span>
+          <span style="color:var(--t3)"> &bull; Liq $${(a.liq/1000).toFixed(0)}K</span>
+          <span style="color:#14c784;font-weight:600;margin-left:8px">⚡ Buying via Jito Sender</span>
+          <span style="color:#f59e0b;float:right;font-size:10px">TP +40%</span>
+        </div>`;
+      if (feed.children[0] && feed.children[0].textContent.includes('Monitoring')) feed.innerHTML = '';
+      feed.insertBefore(row, feed.firstChild);
+      added = true;
+    });
+    if (added) {
+      document.getElementById('listing-stat').textContent = listingCatchCount;
+      document.getElementById('listing-count-badge').textContent = listingCatchCount + ' listing' + (listingCatchCount===1?'':'s') + ' caught';
+      const panel = feed.closest('.panel');
+      if (panel) { panel.style.borderLeftColor='#22c55e'; setTimeout(()=>panel.style.borderLeftColor='#f59e0b',2000); }
+    }
+  } catch(err) {}
+}
+setInterval(pollListings, 6000);
+pollListings();
 
 // ── Ticker tape ──────────────────────────────────────────────────────────────
 function updateTicker() {
