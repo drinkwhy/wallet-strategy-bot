@@ -8,6 +8,7 @@ import time
 import os
 import base64
 import json
+import secrets
 import requests
 import base58
 import websocket
@@ -16,10 +17,32 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from flask import Flask, Response, jsonify, request
 
-load_dotenv(dotenv_path=os.path.join(os.path.expanduser("~"), "Desktop", ".env"))
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-HELIUS_RPC  = os.getenv("HELIUS_RPC")
+def load_environment():
+    env_paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.expanduser("~"), "Desktop", ".env"),
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+def require_env(name):
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} environment variable is required.")
+    return value
+
+
+load_environment()
+
+PRIVATE_KEY = require_env("PRIVATE_KEY")
+HELIUS_RPC  = require_env("HELIUS_RPC")
+DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5000"))
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
 
 keypair = Keypair.from_bytes(base58.b58decode(PRIVATE_KEY))
 wallet  = str(keypair.pubkey())
@@ -491,8 +514,42 @@ def bot_loop():
             log(f"Loop error: {e}")
             time.sleep(10)
 
+def _is_loopback_request():
+    remote = request.remote_addr or ""
+    return remote in {"127.0.0.1", "::1", "localhost"}
+
+
+def _authorized_dashboard_request():
+    if DASHBOARD_USERNAME and DASHBOARD_PASSWORD:
+        auth = request.authorization
+        return bool(
+            auth
+            and secrets.compare_digest(auth.username or "", DASHBOARD_USERNAME)
+            and secrets.compare_digest(auth.password or "", DASHBOARD_PASSWORD)
+        )
+    return _is_loopback_request()
+
+
 # ── Flask API ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+
+
+@app.before_request
+def _dashboard_auth():
+    if _authorized_dashboard_request():
+        return None
+    resp = Response("Authentication required", status=401)
+    if DASHBOARD_USERNAME and DASHBOARD_PASSWORD:
+        resp.headers["WWW-Authenticate"] = 'Basic realm="SolTrader Dashboard"'
+    return resp
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
 
 @app.route("/")
 def index():
@@ -809,5 +866,5 @@ if __name__ == "__main__":
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
 
-    print("\n  Dashboard → http://localhost:5000\n")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print(f"\n  Dashboard → http://{DASHBOARD_HOST}:{DASHBOARD_PORT}\n")
+    app.run(host=DASHBOARD_HOST, port=DASHBOARD_PORT, debug=False)

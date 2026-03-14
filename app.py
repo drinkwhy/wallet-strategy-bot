@@ -8,7 +8,8 @@ Required .env variables:
   STRIPE_SECRET_KEY, STRIPE_PRICE_BASIC, STRIPE_PRICE_PRO, ADMIN_EMAIL
 """
 
-import os, threading, time, base64, json, requests, base58, secrets, hashlib
+import atexit
+import os, threading, time, base64, json, requests, base58, secrets, hashlib, random
 import psycopg2
 import psycopg2.extras
 import string
@@ -23,14 +24,34 @@ import bcrypt
 import stripe
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=os.path.join(os.path.expanduser("~"), "Desktop", ".env"))
+
+
+def load_environment():
+    # Prefer the project-local .env and keep the legacy Desktop path as fallback.
+    env_paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.expanduser("~"), "Desktop", ".env"),
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+load_environment()
+
+
+def require_env(name):
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} environment variable is required.")
+    return value
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SECRET_KEY         = os.getenv("SECRET_KEY", secrets.token_hex(32))
-_fkey              = os.getenv("FERNET_KEY")
-FERNET_KEY         = _fkey.encode() if _fkey else Fernet.generate_key()
-HELIUS_RPC         = os.getenv("HELIUS_RPC", "")
+SECRET_KEY         = require_env("SECRET_KEY")
+FERNET_KEY         = require_env("FERNET_KEY").encode()
+HELIUS_RPC         = require_env("HELIUS_RPC")
 STRIPE_SECRET       = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_PRICE_BASIC  = os.getenv("STRIPE_PRICE_BASIC", "")
 STRIPE_PRICE_PRO    = os.getenv("STRIPE_PRICE_PRO", "")
 STRIPE_PRICE_ELITE  = os.getenv("STRIPE_PRICE_ELITE", "")
@@ -51,6 +72,10 @@ stripe.api_key = STRIPE_SECRET
 SOL_MINT      = "So11111111111111111111111111111111111111112"
 PUMP_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 HEADERS       = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+SESSION_COOKIE_SECURE = os.getenv(
+    "SESSION_COOKIE_SECURE",
+    "1" if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("FLASK_ENV") == "production" else "0",
+) == "1"
 
 RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 PUMP_FUN    = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -62,6 +87,10 @@ PLAN_LIMITS = {
     "elite": {"max_buy_sol": 5.0,  "label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
     "trial": {"max_buy_sol": 0.05, "label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
 }
+PRICE_TO_PLAN = {}
+for _plan_name, _price_id in (("basic", STRIPE_PRICE_BASIC), ("pro", STRIPE_PRICE_PRO), ("elite", STRIPE_PRICE_ELITE)):
+    if _price_id:
+        PRICE_TO_PLAN[_price_id] = _plan_name
 
 PRESETS = {
     "safe": {
@@ -163,6 +192,7 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS perf_fees (
             id SERIAL PRIMARY KEY,
+            session_id TEXT UNIQUE,
             user_id INTEGER,
             pnl_sol REAL, fee_sol REAL, fee_usd REAL,
             charged INTEGER DEFAULT 0,
@@ -177,12 +207,15 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS filter_log (
             id SERIAL PRIMARY KEY,
+            user_id INTEGER,
             mint TEXT, name TEXT,
             passed INTEGER DEFAULT 0,
             reason TEXT,
             score INTEGER DEFAULT 0,
             ts TIMESTAMP DEFAULT NOW()
         )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
         conn.commit()
     finally:
         conn.close()
@@ -212,12 +245,20 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS is_running INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
+            "ALTER TABLE perf_fees ADD COLUMN IF NOT EXISTS session_id TEXT",
+            "ALTER TABLE filter_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
         ]
         for m in migrations:
             try:
                 cur.execute(m)
             except Exception:
                 conn.rollback()
+        try:
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_perf_fees_session_id ON perf_fees (session_id) WHERE session_id IS NOT NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
+        except Exception:
+            conn.rollback()
         try:
             cur.execute("""CREATE TABLE IF NOT EXISTS referrals (
                 id SERIAL PRIMARY KEY,
@@ -323,8 +364,6 @@ def send_daily_summaries():
         except Exception as e:
             print(f"Daily summary error: {e}")
 
-threading.Thread(target=send_daily_summaries, daemon=True).start()
-
 # ── Encryption ─────────────────────────────────────────────────────────────────
 def encrypt_key(private_key_b58: str) -> str:
     return fernet.encrypt(private_key_b58.encode()).decode()
@@ -336,6 +375,11 @@ def decrypt_key(encrypted: str) -> str:
 user_bots    = {}
 seen_tokens  = set()
 market_feed  = deque(maxlen=100)   # live token stream for market board
+BACKGROUND_WORKER_LOCK_ID = 48270431
+_background_workers_started = False
+_background_workers_lock = threading.Lock()
+_background_lock_conn = None
+_UNSET = object()
 
 def ai_score(info):
     """Score a token 0-100 based on multiple signals."""
@@ -512,7 +556,9 @@ class BotInstance:
         self.run_duration_min = run_duration_min
         self.profit_target    = profit_target_sol
         self.started_at       = time.time()
+        self.session_id       = secrets.token_hex(16)
         self.session_drawdown = 0.0
+        self.perf_fee_recorded = False
         self.filter_log       = deque(maxlen=50)   # real-time filter results for UI
 
     def log_msg(self, msg):
@@ -535,8 +581,8 @@ class BotInstance:
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO filter_log (mint,name,passed,reason,score) VALUES (%s,%s,%s,%s,%s)",
-                    (mint, name, int(passed), reason, score)
+                    "INSERT INTO filter_log (user_id,mint,name,passed,reason,score) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (self.user_id, mint, name, int(passed), reason, score)
                 )
                 conn.commit()
             finally:
@@ -684,15 +730,14 @@ class BotInstance:
         parsed  = urlparse(HELIUS_RPC)
         api_key = parse_qs(parsed.query).get("api-key", [""])[0]
         qs = f"?api-key={api_key}" if api_key else ""
-        # HTTP (not HTTPS) for backend — lower latency, no CORS overhead
         return [
-            f"http://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
-            f"http://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
-            f"http://lon-sender.helius-rpc.com/fast{qs}",  # London
-            f"http://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
-            f"http://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
-            f"http://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
-            f"http://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
+            f"https://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
+            f"https://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
+            f"https://lon-sender.helius-rpc.com/fast{qs}",  # London
+            f"https://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
+            f"https://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
+            f"https://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
+            f"https://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
         ]
 
     def sign_and_send(self, swap_tx_b64):
@@ -1041,8 +1086,11 @@ class BotInstance:
                 time.sleep(10)
 
     def record_perf_fee(self):
+        if self.perf_fee_recorded:
+            return
         pnl = self.stats["total_pnl_sol"]
         if pnl <= 0:
+            self.perf_fee_recorded = True
             return
         conn = db()
         try:
@@ -1054,6 +1102,7 @@ class BotInstance:
         finally:
             conn.close()
         if is_admin(email):
+            self.perf_fee_recorded = True
             return  # no performance fee on admin accounts
         pct = PLAN_LIMITS.get(effective_plan(plan, email), PLAN_LIMITS["basic"])["perf_fee"]
         fee_sol = pnl * pct
@@ -1061,12 +1110,17 @@ class BotInstance:
         try:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO perf_fees (user_id,pnl_sol,fee_sol) VALUES (%s,%s,%s)",
-                (self.user_id, pnl, fee_sol)
+                """
+                INSERT INTO perf_fees (session_id,user_id,pnl_sol,fee_sol)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                (self.session_id, self.user_id, pnl, fee_sol)
             )
             conn.commit()
         finally:
             conn.close()
+        self.perf_fee_recorded = True
         self.log_msg(f"Performance fee: {fee_sol:.4f} SOL ({int(pct*100)}% of {pnl:.4f} SOL profit) — collecting…")
         if FEE_WALLET:
             sig = send_sol(self.keypair, FEE_WALLET, fee_sol)
@@ -1075,7 +1129,7 @@ class BotInstance:
                 conn = db()
                 try:
                     cur = conn.cursor()
-                    cur.execute("UPDATE perf_fees SET charged=1 WHERE user_id=%s AND charged=0", (self.user_id,))
+                    cur.execute("UPDATE perf_fees SET charged=1 WHERE session_id=%s", (self.session_id,))
                     conn.commit()
                 finally:
                     conn.close()
@@ -1204,8 +1258,6 @@ def check_whale_wallets():
             print(f"Whale tracker error: {e}")
             time.sleep(30)
 
-threading.Thread(target=check_whale_wallets, daemon=True).start()
-
 def global_scanner():
     time.sleep(10)  # let app fully start first
     while True:
@@ -1278,8 +1330,6 @@ def global_scanner():
         except Exception as e:
             print(f"Scanner error: {e}")
             time.sleep(10)
-
-threading.Thread(target=global_scanner, daemon=True).start()
 
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
 def helius_pool_sniper():
@@ -1393,7 +1443,7 @@ def auto_restart_bots():
             cur = conn.cursor()
             cur.execute("""
                 SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
-                       w.encrypted_key, u.plan
+                       w.encrypted_key, u.plan, u.email
                 FROM bot_settings bs
                 JOIN wallets w ON w.user_id = bs.user_id
                 JOIN users u ON u.id = bs.user_id
@@ -1428,8 +1478,6 @@ def auto_restart_bots():
     except Exception:
         pass
 
-threading.Thread(target=auto_restart_bots, daemon=True).start()
-
 def warm_sender_connections():
     """Ping Helius Sender regional nodes every 30s to reduce cold-start latency."""
     from urllib.parse import urlparse, parse_qs
@@ -1437,8 +1485,8 @@ def warm_sender_connections():
     api_key = parse_qs(parsed.query).get("api-key", [""])[0]
     qs = f"?api-key={api_key}" if api_key else ""
     endpoints = [
-        f"http://slc-sender.helius-rpc.com/fast{qs}",
-        f"http://ewr-sender.helius-rpc.com/fast{qs}",
+        f"https://slc-sender.helius-rpc.com/fast{qs}",
+        f"https://ewr-sender.helius-rpc.com/fast{qs}",
     ]
     while True:
         for url in endpoints:
@@ -1446,8 +1494,6 @@ def warm_sender_connections():
                 requests.get(url.replace("/fast", "/ping"), timeout=4)
             except: pass
         time.sleep(30)
-
-threading.Thread(target=warm_sender_connections, daemon=True).start()
 
 # ── CEX Listing Sniper ─────────────────────────────────────────────────────────
 # Monitors 7 exchange public APIs (free, no auth) every 5s.
@@ -1620,12 +1666,93 @@ def process_listing_alerts():
         except Exception as e:
             print(f"[Listing] Alert processing error: {e}")
 
-threading.Thread(target=listing_scanner,        daemon=True).start()
-threading.Thread(target=process_listing_alerts, daemon=True).start()
+def _release_background_lock():
+    global _background_lock_conn
+    if _background_lock_conn is not None:
+        try:
+            _background_lock_conn.close()
+        except Exception:
+            pass
+        _background_lock_conn = None
+
+
+atexit.register(_release_background_lock)
+
+
+def _acquire_background_worker_lock():
+    global _background_lock_conn
+    if _background_lock_conn is not None:
+        return True
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (BACKGROUND_WORKER_LOCK_ID,))
+            locked = cur.fetchone()[0]
+        if not locked:
+            conn.close()
+            return False
+        _background_lock_conn = conn
+        return True
+    except Exception:
+        conn.close()
+        raise
+
+
+def ensure_background_workers_started():
+    global _background_workers_started
+    if _background_workers_started:
+        return
+    with _background_workers_lock:
+        if _background_workers_started:
+            return
+        if not _acquire_background_worker_lock():
+            return
+        worker_targets = [
+            send_daily_summaries,
+            check_whale_wallets,
+            global_scanner,
+            auto_restart_bots,
+            warm_sender_connections,
+            listing_scanner,
+            process_listing_alerts,
+        ]
+        for target in worker_targets:
+            threading.Thread(target=target, daemon=True).start()
+        _background_workers_started = True
+
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
+ensure_background_workers_started()
+
+
+@app.before_request
+def _before_request_security():
+    ensure_background_workers_started()
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.endpoint != "stripe_webhook":
+        origin = request.headers.get("Origin") or request.headers.get("Referer")
+        if origin:
+            allowed = request.host_url.rstrip("/")
+            if not origin.startswith(allowed):
+                return Response("Forbidden", status=403)
+
+
+@app.after_request
+def _apply_security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    if request.is_secure:
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return resp
 
 def login_required(f):
     @wraps(f)
@@ -1652,6 +1779,41 @@ def admin_required(f):
             return redirect(url_for("dashboard"))
         return f(*args, **kwargs)
     return decorated
+
+
+def _plan_from_stripe_subscription(subscription):
+    items = (((subscription or {}).get("items") or {}).get("data") or [])
+    for item in items:
+        price_id = ((item.get("price") or {}).get("id") or "").strip()
+        if price_id in PRICE_TO_PLAN:
+            return PRICE_TO_PLAN[price_id]
+    return None
+
+
+def _update_user_subscription(user_id, plan=_UNSET, customer_id=_UNSET, subscription_id=_UNSET):
+    if not user_id:
+        return
+    updates = []
+    values = []
+    if plan is not _UNSET:
+        updates.append("plan=%s")
+        values.append(plan)
+    if customer_id is not _UNSET:
+        updates.append("stripe_customer_id=%s")
+        values.append(customer_id)
+    if subscription_id is not _UNSET:
+        updates.append("stripe_subscription_id=%s")
+        values.append(subscription_id)
+    if not updates:
+        return
+    values.append(user_id)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=%s", tuple(values))
+        conn.commit()
+    finally:
+        conn.close()
 
 # ── PWA routes ─────────────────────────────────────────────────────────────────
 @app.route("/manifest.json")
@@ -1812,6 +1974,7 @@ def signup():
                     conn.commit()
                 finally:
                     conn.close()
+                session.permanent = True
                 session["user_id"] = user_id
                 session["email"]   = email
                 return redirect(url_for("setup"))
@@ -1837,6 +2000,7 @@ def login():
             finally:
                 conn.close()
             if user and bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+                session.permanent = True
                 session["user_id"] = user["id"]
                 session["email"]   = email
                 return redirect(url_for("dashboard"))
@@ -2122,7 +2286,7 @@ def api_filter_log():
     conn = db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT * FROM filter_log ORDER BY id DESC LIMIT 30")
+        cur.execute("SELECT * FROM filter_log WHERE user_id=%s ORDER BY id DESC LIMIT 30", (uid,))
         rows = cur.fetchall()
     finally:
         conn.close()
@@ -2215,6 +2379,62 @@ def api_referral():
                     "referrals": count, "earnings_sol": u["referral_earnings_sol"] or 0})
 
 # ── Stripe ─────────────────────────────────────────────────────────────────────
+@app.route("/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    if not STRIPE_WEBHOOK_SECRET:
+        return Response("Webhook not configured", status=503)
+    payload = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        return Response("Invalid payload", status=400)
+    except stripe.error.SignatureVerificationError:
+        return Response("Invalid signature", status=400)
+
+    event_type = event.get("type", "")
+    data = (event.get("data") or {}).get("object") or {}
+
+    if event_type == "checkout.session.completed":
+        metadata = data.get("metadata") or {}
+        user_id = int(metadata.get("user_id") or data.get("client_reference_id") or 0)
+        plan = metadata.get("plan") or ""
+        _update_user_subscription(
+            user_id,
+            plan=plan if plan else _UNSET,
+            customer_id=data.get("customer"),
+            subscription_id=data.get("subscription"),
+        )
+    elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
+        customer_id = data.get("customer")
+        subscription_id = data.get("id")
+        status = (data.get("status") or "").lower()
+        plan = _plan_from_stripe_subscription(data)
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id FROM users
+                WHERE stripe_subscription_id=%s OR stripe_customer_id=%s
+                LIMIT 1
+                """,
+                (subscription_id, customer_id),
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            resolved_plan = plan if status in {"trialing", "active"} else "free"
+            _update_user_subscription(
+                row["id"],
+                plan=resolved_plan,
+                customer_id=customer_id,
+                subscription_id=subscription_id if status in {"trialing", "active"} else None,
+            )
+    return jsonify({"ok": True})
+
+
 @app.route("/subscribe/<plan>")
 @login_required
 def subscribe(plan):
@@ -2225,6 +2445,10 @@ def subscribe(plan):
         conn = db()
         try:
             cur = conn.cursor()
+            cur.execute("SELECT stripe_subscription_id FROM users WHERE id=%s", (uid,))
+            user = cur.fetchone()
+            if user and user.get("stripe_subscription_id"):
+                return "Cancel the active Stripe subscription before switching to the free plan.", 400
             cur.execute("UPDATE users SET plan='free' WHERE id=%s", (uid,))
             conn.commit()
         finally:
@@ -2232,15 +2456,19 @@ def subscribe(plan):
         return redirect(url_for("dashboard"))
     price_map = {"basic": STRIPE_PRICE_BASIC, "pro": STRIPE_PRICE_PRO, "elite": STRIPE_PRICE_ELITE}
     price_id  = price_map.get(plan, "")
+    if plan not in price_map:
+        return "Unknown plan.", 400
     if not price_id or not STRIPE_SECRET:
         return "Stripe not configured.", 500
     try:
         checkout = stripe.checkout.Session.create(
+            client_reference_id=str(uid),
             customer_email=email,
             payment_method_types=["card"],
             line_items=[{"price": price_id, "quantity": 1}],
+            metadata={"user_id": str(uid), "plan": plan},
             mode="subscription",
-            success_url=request.host_url + "subscribe/success?plan=" + plan,
+            success_url=request.host_url.rstrip("/") + url_for("subscribe_success") + "?session_id={CHECKOUT_SESSION_ID}",
             cancel_url=request.host_url + "dashboard",
         )
         return redirect(checkout.url)
@@ -2250,15 +2478,40 @@ def subscribe(plan):
 @app.route("/subscribe/success")
 @login_required
 def subscribe_success():
-    uid  = session["user_id"]
-    plan = request.args.get("plan","basic")
-    conn = db()
+    uid = session["user_id"]
+    session_id = request.args.get("session_id", "").strip()
+    if not session_id:
+        return "Missing checkout session.", 400
     try:
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET plan=%s WHERE id=%s", (plan, uid))
-        conn.commit()
-    finally:
-        conn.close()
+        checkout = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        return f"Stripe verification error: {e}", 400
+
+    metadata = checkout.get("metadata") or {}
+    linked_user_id = str(metadata.get("user_id") or checkout.get("client_reference_id") or "")
+    if linked_user_id != str(uid):
+        return "Checkout session does not match the current account.", 403
+    if checkout.get("mode") != "subscription" or checkout.get("status") != "complete":
+        return "Checkout session is not complete.", 400
+    if checkout.get("payment_status") not in {"paid", "no_payment_required"}:
+        return "Payment has not been finalized.", 400
+
+    plan = metadata.get("plan") or ""
+    if not plan and checkout.get("subscription"):
+        try:
+            subscription = stripe.Subscription.retrieve(checkout["subscription"])
+            plan = _plan_from_stripe_subscription(subscription) or ""
+        except Exception:
+            plan = ""
+    if plan not in {"basic", "pro", "elite"}:
+        return "Could not determine subscribed plan.", 400
+
+    _update_user_subscription(
+        uid,
+        plan=plan,
+        customer_id=checkout.get("customer"),
+        subscription_id=checkout.get("subscription"),
+    )
     return redirect(url_for("dashboard"))
 
 # ── Admin ──────────────────────────────────────────────────────────────────────
@@ -3717,6 +3970,7 @@ loadBlacklist();
 """
 
 if __name__ == "__main__":
+    ensure_background_workers_started()
     print(f"\n  SolTrader Platform → http://localhost:5000")
     print(f"  Admin account: {ADMIN_EMAIL}")
     print(f"  Database: {DATABASE_URL}\n")

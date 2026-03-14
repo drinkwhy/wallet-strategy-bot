@@ -7,10 +7,28 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 import base58
 
-load_dotenv(dotenv_path=os.path.join(os.path.expanduser("~"), "Desktop", ".env"))
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-HELIUS_RPC = os.getenv("HELIUS_RPC")
+def load_environment():
+    env_paths = [
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.expanduser("~"), "Desktop", ".env"),
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+def require_env(name):
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} environment variable is required.")
+    return value
+
+
+load_environment()
+
+PRIVATE_KEY = require_env("PRIVATE_KEY")
+HELIUS_RPC = require_env("HELIUS_RPC")
 
 MAX_BUY_SOL = 0.05   # ~$5-10 per trade
 TAKE_PROFIT = 2.0    # sell at 2x
@@ -32,7 +50,7 @@ def get_sol_balance():
         "jsonrpc": "2.0", "id": 1,
         "method": "getBalance",
         "params": [wallet]
-    })
+    }, timeout=8)
     return resp.json().get("result", {}).get("value", 0) / 1e9
 
 
@@ -51,7 +69,7 @@ def sign_and_send(swap_transaction):
             "preflightCommitment": "confirmed",
             "maxRetries": 3
         }]
-    })
+    }, timeout=15)
     result = resp.json()
     if "result" in result:
         return result["result"]  # tx signature
@@ -102,7 +120,7 @@ def get_token_balance(address):
         "jsonrpc": "2.0", "id": 1,
         "method": "getTokenAccountsByOwner",
         "params": [wallet, {"mint": address}, {"encoding": "jsonParsed"}]
-    })
+    }, timeout=8)
     accounts = resp.json().get("result", {}).get("value", [])
     if not accounts:
         return 0
@@ -124,7 +142,7 @@ def buy_token(address, name, entry_price):
             f"&outputMint={address}"
             f"&amount={int(MAX_BUY_SOL * 1e9)}"
             f"&slippageBps=1000"
-        ).json()
+        , timeout=10).json()
 
         if "error" in quote:
             print(f"   ❌ No route: {quote['error']}")
@@ -134,7 +152,7 @@ def buy_token(address, name, entry_price):
             "quoteResponse": quote,
             "userPublicKey": wallet,
             "wrapAndUnwrapSol": True,
-        }).json()
+        }, timeout=10).json()
 
         swap_tx = swap_resp.get("swapTransaction")
         if not swap_tx:
@@ -176,7 +194,7 @@ def sell_token(address, reason):
             f"&outputMint=So11111111111111111111111111111111111111112"
             f"&amount={token_amount}"
             f"&slippageBps=1000"
-        ).json()
+        , timeout=10).json()
 
         if "error" in quote:
             print(f"   ❌ No sell route for {pos['name']}: {quote['error']}")
@@ -186,7 +204,7 @@ def sell_token(address, reason):
             "quoteResponse": quote,
             "userPublicKey": wallet,
             "wrapAndUnwrapSol": True,
-        }).json()
+        }, timeout=10).json()
 
         swap_tx = swap_resp.get("swapTransaction")
         if not swap_tx:
