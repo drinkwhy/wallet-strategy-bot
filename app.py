@@ -182,6 +182,20 @@ def init_db():
             max_correlated INTEGER DEFAULT 3
         )""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS open_positions (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
+            name TEXT,
+            entry_price REAL,
+            peak_price REAL,
+            entry_sol REAL,
+            tp1_hit INTEGER DEFAULT 0,
+            dev_wallet TEXT,
+            opened_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, mint)
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
             user_id INTEGER,
@@ -921,6 +935,23 @@ class BotInstance:
                 "timestamp":time.time(),"tp1_hit":False,"entry_sol":s["max_buy_sol"],
                 "dev_wallet": dev_wallet,
             }
+            try:
+                _conn = db()
+                try:
+                    _c = _conn.cursor()
+                    _c.execute("""INSERT INTO open_positions
+                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet)
+                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                  ON CONFLICT (user_id,mint) DO UPDATE
+                                  SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
+                                      peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
+                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
+                               (self.user_id, mint, name, price, price, s["max_buy_sol"], 0, dev_wallet))
+                    _conn.commit()
+                finally:
+                    _conn.close()
+            except Exception as _e:
+                self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.log_filter(name, mint, True, f"BUY @ ${price:.8f} | slip={slippage}bps", score=0)
             self.log_msg(f"BUY {name} @ ${price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
@@ -947,6 +978,14 @@ class BotInstance:
             total = self.get_token_balance(mint)
             if total == 0:
                 del self.positions[mint]
+                try:
+                    _conn = db()
+                    try:
+                        _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
+                        _conn.commit()
+                    finally:
+                        _conn.close()
+                except: pass
                 return
             amount = int(total * pct)
             if not amount:
@@ -1004,8 +1043,24 @@ class BotInstance:
                     conn.close()
                 if pct >= 1.0:
                     del self.positions[mint]
+                    try:
+                        _conn = db()
+                        try:
+                            _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
+                            _conn.commit()
+                        finally:
+                            _conn.close()
+                    except: pass
                 else:
                     self.positions[mint]["tp1_hit"] = True
+                    try:
+                        _conn = db()
+                        try:
+                            _conn.cursor().execute("UPDATE open_positions SET tp1_hit=1 WHERE user_id=%s AND mint=%s", (self.user_id, mint))
+                            _conn.commit()
+                        finally:
+                            _conn.close()
+                    except: pass
                 self.refresh_balance()
         except Exception as e:
             self.log_msg(f"Sell error {pos['name']}: {e}")
@@ -1019,6 +1074,14 @@ class BotInstance:
                 continue
             if cur > pos["peak_price"]:
                 self.positions[mint]["peak_price"] = cur
+                try:
+                    _conn = db()
+                    try:
+                        _conn.cursor().execute("UPDATE open_positions SET peak_price=%s WHERE user_id=%s AND mint=%s", (cur, self.user_id, mint))
+                        _conn.commit()
+                    finally:
+                        _conn.close()
+                except: pass
             ratio      = cur / pos["entry_price"]
             peak_ratio = pos["peak_price"] / pos["entry_price"]
             age_min    = (time.time() - pos["timestamp"]) / 60
@@ -1473,6 +1536,30 @@ def auto_restart_bots():
                     run_duration_min=row["run_duration_min"],
                     profit_target_sol=row["profit_target_sol"])
                 user_bots[uid] = bot
+                # Reload open positions from DB so they survive Railway restarts
+                try:
+                    _conn = db()
+                    try:
+                        _c = _conn.cursor()
+                        _c.execute("SELECT * FROM open_positions WHERE user_id=%s", (uid,))
+                        saved_pos = _c.fetchall()
+                    finally:
+                        _conn.close()
+                    for p in saved_pos:
+                        opened_ts = p["opened_at"].timestamp() if p.get("opened_at") else time.time()
+                        bot.positions[p["mint"]] = {
+                            "name":       p["name"],
+                            "entry_price": p["entry_price"],
+                            "peak_price":  p["peak_price"],
+                            "timestamp":   opened_ts,
+                            "tp1_hit":     bool(p["tp1_hit"]),
+                            "entry_sol":   p["entry_sol"],
+                            "dev_wallet":  p["dev_wallet"],
+                        }
+                    if saved_pos:
+                        print(f"[U{uid}] Restored {len(saved_pos)} open position(s) from DB")
+                except Exception as _e:
+                    print(f"[WARN] Could not reload positions for user {uid}: {_e}")
                 t = threading.Thread(target=bot.run, daemon=True)
                 t.start()
                 bot.thread = t
