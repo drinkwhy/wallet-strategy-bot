@@ -739,13 +739,13 @@ class BotInstance:
         api_key = parse_qs(parsed.query).get("api-key", [""])[0]
         qs = f"?api-key={api_key}" if api_key else ""
         return [
-            f"https://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
-            f"https://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
-            f"https://lon-sender.helius-rpc.com/fast{qs}",  # London
-            f"https://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
-            f"https://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
-            f"https://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
-            f"https://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
+            f"http://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
+            f"http://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
+            f"http://lon-sender.helius-rpc.com/fast{qs}",  # London
+            f"http://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
+            f"http://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
+            f"http://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
+            f"http://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
         ]
 
     def sign_and_send(self, swap_tx_b64):
@@ -1494,8 +1494,8 @@ def warm_sender_connections():
     api_key = parse_qs(parsed.query).get("api-key", [""])[0]
     qs = f"?api-key={api_key}" if api_key else ""
     endpoints = [
-        f"https://slc-sender.helius-rpc.com/fast{qs}",
-        f"https://ewr-sender.helius-rpc.com/fast{qs}",
+        f"http://slc-sender.helius-rpc.com/fast{qs}",
+        f"http://ewr-sender.helius-rpc.com/fast{qs}",
     ]
     while True:
         for url in endpoints:
