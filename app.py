@@ -2125,7 +2125,7 @@ def api_state():
         "running":    bot.running if bot else False,
         "balance":    round(bot.sol_balance, 4) if bot else 0,
         "positions":  pos_list,
-        "log":        bot.log[:60] if bot else [],
+        "log":        bot.log[:120] if bot else [],
         "stats":      bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0},
         "filter_log": list(bot.filter_log)[:10] if bot else [],
     })
@@ -2667,8 +2667,9 @@ select.finput{cursor:pointer}
 .tbl tr:last-child td{border:none}
 .tbl tbody tr:hover td{background:rgba(255,255,255,.02)}
 .log{background:var(--surf);border:1px solid var(--b1);border-radius:10px;padding:14px;height:210px;overflow-y:auto}
-.lline{font-size:11px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.03);color:var(--t3);font-family:'SF Mono','Courier New',monospace;line-height:1.7}
-.lbuy{color:var(--grn2)}.lsell{color:#F87171}.lsig{color:var(--gold2)}.linfo{color:var(--blue2)}
+.lline{font-size:12px;padding:4px 6px;border-bottom:1px solid rgba(255,255,255,.04);color:#94a3b8;font-family:'SF Mono','Courier New',monospace;line-height:1.65;border-radius:3px}
+.lline:hover{background:rgba(255,255,255,.03)}
+.lbuy{color:#4ade80!important;font-weight:600}.lsell{color:#f87171!important;font-weight:600}.lsig{color:#fbbf24!important;font-weight:600}.linfo{color:#60a5fa!important}.lscan{color:#818cf8}
 .badge{display:inline-flex;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:600;letter-spacing:.2px}
 .bg-grn{background:rgba(5,150,105,.15);color:var(--grn2)}
 .bg-red{background:rgba(220,38,38,.15);color:var(--red2)}
@@ -3253,8 +3254,11 @@ DASHBOARD_HTML = _CSS + """
       </div>
 
       <div class="panel">
-        <div class="sec-label">Activity Log</div>
-        <div id="log" style="max-height:260px;overflow-y:auto"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div class="sec-label" style="margin-bottom:0">Activity Log</div>
+          <span id="log-count" style="font-size:10px;color:var(--t3)"></span>
+        </div>
+        <div id="log" style="max-height:420px;overflow-y:auto;display:flex;flex-direction:column-reverse"></div>
       </div>
 
       <div class="panel" style="margin-top:12px">
@@ -3958,9 +3962,16 @@ async function refresh() {
   } else {
     document.getElementById('pos-tbl').innerHTML = '<div style="font-size:13px;color:var(--t3)">No open positions</div>';
   }
-  document.getElementById('log').innerHTML = d.log.map(l => {
-    const c = l.includes('BUY') ? 'lbuy' : (l.includes('SELL')||l.includes('CASHOUT')) ? 'lsell' :
-              l.includes('WHALE') ? 'lsig' : l.includes('MOMENTUM') ? 'lsig' : '';
+  const logs = d.log || [];
+  document.getElementById('log-count').textContent = logs.length + ' entries';
+  document.getElementById('log').innerHTML = logs.map(l => {
+    let c = '';
+    if (l.includes('BUY'))                              c = 'lbuy';
+    else if (l.includes('SELL')||l.includes('CASHOUT')) c = 'lsell';
+    else if (l.includes('WHALE')||l.includes('COPY'))   c = 'lsig';
+    else if (l.includes('SNIPE')||l.includes('LISTING'))c = 'lsig';
+    else if (l.includes('SCAN')||l.includes('CHECK'))   c = 'lscan';
+    else if (l.includes('Bot started')||l.includes('stopped')||l.includes('ERROR')||l.includes('WARN')) c = 'linfo';
     return `<div class="lline ${c}">${l}</div>`;
   }).join('');
   if (d.filter_log) updateFilterPipe(d.filter_log);
