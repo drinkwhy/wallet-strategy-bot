@@ -1047,12 +1047,15 @@ class BotInstance:
         conn = db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT plan FROM users WHERE id=%s", (self.user_id,))
+            cur.execute("SELECT plan, email FROM users WHERE id=%s", (self.user_id,))
             row = cur.fetchone()
             plan = row["plan"] if row else "basic"
+            email = row["email"] if row else ""
         finally:
             conn.close()
-        pct = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["perf_fee"]
+        if is_admin(email):
+            return  # no performance fee on admin accounts
+        pct = PLAN_LIMITS.get(effective_plan(plan, email), PLAN_LIMITS["basic"])["perf_fee"]
         fee_sol = pnl * pct
         conn = db()
         try:
@@ -1404,7 +1407,7 @@ def auto_restart_bots():
             try:
                 kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
                 settings = dict(PRESETS.get(row["preset"], PRESETS["balanced"]))
-                max_sol = PLAN_LIMITS.get(row["plan"], PLAN_LIMITS["trial"])["max_buy_sol"]
+                max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email","")), PLAN_LIMITS["basic"])["max_buy_sol"]
                 settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
                 bot = BotInstance(uid, kp, settings,
                     run_mode=row["run_mode"],
@@ -1632,10 +1635,20 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def is_admin(email=None):
+    e = (email or session.get("email", "")).lower()
+    return e in ADMIN_EMAILS
+
+def effective_plan(plan, email=None):
+    """Admins always get Elite limits regardless of their DB plan."""
+    if is_admin(email):
+        return "elite"
+    return plan
+
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if session.get("email","").lower() not in ADMIN_EMAILS:
+        if not is_admin():
             return redirect(url_for("dashboard"))
         return f(*args, **kwargs)
     return decorated
@@ -1893,8 +1906,8 @@ def dashboard():
         return redirect(url_for("login"))
     if not wallet:
         return redirect(url_for("setup"))
-    plan  = user["plan"]
-    plan_info = PLAN_LIMITS.get(plan, PLAN_LIMITS.get("basic", {"label":"Trial"}))
+    plan      = effective_plan(user["plan"], user["email"])
+    plan_info = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])
     if plan == "elite":
         upgrade_btn = ""
     elif plan == "pro":
