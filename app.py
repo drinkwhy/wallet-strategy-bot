@@ -2147,15 +2147,19 @@ def api_start():
     finally:
         conn.close()
     if not w:
-        return jsonify({"ok":False,"msg":"Wallet not configured"})
-    if u["plan"] == "trial":
+        return jsonify({"ok":False,"msg":"Wallet not configured — go to /setup"})
+    plan = effective_plan(u["plan"], u["email"])
+    if plan == "trial":
         trial_ends = datetime.fromisoformat(u["trial_ends"]) if u["trial_ends"] else datetime.utcnow()
         if datetime.utcnow() > trial_ends:
-            return jsonify({"ok":False,"msg":"Trial expired — please subscribe"})
-    kp       = Keypair.from_bytes(base58.b58decode(decrypt_key(w["encrypted_key"])))
+            return jsonify({"ok":False,"msg":"Trial expired — please subscribe at /subscribe/basic"})
+    try:
+        kp = Keypair.from_bytes(base58.b58decode(decrypt_key(w["encrypted_key"])))
+    except Exception:
+        return jsonify({"ok":False,"msg":"Wallet key could not be decrypted — please re-enter your private key at /setup"})
     preset   = bs["preset"] if bs else "balanced"
     settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
-    max_sol  = PLAN_LIMITS.get(u["plan"],PLAN_LIMITS["trial"])["max_buy_sol"]
+    max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
     settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
         uid, kp, settings,
@@ -3676,10 +3680,17 @@ async function refresh() {
 async function toggleBot() {
   const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'})
     .then(r=>r.json()).catch(()=>null);
-  if (res && !res.ok && res.msg) {
-    document.getElementById('stxt').textContent = '⚠️ ' + res.msg;
+  if (!res) {
+    document.getElementById('stxt').textContent = '⚠️ Server error — check Railway logs';
+    return;
   }
-  setTimeout(refresh, 1000);
+  if (!res.ok && res.msg) {
+    document.getElementById('stxt').textContent = '⚠️ ' + res.msg;
+    document.getElementById('stxt').style.color = '#f23645';
+    return;
+  }
+  document.getElementById('stxt').style.color = '';
+  setTimeout(refresh, 800);
 }
 async function cashout() {
   if (!confirm('Sell all open positions at market price?')) return;
