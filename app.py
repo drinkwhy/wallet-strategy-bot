@@ -214,9 +214,17 @@ def init_db():
             score INTEGER DEFAULT 0,
             ts TIMESTAMP DEFAULT NOW()
         )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
         conn.commit()
+        # indexes on columns added by migrate_db — safe to skip if column not yet present
+        for _idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)",
+        ]:
+            try:
+                cur.execute(_idx_sql)
+                conn.commit()
+            except Exception:
+                conn.rollback()
     finally:
         conn.close()
 
