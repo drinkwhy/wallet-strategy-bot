@@ -1683,9 +1683,9 @@ def _acquire_background_worker_lock():
     global _background_lock_conn
     if _background_lock_conn is not None:
         return True
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
     try:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (BACKGROUND_WORKER_LOCK_ID,))
             locked = cur.fetchone()[0]
@@ -1694,9 +1694,9 @@ def _acquire_background_worker_lock():
             return False
         _background_lock_conn = conn
         return True
-    except Exception:
-        conn.close()
-        raise
+    except Exception as e:
+        print(f"[WARN] Background worker lock failed: {e}")
+        return False
 
 
 def ensure_background_workers_started():
@@ -1731,7 +1731,10 @@ app.config.update(
     SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
-ensure_background_workers_started()
+try:
+    ensure_background_workers_started()
+except Exception as _e:
+    print(f"[WARN] Background workers not started at module load: {_e}")
 
 
 @app.before_request
