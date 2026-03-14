@@ -3110,6 +3110,8 @@ DASHBOARD_HTML = _CSS + """
 @keyframes featPulse{0%,100%{opacity:1}50%{opacity:.6}}
 .feat-pulse{animation:featPulse 2s ease-in-out infinite}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+/* Activity log bottom bar */
+#activity-bar{position:fixed;bottom:0;left:0;right:0;height:200px;background:#0d1117;border-top:1px solid #1e293b;display:flex;flex-direction:column;z-index:1000;transition:height .25s ease}
 /* Chart tabs */
 .chart-tab{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:5px 14px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
 .chart-tab.active{background:var(--grn);color:#000;border-color:var(--grn)}
@@ -3253,15 +3255,7 @@ DASHBOARD_HTML = _CSS + """
         <div id="pos-tbl"><div style="font-size:13px;color:var(--t3)">No open positions</div></div>
       </div>
 
-      <div class="panel">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-          <div class="sec-label" style="margin-bottom:0">Activity Log</div>
-          <span id="log-count" style="font-size:10px;color:var(--t3)"></span>
-        </div>
-        <div id="log" style="max-height:420px;overflow-y:auto;display:flex;flex-direction:column-reverse"></div>
-      </div>
-
-      <div class="panel" style="margin-top:12px">
+      <div class="panel" style="margin-top:0">
         <div class="sec-label">Filter Pipeline <span style="font-size:10px;color:var(--t3);font-weight:400">— real-time token screening</span></div>
         <div id="filter-pipe"><div style="font-size:12px;color:var(--t3)">Start the bot to see token filtering…</div></div>
       </div>
@@ -3347,7 +3341,34 @@ DASHBOARD_HTML = _CSS + """
   </div>
 </div>
 
+<!-- Activity log — fixed bottom bar -->
+<div id="activity-bar">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 16px 4px;border-bottom:1px solid #1e293b;flex-shrink:0">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3)">Activity Log</span>
+      <span id="log-count" style="font-size:10px;color:var(--t3)"></span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span id="log-live-dot" style="width:6px;height:6px;border-radius:50%;background:var(--grn);display:inline-block;animation:pulse 1.5s ease-in-out infinite"></span>
+      <button onclick="toggleLogBar()" style="background:none;border:none;color:var(--t3);font-size:12px;cursor:pointer;padding:2px 6px;border-radius:4px" id="log-toggle-btn">▼ collapse</button>
+    </div>
+  </div>
+  <div id="log" style="flex:1;overflow-y:auto;display:flex;flex-direction:column-reverse;padding:4px 0"></div>
+</div>
+
 <script>
+// add bottom padding so content doesn't hide behind the log bar
+document.querySelector('.wrap').style.paddingBottom = '200px';
+
+let logBarExpanded = true;
+function toggleLogBar() {
+  const bar = document.getElementById('activity-bar');
+  const btn = document.getElementById('log-toggle-btn');
+  logBarExpanded = !logBarExpanded;
+  bar.style.height = logBarExpanded ? '200px' : '36px';
+  btn.textContent  = logBarExpanded ? '▼ collapse' : '▲ expand';
+}
+
 let running = false;
 let activeFilter = 'all';
 let allTokens = [];
