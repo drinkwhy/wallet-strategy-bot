@@ -106,14 +106,27 @@ class _RateLimiter:
                 return False
             time.sleep(0.05)
 
-_dex_limiter = _RateLimiter(rate_per_sec=15)
+_dex_limiter = _RateLimiter(rate_per_sec=4)
+_dex_backoff_until = 0  # epoch timestamp — skip requests until this time
 
 def dex_get(url, **kwargs):
-    """Rate-limited GET to DexScreener API."""
+    """Rate-limited GET to DexScreener API with 429 backoff."""
+    global _dex_backoff_until
+    now = time.time()
+    if now < _dex_backoff_until:
+        # Still in backoff — return a fake 429 without hitting the API
+        class _Fake429:
+            status_code = 429
+            text = ""
+            def json(self): return {}
+        return _Fake429()
     _dex_limiter.acquire()
     kwargs.setdefault("headers", HEADERS)
     kwargs.setdefault("timeout", 8)
-    return requests.get(url, **kwargs)
+    resp = requests.get(url, **kwargs)
+    if resp.status_code == 429:
+        _dex_backoff_until = time.time() + 30  # back off 30s on any 429
+    return resp
 
 PLAN_LIMITS = {
     "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
@@ -942,14 +955,17 @@ class BotInstance:
 
     def get_token_price(self, mint):
         try:
-            pairs = dex_get(
+            resp = dex_get(
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                 timeout=5
-            ).json().get("pairs")
+            )
+            if resp.status_code != 200:
+                return None
+            pairs = resp.json().get("pairs")
             if pairs:
                 return float(pairs[0].get("priceUsd") or 0)
-        except Exception as _e:
-            print(f"[ERROR] {_e}", flush=True)
+        except Exception:
+            pass
         return None
 
     def is_safe_token(self, mint):
@@ -1538,10 +1554,13 @@ def check_whale_wallets():
                             if post_amt > pre_amt * 1.5 and post_amt > 0:
                                 # whale bought this token — get price info and signal bots
                                 try:
-                                    pairs = requests.get(
+                                    _wr = dex_get(
                                         f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                        headers=HEADERS, timeout=5
-                                    ).json().get("pairs")
+                                        timeout=5
+                                    )
+                                    if _wr.status_code != 200:
+                                        continue
+                                    pairs = _wr.json().get("pairs")
                                     if not pairs:
                                         continue
                                     p = pairs[0]
@@ -1654,33 +1673,42 @@ def global_scanner():
             )
             if r.status_code != 200:
                 print(f"[SCANNER] token-profiles HTTP {r.status_code}", flush=True)
-                time.sleep(15)
+                time.sleep(30 if r.status_code == 429 else 15)
                 continue
-            tokens = r.json() if isinstance(r.json(), list) else []
+            try:
+                data = r.json()
+                tokens = data if isinstance(data, list) else []
+            except Exception:
+                tokens = []
             sol_tokens = [t for t in tokens if t.get("chainId") == "solana"]
             with seen_tokens_lock:
                 new_tokens  = [t for t in sol_tokens if t.get("tokenAddress") and t["tokenAddress"] not in seen_tokens]
                 for t in new_tokens:
                     seen_tokens.add(t["tokenAddress"])
-            print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
+            if new_tokens:
+                print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
             for t in new_tokens:
                 mint = t["tokenAddress"]
                 try:
-                    pairs = dex_get(
+                    resp = dex_get(
                         f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                         timeout=5
-                    ).json().get("pairs") or []
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    pairs = resp.json().get("pairs") or []
                     if not pairs:
                         continue
                     info = _process_dex_pair(pairs[0])
                     if info:
                         _broadcast_signal(info)
-                except Exception as _e:
-                    print(f"[ERROR] {_e}", flush=True)
-            time.sleep(12)
+                    time.sleep(0.3)  # small delay between per-token lookups
+                except Exception:
+                    pass
+            time.sleep(20)
         except Exception as e:
             print(f"[SCANNER] error: {e}", flush=True)
-            time.sleep(15)
+            time.sleep(20)
 
 def new_pairs_scanner():
     """Secondary scanner: polls DexScreener boosted + latest Solana pairs directly."""
@@ -1691,39 +1719,53 @@ def new_pairs_scanner():
     ]
     while True:
         try:
+            got_429 = False
             for url in SCAN_URLS:
                 label = url.split("/")[-2]
                 try:
                     resp = dex_get(url, timeout=8)
                     if resp.status_code != 200:
-                        print(f"[SCANNER2] {label} HTTP {resp.status_code}", flush=True)
+                        if resp.status_code == 429:
+                            got_429 = True
+                        else:
+                            print(f"[SCANNER2] {label} HTTP {resp.status_code}", flush=True)
                         continue
-                    items = resp.json() if isinstance(resp.json(), list) else []
+                    try:
+                        data = resp.json()
+                        items = data if isinstance(data, list) else []
+                    except Exception:
+                        items = []
                     sol = [i for i in items if i.get("chainId") == "solana"]
                     with seen_tokens_lock:
                         new = [i for i in sol if i.get("tokenAddress") and i["tokenAddress"] not in seen_tokens]
                         for item in new:
                             seen_tokens.add(item["tokenAddress"])
-                    print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
+                    if new:
+                        print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
                     for item in new:
                         mint = item["tokenAddress"]
                         try:
-                            pairs = requests.get(
+                            r2 = dex_get(
                                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                headers=HEADERS, timeout=5
-                            ).json().get("pairs") or []
+                                timeout=5
+                            )
+                            if r2.status_code != 200:
+                                continue
+                            pairs = r2.json().get("pairs") or []
                             if pairs:
                                 info = _process_dex_pair(pairs[0])
                                 if info:
                                     _broadcast_signal(info)
-                        except Exception as _e:
-                            print(f"[ERROR] {_e}", flush=True)
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+                    time.sleep(1)  # pause between the two URLs
                 except Exception as e2:
                     print(f"[SCANNER2] {label} error: {e2}", flush=True)
-            time.sleep(8)
+            time.sleep(30 if got_429 else 15)
         except Exception as e:
             print(f"[SCANNER2] outer error: {e}", flush=True)
-            time.sleep(15)
+            time.sleep(20)
 
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
 def helius_pool_sniper():
@@ -1779,11 +1821,13 @@ def helius_pool_sniper():
                             seen_tokens.add(mint)
                             # Fetch info and add to market feed immediately
                             try:
-                                pairs = dex_get(
+                                _pr = dex_get(
                                     f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                                     timeout=5
-                                ).json().get("pairs")
-                                if not pairs: return
+                                )
+                                if _pr.status_code != 200: continue
+                                pairs = _pr.json().get("pairs")
+                                if not pairs: continue
                                 p = pairs[0]
                                 created_at = p.get("pairCreatedAt")
                                 age_min = (time.time()*1000 - created_at)/60000 if created_at else 0
@@ -1980,10 +2024,13 @@ def _extract_symbols(exchange, data):
 def _find_solana_token(symbol):
     """Search DexScreener for a Solana token by symbol. Returns (mint, name, price, liq) or None."""
     try:
-        r = dex_get(
+        _sr = dex_get(
             f"https://api.dexscreener.com/latest/dex/search?q={symbol}",
             timeout=8
-        ).json()
+        )
+        if _sr.status_code != 200:
+            return None
+        r = _sr.json()
         pairs = r.get("pairs") or []
         sol_pairs = [p for p in pairs
                      if p.get("chainId") == "solana"
