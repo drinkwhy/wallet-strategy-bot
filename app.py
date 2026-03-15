@@ -10,6 +10,7 @@ Required .env variables:
 
 import atexit
 import os, threading, time, base64, json, requests, base58, secrets, hashlib, random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 import psycopg2.extras
 import string
@@ -785,24 +786,33 @@ class BotInstance:
             signed_tx = VersionedTransaction(tx.message, [self.keypair])
             enc = base64.b64encode(bytes(signed_tx)).decode()
 
-        # ── send via Helius Sender (try first 2 regional nodes) ────────────
+        # ── send via Helius Sender (all regions in parallel, first wins) ───
         send_params = {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
-        for url in self._sender_endpoints()[:2]:
-            try:
-                r   = requests.post(url, json={
-                    "jsonrpc":"2.0","id":str(int(time.time()*1000)),
-                    "method":"sendTransaction","params":[enc, send_params]
-                }, timeout=8)
-                res = r.json()
-                if res.get("result"):
-                    region = url.split("//")[1].split("-sender")[0]
-                    self.log_msg(f"⚡ Sent via Helius Sender ({region})")
-                    return res["result"]
-                if res.get("error"):
-                    self.log_msg(f"Sender error: {res['error'].get('message','?')}")
-                    break   # hard RPC error — skip remaining regions
-            except Exception as e:
-                self.log_msg(f"Sender unreachable ({url.split('//')[1].split('/')[0]}): {e}")
+        req_id = str(int(time.time()*1000))
+        def _send_region(url):
+            r = requests.post(url, json={
+                "jsonrpc":"2.0","id":req_id,
+                "method":"sendTransaction","params":[enc, send_params]
+            }, timeout=5)
+            res = r.json()
+            if res.get("result"):
+                return url, res["result"]
+            if res.get("error"):
+                raise ValueError(res["error"].get("message","?"))
+            return None
+
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            futures = {pool.submit(_send_region, u): u for u in self._sender_endpoints()}
+            for fut in as_completed(futures, timeout=6):
+                try:
+                    result = fut.result()
+                    if result:
+                        url, sig = result
+                        region = url.split("//")[1].split("-sender")[0]
+                        self.log_msg(f"⚡ Sent via Helius Sender ({region})")
+                        return sig
+                except Exception as e:
+                    pass  # other regions may still succeed
 
         # ── fallback: regular Helius RPC ────────────────────────────────────
         try:
@@ -818,22 +828,33 @@ class BotInstance:
             self.log_msg(f"sendTransaction error: {e}")
             return None
 
+    def _jupiter_quote_single(self, url):
+        """Try a single Jupiter quote URL with retries. Returns quote dict or None."""
+        for attempt in range(2):
+            try:
+                r = requests.get(url, timeout=8).json()
+                if "error" not in r:
+                    return r
+            except Exception:
+                if attempt < 1:
+                    time.sleep(0.5)
+        return None
+
     def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
-        # swap/v1 endpoints (recommended by Helius Sender docs)
         urls = [
             f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
             f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         ]
-        for url in urls:
-            for attempt in range(3):
+        # Hit both endpoints in parallel, take first success
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(self._jupiter_quote_single, u): u for u in urls}
+            for fut in as_completed(futures, timeout=12):
                 try:
-                    r = requests.get(url, timeout=12).json()
-                    return None if "error" in r else r
+                    result = fut.result()
+                    if result:
+                        return result
                 except Exception as e:
-                    if attempt < 2:
-                        time.sleep(2)
-                    else:
-                        self.log_msg(f"Jupiter quote failed ({url.split('/')[2]}): {e}")
+                    self.log_msg(f"Jupiter quote failed ({futures[fut].split('/')[2]}): {e}")
         return None
 
     def jupiter_swap(self, quote):
@@ -1000,8 +1021,29 @@ class BotInstance:
             return
         sig = self.sign_and_send(swap_tx)
         if sig:
+            # Compute real entry price from execution instead of DexScreener quote
+            real_price = price  # fallback to scanner price
+            try:
+                time.sleep(1.5)  # brief wait for tx to land
+                tokens_received = self.get_token_balance(mint)
+                if tokens_received > 0:
+                    # real_price = SOL spent per token (in USD-equivalent via price)
+                    # Use ratio: we paid max_buy_sol SOL for tokens_received tokens
+                    # So entry_price = dexscreener_price * (expected_tokens / actual_tokens)
+                    # Expected tokens at quote price = (max_buy_sol * SOL_price) / token_price
+                    # Simpler: just derive from the Jupiter quote output vs actual
+                    expected_out = int(quote.get("outAmount", 0))
+                    if expected_out > 0:
+                        # Adjust entry price by slippage ratio (actual vs quoted)
+                        slip_ratio = expected_out / tokens_received if tokens_received > 0 else 1
+                        real_price = price * slip_ratio
+                        if abs(slip_ratio - 1) > 0.01:
+                            self.log_msg(f"📊 Entry adjusted: ${price:.8f} → ${real_price:.8f} (slip {(slip_ratio-1)*100:+.1f}%)")
+            except Exception as _ep:
+                self.log_msg(f"[WARN] Could not compute real entry: {_ep}")
+
             self.positions[mint] = {
-                "name":name,"entry_price":price,"peak_price":price,
+                "name":name,"entry_price":real_price,"peak_price":real_price,
                 "timestamp":time.time(),"tp1_hit":False,"entry_sol":s["max_buy_sol"],
                 "dev_wallet": dev_wallet,
             }
@@ -1016,7 +1058,7 @@ class BotInstance:
                                   SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
                                       peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
                                       tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
-                               (self.user_id, mint, name, price, price, s["max_buy_sol"], 0, dev_wallet))
+                               (self.user_id, mint, name, real_price, real_price, s["max_buy_sol"], 0, dev_wallet))
                     _conn.commit()
                 finally:
                     _conn.close()
@@ -1024,8 +1066,8 @@ class BotInstance:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
             self.consecutive_losses  = 0   # reset on successful buy
-            self.log_filter(name, mint, True, f"BUY @ ${price:.8f} | slip={slippage}bps", score=0)
-            self.log_msg(f"BUY {name} @ ${price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
+            self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
+            self.log_msg(f"BUY {name} @ ${real_price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
                 conn = db()
@@ -1144,11 +1186,28 @@ class BotInstance:
         except Exception as e:
             self.log_msg(f"Sell error {pos['name']}: {e}")
 
+    def _batch_token_prices(self, mints):
+        """Fetch prices for multiple mints in parallel. Returns {mint: price}."""
+        prices = {}
+        if not mints:
+            return prices
+        def _fetch(m):
+            return m, self.get_token_price(m)
+        with ThreadPoolExecutor(max_workers=min(len(mints), 5)) as pool:
+            for m, p in pool.map(lambda m: _fetch(m), mints):
+                if p:
+                    prices[m] = p
+        return prices
+
     def check_positions(self):
         s = self.settings
-        for mint in list(self.positions.keys()):
-            pos = self.positions[mint]
-            cur = self.get_token_price(mint)
+        mints = list(self.positions.keys())
+        prices = self._batch_token_prices(mints)
+        for mint in mints:
+            pos = self.positions.get(mint)
+            if not pos:
+                continue
+            cur = prices.get(mint)
             if not cur or not pos["entry_price"]:
                 continue
             if cur > pos["peak_price"]:
@@ -1249,10 +1308,10 @@ class BotInstance:
                     break
                 if self.positions:
                     self.check_positions()
-                time.sleep(10)
+                time.sleep(3)
             except Exception as e:
                 self.log_msg(f"Loop error: {e}")
-                time.sleep(10)
+                time.sleep(3)
 
     def record_perf_fee(self):
         if self.perf_fee_recorded:
