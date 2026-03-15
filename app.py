@@ -2210,6 +2210,17 @@ def _apply_security_headers(resp):
         resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return resp
 
+@app.route("/debug-dash")
+def debug_dash():
+    """Temporary debug route to test dashboard rendering."""
+    try:
+        html = DASHBOARD_HTML.replace("{{PRESET}}", "balanced")
+        return Response(f"<h1>OK</h1><p>DASHBOARD_HTML length: {len(html)}</p><p>First 200 chars: {html[:200]}</p>", mimetype="text/html")
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        return Response(f"<h1>DASHBOARD_HTML ERROR</h1><pre>{tb}</pre>", status=500, mimetype="text/html")
+
 @app.route("/health")
 def health_check():
     """Health check endpoint for Railway / load balancers."""
