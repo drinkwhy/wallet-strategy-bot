@@ -925,14 +925,15 @@ class BotInstance:
             return "Rate limit: 5 buys/hour max"
         return None
 
-    def check_honeypot(self, mint):
-        """Simulate a sell via Jupiter. Returns False if no sell route = likely honeypot."""
+    def check_honeypot(self, mint, age_min=0):
+        """Simulate a sell via Jupiter. Skip check for very new tokens (< 20m) — no route yet."""
+        if age_min < 20:
+            return True  # too new for Jupiter to index; rely on authority checks instead
         try:
-            # Try to quote selling a tiny amount back to SOL (50% slippage to be generous)
-            test_quote = self.jupiter_quote(mint, SOL_MINT, 1_000_000, 5000)
+            test_quote = self.jupiter_quote(mint, SOL_MINT, 10_000_000, 5000)
             return test_quote is not None
         except:
-            return True  # API error — give benefit of the doubt
+            return True
 
     def buy(self, mint, name, price, liq=0, dev_wallet=None):
         s = self.settings
@@ -947,8 +948,9 @@ class BotInstance:
         if rl:
             self.log_filter(name, mint, False, rl)
             return
-        # ── Honeypot simulation ──────────────────────────────────────────────
-        if not self.check_honeypot(mint):
+        # ── Honeypot simulation (skip for tokens < 20m — Jupiter not indexed yet) ─
+        token_age = self.positions.get(mint, {}).get("age_min", 0)
+        if not self.check_honeypot(mint, age_min=token_age):
             self.log_filter(name, mint, False, "HONEYPOT — no sell route found via Jupiter")
             return
         # Drawdown limit
@@ -1189,22 +1191,30 @@ class BotInstance:
         if mint in self.positions:
             return
         s = self.settings
-        if not (s.get("min_mc",0) <= mc <= s.get("max_mc",999999)):
+        min_mc  = s.get("min_mc", 0)
+        max_mc  = s.get("max_mc", 999999)
+        min_liq = s.get("min_liq", 0)
+        max_age = s.get("max_age_min", 999)
+        if not (min_mc <= mc <= max_mc):
+            self.log_filter(name, mint, False, f"MC ${mc:,.0f} outside [{min_mc:,}–{max_mc:,}]")
             return
-        if liq < s.get("min_liq",0):
+        if liq < min_liq:
+            self.log_filter(name, mint, False, f"Liq ${liq:,.0f} < min ${min_liq:,}")
             return
-        if age_min > s.get("max_age_min",999):
+        if age_min > max_age:
+            self.log_filter(name, mint, False, f"Age {age_min:.0f}m > max {max_age}m")
             return
-        if change < 0:
+        if change < -20:   # allow slightly negative — new tokens often show 0 or small negative
+            self.log_filter(name, mint, False, f"1h change {change:.0f}% too negative")
             return
         # ── Time-of-day filter ───────────────────────────────────────────────
-        # Peak volume: 12:00–22:00 UTC. Outside that window, require stronger signal.
         utc_hour = time.gmtime().tm_hour
-        if not (12 <= utc_hour < 22):
-            if change < 50:   # outside peak hours — only act on strong momentum
+        if not (10 <= utc_hour < 23):
+            if change < 30:
+                self.log_filter(name, mint, False, f"Off-peak hours ({utc_hour}:00 UTC) — change {change:.0f}% < 30%")
                 return
-        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Vol:${vol:,.0f} Liq:${liq:,.0f} | Age:{age_min:.0f}m +{change:.0f}%")
-        self.log_filter(name, mint, True, f"Signal passed all filters | score={self.settings.get('_last_score',0)}")
+        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}%")
+        self.log_filter(name, mint, True, f"Signal passed all filters")
         self.buy(mint, name, price, liq=liq, dev_wallet=None)
 
     def cashout_all(self):
@@ -1404,8 +1414,62 @@ def check_whale_wallets():
             print(f"Whale tracker error: {e}")
             time.sleep(30)
 
+def _process_dex_pair(p):
+    """Extract token info dict from a DexScreener pair object. Returns None if unusable."""
+    try:
+        mint = (p.get("baseToken") or {}).get("address")
+        if not mint or mint == SOL_MINT:
+            return None
+        price = float(p.get("priceUsd") or 0)
+        if not price:
+            return None
+        created_at = p.get("pairCreatedAt")
+        age_min    = (time.time()*1000 - created_at) / 60000 if created_at else 9999
+        vol        = (p.get("volume") or {}).get("h24", 0) or 0
+        change     = (p.get("priceChange") or {}).get("h1", 0) or 0
+        momentum   = volume_velocity(mint, vol)
+        info = {
+            "mint":     mint,
+            "name":     p.get("baseToken",{}).get("name","Unknown"),
+            "symbol":   p.get("baseToken",{}).get("symbol","?"),
+            "price":    price,
+            "mc":       p.get("marketCap", 0) or 0,
+            "vol":      vol,
+            "liq":      (p.get("liquidity") or {}).get("usd", 0) or 0,
+            "age_min":  age_min,
+            "change":   change,
+            "momentum": momentum,
+            "ts":       int(time.time()),
+        }
+        info["score"] = min(100, ai_score(info) + check_social_signals(str(p)))
+        return info
+    except:
+        return None
+
+def _broadcast_signal(info):
+    """Push info to market_feed and evaluate against all running bots."""
+    mint = info["mint"]
+    market_feed.appendleft(info)
+    record_price(mint, info["price"])
+    for bot in list(user_bots.values()):
+        if not bot.running:
+            continue
+        try:
+            effective_change = info["change"]
+            if info["momentum"] >= 60:
+                bot.log_msg(f"⚡ MOMENTUM: {info['name']} vel={info['momentum']}")
+                effective_change = max(effective_change, 25)
+            bot.evaluate_signal(
+                mint, info["name"], info["price"],
+                info["mc"], info["vol"], info["liq"],
+                info["age_min"], effective_change
+            )
+        except:
+            pass
+
 def global_scanner():
-    time.sleep(10)  # let app fully start first
+    """Primary scanner: DexScreener latest token profiles (established flow)."""
+    time.sleep(10)
     while True:
         try:
             r = requests.get(
@@ -1413,7 +1477,7 @@ def global_scanner():
                 headers=HEADERS, timeout=10
             )
             if r.status_code != 200:
-                time.sleep(10)
+                time.sleep(15)
                 continue
             tokens = r.json() if isinstance(r.json(), list) else []
             for t in tokens:
@@ -1427,56 +1491,59 @@ def global_scanner():
                     pairs = requests.get(
                         f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                         headers=HEADERS, timeout=5
-                    ).json().get("pairs")
+                    ).json().get("pairs") or []
                     if not pairs:
                         continue
-                    p = pairs[0]
-                    created_at = p.get("pairCreatedAt")
-                    age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
-                    vol    = (p.get("volume") or {}).get("h24", 0) or 0
-                    change = (p.get("priceChange") or {}).get("h1", 0) or 0
-                    momentum = volume_velocity(mint, vol)
-                    info = {
-                        "name":     p.get("baseToken",{}).get("name","Unknown"),
-                        "symbol":   p.get("baseToken",{}).get("symbol","?"),
-                        "price":    float(p.get("priceUsd") or 0),
-                        "mc":       p.get("marketCap",0) or 0,
-                        "vol":      vol,
-                        "liq":      (p.get("liquidity") or {}).get("usd",0) or 0,
-                        "age_min":  age_min,
-                        "change":   change,
-                        "momentum": momentum,
-                        "social":   check_social_signals(p),
-                    }
-                    if not info["price"]:
-                        continue
-                    info["mint"] = mint
-                    info["score"] = ai_score(info)
-                    info["score"] = min(100, info["score"] + check_social_signals(str(p)))
-                    info["ts"] = int(time.time())
-                    market_feed.appendleft(info)
-                    record_price(mint, info.get("price", 0))
-                    for bot in list(user_bots.values()):
-                        if bot.running:
-                            try:
-                                # boost signal on high momentum tokens
-                                effective_change = info["change"]
-                                if momentum >= 60:
-                                    bot.log_msg(f"⚡ MOMENTUM SPIKE: {info['name']} score={momentum} (velocity)")
-                                    effective_change = max(effective_change, 25)
-                                bot.evaluate_signal(
-                                    mint, info["name"], info["price"],
-                                    info["mc"], info["vol"], info["liq"],
-                                    info["age_min"], effective_change
-                                )
-                            except:
-                                pass
+                    info = _process_dex_pair(pairs[0])
+                    if info:
+                        _broadcast_signal(info)
                 except:
                     pass
-            time.sleep(10)
+            time.sleep(12)
         except Exception as e:
             print(f"Scanner error: {e}")
-            time.sleep(10)
+            time.sleep(15)
+
+def new_pairs_scanner():
+    """Secondary scanner: polls DexScreener boosted + latest Solana pairs directly."""
+    time.sleep(15)
+    # Endpoints that surface fresh Solana meme coins
+    SCAN_URLS = [
+        "https://api.dexscreener.com/token-boosts/latest/v1",   # trending boosted
+        "https://api.dexscreener.com/token-boosts/top/v1",      # top boosted
+    ]
+    while True:
+        try:
+            for url in SCAN_URLS:
+                try:
+                    resp = requests.get(url, headers=HEADERS, timeout=8)
+                    if resp.status_code != 200:
+                        continue
+                    items = resp.json() if isinstance(resp.json(), list) else []
+                    for item in items:
+                        if item.get("chainId") != "solana":
+                            continue
+                        mint = item.get("tokenAddress")
+                        if not mint or mint in seen_tokens:
+                            continue
+                        seen_tokens.add(mint)
+                        try:
+                            pairs = requests.get(
+                                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                headers=HEADERS, timeout=5
+                            ).json().get("pairs") or []
+                            if pairs:
+                                info = _process_dex_pair(pairs[0])
+                                if info:
+                                    _broadcast_signal(info)
+                        except:
+                            pass
+                except:
+                    pass
+            time.sleep(8)
+        except Exception as e:
+            print(f"New-pairs scanner error: {e}")
+            time.sleep(15)
 
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
 def helius_pool_sniper():
@@ -1883,6 +1950,7 @@ def ensure_background_workers_started():
             send_daily_summaries,
             check_whale_wallets,
             global_scanner,
+            new_pairs_scanner,
             auto_restart_bots,
             warm_sender_connections,
             listing_scanner,
