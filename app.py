@@ -912,17 +912,10 @@ class BotInstance:
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
         now = time.time()
-        # Reset hourly counter
-        if now - self.hour_start >= 3600:
-            self.buys_this_hour = 0
-            self.hour_start = now
         # Cooldown after losses
         if now < self.cooldown_until:
             mins = int((self.cooldown_until - now) / 60) + 1
             return f"Loss cooldown active ({mins}m remaining)"
-        # Max 5 buys per hour (prevents overtrading)
-        if self.buys_this_hour >= 5:
-            return "Rate limit: 5 buys/hour max"
         return None
 
     def check_honeypot(self, mint, age_min=0):
