@@ -2522,8 +2522,10 @@ def setup():
 @app.route("/dashboard")
 @login_required
 def dashboard():
+    print("[DEBUG] Dashboard route hit", flush=True)
     try:
         uid = session["user_id"]
+        print(f"[DEBUG] user_id={uid}", flush=True)
         conn = db()
         try:
             cur = conn.cursor()
