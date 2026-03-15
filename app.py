@@ -901,12 +901,12 @@ class BotInstance:
         """Returns a reason string if trading should halt, else None."""
         if self.start_balance > 0:
             daily_loss_pct = (self.start_balance - self.sol_balance) / self.start_balance
-            if daily_loss_pct >= 0.03:
-                return f"Daily loss limit −3% hit ({daily_loss_pct*100:.1f}%)"
+            if daily_loss_pct >= 0.20:
+                return f"Daily loss limit −20% hit ({daily_loss_pct*100:.1f}%)"
         if self.peak_balance > 0:
             drawdown_pct = (self.peak_balance - self.sol_balance) / self.peak_balance
-            if drawdown_pct >= 0.20:
-                return f"Max drawdown −20% hit ({drawdown_pct*100:.1f}%)"
+            if drawdown_pct >= 0.50:
+                return f"Max drawdown −50% hit ({drawdown_pct*100:.1f}%)"
         return None
 
     def check_rate_limit(self, name, mint):
