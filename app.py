@@ -108,7 +108,7 @@ PRESETS = {
         "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":2.0,
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
         "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
-        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
     "degen": {
