@@ -1884,6 +1884,7 @@ def auto_restart_bots():
             cur = conn.cursor()
             cur.execute("""
                 SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
+                       bs.max_correlated, bs.drawdown_limit_sol, bs.custom_settings,
                        w.encrypted_key, u.plan, u.email
                 FROM bot_settings bs
                 JOIN wallets w ON w.user_id = bs.user_id
@@ -1898,6 +1899,18 @@ def auto_restart_bots():
             try:
                 kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
                 settings = dict(PRESETS.get(row["preset"], PRESETS["balanced"]))
+                if row.get("max_correlated") is not None:
+                    settings["max_correlated"] = row["max_correlated"]
+                if row.get("drawdown_limit_sol") is not None:
+                    settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
+                if row.get("custom_settings"):
+                    try:
+                        import json as _json
+                        custom = _json.loads(row["custom_settings"])
+                        if isinstance(custom, dict):
+                            settings.update(custom)
+                    except Exception:
+                        pass
                 max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email","")), PLAN_LIMITS["basic"])["max_buy_sol"]
                 settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
                 bot = BotInstance(uid, kp, settings,
@@ -2693,6 +2706,21 @@ def api_start():
         return jsonify({"ok":False,"msg":"Wallet key could not be decrypted — please re-enter your private key at /setup"})
     preset   = bs["preset"] if bs else "balanced"
     settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
+    # Apply user-specific overrides saved in DB on top of preset defaults
+    if bs:
+        if bs.get("max_correlated") is not None:
+            settings["max_correlated"] = bs["max_correlated"]
+        if bs.get("drawdown_limit_sol") is not None:
+            settings["drawdown_limit_sol"] = bs["drawdown_limit_sol"]
+        # Apply custom_settings JSON overrides (tp1_mult, stop_loss, etc.)
+        if bs.get("custom_settings"):
+            try:
+                import json as _json
+                custom = _json.loads(bs["custom_settings"])
+                if isinstance(custom, dict):
+                    settings.update(custom)
+            except Exception:
+                pass
     max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
     settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
@@ -2780,16 +2808,19 @@ def api_settings():
             try: overrides[key] = cast(data[key])
             except Exception as _e:
                 print(f"[ERROR] {_e}", flush=True)
+    import json as _json
     conn = db()
     try:
         cur = conn.cursor()
         cur.execute("""
             UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
-            max_correlated=%s,drawdown_limit_sol=%s
+            max_correlated=%s,drawdown_limit_sol=%s,custom_settings=%s
             WHERE user_id=%s
         """, (preset, run_mode, duration, profit,
               overrides.get("max_correlated", 5),
-              overrides.get("drawdown_limit_sol", 0.5), uid))
+              overrides.get("drawdown_limit_sol", 0.5),
+              _json.dumps(overrides) if overrides else None,
+              uid))
         conn.commit()
     finally:
         db_return(conn)
@@ -4608,6 +4639,7 @@ async function refresh() {
 }
 
 async function toggleBot() {
+  if (!running) { await saveSettings(); }  // persist current preset + params before starting
   const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>null);
   if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
