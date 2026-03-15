@@ -11,8 +11,10 @@ Required .env variables:
 import atexit
 import os, threading, time, base64, json, requests, base58, secrets, hashlib, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import string
 from collections import deque
 from datetime import datetime, timedelta
@@ -81,6 +83,38 @@ SESSION_COOKIE_SECURE = os.getenv(
 RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 PUMP_FUN    = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
+# ── DexScreener rate limiter (token bucket) ───────────────────────────────────
+class _RateLimiter:
+    """Simple thread-safe token bucket rate limiter."""
+    def __init__(self, rate_per_sec=15):
+        self._rate = rate_per_sec
+        self._tokens = rate_per_sec
+        self._last = time.time()
+        self._lock = threading.Lock()
+
+    def acquire(self, timeout=5):
+        deadline = time.time() + timeout
+        while True:
+            with self._lock:
+                now = time.time()
+                self._tokens = min(self._rate, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= 1:
+                    self._tokens -= 1
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+
+_dex_limiter = _RateLimiter(rate_per_sec=15)
+
+def dex_get(url, **kwargs):
+    """Rate-limited GET to DexScreener API."""
+    _dex_limiter.acquire()
+    kwargs.setdefault("headers", HEADERS)
+    kwargs.setdefault("timeout", 8)
+    return requests.get(url, **kwargs)
+
 PLAN_LIMITS = {
     "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
     "basic": {"max_buy_sol": 0.1,  "label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
@@ -131,10 +165,24 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
+_db_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=2, maxconn=20,
+    dsn=DATABASE_URL,
+    cursor_factory=psycopg2.extras.RealDictCursor,
+)
+
 def db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn = _db_pool.getconn()
     conn.autocommit = False
     return conn
+
+def db_return(conn):
+    """Return a connection to the pool. Call this instead of conn.close()."""
+    try:
+        conn.rollback()  # reset any uncommitted state
+    except Exception:
+        pass
+    _db_pool.putconn(conn)
 
 def init_db():
     conn = db()
@@ -234,6 +282,10 @@ def init_db():
         for _idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
+            "CREATE INDEX IF NOT EXISTS idx_trades_user_id_ts ON trades (user_id, timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_bot_settings_user_id ON bot_settings (user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_open_positions_user_id ON open_positions (user_id)",
         ]:
             try:
                 cur.execute(_idx_sql)
@@ -241,7 +293,7 @@ def init_db():
             except Exception:
                 conn.rollback()
     finally:
-        conn.close()
+        db_return(conn)
 
 init_db()
 
@@ -292,7 +344,7 @@ def migrate_db():
             conn.rollback()
         conn.commit()
     finally:
-        conn.close()
+        db_return(conn)
 migrate_db()
 
 def make_referral_code():
@@ -308,8 +360,8 @@ def send_telegram(chat_id, msg):
             json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
             timeout=5
         )
-    except:
-        pass
+    except Exception as _e:
+        print(f"[ERROR] Telegram send failed: {_e}", flush=True)
 
 # ── Email notifications (SendGrid) ────────────────────────────────────────────
 def send_email(to_email, subject, body_html):
@@ -344,7 +396,7 @@ def send_daily_summaries():
                 cur.execute("SELECT id, email FROM users")
                 users = cur.fetchall()
             finally:
-                conn.close()
+                db_return(conn)
             for u in users:
                 uid = u["id"]
                 conn = db()
@@ -357,7 +409,7 @@ def send_daily_summaries():
                     """, (uid,))
                     trades = cur.fetchall()
                 finally:
-                    conn.close()
+                    db_return(conn)
                 if not trades:
                     continue
                 total_pnl = sum(t["pnl_sol"] or 0 for t in trades)
@@ -396,7 +448,9 @@ def decrypt_key(encrypted: str) -> str:
 
 # ── Per-user bot instances ─────────────────────────────────────────────────────
 user_bots    = {}
+user_bots_lock = threading.Lock()
 seen_tokens  = set()
+seen_tokens_lock = threading.Lock()
 market_feed  = deque(maxlen=100)   # live token stream for market board
 BACKGROUND_WORKER_LOCK_ID = 48270431
 _background_workers_started = False
@@ -452,7 +506,8 @@ def check_holder_concentration(mint):
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
         if total <= 0: return True
         return (top5 / total) < 0.50
-    except:
+    except Exception as _e:
+        print(f"[ERROR] Holder check failed: {_e}", flush=True)
         return True
 
 def check_social_signals(info):
@@ -478,7 +533,7 @@ def check_dev_blacklist(dev_wallet):
         cur.execute("SELECT 1 FROM dev_blacklist WHERE dev_wallet=%s", (dev_wallet,))
         row = cur.fetchone()
     finally:
-        conn.close()
+        db_return(conn)
     return row is None
 
 def blacklist_dev(dev_wallet, reason="rugged"):
@@ -489,8 +544,9 @@ def blacklist_dev(dev_wallet, reason="rugged"):
             cur.execute("INSERT INTO dev_blacklist (dev_wallet,reason) VALUES (%s,%s) ON CONFLICT DO NOTHING", (dev_wallet, reason))
             conn.commit()
         finally:
-            conn.close()
-    except: pass
+            db_return(conn)
+    except Exception as _e:
+        print(f"[ERROR] {_e}", flush=True)
 
 def get_market_stats():
     """Aggregate recent trade stats for AI settings suggestion."""
@@ -504,7 +560,7 @@ def get_market_stats():
             """)
             trades = cur.fetchall()
         finally:
-            conn.close()
+            db_return(conn)
         if not trades: return {}
         wins   = [t for t in trades if (t["pnl_sol"] or 0) > 0]
         losses = [t for t in trades if (t["pnl_sol"] or 0) < 0]
@@ -616,8 +672,9 @@ class BotInstance:
                 )
                 conn.commit()
             finally:
-                conn.close()
-        except: pass
+                db_return(conn)
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
 
     def should_stop(self):
         if self.run_mode == "duration" and self.run_duration_min > 0:
@@ -638,8 +695,8 @@ class BotInstance:
             self.sol_balance = r.json().get("result",{}).get("value",0) / 1e9
             if self.sol_balance > self.peak_balance:
                 self.peak_balance = self.sol_balance
-        except:
-            pass
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
 
     # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
     JITO_TIPS = [
@@ -662,7 +719,8 @@ class BotInstance:
             r = requests.get("https://bundles.jito.wtf/api/v1/bundles/tip_floor", timeout=4).json()
             tip_sol = r[0].get("landed_tips_75th_percentile", 0.0002)
             return max(int(tip_sol * 1e9), self.TIP_LAMPORTS)
-        except:
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
             return self.TIP_LAMPORTS
 
     def _inject_tip(self, tx):
@@ -889,14 +947,14 @@ class BotInstance:
 
     def get_token_price(self, mint):
         try:
-            pairs = requests.get(
+            pairs = dex_get(
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                headers=HEADERS, timeout=5
+                timeout=5
             ).json().get("pairs")
             if pairs:
                 return float(pairs[0].get("priceUsd") or 0)
-        except:
-            pass
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
         return None
 
     def is_safe_token(self, mint):
@@ -916,7 +974,8 @@ class BotInstance:
             if freeze_auth is not None:
                 return False
             return True
-        except:
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
             return True
 
     def check_circuit_breakers(self):
@@ -947,7 +1006,8 @@ class BotInstance:
         try:
             test_quote = self.jupiter_quote(mint, SOL_MINT, 10_000_000, 5000)
             return test_quote is not None
-        except:
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
             return True
 
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
@@ -1061,7 +1121,7 @@ class BotInstance:
                                (self.user_id, mint, name, real_price, real_price, s["max_buy_sol"], 0, dev_wallet))
                     _conn.commit()
                 finally:
-                    _conn.close()
+                    db_return(_conn)
             except Exception as _e:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
@@ -1076,11 +1136,12 @@ class BotInstance:
                     cur.execute("SELECT telegram_chat_id FROM users WHERE id=%s", (self.user_id,))
                     u = cur.fetchone()
                 finally:
-                    conn.close()
+                    db_return(conn)
                 if u and u["telegram_chat_id"]:
                     send_telegram(u["telegram_chat_id"],
                         f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {s['max_buy_sol']} SOL\n🔗 solscan.io/tx/{sig}")
-            except: pass
+            except Exception as _e:
+                print(f"[ERROR] {_e}", flush=True)
         else:
             self.log_filter(name, mint, False, "Transaction failed to send")
 
@@ -1098,8 +1159,9 @@ class BotInstance:
                         _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                         _conn.commit()
                     finally:
-                        _conn.close()
-                except: pass
+                        db_return(_conn)
+                except Exception as _e:
+                    print(f"[ERROR] {_e}", flush=True)
                 return
             amount = int(total * pct)
             if not amount:
@@ -1143,15 +1205,15 @@ class BotInstance:
                         _cur.execute("SELECT telegram_chat_id FROM users WHERE id=%s", (self.user_id,))
                         u = _cur.fetchone()
                     finally:
-                        conn.close()
+                        db_return(conn)
                     if u and u["telegram_chat_id"]:
                         emoji = "🟢" if pnl_pct >= 0 else "🔴"
                         send_telegram(u["telegram_chat_id"],
                             f"{emoji} <b>SELL</b> {pos['name']} {int(pct*100)}%\n"
                             f"📈 {pnl_pct:+.1f}% | {pnl_sol:+.4f} SOL\n"
                             f"📝 {reason}")
-                except:
-                    pass
+                except Exception as _e:
+                    print(f"[ERROR] {_e}", flush=True)
                 conn = db()
                 try:
                     _cur = conn.cursor()
@@ -1161,7 +1223,7 @@ class BotInstance:
                     )
                     conn.commit()
                 finally:
-                    conn.close()
+                    db_return(conn)
                 if pct >= 1.0:
                     del self.positions[mint]
                     try:
@@ -1170,8 +1232,9 @@ class BotInstance:
                             _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                             _conn.commit()
                         finally:
-                            _conn.close()
-                    except: pass
+                            db_return(_conn)
+                    except Exception as _e:
+                        print(f"[ERROR] {_e}", flush=True)
                 else:
                     self.positions[mint]["tp1_hit"] = True
                     try:
@@ -1180,8 +1243,9 @@ class BotInstance:
                             _conn.cursor().execute("UPDATE open_positions SET tp1_hit=1 WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                             _conn.commit()
                         finally:
-                            _conn.close()
-                    except: pass
+                            db_return(_conn)
+                    except Exception as _e:
+                        print(f"[ERROR] {_e}", flush=True)
                 self.refresh_balance()
         except Exception as e:
             self.log_msg(f"Sell error {pos['name']}: {e}")
@@ -1218,8 +1282,9 @@ class BotInstance:
                         _conn.cursor().execute("UPDATE open_positions SET peak_price=%s WHERE user_id=%s AND mint=%s", (cur, self.user_id, mint))
                         _conn.commit()
                     finally:
-                        _conn.close()
-                except: pass
+                        db_return(_conn)
+                except Exception as _e:
+                    print(f"[ERROR] {_e}", flush=True)
             ratio      = cur / pos["entry_price"]
             peak_ratio = pos["peak_price"] / pos["entry_price"]
             age_min    = (time.time() - pos["timestamp"]) / 60
@@ -1328,7 +1393,7 @@ class BotInstance:
             plan = row["plan"] if row else "basic"
             email = row["email"] if row else ""
         finally:
-            conn.close()
+            db_return(conn)
         if is_admin(email):
             self.perf_fee_recorded = True
             return  # no performance fee on admin accounts
@@ -1347,7 +1412,7 @@ class BotInstance:
             )
             conn.commit()
         finally:
-            conn.close()
+            db_return(conn)
         self.perf_fee_recorded = True
         self.log_msg(f"Performance fee: {fee_sol:.4f} SOL ({int(pct*100)}% of {pnl:.4f} SOL profit) — collecting…")
         if FEE_WALLET:
@@ -1360,7 +1425,7 @@ class BotInstance:
                     cur.execute("UPDATE perf_fees SET charged=1 WHERE session_id=%s", (self.session_id,))
                     conn.commit()
                 finally:
-                    conn.close()
+                    db_return(conn)
             else:
                 self.log_msg(f"⚠️ Fee collection failed — {fee_sol:.4f} SOL logged for manual collection")
 
@@ -1404,7 +1469,8 @@ def check_whale_wallets():
     time.sleep(15)  # let app fully start first
     while True:
         try:
-            active_bots = [b for b in user_bots.values() if b.running]
+            with user_bots_lock:
+                active_bots = [b for b in user_bots.values() if b.running]
             if not active_bots:
                 time.sleep(30)
                 continue
@@ -1475,12 +1541,12 @@ def check_whale_wallets():
                                             bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
                                             try:
                                                 bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, 0)
-                                            except:
-                                                pass
-                                except:
-                                    pass
-                except:
-                    pass
+                                            except Exception as _e:
+                                                print(f"[ERROR] {_e}", flush=True)
+                                except Exception as _e:
+                                    print(f"[ERROR] {_e}", flush=True)
+                except Exception as _e:
+                    print(f"[ERROR] {_e}", flush=True)
             time.sleep(20)
         except Exception as e:
             print(f"Whale tracker error: {e}")
@@ -1515,7 +1581,8 @@ def _process_dex_pair(p):
         }
         info["score"] = min(100, ai_score(info) + check_social_signals(str(p)))
         return info
-    except:
+    except Exception as _e:
+        print(f"[ERROR] {_e}", flush=True)
         return None
 
 def _broadcast_signal(info):
@@ -1523,7 +1590,8 @@ def _broadcast_signal(info):
     mint = info["mint"]
     market_feed.appendleft(info)
     record_price(mint, info["price"])
-    running_bots = [b for b in user_bots.values() if b.running]
+    with user_bots_lock:
+        running_bots = [b for b in user_bots.values() if b.running]
     print(f"[SCAN] {info['name']} | MC:${info['mc']:,.0f} Liq:${info['liq']:,.0f} Age:{info['age_min']:.0f}m Chg:{info['change']:+.0f}% | bots={len(running_bots)}", flush=True)
     for bot in running_bots:
         try:
@@ -1544,9 +1612,9 @@ def global_scanner():
     time.sleep(10)
     while True:
         try:
-            r = requests.get(
+            r = dex_get(
                 "https://api.dexscreener.com/token-profiles/latest/v1",
-                headers=HEADERS, timeout=10
+                timeout=10
             )
             if r.status_code != 200:
                 print(f"[SCANNER] token-profiles HTTP {r.status_code}", flush=True)
@@ -1554,23 +1622,25 @@ def global_scanner():
                 continue
             tokens = r.json() if isinstance(r.json(), list) else []
             sol_tokens = [t for t in tokens if t.get("chainId") == "solana"]
-            new_tokens  = [t for t in sol_tokens if t.get("tokenAddress") and t["tokenAddress"] not in seen_tokens]
+            with seen_tokens_lock:
+                new_tokens  = [t for t in sol_tokens if t.get("tokenAddress") and t["tokenAddress"] not in seen_tokens]
+                for t in new_tokens:
+                    seen_tokens.add(t["tokenAddress"])
             print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
             for t in new_tokens:
                 mint = t["tokenAddress"]
-                seen_tokens.add(mint)
                 try:
-                    pairs = requests.get(
+                    pairs = dex_get(
                         f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        headers=HEADERS, timeout=5
+                        timeout=5
                     ).json().get("pairs") or []
                     if not pairs:
                         continue
                     info = _process_dex_pair(pairs[0])
                     if info:
                         _broadcast_signal(info)
-                except:
-                    pass
+                except Exception as _e:
+                    print(f"[ERROR] {_e}", flush=True)
             time.sleep(12)
         except Exception as e:
             print(f"[SCANNER] error: {e}", flush=True)
@@ -1588,17 +1658,19 @@ def new_pairs_scanner():
             for url in SCAN_URLS:
                 label = url.split("/")[-2]
                 try:
-                    resp = requests.get(url, headers=HEADERS, timeout=8)
+                    resp = dex_get(url, timeout=8)
                     if resp.status_code != 200:
                         print(f"[SCANNER2] {label} HTTP {resp.status_code}", flush=True)
                         continue
                     items = resp.json() if isinstance(resp.json(), list) else []
                     sol = [i for i in items if i.get("chainId") == "solana"]
-                    new = [i for i in sol if i.get("tokenAddress") and i["tokenAddress"] not in seen_tokens]
+                    with seen_tokens_lock:
+                        new = [i for i in sol if i.get("tokenAddress") and i["tokenAddress"] not in seen_tokens]
+                        for item in new:
+                            seen_tokens.add(item["tokenAddress"])
                     print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
                     for item in new:
                         mint = item["tokenAddress"]
-                        seen_tokens.add(mint)
                         try:
                             pairs = requests.get(
                                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -1608,8 +1680,8 @@ def new_pairs_scanner():
                                 info = _process_dex_pair(pairs[0])
                                 if info:
                                     _broadcast_signal(info)
-                        except:
-                            pass
+                        except Exception as _e:
+                            print(f"[ERROR] {_e}", flush=True)
                 except Exception as e2:
                     print(f"[SCANNER2] {label} error: {e2}", flush=True)
             time.sleep(8)
@@ -1671,9 +1743,9 @@ def helius_pool_sniper():
                             seen_tokens.add(mint)
                             # Fetch info and add to market feed immediately
                             try:
-                                pairs = requests.get(
+                                pairs = dex_get(
                                     f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                    headers=HEADERS, timeout=5
+                                    timeout=5
                                 ).json().get("pairs")
                                 if not pairs: return
                                 p = pairs[0]
@@ -1700,9 +1772,12 @@ def helius_pool_sniper():
                                         try:
                                             bot.evaluate_signal(mint,info["name"],info["price"],
                                                 info["mc"],info["vol"],liq,age_min,change)
-                                        except: pass
-                            except: pass
-                except: pass
+                                        except Exception as _e:
+                                            print(f"[ERROR] {_e}", flush=True)
+                            except Exception as _e:
+                                print(f"[ERROR] {_e}", flush=True)
+                except Exception as _e:
+                    print(f"[ERROR] {_e}", flush=True)
 
             def on_error(ws, err): print(f"[Sniper] WS error: {err}")
             def on_close(ws, *a): print("[Sniper] WS closed — reconnecting...")
@@ -1737,7 +1812,7 @@ def auto_restart_bots():
             """)
             rows = cur.fetchall()
         finally:
-            conn.close()
+            db_return(conn)
         for row in rows:
             uid = row["user_id"]
             try:
@@ -1749,7 +1824,8 @@ def auto_restart_bots():
                     run_mode=row["run_mode"],
                     run_duration_min=row["run_duration_min"],
                     profit_target_sol=row["profit_target_sol"])
-                user_bots[uid] = bot
+                with user_bots_lock:
+                    user_bots[uid] = bot
                 # Reload open positions from DB so they survive Railway restarts
                 try:
                     _conn = db()
@@ -1758,7 +1834,7 @@ def auto_restart_bots():
                         _c.execute("SELECT * FROM open_positions WHERE user_id=%s", (uid,))
                         saved_pos = _c.fetchall()
                     finally:
-                        _conn.close()
+                        db_return(_conn)
                     for p in saved_pos:
                         opened_ts = p["opened_at"].timestamp() if p.get("opened_at") else time.time()
                         bot.positions[p["mint"]] = {
@@ -1784,7 +1860,7 @@ def auto_restart_bots():
                     cur.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
                     conn.commit()
                 finally:
-                    conn.close()
+                    db_return(conn)
     except Exception:
         pass
 
@@ -1802,7 +1878,8 @@ def warm_sender_connections():
         for url in endpoints:
             try:
                 requests.get(url.replace("/fast", "/ping"), timeout=4)
-            except: pass
+            except Exception as _e:
+                print(f"[ERROR] {_e}", flush=True)
         time.sleep(30)
 
 # ── CEX Listing Sniper ─────────────────────────────────────────────────────────
@@ -1860,16 +1937,16 @@ def _extract_symbols(exchange, data):
             for p in data:
                 if p.get("trade_status") == "tradable" and p.get("id","").endswith("_USDT"):
                     syms.add(p["id"].split("_")[0].upper())
-    except:
-        pass
+    except Exception as _e:
+        print(f"[ERROR] {_e}", flush=True)
     return syms
 
 def _find_solana_token(symbol):
     """Search DexScreener for a Solana token by symbol. Returns (mint, name, price, liq) or None."""
     try:
-        r = requests.get(
+        r = dex_get(
             f"https://api.dexscreener.com/latest/dex/search?q={symbol}",
-            headers=HEADERS, timeout=8
+            timeout=8
         ).json()
         pairs = r.get("pairs") or []
         sol_pairs = [p for p in pairs
@@ -1889,7 +1966,8 @@ def _find_solana_token(symbol):
         if not price:
             return None
         return mint, name, price, liq
-    except:
+    except Exception as _e:
+        print(f"[ERROR] {_e}", flush=True)
         return None
 
 def listing_scanner():
@@ -1902,7 +1980,8 @@ def listing_scanner():
         try:
             data = requests.get(url, headers=HEADERS, timeout=10).json()
             _listing_known[exchange] = _extract_symbols(exchange, data)
-        except:
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
             _listing_known[exchange] = set()
         time.sleep(1)
 
@@ -1988,6 +2067,18 @@ def _release_background_lock():
 
 atexit.register(_release_background_lock)
 
+SEEN_TOKENS_MAX = 50_000
+
+def _prune_seen_tokens():
+    """Periodically clear seen_tokens to prevent unbounded memory growth."""
+    while True:
+        time.sleep(3600)  # every hour
+        with seen_tokens_lock:
+            size = len(seen_tokens)
+            if size > SEEN_TOKENS_MAX:
+                seen_tokens.clear()
+                print(f"[PRUNE] Cleared seen_tokens ({size} entries)", flush=True)
+
 
 def _acquire_background_worker_lock():
     global _background_lock_conn
@@ -2027,6 +2118,7 @@ def ensure_background_workers_started():
             warm_sender_connections,
             listing_scanner,
             process_listing_alerts,
+            _prune_seen_tokens,
         ]
         for target in worker_targets:
             threading.Thread(target=target, daemon=True).start()
@@ -2041,13 +2133,33 @@ app.secret_key = SECRET_KEY
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False,   # Railway terminates TLS at proxy — app sees HTTP
+    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
 try:
     ensure_background_workers_started()
 except Exception as _e:
     print(f"[WARN] Background workers not started at module load: {_e}")
+
+
+def _graceful_shutdown(signum, frame):
+    """Stop all running bots and persist positions on SIGTERM/SIGINT."""
+    print(f"[SHUTDOWN] Signal {signum} received — stopping all bots...", flush=True)
+    with user_bots_lock:
+        bots = list(user_bots.values())
+    for bot in bots:
+        try:
+            bot.running = False
+        except Exception:
+            pass
+    # Give bots a moment to finish current sell cycles
+    time.sleep(2)
+    print("[SHUTDOWN] All bots stopped. Exiting.", flush=True)
+    _release_background_lock()
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+signal.signal(signal.SIGINT, _graceful_shutdown)
 
 
 @app.before_request
@@ -2063,6 +2175,19 @@ def _apply_security_headers(resp):
     if request.is_secure:
         resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return resp
+
+@app.route("/health")
+def health_check():
+    """Health check endpoint for Railway / load balancers."""
+    try:
+        conn = db()
+        try:
+            conn.cursor().execute("SELECT 1")
+        finally:
+            db_return(conn)
+        return jsonify({"status": "ok", "db": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "db": str(e)}), 503
 
 def login_required(f):
     @wraps(f)
@@ -2123,7 +2248,7 @@ def _update_user_subscription(user_id, plan=_UNSET, customer_id=_UNSET, subscrip
         cur.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=%s", tuple(values))
         conn.commit()
     finally:
-        conn.close()
+        db_return(conn)
 
 # ── PWA routes ─────────────────────────────────────────────────────────────────
 @app.route("/manifest.json")
@@ -2267,7 +2392,7 @@ def signup():
                     if referrer:
                         ref_by = referrer["id"]
                 finally:
-                    conn.close()
+                    db_return(conn)
             try:
                 conn = db()
                 try:
@@ -2283,7 +2408,7 @@ def signup():
                                      (ref_by, user_id))
                     conn.commit()
                 finally:
-                    conn.close()
+                    db_return(conn)
                 session.permanent = True
                 session["user_id"] = user_id
                 session["email"]   = email
@@ -2308,7 +2433,7 @@ def login():
                 cur.execute("SELECT * FROM users WHERE email=%s", (email,))
                 user = cur.fetchone()
             finally:
-                conn.close()
+                db_return(conn)
             if user and bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
                 session.permanent = True
                 session["user_id"] = user["id"]
@@ -2353,7 +2478,7 @@ def setup():
                     (uid, preset, run_mode, duration, profit, 0))
                 conn.commit()
             finally:
-                conn.close()
+                db_return(conn)
             return redirect(url_for("dashboard"))
         except Exception as e:
             error = f"Invalid private key: {e}"
@@ -2374,7 +2499,7 @@ def dashboard():
         cur.execute("SELECT * FROM bot_settings WHERE user_id=%s", (uid,))
         bsettings = cur.fetchone()
     finally:
-        conn.close()
+        db_return(conn)
     if not user:
         session.clear()
         return redirect(url_for("login"))
@@ -2437,8 +2562,9 @@ def api_state():
 @login_required
 def api_start():
     uid = session["user_id"]
-    if uid in user_bots and user_bots[uid].running:
-        return jsonify({"ok":False,"msg":"Already running"})
+    with user_bots_lock:
+        if uid in user_bots and user_bots[uid].running:
+            return jsonify({"ok":False,"msg":"Already running"})
     conn = db()
     try:
         cur = conn.cursor()
@@ -2449,7 +2575,7 @@ def api_start():
         cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
         u = cur.fetchone()
     finally:
-        conn.close()
+        db_return(conn)
     if not w:
         return jsonify({"ok":False,"msg":"Wallet not configured — go to /setup"})
     plan = effective_plan(u["plan"], u["email"])
@@ -2471,7 +2597,8 @@ def api_start():
         run_duration_min  = bs["run_duration_min"] if bs else 0,
         profit_target_sol = bs["profit_target_sol"] if bs else 0,
     )
-    user_bots[uid] = bot
+    with user_bots_lock:
+        user_bots[uid] = bot
     t = threading.Thread(target=bot.run, daemon=True)
     t.start()
     bot.thread = t
@@ -2481,7 +2608,7 @@ def api_start():
         cur.execute("UPDATE bot_settings SET is_running=1 WHERE user_id=%s", (uid,))
         conn.commit()
     finally:
-        conn.close()
+        db_return(conn)
     return jsonify({"ok":True})
 
 @app.route("/api/stop", methods=["POST"])
@@ -2498,7 +2625,7 @@ def api_stop():
             cur.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
             conn.commit()
         finally:
-            conn.close()
+            db_return(conn)
     return jsonify({"ok":True})
 
 @app.route("/api/cashout", methods=["POST"])
@@ -2528,7 +2655,8 @@ def api_settings():
     ]:
         if key in data:
             try: overrides[key] = cast(data[key])
-            except: pass
+            except Exception as _e:
+                print(f"[ERROR] {_e}", flush=True)
     conn = db()
     try:
         cur = conn.cursor()
@@ -2541,7 +2669,7 @@ def api_settings():
               overrides.get("drawdown_limit_sol", 0.5), uid))
         conn.commit()
     finally:
-        conn.close()
+        db_return(conn)
     bot = user_bots.get(uid)
     if bot:
         bot.settings.update(PRESETS.get(preset, bot.settings))
@@ -2641,10 +2769,12 @@ def api_market_feed():
 @login_required
 def api_manual_buy():
     uid  = session["user_id"]
-    mint = (request.json or {}).get("mint", "")
-    name = (request.json or {}).get("name", "Unknown")
-    if not mint:
-        return jsonify({"ok": False, "msg": "No mint provided"})
+    mint = (request.json or {}).get("mint", "").strip()
+    name = (request.json or {}).get("name", "Unknown").strip()[:64]
+    if not mint or len(mint) < 32 or len(mint) > 64:
+        return jsonify({"ok": False, "msg": "Invalid mint address"})
+    if not all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in mint):
+        return jsonify({"ok": False, "msg": "Invalid mint address format"})
     bot = user_bots.get(uid)
     if not bot or not bot.running:
         return jsonify({"ok": False, "msg": "Bot not running — start bot first"})
@@ -2652,10 +2782,11 @@ def api_manual_buy():
         return jsonify({"ok": False, "msg": "Already in position"})
     # get current price
     try:
-        pairs = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                             headers=HEADERS, timeout=5).json().get("pairs")
+        pairs = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                        timeout=5).json().get("pairs")
         price = float(pairs[0].get("priceUsd") or 0) if pairs else 0
-    except:
+    except Exception as _e:
+        print(f"[ERROR] {_e}", flush=True)
         price = 0
     if not price:
         return jsonify({"ok": False, "msg": "Could not fetch price"})
@@ -2673,7 +2804,7 @@ def api_telegram():
         cur.execute("UPDATE users SET telegram_chat_id=%s WHERE id=%s", (chat_id or None, uid))
         conn.commit()
     finally:
-        conn.close()
+        db_return(conn)
     if chat_id:
         send_telegram(chat_id, "✅ <b>SolTrader</b> connected! You'll receive alerts when your bot buys and sells.")
     return jsonify({"ok": True})
@@ -2696,7 +2827,7 @@ def api_filter_log():
         cur.execute("SELECT * FROM filter_log WHERE user_id=%s ORDER BY id DESC LIMIT 30", (uid,))
         rows = cur.fetchall()
     finally:
-        conn.close()
+        db_return(conn)
     return jsonify([dict(r) for r in rows])
 
 # Price history for candlestick chart — mint → [(unix_ts, price), ...]
@@ -2751,7 +2882,7 @@ def api_dev_blacklist():
         cur.execute("SELECT * FROM dev_blacklist ORDER BY created_at DESC LIMIT 50")
         rows = cur.fetchall()
     finally:
-        conn.close()
+        db_return(conn)
     return jsonify([dict(r) for r in rows])
 
 @app.route("/api/admin/override-preset", methods=["POST"])
@@ -2771,7 +2902,7 @@ def api_override_preset():
             cur.execute("SELECT user_id FROM bot_settings WHERE preset=%s AND is_running=1", (preset,))
             rows = cur.fetchall()
         finally:
-            conn.close()
+            db_return(conn)
         for row in rows:
             bot = user_bots.get(row["user_id"])
             if bot:
@@ -2791,7 +2922,7 @@ def api_referral():
         cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=%s", (uid,))
         count = cur.fetchone()["c"]
     finally:
-        conn.close()
+        db_return(conn)
     code = u["referral_code"] or ""
     link = f"https://soltrader-production.up.railway.app/ref/{code}"
     return jsonify({"ok": True, "code": code, "link": link,
@@ -2842,7 +2973,7 @@ def stripe_webhook():
             )
             row = cur.fetchone()
         finally:
-            conn.close()
+            db_return(conn)
         if row:
             resolved_plan = plan if status in {"trialing", "active"} else "free"
             _update_user_subscription(
@@ -2871,7 +3002,7 @@ def subscribe(plan):
             cur.execute("UPDATE users SET plan='free' WHERE id=%s", (uid,))
             conn.commit()
         finally:
-            conn.close()
+            db_return(conn)
         return redirect(url_for("dashboard"))
     price_map = {"basic": STRIPE_PRICE_BASIC, "pro": STRIPE_PRICE_PRO, "elite": STRIPE_PRICE_ELITE}
     price_id  = price_map.get(plan, "")
@@ -2948,7 +3079,7 @@ def admin():
         cur.execute("SELECT * FROM perf_fees ORDER BY created_at DESC")
         fees = cur.fetchall()
     finally:
-        conn.close()
+        db_return(conn)
     active        = sum(1 for b in user_bots.values() if b.running)
     total_fee_sol = sum(f["fee_sol"] for f in fees)
     return Response(
