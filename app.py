@@ -4077,11 +4077,26 @@ function toggleStop(v) {
   document.getElementById('f-dur').style.display = v==='duration' ? 'block':'none';
   document.getElementById('f-pft').style.display = v==='profit'   ? 'block':'none';
 }
+const PRESET_SETTINGS = {
+  safe:     {maxpos:2, cooldown:10, tp1:1.2, tp2:1.5, sl:0.85, trail:0.15, buy:0.02, dd:0.3},
+  balanced: {maxpos:5, cooldown:10, tp1:1.2, tp2:1.5, sl:0.75, trail:0.20, buy:0.04, dd:0.5},
+  degen:    {maxpos:5, cooldown:5,  tp1:2.0, tp2:10.0, sl:0.60, trail:0.30, buy:0.10, dd:1.0},
+};
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('pc-' + name);
   if (el) el.classList.add('active');
   document.getElementById('s-preset').value = name;
+  const p = PRESET_SETTINGS[name];
+  if (!p) return;
+  document.getElementById('s-maxpos').value   = p.maxpos;
+  document.getElementById('s-cooldown').value = p.cooldown;
+  document.getElementById('s-tp1').value      = p.tp1;
+  document.getElementById('s-tp2').value      = p.tp2;
+  document.getElementById('s-sl').value       = p.sl;
+  document.getElementById('s-trail').value    = p.trail;
+  document.getElementById('s-buy').value      = p.buy;
+  document.getElementById('s-dd').value       = p.dd;
 }
 async function saveSettings() {
   const res = await fetch('/api/settings', {
