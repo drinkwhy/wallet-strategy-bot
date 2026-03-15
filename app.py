@@ -2575,19 +2575,23 @@ def api_state():
     bot = user_bots.get(uid)
     pos_list = []
     if bot:
-        for mint, p in bot.positions.items():
-            cur   = bot.get_token_price(mint)
-            ratio = (cur / p["entry_price"]) if cur and p["entry_price"] else None
-            pos_list.append({
-                "address":       mint,
-                "name":          p["name"],
-                "entry_price":   p["entry_price"],
-                "current_price": cur,
-                "ratio":         ratio,
-                "pnl":           f"{(ratio-1)*100:+.1f}%" if ratio else "?",
-                "age_min":       round((time.time()-p["timestamp"])/60,1),
-                "tp1_hit":       p["tp1_hit"],
-            })
+        pos_snapshot = dict(bot.positions)  # thread-safe snapshot
+        for mint, p in pos_snapshot.items():
+            try:
+                cur   = bot.get_token_price(mint)
+                ratio = (cur / p["entry_price"]) if cur and p["entry_price"] else None
+                pos_list.append({
+                    "address":       mint,
+                    "name":          p["name"],
+                    "entry_price":   p["entry_price"],
+                    "current_price": cur,
+                    "ratio":         ratio,
+                    "pnl":           f"{(ratio-1)*100:+.1f}%" if ratio else "?",
+                    "age_min":       round((time.time()-p["timestamp"])/60,1),
+                    "tp1_hit":       p["tp1_hit"],
+                })
+            except Exception:
+                pass  # position was sold mid-iteration
     stats = bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0}
     total_trades = stats["wins"] + stats["losses"]
     stats["win_rate"] = round(stats["wins"] / total_trades * 100, 1) if total_trades else 0
@@ -3018,25 +3022,29 @@ def api_position_analytics():
     if not bot:
         return jsonify({"positions": [], "risk": {}})
     positions = []
-    for mint, p in bot.positions.items():
-        cur_price = bot.get_token_price(mint)
-        ratio = (cur_price / p["entry_price"]) if cur_price and p["entry_price"] else None
-        peak_ratio = (p.get("peak_price", p["entry_price"]) / p["entry_price"]) if p["entry_price"] else None
-        chart_data = [{"ts": ts, "price": pr} for ts, pr in _price_history.get(mint, [])[-50:]]
-        positions.append({
-            "mint": mint, "name": p["name"],
-            "entry_price": p["entry_price"], "current_price": cur_price,
-            "peak_price": p.get("peak_price", p["entry_price"]),
-            "ratio": ratio, "peak_ratio": peak_ratio,
-            "pnl_pct": round((ratio - 1) * 100, 1) if ratio else 0,
-            "age_min": round((time.time() - p["timestamp"]) / 60, 1),
-            "tp1_hit": p["tp1_hit"], "entry_sol": p["entry_sol"],
-            "dev_wallet": p.get("dev_wallet"),
-            "chart": chart_data,
-            "tp1_price": p["entry_price"] * bot.settings.get("tp1_mult", 1.5),
-            "tp2_price": p["entry_price"] * bot.settings.get("tp2_mult", 2.0),
-            "sl_price": p["entry_price"] * bot.settings.get("stop_loss", 0.75),
-        })
+    pos_snapshot = dict(bot.positions)  # thread-safe snapshot
+    for mint, p in pos_snapshot.items():
+        try:
+            cur_price = bot.get_token_price(mint)
+            ratio = (cur_price / p["entry_price"]) if cur_price and p["entry_price"] else None
+            peak_ratio = (p.get("peak_price", p["entry_price"]) / p["entry_price"]) if p["entry_price"] else None
+            chart_data = [{"ts": ts, "price": pr} for ts, pr in _price_history.get(mint, [])[-50:]]
+            positions.append({
+                "mint": mint, "name": p["name"],
+                "entry_price": p["entry_price"], "current_price": cur_price,
+                "peak_price": p.get("peak_price", p["entry_price"]),
+                "ratio": ratio, "peak_ratio": peak_ratio,
+                "pnl_pct": round((ratio - 1) * 100, 1) if ratio else 0,
+                "age_min": round((time.time() - p["timestamp"]) / 60, 1),
+                "tp1_hit": p["tp1_hit"], "entry_sol": p["entry_sol"],
+                "dev_wallet": p.get("dev_wallet"),
+                "chart": chart_data,
+                "tp1_price": p["entry_price"] * bot.settings.get("tp1_mult", 1.5),
+                "tp2_price": p["entry_price"] * bot.settings.get("tp2_mult", 2.0),
+                "sl_price": p["entry_price"] * bot.settings.get("stop_loss", 0.75),
+            })
+        except Exception:
+            pass  # position was sold mid-iteration
     risk = {
         "session_drawdown": round(bot.session_drawdown, 4),
         "drawdown_limit": bot.settings.get("drawdown_limit_sol", 0.5),
