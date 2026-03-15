@@ -146,6 +146,15 @@ PRESETS = {
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
+    "aggressive": {
+        "label":"Aggressive — Higher Risk / Bigger Swings",
+        "description":"Larger positions, wider stops. More exposure for trending markets.",
+        "max_buy_sol":0.07,"tp1_mult":1.8,"tp2_mult":4.0,
+        "trail_pct":0.25,"stop_loss":0.65,"max_age_min":2880,"time_stop_min":45,
+        "min_liq":2000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
+        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
+        "listing_sniper":True,
+    },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
         "description":"Larger positions, wide stops. For hot markets only.",
@@ -4441,6 +4450,12 @@ async function pollListings() {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
+const PRESET_SETTINGS = {
+  safe:       { max_buy_sol:0.02, tp1_mult:1.3, tp2_mult:2.0, stop_loss:0.85, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3 },
+  balanced:   { max_buy_sol:0.04, tp1_mult:1.2, tp2_mult:1.5, stop_loss:0.75, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5 },
+  aggressive: { max_buy_sol:0.07, tp1_mult:1.8, tp2_mult:4.0, stop_loss:0.65, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8 },
+  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.60, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0 }
+};
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('pc-' + name);
@@ -4448,14 +4463,12 @@ function selectPreset(name) {
   document.getElementById('s-preset').value = name;
   const p = PRESET_SETTINGS[name];
   if (!p) return;
-  document.getElementById('s-maxpos').value   = p.maxpos;
-  document.getElementById('s-cooldown').value = p.cooldown;
-  document.getElementById('s-tp1').value      = p.tp1;
-  document.getElementById('s-tp2').value      = p.tp2;
-  document.getElementById('s-sl').value       = p.sl;
-  document.getElementById('s-trail').value    = p.trail;
-  document.getElementById('s-buy').value      = p.buy;
-  document.getElementById('s-dd').value       = p.dd;
+  const m = { 's-buy':p.max_buy_sol, 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss,
+              's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol };
+  for (const [id, val] of Object.entries(m)) {
+    const inp = document.getElementById(id);
+    if (inp) inp.value = val;
+  }
 }
 async function saveSettings() {
   const res = await fetch('/api/settings', {
