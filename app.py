@@ -579,9 +579,15 @@ class BotInstance:
         self.profit_target    = profit_target_sol
         self.started_at       = time.time()
         self.session_id       = secrets.token_hex(16)
-        self.session_drawdown = 0.0
+        self.session_drawdown  = 0.0
         self.perf_fee_recorded = False
-        self.filter_log       = deque(maxlen=50)   # real-time filter results for UI
+        self.filter_log        = deque(maxlen=50)
+        # ── Risk controls ───────────────────────────────────────────────────
+        self.peak_balance       = 0.0   # for max-drawdown circuit breaker
+        self.buys_this_hour     = 0
+        self.hour_start         = time.time()
+        self.consecutive_losses = 0
+        self.cooldown_until     = 0.0   # epoch — no buys before this time
 
     def log_msg(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -628,6 +634,8 @@ class BotInstance:
                 "jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]
             }, timeout=5)
             self.sol_balance = r.json().get("result",{}).get("value",0) / 1e9
+            if self.sol_balance > self.peak_balance:
+                self.peak_balance = self.sol_balance
         except:
             pass
 
@@ -889,8 +897,60 @@ class BotInstance:
         except:
             return True
 
+    def check_circuit_breakers(self):
+        """Returns a reason string if trading should halt, else None."""
+        if self.start_balance > 0:
+            daily_loss_pct = (self.start_balance - self.sol_balance) / self.start_balance
+            if daily_loss_pct >= 0.03:
+                return f"Daily loss limit −3% hit ({daily_loss_pct*100:.1f}%)"
+        if self.peak_balance > 0:
+            drawdown_pct = (self.peak_balance - self.sol_balance) / self.peak_balance
+            if drawdown_pct >= 0.20:
+                return f"Max drawdown −20% hit ({drawdown_pct*100:.1f}%)"
+        return None
+
+    def check_rate_limit(self, name, mint):
+        """Returns a block reason string if rate-limited, else None."""
+        now = time.time()
+        # Reset hourly counter
+        if now - self.hour_start >= 3600:
+            self.buys_this_hour = 0
+            self.hour_start = now
+        # Cooldown after losses
+        if now < self.cooldown_until:
+            mins = int((self.cooldown_until - now) / 60) + 1
+            return f"Loss cooldown active ({mins}m remaining)"
+        # Max 5 buys per hour (prevents overtrading)
+        if self.buys_this_hour >= 5:
+            return "Rate limit: 5 buys/hour max"
+        return None
+
+    def check_honeypot(self, mint):
+        """Simulate a sell via Jupiter. Returns False if no sell route = likely honeypot."""
+        try:
+            # Try to quote selling a tiny amount back to SOL (50% slippage to be generous)
+            test_quote = self.jupiter_quote(mint, SOL_MINT, 1_000_000, 5000)
+            return test_quote is not None
+        except:
+            return True  # API error — give benefit of the doubt
+
     def buy(self, mint, name, price, liq=0, dev_wallet=None):
         s = self.settings
+        # ── Circuit breakers ─────────────────────────────────────────────────
+        cb = self.check_circuit_breakers()
+        if cb:
+            self.log_msg(f"⛔ CIRCUIT BREAKER — {cb} — halting bot")
+            self.running = False
+            return
+        # ── Rate limiting ────────────────────────────────────────────────────
+        rl = self.check_rate_limit(name, mint)
+        if rl:
+            self.log_filter(name, mint, False, rl)
+            return
+        # ── Honeypot simulation ──────────────────────────────────────────────
+        if not self.check_honeypot(mint):
+            self.log_filter(name, mint, False, "HONEYPOT — no sell route found via Jupiter")
+            return
         # Drawdown limit
         if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
             self.log_filter(name, mint, False, f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)")
@@ -952,6 +1012,8 @@ class BotInstance:
                     _conn.close()
             except Exception as _e:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
+            self.buys_this_hour     += 1
+            self.consecutive_losses  = 0   # reset on successful buy
             self.log_filter(name, mint, True, f"BUY @ ${price:.8f} | slip={slippage}bps", score=0)
             self.log_msg(f"BUY {name} @ ${price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
@@ -1012,8 +1074,14 @@ class BotInstance:
                     self.log_msg(f"⛔ Dev blacklisted: {pos['dev_wallet'][:8]}...")
                 if pnl_pct >= 0:
                     self.stats["wins"] += 1
+                    self.consecutive_losses = 0
                 else:
                     self.stats["losses"] += 1
+                    self.consecutive_losses += 1
+                    # Cooldown: 10m after 1 loss, 1h after 3+ consecutive losses
+                    cooldown_sec = 3600 if self.consecutive_losses >= 3 else 600
+                    self.cooldown_until = time.time() + cooldown_sec
+                    self.log_msg(f"⏸ Cooldown {cooldown_sec//60}m after {self.consecutive_losses} consecutive loss(es)")
                 # Telegram alert
                 try:
                     conn = db()
@@ -1129,6 +1197,12 @@ class BotInstance:
             return
         if change < 0:
             return
+        # ── Time-of-day filter ───────────────────────────────────────────────
+        # Peak volume: 12:00–22:00 UTC. Outside that window, require stronger signal.
+        utc_hour = time.gmtime().tm_hour
+        if not (12 <= utc_hour < 22):
+            if change < 50:   # outside peak hours — only act on strong momentum
+                return
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Vol:${vol:,.0f} Liq:${liq:,.0f} | Age:{age_min:.0f}m +{change:.0f}%")
         self.log_filter(name, mint, True, f"Signal passed all filters | score={self.settings.get('_last_score',0)}")
         self.buy(mint, name, price, liq=liq, dev_wallet=None)
@@ -1141,6 +1215,7 @@ class BotInstance:
     def run(self):
         self.refresh_balance()
         self.start_balance = self.sol_balance
+        self.peak_balance  = self.sol_balance
         self.log_msg(f"Bot started | Wallet: {self.wallet} | Balance: {self.sol_balance:.4f} SOL")
         while self.running:
             try:
