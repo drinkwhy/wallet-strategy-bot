@@ -948,47 +948,61 @@ class BotInstance:
         rl = self.check_rate_limit(name, mint)
         if rl:
             self.log_filter(name, mint, False, rl)
+            self.log_msg(f"SKIP {name} — {rl}")
             return
         # ── Honeypot simulation (skip for tokens < 20m — Jupiter not indexed yet) ─
         if not self.check_honeypot(mint, age_min=age_min):
             self.log_filter(name, mint, False, "HONEYPOT — no sell route found via Jupiter")
+            self.log_msg(f"SKIP {name} — HONEYPOT detected")
             return
         # Drawdown limit
         if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
-            self.log_filter(name, mint, False, f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)")
+            reason = f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
             return
         # Correlated position limit
         if len(self.positions) >= s.get("max_correlated", 5):
-            self.log_filter(name, mint, False, f"Max correlated positions ({len(self.positions)})")
+            reason = f"Max correlated positions ({len(self.positions)})"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
             return
         if self.sol_balance < s["max_buy_sol"] + 0.01:
-            self.log_filter(name, mint, False, f"Low balance ({self.sol_balance:.4f} SOL)")
+            reason = f"Low balance ({self.sol_balance:.4f} SOL, need {s['max_buy_sol']+0.01:.4f})"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
             return
         if mint in self.positions:
+            self.log_msg(f"SKIP {name} — already in position")
             return
         # Anti-rug / mint auth check (skip for brand-new tokens — bonding curve has non-null mint auth by design)
         if s.get("anti_rug") and age_min >= 30 and not self.is_safe_token(mint):
             self.log_filter(name, mint, False, "RUG RISK — mint/freeze auth active")
-            self.log_msg(f"RUG RISK — skip {name}")
+            self.log_msg(f"SKIP {name} — RUG RISK (mint/freeze auth)")
             return
         # Dev blacklist
         if dev_wallet and not check_dev_blacklist(dev_wallet):
-            self.log_filter(name, mint, False, f"Dev blacklisted ({dev_wallet[:8]}...)")
+            reason = f"Dev blacklisted ({dev_wallet[:8]}...)"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
             return
         # Holder concentration (skip for very new tokens — pump.fun always starts concentrated)
         if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint):
             self.log_filter(name, mint, False, "Top 5 holders own >50% of supply")
-            self.log_msg(f"HOLDER RISK — skip {name}")
+            self.log_msg(f"SKIP {name} — holder concentration too high")
             return
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
+        self.log_msg(f"Quoting {name} | slippage={slippage}bps ...")
         quote = self.jupiter_quote(SOL_MINT, mint, int(s["max_buy_sol"]*1e9), slippage)
         if not quote:
             self.log_filter(name, mint, False, "No Jupiter quote available")
+            self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
             return
         swap_tx = self.jupiter_swap(quote)
         if not swap_tx:
             self.log_filter(name, mint, False, "Jupiter swap build failed")
+            self.log_msg(f"SKIP {name} — Jupiter swap build failed")
             return
         sig = self.sign_and_send(swap_tx)
         if sig:
