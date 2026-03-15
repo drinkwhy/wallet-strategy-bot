@@ -2037,8 +2037,8 @@ def listing_scanner():
                                     "ts":       time.time(),
                                 })
                                 print(f"[Listing] ✅ Found on Solana: {name} ({mint[:8]}...) — alerting bots")
-                except Exception as e:
-                    print(f"[Listing] {exchange} poll error: {e}")
+                except Exception:
+                    pass  # exchange API timeouts are normal
                 time.sleep(0.8)   # stagger requests across exchanges
             time.sleep(5)
         except Exception as e:
@@ -2209,17 +2209,6 @@ def _apply_security_headers(resp):
     if request.is_secure:
         resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return resp
-
-@app.route("/debug-dash")
-def debug_dash():
-    """Temporary debug route to test dashboard rendering."""
-    try:
-        html = DASHBOARD_HTML.replace("{{PRESET}}", "balanced")
-        return Response(f"<h1>OK</h1><p>DASHBOARD_HTML length: {len(html)}</p><p>First 200 chars: {html[:200]}</p>", mimetype="text/html")
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        return Response(f"<h1>DASHBOARD_HTML ERROR</h1><pre>{tb}</pre>", status=500, mimetype="text/html")
 
 @app.route("/health")
 def health_check():
@@ -2533,10 +2522,8 @@ def setup():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    print("[DEBUG] Dashboard route hit", flush=True)
     try:
         uid = session["user_id"]
-        print(f"[DEBUG] user_id={uid}", flush=True)
         conn = db()
         try:
             cur = conn.cursor()
@@ -3015,7 +3002,12 @@ def api_pnl_history():
             "worst_trade": round(worst_t, 4),
             "max_drawdown": round(max_dd, 4),
         },
-        "fees": [dict(f) for f in fees],
+        "fees": [{
+            "session_id": f["session_id"],
+            "pnl_sol": f["pnl_sol"],
+            "fee_sol": f["fee_sol"],
+            "created_at": f["created_at"].isoformat() if hasattr(f["created_at"], "isoformat") else str(f.get("created_at", "")),
+        } for f in fees],
     })
 
 @app.route("/api/position-analytics")
