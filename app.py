@@ -97,8 +97,8 @@ PRESETS = {
         "label":"Safe — Low Risk / Consistent",
         "description":"Small positions, tight stops. Capital preservation first.",
         "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":2.0,
-        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":20,"time_stop_min":20,
-        "min_liq":25000,"min_mc":10000,"max_mc":80000,"priority_fee":10000,
+        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":720,"time_stop_min":20,
+        "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
     },
@@ -106,8 +106,8 @@ PRESETS = {
         "label":"Balanced — Medium Risk / Steady Profit",
         "description":"Moderate positions, balanced take-profits. Best for most markets.",
         "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":3.0,
-        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":30,"time_stop_min":30,
-        "min_liq":10000,"min_mc":5000,"max_mc":150000,"priority_fee":30000,
+        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
+        "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
@@ -115,8 +115,8 @@ PRESETS = {
         "label":"Degen — High Risk / Max Profit",
         "description":"Larger positions, wide stops. For hot markets only.",
         "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
-        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":10,"time_stop_min":60,
-        "min_liq":5000,"min_mc":2000,"max_mc":250000,"priority_fee":100000,
+        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":4320,"time_stop_min":60,
+        "min_liq":0,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
     },
@@ -1199,7 +1199,7 @@ class BotInstance:
         if not (min_mc <= mc <= max_mc):
             self.log_filter(name, mint, False, f"MC ${mc:,.0f} outside [{min_mc:,}–{max_mc:,}]")
             return
-        if liq < min_liq:
+        if liq > 0 and liq < min_liq:   # liq=0 means DexScreener didn't report it, not actually $0
             self.log_filter(name, mint, False, f"Liq ${liq:,.0f} < min ${min_liq:,}")
             return
         if age_min > max_age:
