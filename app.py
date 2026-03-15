@@ -935,7 +935,7 @@ class BotInstance:
         except:
             return True
 
-    def buy(self, mint, name, price, liq=0, dev_wallet=None):
+    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
         s = self.settings
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
@@ -949,8 +949,7 @@ class BotInstance:
             self.log_filter(name, mint, False, rl)
             return
         # ── Honeypot simulation (skip for tokens < 20m — Jupiter not indexed yet) ─
-        token_age = self.positions.get(mint, {}).get("age_min", 0)
-        if not self.check_honeypot(mint, age_min=token_age):
+        if not self.check_honeypot(mint, age_min=age_min):
             self.log_filter(name, mint, False, "HONEYPOT — no sell route found via Jupiter")
             return
         # Drawdown limit
@@ -966,8 +965,8 @@ class BotInstance:
             return
         if mint in self.positions:
             return
-        # Anti-rug / mint auth check
-        if s.get("anti_rug") and not self.is_safe_token(mint):
+        # Anti-rug / mint auth check (skip for brand-new tokens — bonding curve has non-null mint auth by design)
+        if s.get("anti_rug") and age_min >= 30 and not self.is_safe_token(mint):
             self.log_filter(name, mint, False, "RUG RISK — mint/freeze auth active")
             self.log_msg(f"RUG RISK — skip {name}")
             return
@@ -975,8 +974,8 @@ class BotInstance:
         if dev_wallet and not check_dev_blacklist(dev_wallet):
             self.log_filter(name, mint, False, f"Dev blacklisted ({dev_wallet[:8]}...)")
             return
-        # Holder concentration
-        if s.get("check_holders") and not check_holder_concentration(mint):
+        # Holder concentration (skip for very new tokens — pump.fun always starts concentrated)
+        if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint):
             self.log_filter(name, mint, False, "Top 5 holders own >50% of supply")
             self.log_msg(f"HOLDER RISK — skip {name}")
             return
@@ -1215,7 +1214,7 @@ class BotInstance:
                 return
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}%")
         self.log_filter(name, mint, True, f"Signal passed all filters")
-        self.buy(mint, name, price, liq=liq, dev_wallet=None)
+        self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
