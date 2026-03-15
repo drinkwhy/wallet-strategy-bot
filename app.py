@@ -937,6 +937,7 @@ class BotInstance:
 
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
         s = self.settings
+        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={s['max_buy_sol']+0.01:.4f}", flush=True)
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
         if cb:
@@ -1194,6 +1195,7 @@ class BotInstance:
         max_mc  = s.get("max_mc", 999999)
         min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
+        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}%", flush=True)
         if not (min_mc <= mc <= max_mc):
             self.log_filter(name, mint, False, f"MC ${mc:,.0f} outside [{min_mc:,}–{max_mc:,}]")
             return
@@ -1203,10 +1205,9 @@ class BotInstance:
         if age_min > max_age:
             self.log_filter(name, mint, False, f"Age {age_min:.0f}m > max {max_age}m")
             return
-        if change < -20:   # allow slightly negative — new tokens often show 0 or small negative
+        if change < -20:
             self.log_filter(name, mint, False, f"1h change {change:.0f}% too negative")
             return
-        # ── Time-of-day filter ───────────────────────────────────────────────
         utc_hour = time.gmtime().tm_hour
         if not (10 <= utc_hour < 23):
             if change < 30:
@@ -1450,9 +1451,9 @@ def _broadcast_signal(info):
     mint = info["mint"]
     market_feed.appendleft(info)
     record_price(mint, info["price"])
-    for bot in list(user_bots.values()):
-        if not bot.running:
-            continue
+    running_bots = [b for b in user_bots.values() if b.running]
+    print(f"[SCAN] {info['name']} | MC:${info['mc']:,.0f} Liq:${info['liq']:,.0f} Age:{info['age_min']:.0f}m Chg:{info['change']:+.0f}% | bots={len(running_bots)}", flush=True)
+    for bot in running_bots:
         try:
             effective_change = info["change"]
             if info["momentum"] >= 60:
@@ -1463,8 +1464,8 @@ def _broadcast_signal(info):
                 info["mc"], info["vol"], info["liq"],
                 info["age_min"], effective_change
             )
-        except:
-            pass
+        except Exception as _be:
+            print(f"[SCAN] evaluate_signal error: {_be}", flush=True)
 
 def global_scanner():
     """Primary scanner: DexScreener latest token profiles (established flow)."""
@@ -1476,15 +1477,15 @@ def global_scanner():
                 headers=HEADERS, timeout=10
             )
             if r.status_code != 200:
+                print(f"[SCANNER] token-profiles HTTP {r.status_code}", flush=True)
                 time.sleep(15)
                 continue
             tokens = r.json() if isinstance(r.json(), list) else []
-            for t in tokens:
-                if t.get("chainId") != "solana":
-                    continue
-                mint = t.get("tokenAddress")
-                if not mint or mint in seen_tokens:
-                    continue
+            sol_tokens = [t for t in tokens if t.get("chainId") == "solana"]
+            new_tokens  = [t for t in sol_tokens if t.get("tokenAddress") and t["tokenAddress"] not in seen_tokens]
+            print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
+            for t in new_tokens:
+                mint = t["tokenAddress"]
                 seen_tokens.add(mint)
                 try:
                     pairs = requests.get(
@@ -1500,31 +1501,31 @@ def global_scanner():
                     pass
             time.sleep(12)
         except Exception as e:
-            print(f"Scanner error: {e}")
+            print(f"[SCANNER] error: {e}", flush=True)
             time.sleep(15)
 
 def new_pairs_scanner():
     """Secondary scanner: polls DexScreener boosted + latest Solana pairs directly."""
     time.sleep(15)
-    # Endpoints that surface fresh Solana meme coins
     SCAN_URLS = [
-        "https://api.dexscreener.com/token-boosts/latest/v1",   # trending boosted
-        "https://api.dexscreener.com/token-boosts/top/v1",      # top boosted
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+        "https://api.dexscreener.com/token-boosts/top/v1",
     ]
     while True:
         try:
             for url in SCAN_URLS:
+                label = url.split("/")[-2]
                 try:
                     resp = requests.get(url, headers=HEADERS, timeout=8)
                     if resp.status_code != 200:
+                        print(f"[SCANNER2] {label} HTTP {resp.status_code}", flush=True)
                         continue
                     items = resp.json() if isinstance(resp.json(), list) else []
-                    for item in items:
-                        if item.get("chainId") != "solana":
-                            continue
-                        mint = item.get("tokenAddress")
-                        if not mint or mint in seen_tokens:
-                            continue
+                    sol = [i for i in items if i.get("chainId") == "solana"]
+                    new = [i for i in sol if i.get("tokenAddress") and i["tokenAddress"] not in seen_tokens]
+                    print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
+                    for item in new:
+                        mint = item["tokenAddress"]
                         seen_tokens.add(mint)
                         try:
                             pairs = requests.get(
@@ -1537,11 +1538,11 @@ def new_pairs_scanner():
                                     _broadcast_signal(info)
                         except:
                             pass
-                except:
-                    pass
+                except Exception as e2:
+                    print(f"[SCANNER2] {label} error: {e2}", flush=True)
             time.sleep(8)
         except Exception as e:
-            print(f"New-pairs scanner error: {e}")
+            print(f"[SCANNER2] outer error: {e}", flush=True)
             time.sleep(15)
 
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
