@@ -2168,6 +2168,13 @@ try:
 except Exception as _e:
     print(f"[WARN] Background workers not started at module load: {_e}")
 
+@app.errorhandler(500)
+def handle_500(e):
+    import traceback
+    traceback.print_exc()
+    print(f"[ERROR-500] {e}", flush=True)
+    return f"<h1>500</h1><pre>{e}</pre>", 500
+
 
 def _graceful_shutdown(signum, frame):
     """Stop all running bots and persist positions on SIGTERM/SIGINT."""
@@ -2515,44 +2522,50 @@ def setup():
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    uid = session["user_id"]
-    conn = db()
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
-        user = cur.fetchone()
-        cur.execute("SELECT * FROM wallets WHERE user_id=%s", (uid,))
-        wallet = cur.fetchone()
-        cur.execute("SELECT * FROM bot_settings WHERE user_id=%s", (uid,))
-        bsettings = cur.fetchone()
-    finally:
-        db_return(conn)
-    if not user:
-        session.clear()
-        return redirect(url_for("login"))
-    if not wallet:
-        return redirect(url_for("setup"))
-    plan      = effective_plan(user["plan"], user["email"])
-    plan_info = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])
-    if plan == "elite":
-        upgrade_btn = ""
-    elif plan == "pro":
-        upgrade_btn = '<a href="/subscribe/elite" class="nbtn" style="background:linear-gradient(135deg,#a855f7,#7c3aed)">⚡ Go Elite — $199/mo</a>'
-    elif plan == "basic":
-        upgrade_btn = '<a href="/subscribe/pro" class="nbtn" style="background:linear-gradient(135deg,#14c784,#0fa86a)">⚡ Upgrade to Pro</a>'
-    elif plan == "free":
-        upgrade_btn = '<a href="/subscribe/basic" class="nbtn">Subscribe — $49/mo (drop to 15% fee)</a>'
-    else:
-        upgrade_btn = '<a href="/subscribe/free" class="nbtn" style="background:var(--bg3);border:1px solid var(--grn);color:var(--grn)">Profit Only — Free</a>'
-    return Response(DASHBOARD_HTML
-        .replace("{{EMAIL}}", user["email"])
-        .replace("{{PLAN_LABEL}}", plan_info["label"])
-        .replace("{{UPGRADE_BTN}}", upgrade_btn)
-        .replace("{{PLAN}}", plan_info["label"])
-        .replace("{{WALLET}}", wallet["public_key"])
-        .replace("{{PRESET}}", bsettings["preset"] if bsettings else "balanced"),
-        mimetype="text/html"
-    )
+        uid = session["user_id"]
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
+            user = cur.fetchone()
+            cur.execute("SELECT * FROM wallets WHERE user_id=%s", (uid,))
+            wallet = cur.fetchone()
+            cur.execute("SELECT * FROM bot_settings WHERE user_id=%s", (uid,))
+            bsettings = cur.fetchone()
+        finally:
+            db_return(conn)
+        if not user:
+            session.clear()
+            return redirect(url_for("login"))
+        if not wallet:
+            return redirect(url_for("setup"))
+        plan      = effective_plan(user["plan"], user["email"])
+        plan_info = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])
+        if plan == "elite":
+            upgrade_btn = ""
+        elif plan == "pro":
+            upgrade_btn = '<a href="/subscribe/elite" class="nbtn" style="background:linear-gradient(135deg,#a855f7,#7c3aed)">Go Elite</a>'
+        elif plan == "basic":
+            upgrade_btn = '<a href="/subscribe/pro" class="nbtn" style="background:linear-gradient(135deg,#14c784,#0fa86a)">Upgrade to Pro</a>'
+        elif plan == "free":
+            upgrade_btn = '<a href="/subscribe/basic" class="nbtn">Subscribe</a>'
+        else:
+            upgrade_btn = '<a href="/subscribe/free" class="nbtn" style="background:var(--bg3);border:1px solid var(--grn);color:var(--grn)">Profit Only</a>'
+        return Response(DASHBOARD_HTML
+            .replace("{{EMAIL}}", user.get("email", ""))
+            .replace("{{PLAN_LABEL}}", plan_info.get("label", ""))
+            .replace("{{UPGRADE_BTN}}", upgrade_btn)
+            .replace("{{PLAN}}", plan_info.get("label", ""))
+            .replace("{{WALLET}}", wallet.get("public_key", ""))
+            .replace("{{PRESET}}", (bsettings or {}).get("preset", "balanced")),
+            mimetype="text/html"
+        )
+    except Exception as e:
+        print(f"[ERROR] Dashboard route: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return Response(f"<h1>Dashboard Error</h1><pre>{e}</pre>", status=500, mimetype="text/html")
 
 # ── API ────────────────────────────────────────────────────────────────────────
 @app.route("/api/state")
