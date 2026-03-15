@@ -458,39 +458,24 @@ _background_workers_lock = threading.Lock()
 _background_lock_conn = None
 _UNSET = object()
 
+def ai_score_detailed(info):
+    """Score a token 0-100 with component breakdown."""
+    vol = info.get("vol", 0)
+    liq = info.get("liq", 0)
+    age = info.get("age_min", 9999)
+    chg = info.get("change", 0)
+    mom = info.get("momentum", 0)
+    vol_s = 25 if vol > 100000 else 18 if vol > 50000 else 10 if vol > 10000 else 5 if vol > 1000 else 0
+    liq_s = 20 if liq > 50000 else 14 if liq > 20000 else 8 if liq > 5000 else 3 if liq > 1000 else 0
+    age_s = 20 if age < 5 else 14 if age < 15 else 8 if age < 30 else 3 if age < 60 else 0
+    chg_s = 20 if chg > 100 else 15 if chg > 50 else 10 if chg > 20 else 5 if chg > 5 else -10 if chg < -20 else 0
+    mom_s = min(15, int(mom * 0.15))
+    total = max(0, min(100, vol_s + liq_s + age_s + chg_s + mom_s))
+    return {"total": total, "volume": vol_s, "liquidity": liq_s, "age": age_s, "price_change": chg_s, "momentum": mom_s}
+
 def ai_score(info):
     """Score a token 0-100 based on multiple signals."""
-    score = 0
-    vol   = info.get("vol", 0)
-    liq   = info.get("liq", 0)
-    mc    = info.get("mc", 0)
-    age   = info.get("age_min", 9999)
-    chg   = info.get("change", 0)
-    mom   = info.get("momentum", 0)
-    # Volume score (0-25)
-    if vol > 100000: score += 25
-    elif vol > 50000: score += 18
-    elif vol > 10000: score += 10
-    elif vol > 1000:  score += 5
-    # Liquidity score (0-20)
-    if liq > 50000: score += 20
-    elif liq > 20000: score += 14
-    elif liq > 5000:  score += 8
-    elif liq > 1000:  score += 3
-    # Age score — fresh tokens score higher (0-20)
-    if age < 5:    score += 20
-    elif age < 15: score += 14
-    elif age < 30: score += 8
-    elif age < 60: score += 3
-    # Price change (0-20)
-    if chg > 100: score += 20
-    elif chg > 50: score += 15
-    elif chg > 20: score += 10
-    elif chg > 5:  score += 5
-    elif chg < -20: score -= 10
-    # Momentum (0-15)
-    score += int(mom * 0.15)
-    return max(0, min(100, score))
+    return ai_score_detailed(info)["total"]
 
 def check_holder_concentration(mint):
     """Returns True if top holders don't own >50% of supply."""
@@ -639,6 +624,7 @@ class BotInstance:
         self.session_drawdown  = 0.0
         self.perf_fee_recorded = False
         self.filter_log        = deque(maxlen=50)
+        self.signal_explorer_log = deque(maxlen=200)
         # ── Risk controls ───────────────────────────────────────────────────
         self.peak_balance       = 0.0   # for max-drawdown circuit breaker
         self.buys_this_hour     = 0
@@ -1332,24 +1318,52 @@ class BotInstance:
         max_mc  = s.get("max_mc", 999999)
         min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
+        # Build signal explorer entry with detailed AI score
+        _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
+        _sd = ai_score_detailed(_sinfo)
+        sig_entry = {
+            "mint": mint, "name": name, "price": price,
+            "mc": mc, "vol": vol, "liq": liq, "age_min": age_min, "change": change,
+            "score": _sd, "passed": False, "reason": "",
+            "filters": [
+                {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
+                {"name": "Liquidity", "passed": liq == 0 or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
+                {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
+                {"name": "Price Change", "passed": change >= -20, "value": f"{change:+.0f}%", "threshold": "> -20%"},
+            ],
+            "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
+        }
         print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}%", flush=True)
         if not (min_mc <= mc <= max_mc):
-            self.log_filter(name, mint, False, f"MC ${mc:,.0f} outside [{min_mc:,}–{max_mc:,}]")
+            sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if liq > 0 and liq < min_liq:   # liq=0 means DexScreener didn't report it, not actually $0
-            self.log_filter(name, mint, False, f"Liq ${liq:,.0f} < min ${min_liq:,}")
+        if liq > 0 and liq < min_liq:
+            sig_entry["reason"] = f"Liq ${liq:,.0f} < min ${min_liq:,}"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if age_min > max_age:
-            self.log_filter(name, mint, False, f"Age {age_min:.0f}m > max {max_age}m")
+            sig_entry["reason"] = f"Age {age_min:.0f}m > max {max_age}m"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if change < -20:
-            self.log_filter(name, mint, False, f"1h change {change:.0f}% too negative")
+            sig_entry["reason"] = f"1h change {change:.0f}% too negative"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
             return
         utc_hour = time.gmtime().tm_hour
         if not (10 <= utc_hour < 23):
             if change < 30:
-                self.log_filter(name, mint, False, f"Off-peak hours ({utc_hour}:00 UTC) — change {change:.0f}% < 30%")
+                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < 30%"
+                self.signal_explorer_log.appendleft(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
                 return
+        sig_entry["passed"] = True
+        sig_entry["reason"] = "Passed all filters"
+        self.signal_explorer_log.appendleft(sig_entry)
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}%")
         self.log_filter(name, mint, True, f"Signal passed all filters")
         self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
@@ -1461,8 +1475,15 @@ WHALE_WALLETS = [
     "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m33NDcj8ppump",  # active degen wallet
     "5tzFkiKscXHK5ZXCGbGuykB2NZuNQn8aVJHsZcFKpNGe",  # dex whale
 ]
+WHALE_LABELS = {
+    "GSTnwUkbsGqXbBHzA8sHsm7FijhKb4CDGS1zAxZAVwsV": "Pump Sniper",
+    "HVWBLYoq5Nvh8vqKnFDqbGAXkLCKiMoRcVGR4JEGMEX": "Meme Sniper",
+    "AKnL4NNf3DGWZJS6cPknBuEGnVsV4A4m33NDcj8ppump": "Degen Alpha",
+    "5tzFkiKscXHK5ZXCGbGuykB2NZuNQn8aVJHsZcFKpNGe": "DEX Whale",
+}
 _whale_seen  = set()
 _whale_mints = {}   # mint -> last_seen timestamp (dedup per token)
+_whale_buys  = deque(maxlen=200)  # recent whale buys for dashboard
 
 def check_whale_wallets():
     """Poll recent transactions of whale wallets and copy their buys."""
@@ -1536,6 +1557,12 @@ def check_whale_wallets():
                                     if now - _whale_mints.get(mint, 0) < 300:
                                         continue
                                     _whale_mints[mint] = now
+                                    _whale_buys.appendleft({
+                                        "wallet": wallet, "label": WHALE_LABELS.get(wallet, wallet[:8]+"..."),
+                                        "mint": mint, "name": name, "price": price,
+                                        "mc": mc, "vol": vol, "liq": liq,
+                                        "timestamp": now, "ts": time.strftime("%H:%M:%S"),
+                                    })
                                     for bot in list(user_bots.values()):
                                         if bot.running and mint not in bot.positions:
                                             bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
@@ -2548,12 +2575,16 @@ def api_state():
                 "age_min":       round((time.time()-p["timestamp"])/60,1),
                 "tp1_hit":       p["tp1_hit"],
             })
+    stats = bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0}
+    total_trades = stats["wins"] + stats["losses"]
+    stats["win_rate"] = round(stats["wins"] / total_trades * 100, 1) if total_trades else 0
+    stats["streak"] = -(bot.consecutive_losses) if bot and bot.consecutive_losses > 0 else stats["wins"]
     return jsonify({
         "running":    bot.running if bot else False,
         "balance":    round(bot.sol_balance, 4) if bot else 0,
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
-        "stats":      bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0},
+        "stats":      stats,
         "filter_log": list(bot.filter_log)[:10] if bot else [],
         "settings":   bot.settings if bot else {},
     })
@@ -2636,6 +2667,25 @@ def api_cashout():
     if bot:
         bot.cashout_all()
     return jsonify({"ok":True})
+
+@app.route("/api/manual-sell", methods=["POST"])
+@login_required
+def api_manual_sell():
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+    if not bot:
+        return jsonify({"ok": False, "msg": "Bot not running"})
+    data = request.get_json(force=True) or {}
+    mint = data.get("mint", "").strip()
+    pct = float(data.get("pct", 1.0))
+    if not mint or mint not in bot.positions:
+        return jsonify({"ok": False, "msg": "Position not found"})
+    pct = max(0.01, min(1.0, pct))
+    try:
+        bot.sell(mint, pct, f"Manual sell {int(pct*100)}%")
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
 
 @app.route("/api/settings", methods=["POST"])
 @login_required
@@ -2856,6 +2906,153 @@ listing_alert_queue.put = _tracked_put
 @login_required
 def api_listing_alerts():
     return jsonify(_recent_listing_alerts[:20])
+
+@app.route("/api/signal-explorer")
+@login_required
+def api_signal_explorer():
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+    if not bot:
+        return jsonify({"recent": [], "stats": {"total_evaluated": 0, "pass_rate": 0, "top_reject_reasons": []}})
+    recent = list(bot.signal_explorer_log)[:100]
+    total = len(recent)
+    passed = sum(1 for s in recent if s.get("passed"))
+    reasons = {}
+    for s in recent:
+        if not s.get("passed") and s.get("reason"):
+            reasons[s["reason"]] = reasons.get(s["reason"], 0) + 1
+    top_reasons = sorted(reasons.items(), key=lambda x: -x[1])[:5]
+    return jsonify({
+        "recent": recent,
+        "stats": {
+            "total_evaluated": total,
+            "pass_rate": round(passed / total * 100, 1) if total > 0 else 0,
+            "top_reject_reasons": [{"reason": r, "count": c} for r, c in top_reasons],
+        }
+    })
+
+@app.route("/api/pnl-history")
+@login_required
+def api_pnl_history():
+    uid = session["user_id"]
+    days = request.args.get("days", "7")
+    interval = "7 days" if days == "7" else "1 day" if days == "1" else "365 days"
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, mint, name, action, price, pnl_sol, timestamp
+            FROM trades WHERE user_id=%s AND timestamp >= NOW() - INTERVAL '""" + interval + """'
+            ORDER BY timestamp ASC
+        """, (uid,))
+        trades = cur.fetchall()
+        cur.execute("""
+            SELECT session_id, pnl_sol, fee_sol, created_at
+            FROM perf_fees WHERE user_id=%s ORDER BY created_at DESC LIMIT 50
+        """, (uid,))
+        fees = cur.fetchall()
+    finally:
+        db_return(conn)
+    cumulative = []
+    running_pnl = 0
+    peak_pnl = 0
+    max_dd = 0
+    wins = 0
+    losses = 0
+    best_t = 0
+    worst_t = 0
+    for t in trades:
+        pnl = t["pnl_sol"] or 0
+        if t["action"] == "sell":
+            running_pnl += pnl
+            if pnl > 0: wins += 1
+            else: losses += 1
+            best_t = max(best_t, pnl)
+            worst_t = min(worst_t, pnl)
+        peak_pnl = max(peak_pnl, running_pnl)
+        dd = peak_pnl - running_pnl
+        max_dd = max(max_dd, dd)
+        cumulative.append({
+            "ts": t["timestamp"].isoformat() if hasattr(t["timestamp"], "isoformat") else str(t["timestamp"]),
+            "pnl": round(running_pnl, 4),
+            "drawdown": round(dd, 4),
+        })
+    total_t = wins + losses
+    return jsonify({
+        "cumulative": cumulative,
+        "stats": {
+            "total_pnl": round(running_pnl, 4),
+            "total_trades": total_t,
+            "wins": wins, "losses": losses,
+            "win_rate": round(wins / total_t * 100, 1) if total_t else 0,
+            "best_trade": round(best_t, 4),
+            "worst_trade": round(worst_t, 4),
+            "max_drawdown": round(max_dd, 4),
+        },
+        "fees": [dict(f) for f in fees],
+    })
+
+@app.route("/api/position-analytics")
+@login_required
+def api_position_analytics():
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+    if not bot:
+        return jsonify({"positions": [], "risk": {}})
+    positions = []
+    for mint, p in bot.positions.items():
+        cur_price = bot.get_token_price(mint)
+        ratio = (cur_price / p["entry_price"]) if cur_price and p["entry_price"] else None
+        peak_ratio = (p.get("peak_price", p["entry_price"]) / p["entry_price"]) if p["entry_price"] else None
+        chart_data = [{"ts": ts, "price": pr} for ts, pr in _price_history.get(mint, [])[-50:]]
+        positions.append({
+            "mint": mint, "name": p["name"],
+            "entry_price": p["entry_price"], "current_price": cur_price,
+            "peak_price": p.get("peak_price", p["entry_price"]),
+            "ratio": ratio, "peak_ratio": peak_ratio,
+            "pnl_pct": round((ratio - 1) * 100, 1) if ratio else 0,
+            "age_min": round((time.time() - p["timestamp"]) / 60, 1),
+            "tp1_hit": p["tp1_hit"], "entry_sol": p["entry_sol"],
+            "dev_wallet": p.get("dev_wallet"),
+            "chart": chart_data,
+            "tp1_price": p["entry_price"] * bot.settings.get("tp1_mult", 1.5),
+            "tp2_price": p["entry_price"] * bot.settings.get("tp2_mult", 2.0),
+            "sl_price": p["entry_price"] * bot.settings.get("stop_loss", 0.75),
+        })
+    risk = {
+        "session_drawdown": round(bot.session_drawdown, 4),
+        "drawdown_limit": bot.settings.get("drawdown_limit_sol", 0.5),
+        "consecutive_losses": bot.consecutive_losses,
+        "cooldown_remaining": max(0, round(bot.cooldown_until - time.time())),
+        "peak_balance": round(bot.peak_balance, 4),
+        "current_balance": round(bot.sol_balance, 4),
+        "positions_count": len(bot.positions),
+        "max_positions": bot.settings.get("max_correlated", 5),
+    }
+    return jsonify({"positions": positions, "risk": risk})
+
+@app.route("/api/whale-activity")
+@login_required
+def api_whale_activity():
+    recent = list(_whale_buys)[:50]
+    for entry in recent:
+        try:
+            hist = _price_history.get(entry["mint"], [])
+            cur_price = hist[-1][1] if hist else None
+            entry["current_price"] = cur_price
+            entry["pnl_pct"] = round((cur_price / entry["price"] - 1) * 100, 1) if cur_price and entry.get("price") else None
+        except Exception:
+            entry["current_price"] = None
+            entry["pnl_pct"] = None
+    whale_stats = []
+    for w in WHALE_WALLETS:
+        buys = [b for b in recent if b["wallet"] == w]
+        whale_stats.append({
+            "label": WHALE_LABELS.get(w, w[:8]+"..."), "address": w,
+            "buys_24h": len(buys),
+            "avg_pnl": round(sum(b.get("pnl_pct", 0) or 0 for b in buys) / len(buys), 1) if buys else 0,
+        })
+    return jsonify({"recent_buys": recent, "whale_stats": whale_stats})
 
 @app.route("/api/admin/suggest-settings")
 @admin_required
@@ -3110,6 +3307,7 @@ _CSS = """<meta charset="UTF-8"><meta name="viewport" content="width=device-widt
 <meta name="apple-mobile-web-app-title" content="SolTrader">
 <link rel="manifest" href="/manifest.json">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -3246,15 +3444,15 @@ LANDING_HTML = _CSS + """
 
 <!-- Hero -->
 <div style="text-align:center;padding:80px 24px 60px;max-width:680px;margin:0 auto">
-  <div class="sniper-badge" style="margin-bottom:20px">NEW &nbsp;·&nbsp; CEX Listing Sniper — auto-buys before the pump</div>
+  <div class="sniper-badge" style="margin-bottom:20px">NEW &nbsp;·&nbsp; Signal Explorer + Whale Copy Dashboard</div>
   <h1 style="font-size:44px;font-weight:800;line-height:1.1;letter-spacing:-1.5px;margin-bottom:18px">
     The Most Advanced<br>Solana Trading Bot
   </h1>
   <p style="font-size:15.5px;color:var(--t2);max-width:480px;margin:0 auto 38px;line-height:1.75">
-    12 institutional trading techniques, CEX listing sniping, Jito-routed execution, and real-time AI scoring — all in one non-custodial platform.
+    See WHY every token is accepted or rejected. Track whale wallets in real time. Visualize your P&amp;L with interactive charts. No other bot shows you this.
   </p>
   <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
-    <a href="/signup" class="btn btn-primary" style="padding:14px 36px;font-size:15px">Start Free 7-Day Trial</a>
+    <a href="/signup" class="btn btn-primary" style="padding:14px 36px;font-size:15px">Start Trading in 2 Minutes</a>
     <a href="#pricing" class="btn btn-ghost" style="padding:14px 26px;font-size:15px">View Pricing ↓</a>
   </div>
   <div class="trust" style="margin-top:30px">
@@ -3266,9 +3464,37 @@ LANDING_HTML = _CSS + """
   </div>
 </div>
 
-<!-- Features Grid -->
-<div style="max-width:960px;margin:0 auto;padding:0 24px 68px">
+<!-- Unique Features -->
+<div style="max-width:960px;margin:0 auto;padding:0 24px 48px">
   <div style="text-align:center;margin-bottom:32px">
+    <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--t3);margin-bottom:10px">Features No Other Bot Has</div>
+    <h2 style="font-size:27px;font-weight:700;letter-spacing:-.5px">4 Tools You Won't Find Anywhere Else</h2>
+  </div>
+  <div class="lp-feat-grid" style="grid-template-columns:repeat(2,1fr)">
+    <div class="lp-feat" style="border-color:rgba(37,99,235,.3)">
+      <div class="lp-feat-icon" style="background:rgba(37,99,235,.12)">🔬</div>
+      <h3>Signal Explorer</h3>
+      <p>See exactly WHY every token was accepted or rejected. Radar charts show AI score breakdowns. Filter pipeline shows each check with actual values vs thresholds.</p>
+    </div>
+    <div class="lp-feat" style="border-color:rgba(168,85,247,.3)">
+      <div class="lp-feat-icon" style="background:rgba(168,85,247,.12)">🐋</div>
+      <h3>Whale Copy Dashboard</h3>
+      <p>Live feed of whale wallet buys with real-time P&amp;L tracking. See which whales are profitable, what they're buying, and whether you copied their trades.</p>
+    </div>
+    <div class="lp-feat" style="border-color:rgba(20,199,132,.3)">
+      <div class="lp-feat-icon" style="background:rgba(20,199,132,.12)">📊</div>
+      <h3>Position Analytics</h3>
+      <p>Mini price charts per position with TP/SL overlay lines. Risk dashboard shows drawdown progress, cooldown timers, and consecutive loss tracking in real time.</p>
+    </div>
+    <div class="lp-feat" style="border-color:rgba(245,158,11,.3)">
+      <div class="lp-feat-icon" style="background:rgba(245,158,11,.12)">📈</div>
+      <h3>P&amp;L Curves</h3>
+      <p>Interactive Chart.js visualizations of your cumulative P&amp;L and drawdown over time. Stats cards show win rate, best/worst trades, profit factor, and max drawdown.</p>
+    </div>
+  </div>
+
+  <!-- All Features Grid -->
+  <div style="text-align:center;margin:48px 0 32px">
     <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--t3);margin-bottom:10px">Everything Included</div>
     <h2 style="font-size:27px;font-weight:700;letter-spacing:-.5px">Built for Serious Traders</h2>
   </div>
@@ -3276,48 +3502,63 @@ LANDING_HTML = _CSS + """
     <div class="lp-feat">
       <div class="lp-feat-icon" style="background:rgba(245,158,11,.12)">🔔</div>
       <h3>CEX Listing Sniper</h3>
-      <p>Monitors Binance, Coinbase, OKX, Kraken, Bybit, KuCoin &amp; Gate.io simultaneously. Auto-buys Solana tokens the moment they get listed — before the public pump.</p>
+      <p>Monitors Binance, Coinbase, OKX, Kraken, Bybit, KuCoin &amp; Gate.io simultaneously. Auto-buys before the public pump.</p>
     </div>
     <div class="lp-feat">
       <div class="lp-feat-icon" style="background:rgba(20,199,132,.12)">⚡</div>
       <h3>Helius Sender + Jito Tips</h3>
-      <p>Transactions route through Jito validator network with priority tips for guaranteed fast landing. Skip the mempool, beat the bots.</p>
-    </div>
-    <div class="lp-feat">
-      <div class="lp-feat-icon" style="background:rgba(168,85,247,.12)">🐋</div>
-      <h3>Whale Wallet Tracker</h3>
-      <p>Mirrors moves from known profitable wallets on Solana in real time. When a whale buys, your bot buys seconds later.</p>
+      <p>Transactions route through Jito validator network with priority tips. Skip the mempool, beat the bots.</p>
     </div>
     <div class="lp-feat">
       <div class="lp-feat-icon" style="background:rgba(37,99,235,.12)">🛡️</div>
       <h3>Multi-Layer Rug Detection</h3>
-      <p>Checks mint authority, freeze authority, LP lock status, holder concentration, and dev wallet history before every single buy.</p>
+      <p>Checks mint authority, freeze authority, LP lock, holder concentration, and dev wallet history before every buy.</p>
     </div>
     <div class="lp-feat">
-      <div class="lp-feat-icon" style="background:rgba(5,150,105,.12)">📈</div>
+      <div class="lp-feat-icon" style="background:rgba(5,150,105,.12)">🎯</div>
       <h3>Multi-Stage Take Profits</h3>
-      <p>TP1 secures initial profits, TP2 rides the moonshot, trailing stop maximizes gains. Partial sells lock in profit without exiting the position.</p>
+      <p>TP1 secures initial profits, TP2 rides the moonshot, trailing stop maximizes gains with partial sells.</p>
     </div>
     <div class="lp-feat">
-      <div class="lp-feat-icon" style="background:rgba(239,68,68,.12)">🎯</div>
+      <div class="lp-feat-icon" style="background:rgba(239,68,68,.12)">🔍</div>
       <h3>Bundle &amp; Snipe Detection</h3>
-      <p>Identifies coordinated launch bundles and on-chain snipers. Avoids tokens where bots already dominate supply — you enter clean.</p>
-    </div>
-    <div class="lp-feat">
-      <div class="lp-feat-icon" style="background:rgba(20,199,132,.12)">⚡</div>
-      <h3>Dynamic Slippage</h3>
-      <p>Automatically adjusts slippage based on pool liquidity depth. Low liquidity → tighter slippage. Prevents excessive price impact on every trade.</p>
-    </div>
-    <div class="lp-feat">
-      <div class="lp-feat-icon" style="background:rgba(245,158,11,.12)">📊</div>
-      <h3>Volume Velocity Scoring</h3>
-      <p>Measures volume acceleration — not just raw volume. Catches tokens gaining momentum 3–5 minutes before they appear on trending lists.</p>
+      <p>Identifies coordinated launch bundles. Avoids tokens where bots already dominate supply.</p>
     </div>
     <div class="lp-feat">
       <div class="lp-feat-icon" style="background:rgba(168,85,247,.12)">🤖</div>
-      <h3>AI Settings Optimization</h3>
-      <p>Admin panel analyzes your 24h win rate and auto-suggests optimal filter thresholds. Market adapts — your settings adapt with it.</p>
+      <h3>AI Score + Volume Velocity</h3>
+      <p>AI scoring with volume acceleration detection. Catches momentum 3-5 minutes before trending lists.</p>
     </div>
+  </div>
+
+  <!-- Competitor Comparison -->
+  <div style="text-align:center;margin:48px 0 24px">
+    <h2 style="font-size:27px;font-weight:700;letter-spacing:-.5px;margin-bottom:8px">How We Compare</h2>
+    <p style="font-size:13.5px;color:var(--t2)">Features that set SolTrader apart from every competitor</p>
+  </div>
+  <div class="panel" style="padding:0;overflow:hidden;margin-bottom:48px">
+    <table class="cmp-tbl">
+      <thead>
+        <tr>
+          <th style="width:30%">Feature</th>
+          <th style="text-align:center"><span style="color:var(--grn);font-weight:700">SolTrader</span></th>
+          <th style="text-align:center">BullX</th>
+          <th style="text-align:center">Photon</th>
+          <th style="text-align:center">GMGN</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="col-h">Signal Explorer (WHY rejected)</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td></tr>
+        <tr><td class="col-h">Whale Copy Dashboard</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">partial</td></tr>
+        <tr><td class="col-h">Position Analytics + Charts</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td></tr>
+        <tr><td class="col-h">P&amp;L Curves + Drawdown</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">basic</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">basic</td></tr>
+        <tr><td class="col-h">CEX Listing Sniper</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td></tr>
+        <tr><td class="col-h">AI Token Scoring</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">Jito MEV Priority</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td></tr>
+        <tr><td class="col-h">Non-Custodial</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="yes">✓</td></tr>
+        <tr><td class="col-h">No credit card to start</td><td style="text-align:center" class="yes">✓</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="no">—</td><td style="text-align:center" class="yes">✓</td></tr>
+      </tbody>
+    </table>
   </div>
 
   <!-- Pricing -->
@@ -3545,303 +3786,313 @@ function toggleStop(v){
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
 DASHBOARD_HTML = _CSS + """
 <style>
-/* DEX Screener inspired */
-.dex-wrap{overflow-x:auto}
-.dex-tbl{width:100%;border-collapse:collapse;font-size:12px}
-.dex-tbl th{padding:7px 9px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--t3);border-bottom:1px solid var(--b1);cursor:pointer;white-space:nowrap;user-select:none;background:var(--surf)}
-.dex-tbl th:hover{color:var(--t1)}
-.dex-tbl td{padding:6px 9px;border-bottom:1px solid rgba(26,46,69,.25);white-space:nowrap;vertical-align:middle}
-.dex-row{cursor:pointer;transition:background .1s}.dex-row:hover td{background:rgba(255,255,255,.02)}
-.dex-row.selected td{background:rgba(20,199,132,.05)}
-.tok-icon{width:24px;height:24px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0;margin-right:7px}
-.tok-name{font-weight:700;color:var(--t1);font-size:12px}.tok-sym{font-size:10px;color:var(--t3)}
-.chg-pos{color:#14c784;font-weight:700;font-family:monospace}
-.chg-neg{color:#f23645;font-weight:700;font-family:monospace}
-.chg-0{color:var(--t3);font-family:monospace}
-.price-val{font-family:'SF Mono',monospace;font-size:12px;color:var(--t1)}
-.num-val{font-family:monospace;font-size:11px;color:var(--t2)}
-.score-mini{display:inline-block;width:36px;height:4px;border-radius:2px;background:var(--b1);position:relative;vertical-align:middle}
-.score-fill{height:100%;border-radius:2px;position:absolute;left:0;top:0}
-.buy-btn-mini{background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.35);color:#14c784;padding:3px 9px;border-radius:5px;font-size:10px;font-weight:700;cursor:pointer;transition:all .15s}
+.tab-bar{display:flex;gap:0;padding:0 24px;background:rgba(12,24,41,.95);border-bottom:1px solid var(--b1);overflow-x:auto;-webkit-overflow-scrolling:touch;backdrop-filter:blur(12px)}
+.tab-btn{padding:13px 20px;font-size:12px;font-weight:600;color:var(--t3);border:none;background:none;cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent;transition:.2s;letter-spacing:.3px}
+.tab-btn:hover{color:var(--t2)}
+.tab-btn.active{color:var(--blue2);border-bottom-color:var(--blue2)}
+.tab-pane{display:none;padding:20px 24px}
+.tab-pane.active{display:block}
+.glass{background:rgba(16,31,50,.6);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:16px}
+.scanner-layout{display:flex;gap:14px}
+.scanner-sidebar{width:250px;flex-shrink:0;display:flex;flex-direction:column;gap:12px}
+.scanner-main{flex:1;min-width:0}
+@media(max-width:860px){.scanner-layout{flex-direction:column}.scanner-sidebar{width:100%}.tab-bar{gap:0;padding:0 8px}}
+.dex-row{cursor:pointer;transition:.12s}.dex-row:hover td{background:rgba(255,255,255,.03)}.dex-row.selected td{background:rgba(37,99,235,.06)}
+.tok-icon{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;margin-right:8px;flex-shrink:0}
+.tok-name{font-size:12px;font-weight:600;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px}
+.tok-sym{font-size:10px;color:var(--t3)}
+.chg-pos{color:var(--grn);font-weight:600;font-size:11px}.chg-neg{color:var(--red2);font-weight:600;font-size:11px}.chg-0{color:var(--t3);font-size:11px}
+.price-val{font-family:monospace;font-size:11px;color:var(--t2)}.num-val{font-family:monospace;font-size:11px;color:var(--t3)}
+.score-mini{width:44px;height:5px;background:var(--b1);border-radius:3px;overflow:hidden}.score-fill{height:100%;border-radius:3px}
+.sort-pill{padding:4px 10px;font-size:10px;border-radius:20px;border:1px solid var(--b1);background:none;color:var(--t3);cursor:pointer;font-weight:600}.sort-pill.active{background:var(--blue);border-color:var(--blue);color:#fff}
+.buy-btn-mini{padding:3px 10px;font-size:10px;font-weight:700;border:1px solid var(--grn);background:rgba(20,199,132,.1);color:var(--grn);border-radius:6px;cursor:pointer;white-space:nowrap}
 .buy-btn-mini:hover{background:var(--grn);color:#000}
-/* Wallet Tree */
-.tree-panel{background:var(--card);border:1px solid var(--b1);border-radius:10px;padding:14px;margin-top:12px}
-.tree-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.tree-token-name{font-size:15px;font-weight:800;color:var(--t1)}
-.tree-stat-buy{color:#14c784;font-weight:700;font-size:12px}
-.tree-stat-sell{color:#f23645;font-weight:700;font-size:12px}
-#tree-canvas{display:block;width:100%;border-radius:8px;background:#070d17}
-.tree-list{margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px;max-height:160px;overflow-y:auto}
-.tree-wallet-row{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;font-size:10px;font-family:monospace;background:rgba(255,255,255,.02);border:1px solid transparent;cursor:pointer}
-.tree-wallet-row:hover{opacity:.8}
-.tree-wallet-row.is-buy{border-color:rgba(20,199,132,.2)}
-.tree-wallet-row.is-sell{border-color:rgba(242,54,69,.2)}
-.tree-wallet-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
-.tree-wallet-addr{color:var(--t2);flex:1;overflow:hidden;text-overflow:ellipsis}
-.tree-wallet-sol{color:var(--t3);white-space:nowrap}
-/* Scanner controls */
-.scan-ctrl{display:flex;gap:7px;margin-bottom:9px;align-items:center;flex-wrap:wrap}
-.scan-search{flex:1;min-width:100px;background:var(--surf);border:1px solid var(--b1);color:var(--t1);border-radius:7px;padding:6px 12px;font-size:12px;font-family:inherit}
-.scan-search:focus{outline:none;border-color:var(--grn)}
-.sort-pill{background:var(--bg3);border:1px solid var(--bdr);color:var(--t2);padding:4px 10px;border-radius:20px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
-.sort-pill.active{background:rgba(20,199,132,.12);border-color:var(--grn);color:var(--grn)}
-/* Preset cards */
-.preset-card{background:var(--bg3);border:2px solid var(--bdr);border-radius:10px;padding:9px;text-align:center;cursor:pointer;transition:all .2s}
-.preset-card:hover{border-color:var(--grn)}
-@keyframes presetPulse{0%,100%{box-shadow:0 0 0 0 rgba(20,199,132,.5)}60%{box-shadow:0 0 0 7px rgba(20,199,132,0)}}
-.preset-card.active{border-color:var(--grn);background:rgba(20,199,132,.08);animation:presetPulse 2s ease-in-out infinite}
-/* Feature badges */
-.feat-badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;white-space:nowrap}
-@keyframes featPulse{0%,100%{opacity:1}50%{opacity:.6}}.feat-pulse{animation:featPulse 2s ease-in-out infinite}
-/* Toast */
-@keyframes toastIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-.toast{position:fixed;bottom:220px;left:50%;transform:translateX(-50%);background:#0d1117;border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:30px;font-size:13px;font-weight:600;z-index:99999;pointer-events:none;opacity:0;transition:opacity .3s}
-.toast.show{opacity:1;animation:toastIn .3s ease}
-/* Ticker */
-.ticker{background:rgba(20,199,132,.03);border-bottom:1px solid rgba(20,199,132,.12);padding:7px 0;overflow:hidden;white-space:nowrap}
-.ticker-inner{display:inline-flex;gap:32px;animation:scroll 50s linear infinite}
-@keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-.tick-item{font-size:12px;color:var(--t2);display:flex;gap:8px;align-items:center}.tick-name{font-weight:700;color:var(--t1)}
-/* Layout */
-.dash-grid{display:grid;grid-template-columns:300px 1fr;gap:14px;align-items:start}
-@media(max-width:860px){.dash-grid{grid-template-columns:1fr}}
-/* Filter pipeline */
-.fp-item{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--bdr);font-size:11px}
-.fp-pass{color:#14c784;font-weight:700;min-width:14px}.fp-fail{color:#f23645;font-weight:700;min-width:14px}
-.fp-name{font-weight:600;color:var(--t1);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.fp-reason{font-size:10px;color:var(--t3);text-align:right}
-/* Activity bar */
-#activity-bar{position:fixed;bottom:0;left:0;right:0;height:200px;background:#070d17;border-top:1px solid rgba(20,199,132,.2);display:flex;flex-direction:column;z-index:1000;transition:height .25s ease}
+.preset-card{background:var(--surf);border:1px solid var(--b1);border-radius:10px;padding:12px 14px;cursor:pointer;transition:.15s}
+.preset-card:hover{border-color:var(--blue)}.preset-card.active{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+.preset-name{font-size:12px;font-weight:700;margin-bottom:2px}.preset-desc{font-size:10px;color:var(--t3)}
+.sig-list{max-height:480px;overflow-y:auto}
+.sig-row{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid rgba(26,46,69,.4);cursor:pointer;transition:.12s;font-size:12px}
+.sig-row:hover{background:rgba(255,255,255,.03)}
+.sig-row.active{background:rgba(37,99,235,.08);border-left:2px solid var(--blue2)}
+.sig-badge{padding:2px 8px;border-radius:12px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px}
+.sig-pass{background:rgba(20,199,132,.15);color:var(--grn)}.sig-fail{background:rgba(220,38,38,.15);color:var(--red2)}
+.score-bar{height:6px;border-radius:3px;background:var(--b1);overflow:hidden;width:60px;flex-shrink:0}
+.score-bar-fill{height:100%;border-radius:3px}
+.filter-step{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:12px;color:var(--t2)}
+.filter-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.filter-dot.pass{background:var(--grn)}.filter-dot.fail{background:var(--red2)}
+.pos-card{background:var(--card);border:1px solid var(--b1);border-radius:12px;padding:16px;margin-bottom:12px;transition:.2s}
+.pos-card:hover{border-color:var(--blue)}
+.risk-bar{height:8px;border-radius:4px;background:var(--b1);overflow:hidden;margin-top:4px}
+.risk-fill{height:100%;border-radius:4px;transition:width .3s}
+.whale-entry{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--b1);animation:wslide .3s ease}
+@keyframes wslide{from{opacity:0;transform:translateX(-16px)}to{opacity:1;transform:translateX(0)}}
+.whale-card{background:var(--card);border:1px solid var(--b1);border-radius:12px;padding:16px;min-width:200px}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.tree-wallet-row{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--b1);font-size:11px;cursor:pointer;transition:.1s}
+.tree-wallet-row:hover{background:rgba(255,255,255,.03)}
+.tree-wallet-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.tree-wallet-addr{flex:1;font-family:monospace;color:var(--t2);font-size:10px;overflow:hidden;text-overflow:ellipsis}
+.tree-wallet-sol{font-family:monospace;color:var(--t1);font-weight:600;font-size:10px}
+.fp-item{display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px}
+.fp-pass{color:var(--grn);font-weight:700;font-size:10px}.fp-fail{color:var(--red2);font-weight:700;font-size:10px}
+.fp-name{color:var(--t2);font-weight:500}.fp-reason{color:var(--t3);font-size:10px;flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 
-<nav class="nav" style="background:rgba(4,10,20,.97);border-bottom:1px solid rgba(20,199,132,.15)">
-  <a href="/" class="logo">
-    <div class="logo-mark" style="background:linear-gradient(135deg,#14c784,#0fa86a)">S</div>
-    <span style="color:#14c784">Sol</span><span>Trader</span>
-  </a>
+<nav class="nav">
+  <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
-    <span style="font-size:11px;color:var(--t3);background:rgba(20,199,132,.08);padding:3px 10px;border-radius:20px;border:1px solid rgba(20,199,132,.2)">{{PLAN_LABEL}}</span>
-    <span style="font-size:12px;color:var(--t3)">{{EMAIL}}</span>
-    <a href="/setup" style="color:var(--t2)!important">Settings</a>
-    {{UPGRADE_BTN}}
-    <a href="/logout" style="color:var(--t3)!important">Sign Out</a>
+    <div class="status"><div id="sdot" class="sdot sdot-off"></div><span id="stxt" class="stxt">Loading…</span></div>
+    <a href="/admin">Admin</a>
+    <a href="/logout">Sign Out</a>
   </div>
 </nav>
 
-<div class="ticker"><div class="ticker-inner" id="ticker-inner">Loading market data…</div></div>
-<div id="toast" class="toast"></div>
+<div class="ticker-strip" style="background:var(--surf);border-bottom:1px solid var(--b1);overflow:hidden;height:32px;display:flex;align-items:center">
+  <div id="ticker-inner" style="display:flex;gap:28px;white-space:nowrap;animation:tickscroll 40s linear infinite;font-size:12px;color:var(--t2)">Loading market data…</div>
+</div>
+<style>.tick-item{display:inline-flex;gap:6px;align-items:center}.tick-name{font-weight:700;color:var(--t1);font-size:11px}@keyframes tickscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}</style>
 
-<div class="wrap" style="max-width:1400px">
-
-  <!-- Feature badges -->
-  <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
-    <span style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-right:2px">Active</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">⚡ Helius Sender</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">🎯 Jito Tips</span>
-    <span class="feat-badge feat-pulse" style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);color:#f59e0b">🔔 CEX Sniper</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">🐋 Whale Tracker</span>
-    <span class="feat-badge" style="background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.25);color:#14c784">🛡️ Rug Detection</span>
-    <span id="listing-count-badge" style="margin-left:auto;font-size:11px;color:var(--t3)">0 listings caught</span>
-  </div>
-
-  <!-- Stats row -->
-  <div class="stats" style="margin-bottom:14px">
-    <div class="stat"><div class="slabel">SOL Balance</div><div class="sval" id="balance">—</div><div class="ssub">available</div></div>
-    <div class="stat"><div class="slabel">Open Positions</div><div class="sval c-gold" id="pos-count">0</div></div>
+<div class="wrap" style="max-width:1200px">
+  <!-- Stats Row -->
+  <div class="stats" style="grid-template-columns:repeat(7,1fr);margin-top:16px">
+    <div class="stat"><div class="slabel">Balance</div><div class="sval"><span id="balance">—</span> <span style="font-size:12px;color:var(--t3)">SOL</span></div></div>
+    <div class="stat"><div class="slabel">Positions</div><div class="sval" id="pos-count">0</div></div>
     <div class="stat"><div class="slabel">Wins</div><div class="sval c-grn" id="wins">0</div></div>
     <div class="stat"><div class="slabel">Losses</div><div class="sval c-red" id="losses">0</div></div>
-    <div class="stat"><div class="slabel">Session P&amp;L</div><div class="sval" id="pnl">+0.0000</div><div class="ssub">SOL</div></div>
-    <div class="stat" style="background:rgba(245,158,11,.05);border-color:rgba(245,158,11,.2)">
-      <div class="slabel" style="color:#f59e0b">Listings Caught</div>
-      <div class="sval" id="listing-stat" style="color:#f59e0b">0</div>
+    <div class="stat"><div class="slabel">Win Rate</div><div class="sval c-blue" id="win-rate">—</div></div>
+    <div class="stat"><div class="slabel">Session P&L</div><div class="sval" id="pnl">—</div></div>
+    <div class="stat"><div class="slabel">Streak</div><div class="sval" id="streak">—</div></div>
+  </div>
+
+  <!-- Tab Bar -->
+  <div class="tab-bar">
+    <button class="tab-btn active" onclick="switchTab('scanner',this)">Scanner</button>
+    <button class="tab-btn" onclick="switchTab('signals',this)">Signals</button>
+    <button class="tab-btn" onclick="switchTab('whales',this)">Whales</button>
+    <button class="tab-btn" onclick="switchTab('positions',this)">Positions</button>
+    <button class="tab-btn" onclick="switchTab('pnl',this)">P&L</button>
+    <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
+  </div>
+
+  <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
+  <div id="tab-scanner" class="tab-pane active">
+    <div class="scanner-layout">
+      <div class="scanner-sidebar">
+        <div class="glass">
+          <div style="display:flex;gap:8px;margin-bottom:10px">
+            <button id="toggle-btn" class="btn btn-success btn-full" onclick="toggleBot()">▶ Start Bot</button>
+            <button class="btn btn-ghost" onclick="cashout()" style="padding:9px 12px" title="Sell all">💰</button>
+          </div>
+          <input type="hidden" id="s-preset" value="balanced">
+        </div>
+        <div class="glass">
+          <div class="sec-label">Open Positions</div>
+          <div id="pos-tbl" style="max-height:200px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">No open positions</div></div>
+        </div>
+        <div class="glass">
+          <div class="sec-label">Filter Pipeline</div>
+          <div id="filter-pipe" style="max-height:160px;overflow-y:auto"><div style="font-size:11px;color:var(--t3)">Scanning…</div></div>
+        </div>
+        <div class="glass">
+          <div class="sec-label" style="display:flex;justify-content:space-between;align-items:center">
+            <span>CEX Sniper</span>
+            <span id="listing-count-badge" style="font-size:9px;color:var(--gold2);text-transform:none;letter-spacing:0">monitoring</span>
+          </div>
+          <div id="listing-feed" style="max-height:120px;overflow-y:auto;font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
+          <div style="margin-top:6px;font-size:10px;color:var(--t3)">Catches: <span id="listing-stat" style="color:var(--gold2);font-weight:700">0</span></div>
+        </div>
+      </div>
+      <div class="scanner-main">
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--b1)">
+            <div style="display:flex;align-items:center;gap:10px">
+              <span style="font-weight:700;font-size:13px">Live Scanner</span>
+              <span id="token-count" style="font-size:10px;color:var(--t3)">0 tokens</span>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <input id="scan-search" type="text" placeholder="Search…" oninput="renderTokenRows()" style="background:var(--surf);border:1px solid var(--b1);color:var(--t1);padding:5px 10px;border-radius:6px;font-size:11px;width:130px">
+              <button class="sort-pill active" onclick="setSortCol('score',this)">Score</button>
+              <button class="sort-pill" onclick="setSortCol('vol',this)">Vol</button>
+              <button class="sort-pill" onclick="setSortCol('chg',this)">Chg</button>
+              <button class="sort-pill" onclick="setSortCol('age',this)">Age</button>
+              <button style="background:none;border:none;cursor:pointer;font-size:14px" onclick="openDexScreener()" title="Open DexScreener">↗</button>
+            </div>
+          </div>
+          <div style="max-height:550px;overflow-y:auto">
+            <table class="tbl" style="font-size:11px">
+              <thead><tr><th>#</th><th>Token</th><th>Price</th><th>1h</th><th>Vol</th><th>MCap</th><th>Liq</th><th>Age</th><th>Score</th><th></th></tr></thead>
+            </table>
+            <div id="token-rows"></div>
+          </div>
+        </div>
+        <!-- Wallet Tree Panel -->
+        <div id="tree-panel" style="display:none;margin-top:14px" class="glass">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div>
+              <div id="tree-tok-name" style="font-weight:700;font-size:14px"></div>
+              <div id="tree-tok-mint" style="font-size:10px;color:var(--t3);font-family:monospace"></div>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center">
+              <span id="tree-buy-count" class="badge bg-grn">0</span>
+              <span id="tree-sell-count" class="badge bg-red">0</span>
+              <a id="tree-dex-link" href="#" target="_blank" style="font-size:11px;color:var(--blue2)">DexScreener ↗</a>
+              <button onclick="closeTree()" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:16px">&times;</button>
+            </div>
+          </div>
+          <div style="position:relative">
+            <canvas id="tree-canvas" style="width:100%;border-radius:8px;background:#070d17"></canvas>
+            <div id="tree-loading" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;color:var(--t3);font-size:12px">Loading wallet tree…</div>
+          </div>
+          <div id="tree-list" style="max-height:180px;overflow-y:auto;margin-top:8px"></div>
+        </div>
+      </div>
     </div>
   </div>
 
-  <div class="dash-grid">
-
-    <!-- LEFT PANEL -->
-    <div>
-      <div class="panel" style="margin-bottom:10px;border-left:3px solid #14c784">
-        <div class="sec-label">Bot Controls</div>
-        <div class="row" style="margin-bottom:10px">
-          <button class="btn btn-success" id="toggle-btn" onclick="toggleBot()" style="flex:1">▶ Start Bot</button>
-          <button class="btn btn-ghost" onclick="cashout()">↓ Cashout</button>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px">
-          <div class="sdot sdot-off" id="sdot"></div>
-          <span class="stxt" id="stxt" style="font-size:13px">Initializing…</span>
+  <!-- ═══════════════════════ SIGNALS TAB ═══════════════════════ -->
+  <div id="tab-signals" class="tab-pane">
+    <div class="stats" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
+      <div class="stat"><div class="slabel">Evaluated</div><div class="sval" id="sig-total">0</div></div>
+      <div class="stat"><div class="slabel">Pass Rate</div><div class="sval c-grn" id="sig-pass-rate">0%</div></div>
+      <div class="stat"><div class="slabel">Top Rejection</div><div class="sval" id="sig-top-reject" style="font-size:13px;color:var(--t2)">—</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button class="sort-pill active" onclick="sigFilter='all';renderSignals();this.classList.add('active');this.nextElementSibling.classList.remove('active');this.nextElementSibling.nextElementSibling.classList.remove('active')">All</button>
+      <button class="sort-pill" onclick="sigFilter='pass';renderSignals();this.classList.add('active');this.previousElementSibling.classList.remove('active');this.nextElementSibling.classList.remove('active')">Passed</button>
+      <button class="sort-pill" onclick="sigFilter='fail';renderSignals();this.classList.add('active');this.previousElementSibling.classList.remove('active');this.previousElementSibling.previousElementSibling.classList.remove('active')">Rejected</button>
+    </div>
+    <div style="display:flex;gap:16px">
+      <div style="flex:1;min-width:0">
+        <div class="glass" style="padding:0">
+          <div id="sig-list" class="sig-list"></div>
         </div>
       </div>
-
-      <div class="panel" style="margin-bottom:10px">
-        <div class="sec-label">Open Positions</div>
-        <div id="pos-tbl"><div style="font-size:12px;color:var(--t3)">No open positions</div></div>
-      </div>
-
-      <div class="panel" style="margin-bottom:10px">
-        <div class="sec-label">Strategy</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:10px" id="preset-grid">
-          <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
-            <div style="font-size:17px;margin-bottom:2px">🛡️</div>
-            <div style="font-size:11px;font-weight:700;color:var(--t1)">Safe</div>
-            <div style="font-size:9px;color:var(--t3)">0.02 SOL</div>
-          </div>
-          <div class="preset-card" id="pc-balanced" onclick="selectPreset('balanced')">
-            <div style="font-size:17px;margin-bottom:2px">⚖️</div>
-            <div style="font-size:11px;font-weight:700;color:var(--t1)">Balanced</div>
-            <div style="font-size:9px;color:var(--t3)">0.04 SOL</div>
-          </div>
-          <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
-            <div style="font-size:17px;margin-bottom:2px">🔥</div>
-            <div style="font-size:11px;font-weight:700;color:var(--t1)">Degen</div>
-            <div style="font-size:9px;color:var(--t3)">0.10 SOL</div>
-          </div>
-        </div>
-        <input type="hidden" id="s-preset" value="{{PRESET}}">
-        <div class="fgroup" style="margin-bottom:6px">
-          <label class="flabel">Run Mode</label>
-          <select class="finput" id="s-mode" onchange="toggleStop(this.value)">
-            <option value="indefinite">Run Indefinitely</option>
-            <option value="duration">Run for Duration</option>
-            <option value="profit">Stop at Profit Target</option>
-          </select>
-        </div>
-        <div id="f-dur" style="display:none" class="fgroup">
-          <label class="flabel">Duration (minutes)</label>
-          <input class="finput" type="number" id="s-dur" placeholder="e.g. 60" min="1">
-        </div>
-        <div id="f-pft" style="display:none" class="fgroup">
-          <label class="flabel">Profit Target (SOL)</label>
-          <input class="finput" type="number" id="s-pft" placeholder="e.g. 0.5" step="0.01">
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">Max Positions</label>
-            <input class="finput" type="number" id="s-maxpos" value="5" min="1" max="20" step="1">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">Loss Cooldown (min)</label>
-            <input class="finput" type="number" id="s-cooldown" value="10" min="0" step="1">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">TP1 Mult</label>
-            <input class="finput" type="number" id="s-tp1" value="1.5" step="0.1" min="1.1">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">TP2 Mult</label>
-            <input class="finput" type="number" id="s-tp2" value="2.0" step="0.1" min="1.1">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">Stop Loss Mult</label>
-            <input class="finput" type="number" id="s-sl" value="0.75" step="0.05" min="0.1" max="1.0">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">Trail Stop %</label>
-            <input class="finput" type="number" id="s-trail" value="0.20" step="0.05" min="0.05" max="0.9">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">Buy Size (SOL)</label>
-            <input class="finput" type="number" id="s-buy" value="0.04" step="0.01" min="0.01">
-          </div>
-          <div class="fgroup" style="margin-bottom:0">
-            <label class="flabel">Drawdown Limit (SOL)</label>
-            <input class="finput" type="number" id="s-dd" value="0.5" step="0.1" min="0">
-          </div>
-        </div>
-        <button class="btn btn-primary btn-full" onclick="saveSettings()" style="margin-top:10px">Save Settings</button>
-      </div>
-
-      <div class="panel" style="margin-bottom:10px">
-        <div class="sec-label">Filter Pipeline <span style="font-size:10px;color:var(--t3);font-weight:400">— real-time screening</span></div>
-        <div id="filter-pipe"><div style="font-size:11px;color:var(--t3)">Start bot to see screening…</div></div>
-      </div>
-
-      <div class="panel" style="border-left:3px solid #f59e0b">
-        <div class="sec-label" style="color:#f59e0b">🔔 CEX Listing Sniper
-          <span style="font-size:9px;color:var(--t3);font-weight:400"> Binance · Coinbase · OKX · Kraken · Bybit · KuCoin · Gate</span>
-        </div>
-        <div id="listing-feed" style="max-height:160px;overflow-y:auto">
-          <div style="font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
+      <div style="width:340px;flex-shrink:0">
+        <div class="glass" id="sig-detail">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Click a signal to view details</div>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- RIGHT PANEL -->
-    <div>
-      <!-- DEX-style Live Scanner -->
-      <div class="panel" id="scanner-panel">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-          <div style="font-size:13px;font-weight:700;color:var(--t1)">
-            <span class="live-dot" style="width:8px;height:8px;border-radius:50%;background:var(--grn);display:inline-block;margin-right:6px;animation:blink 2s infinite;vertical-align:middle"></span>
-            Live Scanner
-          </div>
-          <div style="display:flex;align-items:center;gap:10px">
-            <span id="token-count" style="font-size:11px;color:var(--t3)">0 tokens</span>
-            <a href="#" onclick="event.preventDefault();openDexScreener()" style="font-size:11px;color:var(--blue2)">↗ DexScreener</a>
-          </div>
-        </div>
-        <div class="scan-ctrl">
-          <input class="scan-search" id="scan-search" placeholder="🔍 Search token name or symbol…" oninput="renderTokenRows()">
-          <button class="sort-pill active" id="pill-score" onclick="setSortCol('score',this)">🔥 Score</button>
-          <button class="sort-pill" id="pill-vol"   onclick="setSortCol('vol',this)">Volume</button>
-          <button class="sort-pill" id="pill-chg"   onclick="setSortCol('chg',this)">1h %</button>
-          <button class="sort-pill" id="pill-age"   onclick="setSortCol('age',this)">New</button>
-        </div>
-        <div class="dex-wrap">
-          <table class="dex-tbl">
-            <thead><tr>
-              <th style="width:30px">#</th>
-              <th>Token</th>
-              <th>Price</th>
-              <th>1h %</th>
-              <th>Volume</th>
-              <th>Mkt Cap</th>
-              <th>Liq</th>
-              <th>Age</th>
-              <th>Score</th>
-              <th style="width:58px"></th>
-            </tr></thead>
-          </table>
-          <div id="token-rows" style="max-height:440px;overflow-y:auto">
-            <div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">Start the bot to begin live scanning…</div>
+  <!-- ═══════════════════════ WHALES TAB ═══════════════════════ -->
+  <div id="tab-whales" class="tab-pane">
+    <div style="display:flex;gap:12px;margin-bottom:16px;overflow-x:auto;padding-bottom:4px" id="whale-cards"></div>
+    <div class="glass" style="padding:0">
+      <div style="padding:12px 16px;border-bottom:1px solid var(--b1);font-weight:700;font-size:13px">Live Whale Feed</div>
+      <div id="whale-feed" style="max-height:500px;overflow-y:auto">
+        <div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">Waiting for whale activity…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ POSITIONS TAB ═══════════════════════ -->
+  <div id="tab-positions" class="tab-pane">
+    <div style="display:flex;gap:16px">
+      <div style="flex:1;min-width:0" id="pos-cards">
+        <div style="text-align:center;color:var(--t3);font-size:13px;padding:40px">No open positions</div>
+      </div>
+      <div style="width:280px;flex-shrink:0">
+        <div class="glass">
+          <div class="sec-label">Risk Dashboard</div>
+          <div id="risk-panel">
+            <div style="margin-bottom:12px">
+              <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2)"><span>Drawdown</span><span id="risk-dd-val">0 / 0.5 SOL</span></div>
+              <div class="risk-bar"><div class="risk-fill" id="risk-dd-bar" style="width:0;background:var(--red2)"></div></div>
+            </div>
+            <div style="margin-bottom:12px">
+              <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2)"><span>Positions</span><span id="risk-pos-val">0 / 5</span></div>
+              <div class="risk-bar"><div class="risk-fill" id="risk-pos-bar" style="width:0;background:var(--blue2)"></div></div>
+            </div>
+            <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Consecutive Losses: <b id="risk-losses">0</b></div>
+            <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Cooldown: <span id="risk-cooldown" style="color:var(--t3)">None</span></div>
+            <div style="font-size:11px;color:var(--t2)">Peak: <b id="risk-peak">—</b> SOL &nbsp; Now: <b id="risk-now">—</b> SOL</div>
           </div>
         </div>
       </div>
+    </div>
+  </div>
 
-      <!-- Wallet Tree panel (shown on row click) -->
-      <div class="tree-panel" id="tree-panel" style="display:none">
-        <div class="tree-header">
-          <div>
-            <div class="tree-token-name" id="tree-tok-name">—</div>
-            <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-top:2px" id="tree-tok-mint">—</div>
-          </div>
-          <div style="display:flex;align-items:center;gap:14px">
-            <span class="tree-stat-buy" id="tree-buy-count">— buys</span>
-            <span style="color:var(--t3)">|</span>
-            <span class="tree-stat-sell" id="tree-sell-count">— sells</span>
-            <a id="tree-dex-link" href="#" target="_blank"
-               style="font-size:11px;color:var(--blue2)">↗ DexScreener</a>
-            <button onclick="closeTree()" style="background:none;border:1px solid var(--bdr);color:var(--t3);padding:4px 10px;border-radius:6px;font-size:11px;cursor:pointer">✕ Close</button>
-          </div>
-        </div>
-        <div style="position:relative">
-          <canvas id="tree-canvas" height="360"></canvas>
-          <div id="tree-loading" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;background:rgba(7,13,23,.85);border-radius:8px;font-size:13px;color:var(--t3);flex-direction:column;gap:8px">
-            <div>Fetching wallet data from Helius…</div>
-            <div style="font-size:11px;color:var(--t3);opacity:.6">Analysing swap transactions</div>
-          </div>
-        </div>
-        <div id="tree-list" class="tree-list"></div>
+  <!-- ═══════════════════════ P&L TAB ═══════════════════════ -->
+  <div id="tab-pnl" class="tab-pane">
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <button class="sort-pill active" onclick="loadPnl('1');document.querySelectorAll('.pnl-range').forEach(b=>b.classList.remove('active'));this.classList.add('active')" data-range="1">24h</button>
+      <button class="sort-pill pnl-range" onclick="loadPnl('7');document.querySelectorAll('.pnl-range').forEach(b=>b.classList.remove('active'));this.classList.add('active')" data-range="7">7d</button>
+      <button class="sort-pill pnl-range" onclick="loadPnl('all');document.querySelectorAll('.pnl-range').forEach(b=>b.classList.remove('active'));this.classList.add('active')" data-range="all">All</button>
+    </div>
+    <div class="stats" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr));margin-bottom:16px">
+      <div class="stat"><div class="slabel">Total P&L</div><div class="sval" id="pnl-total">—</div></div>
+      <div class="stat"><div class="slabel">Win Rate</div><div class="sval" id="pnl-winrate">—</div></div>
+      <div class="stat"><div class="slabel">Best Trade</div><div class="sval c-grn" id="pnl-best">—</div></div>
+      <div class="stat"><div class="slabel">Worst Trade</div><div class="sval c-red" id="pnl-worst">—</div></div>
+      <div class="stat"><div class="slabel">Max Drawdown</div><div class="sval c-red" id="pnl-dd">—</div></div>
+      <div class="stat"><div class="slabel">Trades</div><div class="sval" id="pnl-trades">—</div></div>
+    </div>
+    <div class="glass" style="margin-bottom:14px">
+      <div style="font-weight:600;font-size:13px;margin-bottom:8px">Cumulative P&L</div>
+      <canvas id="pnl-chart" height="220"></canvas>
+    </div>
+    <div class="glass">
+      <div style="font-weight:600;font-size:13px;margin-bottom:8px">Drawdown</div>
+      <canvas id="dd-chart" height="120"></canvas>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
+  <div id="tab-settings" class="tab-pane">
+    <div class="sec-label" style="margin-bottom:14px">Strategy Preset</div>
+    <div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">
+      <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
+        <div class="preset-name">🛡️ Safe</div>
+        <div class="preset-desc">Conservative — low risk, steady gains</div>
       </div>
+      <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
+        <div class="preset-name">⚖️ Balanced</div>
+        <div class="preset-desc">Mix of safety and opportunity</div>
+      </div>
+      <div class="preset-card" id="pc-aggressive" onclick="selectPreset('aggressive')">
+        <div class="preset-name">🔥 Aggressive</div>
+        <div class="preset-desc">Higher risk, bigger swings</div>
+      </div>
+      <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
+        <div class="preset-name">💀 Degen</div>
+        <div class="preset-desc">Full send — maximum exposure</div>
+      </div>
+    </div>
+    <div class="sec-label">Trading Parameters</div>
+    <div class="settings-grid">
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Max Buy (SOL)</label><input class="finput" id="s-buy" type="number" step="0.01" value="0.04"></div>
+        <div class="fgroup"><label class="flabel">Max Positions</label><input class="finput" id="s-maxpos" type="number" value="5"></div>
+        <div class="fgroup"><label class="flabel">Cooldown (min)</label><input class="finput" id="s-cooldown" type="number" value="10"></div>
+      </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">TP1 Multiplier</label><input class="finput" id="s-tp1" type="number" step="0.1" value="1.5"></div>
+        <div class="fgroup"><label class="flabel">TP2 Multiplier</label><input class="finput" id="s-tp2" type="number" step="0.1" value="2.0"></div>
+        <div class="fgroup"><label class="flabel">Stop Loss</label><input class="finput" id="s-sl" type="number" step="0.05" value="0.75"></div>
+      </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Trailing Stop %</label><input class="finput" id="s-trail" type="number" step="0.05" value="0.20"></div>
+        <div class="fgroup"><label class="flabel">Session Drawdown Limit (SOL)</label><input class="finput" id="s-dd" type="number" step="0.1" value="0.5"></div>
+      </div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:10px">
+      <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+      <button class="btn btn-ghost" onclick="switchTab('scanner',document.querySelector('.tab-btn'))">Back to Scanner</button>
     </div>
   </div>
 </div>
 
-<!-- Activity bar — fixed bottom -->
-<div id="activity-bar">
-  <div style="display:flex;align-items:center;justify-content:space-between;padding:5px 16px 3px;border-bottom:1px solid rgba(20,199,132,.15);flex-shrink:0">
-    <div style="display:flex;align-items:center;gap:10px">
-      <span style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#14c784">Activity Log</span>
+<!-- Toast -->
+<div id="toast" style="position:fixed;bottom:230px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:8px;font-size:13px;font-weight:600;z-index:200;opacity:0;transition:opacity .3s;pointer-events:none"></div>
+<style>#toast.show{opacity:1}</style>
+
+<!-- Activity Bar -->
+<div id="activity-bar" style="position:fixed;bottom:0;left:0;right:0;height:200px;background:rgba(7,16,30,.98);border-top:1px solid var(--b1);display:flex;flex-direction:column;z-index:90;backdrop-filter:blur(10px);transition:height .2s">
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 16px;border-bottom:1px solid var(--b1);flex-shrink:0">
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:11px;font-weight:600;color:var(--t2)">Activity Log</span>
       <span id="log-count" style="font-size:10px;color:var(--t3)"></span>
     </div>
     <div style="display:flex;align-items:center;gap:8px">
@@ -3867,6 +4118,26 @@ document.querySelector('.wrap').style.paddingBottom = '214px';
 let running = false, allTokens = [], sortCol = 'score', feedSince = 0;
 let selectedMint = null, logBarExpanded = true;
 let treeCanvas = null, treeCtx = null;
+let _charts = {};
+let _activeTab = 'scanner';
+let _sigData = [], _sigSelected = null, sigFilter = 'all';
+let _tabPollers = {};
+
+// ── Tab System ────────────────────────────────────────────────────────────────
+function switchTab(tab, btn) {
+  _activeTab = tab;
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  if (btn) btn.classList.add('active');
+  // Start tab-specific polling
+  Object.values(_tabPollers).forEach(id => clearInterval(id));
+  _tabPollers = {};
+  if (tab === 'signals') { pollSignals(); _tabPollers.sig = setInterval(pollSignals, 6000); }
+  if (tab === 'whales') { pollWhales(); _tabPollers.whale = setInterval(pollWhales, 8000); }
+  if (tab === 'positions') { pollPositions(); _tabPollers.pos = setInterval(pollPositions, 5000); }
+  if (tab === 'pnl') { loadPnl('7'); }
+}
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
 function toggleLogBar() {
@@ -3879,14 +4150,14 @@ function toggleLogBar() {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function fmtK(n) {
-  if (!n) return '—';
+  if (!n) return '\u2014';
   if (n >= 1e9) return '$' + (n/1e9).toFixed(1) + 'B';
   if (n >= 1e6) return '$' + (n/1e6).toFixed(1) + 'M';
   if (n >= 1e3) return '$' + (n/1e3).toFixed(0) + 'K';
   return '$' + n.toFixed(0);
 }
 function fmtPrice(p) {
-  if (!p) return '—';
+  if (!p) return '\u2014';
   if (p < 0.000001) return '$' + p.toExponential(2);
   if (p < 0.0001)   return '$' + p.toFixed(8);
   if (p < 0.01)     return '$' + p.toFixed(6);
@@ -3930,7 +4201,7 @@ function renderTokenRows() {
   document.getElementById('token-count').textContent = tokens.length + ' tokens';
   const container = document.getElementById('token-rows');
   if (!tokens.length) {
-    container.innerHTML = '<div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">No tokens yet — start the bot to begin scanning</div>';
+    container.innerHTML = '<div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">No tokens yet \u2014 start the bot to begin scanning</div>';
     return;
   }
   container.innerHTML = tokens.map((t, i) => {
@@ -3947,8 +4218,8 @@ function renderTokenRows() {
           <div style="display:flex;align-items:center">
             <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
             <div>
-              <div class="tok-name">${t.name||sym}${sc>=80?' 🔥':''}</div>
-              <div class="tok-sym">${sym}${t.whale?' 🐋':''}</div>
+              <div class="tok-name">${t.name||sym}${sc>=80?' \ud83d\udd25':''}</div>
+              <div class="tok-sym">${sym}${t.whale?' \ud83d\udc0b':''}</div>
             </div>
           </div>
         </td>
@@ -3964,7 +4235,7 @@ function renderTokenRows() {
             <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
           </div>
         </td>
-        <td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy('${t.mint}','${nameSafe}',this)">⚡ Buy</button></td>
+        <td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy('${t.mint}','${nameSafe}',this)">\u26a1 Buy</button></td>
       </tr>
     </tbody></table>`;
   }).join('');
@@ -3973,13 +4244,13 @@ function renderTokenRows() {
 // ── Quick buy ─────────────────────────────────────────────────────────────────
 async function quickBuy(mint, name, btn) {
   const orig = btn.textContent;
-  btn.textContent = '…'; btn.disabled = true;
+  btn.textContent = '\u2026'; btn.disabled = true;
   const res = await fetch('/api/manual-buy', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({mint, name})
   }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
-  btn.textContent = res.ok ? '✅' : '❌';
-  showToast(res.ok ? '⚡ Buy order sent!' : '⚠ ' + (res.msg||'Buy failed'), res.ok);
+  btn.textContent = res.ok ? '\u2705' : '\u274c';
+  showToast(res.ok ? '\u26a1 Buy order sent!' : '\u26a0 ' + (res.msg||'Buy failed'), res.ok);
   setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
   if (res.ok) setTimeout(refresh, 2000);
 }
@@ -3990,13 +4261,12 @@ async function openWalletTree(mint, name) {
   renderTokenRows();
   const panel = document.getElementById('tree-panel');
   panel.style.display = '';
-  document.getElementById('tree-tok-name').textContent = name || mint.slice(0,14)+'…';
+  document.getElementById('tree-tok-name').textContent = name || mint.slice(0,14)+'\u2026';
   document.getElementById('tree-tok-mint').textContent = mint;
-  document.getElementById('tree-buy-count').textContent  = '…';
-  document.getElementById('tree-sell-count').textContent = '…';
+  document.getElementById('tree-buy-count').textContent  = '\u2026';
+  document.getElementById('tree-sell-count').textContent = '\u2026';
   const dexLink = document.getElementById('tree-dex-link');
   if (dexLink) dexLink.href = 'https://dexscreener.com/solana/' + mint;
-
   if (!treeCanvas) {
     treeCanvas = document.getElementById('tree-canvas');
     treeCtx    = treeCanvas.getContext('2d');
@@ -4006,7 +4276,6 @@ async function openWalletTree(mint, name) {
   const loading = document.getElementById('tree-loading');
   loading.style.display = 'flex';
   drawTreeBg();
-
   try {
     const data = await fetch('/api/wallet-tree/' + mint).then(r => r.json());
     loading.style.display = 'none';
@@ -4018,128 +4287,71 @@ async function openWalletTree(mint, name) {
     renderTreeList(data.nodes);
   } catch(e) {
     loading.style.display = 'none';
-    drawTreeMsg('Failed to load — token may be too new');
+    drawTreeMsg('Failed to load \u2014 token may be too new');
   }
   panel.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
-
-function closeTree() {
-  selectedMint = null;
-  document.getElementById('tree-panel').style.display = 'none';
-  renderTokenRows();
-}
-
-function drawTreeBg() {
-  if (!treeCanvas) return;
-  treeCtx.fillStyle = '#070d17';
-  treeCtx.fillRect(0, 0, treeCanvas.width, treeCanvas.height);
-}
-
+function closeTree() { selectedMint = null; document.getElementById('tree-panel').style.display = 'none'; renderTokenRows(); }
+function drawTreeBg() { if (!treeCanvas) return; treeCtx.fillStyle = '#070d17'; treeCtx.fillRect(0,0,treeCanvas.width,treeCanvas.height); }
 function drawTreeMsg(msg) {
   const W = treeCanvas.width, H = treeCanvas.height;
   treeCtx.fillStyle = '#070d17'; treeCtx.fillRect(0,0,W,H);
   treeCtx.fillStyle = '#4b5563'; treeCtx.font = '13px monospace'; treeCtx.textAlign = 'center';
-  treeCtx.fillText(msg, W/2, H/2 - 8);
-  treeCtx.fillStyle = '#374151'; treeCtx.font = '11px monospace';
-  treeCtx.fillText('(try again in a few minutes)', W/2, H/2 + 14);
+  treeCtx.fillText(msg, W/2, H/2);
 }
-
 function drawWalletTree(nodes, edges, tokenName) {
-  const W = treeCanvas.width, H = treeCanvas.height;
-  const ctx = treeCtx;
-  ctx.clearRect(0,0,W,H);
-  ctx.fillStyle = '#070d17'; ctx.fillRect(0,0,W,H);
-
+  const W = treeCanvas.width, H = treeCanvas.height, ctx = treeCtx;
+  ctx.clearRect(0,0,W,H); ctx.fillStyle = '#070d17'; ctx.fillRect(0,0,W,H);
   if (!nodes || nodes.length <= 1) { drawTreeMsg('No swap transactions found yet'); return; }
-
   const positions = {};
   const buyGroup  = nodes.find(n => n.id === 'buys');
   const sellGroup = nodes.find(n => n.id === 'sells');
   const buyWals   = nodes.filter(n => n.type === 'buy');
   const sellWals  = nodes.filter(n => n.type === 'sell');
-
-  // Root
   positions['root'] = {x: W/2, y: 56};
-  // Groups
-  if (buyGroup && sellGroup)   { positions['buys'] = {x:W*0.27, y:140}; positions['sells'] = {x:W*0.73, y:140}; }
-  else if (buyGroup)             positions['buys']  = {x:W/2, y:140};
-  else if (sellGroup)            positions['sells'] = {x:W/2, y:140};
-
-  function spreadWallets(wals, groupId, yBase) {
-    const gp = positions[groupId];
-    if (!gp || !wals.length) return;
+  if (buyGroup && sellGroup) { positions['buys']={x:W*0.27,y:140}; positions['sells']={x:W*0.73,y:140}; }
+  else if (buyGroup) positions['buys']={x:W/2,y:140};
+  else if (sellGroup) positions['sells']={x:W/2,y:140};
+  function spreadWallets(wals, gid, yBase) {
+    const gp = positions[gid]; if (!gp || !wals.length) return;
     const cols = Math.min(wals.length, 5);
     const colW = Math.min(88, (W * 0.44) / Math.max(cols, 1));
-    wals.forEach((n, i) => {
-      positions[n.id] = {
-        x: gp.x - (cols-1)*colW/2 + (i % cols)*colW,
-        y: yBase + Math.floor(i / cols) * 78
-      };
-    });
+    wals.forEach((n, i) => { positions[n.id] = {x: gp.x - (cols-1)*colW/2 + (i%cols)*colW, y: yBase + Math.floor(i/cols)*78}; });
   }
-  spreadWallets(buyWals,  'buys',  230);
-  spreadWallets(sellWals, 'sells', 230);
-
-  // Draw grid lines (subtle)
+  spreadWallets(buyWals, 'buys', 230); spreadWallets(sellWals, 'sells', 230);
   ctx.strokeStyle = '#0f1a28'; ctx.lineWidth = 1;
-  for (let x = 0; x < W; x += 60) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
-  for (let y = 0; y < H; y += 60) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
-
-  // Draw edges
+  for (let x=0;x<W;x+=60){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for (let y=0;y<H;y+=60){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
   edges.forEach(e => {
-    const f = positions[e.from], t = positions[e.to];
-    if (!f || !t) return;
-    const toNode = nodes.find(n => n.id === e.to);
-    const isSell = toNode && (toNode.type === 'sell' || toNode.id === 'sells');
-    const grd = ctx.createLinearGradient(f.x, f.y, t.x, t.y);
-    grd.addColorStop(0, isSell ? 'rgba(242,54,69,.0)' : 'rgba(20,199,132,.0)');
-    grd.addColorStop(1, isSell ? 'rgba(242,54,69,.4)' : 'rgba(20,199,132,.4)');
-    ctx.strokeStyle = grd; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.moveTo(f.x, f.y);
-    const cy = (f.y + t.y) / 2;
-    ctx.bezierCurveTo(f.x, cy, t.x, cy, t.x, t.y);
-    ctx.stroke();
+    const f=positions[e.from],t=positions[e.to]; if(!f||!t) return;
+    const toN=nodes.find(n=>n.id===e.to); const isSell=toN&&(toN.type==='sell'||toN.id==='sells');
+    const grd=ctx.createLinearGradient(f.x,f.y,t.x,t.y);
+    grd.addColorStop(0,isSell?'rgba(242,54,69,.0)':'rgba(20,199,132,.0)');
+    grd.addColorStop(1,isSell?'rgba(242,54,69,.4)':'rgba(20,199,132,.4)');
+    ctx.strokeStyle=grd; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(f.x,f.y);
+    const cy=(f.y+t.y)/2; ctx.bezierCurveTo(f.x,cy,t.x,cy,t.x,t.y); ctx.stroke();
   });
-
-  // Draw nodes
   nodes.forEach(n => {
-    const pos = positions[n.id];
-    if (!pos) return;
-    const isRoot  = n.id === 'root';
-    const isGroup = n.type === 'group_buy' || n.type === 'group_sell';
-    const isBuy   = n.type === 'buy'  || n.id === 'buys';
-    const isSell  = n.type === 'sell' || n.id === 'sells';
-    const r     = isRoot ? 26 : isGroup ? 18 : 15;
-    const color = isRoot ? '#f59e0b' : isBuy ? '#14c784' : '#f23645';
-
-    ctx.shadowBlur = isRoot ? 22 : 10; ctx.shadowColor = color;
-    ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI*2);
-    ctx.fillStyle = color + '18'; ctx.fill();
-    ctx.strokeStyle = color; ctx.lineWidth = isRoot ? 2.5 : 1.8; ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    ctx.fillStyle = color; ctx.textAlign = 'center';
-    ctx.font = isRoot ? 'bold 9px monospace' : isGroup ? 'bold 8px monospace' : '8px monospace';
-    const label = isRoot ? tokenName.slice(0,9) : (n.label||'').slice(0,9);
-    ctx.fillText(label, pos.x, pos.y + 3);
-
-    if (n.sol > 0) {
-      ctx.fillStyle = '#94a3b8'; ctx.font = '7px monospace';
-      ctx.fillText(n.sol.toFixed(3)+'◎', pos.x, pos.y + r + 9);
-    }
+    const pos=positions[n.id]; if(!pos) return;
+    const isRoot=n.id==='root',isGroup=n.type==='group_buy'||n.type==='group_sell';
+    const isBuy=n.type==='buy'||n.id==='buys',isSell=n.type==='sell'||n.id==='sells';
+    const r=isRoot?26:isGroup?18:15; const color=isRoot?'#f59e0b':isBuy?'#14c784':'#f23645';
+    ctx.shadowBlur=isRoot?22:10; ctx.shadowColor=color;
+    ctx.beginPath(); ctx.arc(pos.x,pos.y,r,0,Math.PI*2);
+    ctx.fillStyle=color+'18'; ctx.fill(); ctx.strokeStyle=color; ctx.lineWidth=isRoot?2.5:1.8; ctx.stroke();
+    ctx.shadowBlur=0; ctx.fillStyle=color; ctx.textAlign='center';
+    ctx.font=isRoot?'bold 9px monospace':isGroup?'bold 8px monospace':'8px monospace';
+    ctx.fillText((isRoot?tokenName:(n.label||'')).slice(0,9),pos.x,pos.y+3);
+    if(n.sol>0){ctx.fillStyle='#94a3b8';ctx.font='7px monospace';ctx.fillText(n.sol.toFixed(3)+'\u25ce',pos.x,pos.y+r+9);}
   });
 }
-
 function renderTreeList(nodes) {
-  const all = [
-    ...nodes.filter(n => n.type === 'buy').map(n => ({...n, side:'buy'})),
-    ...nodes.filter(n => n.type === 'sell').map(n => ({...n, side:'sell'}))
-  ];
+  const all = [...nodes.filter(n=>n.type==='buy').map(n=>({...n,side:'buy'})),...nodes.filter(n=>n.type==='sell').map(n=>({...n,side:'sell'}))];
   document.getElementById('tree-list').innerHTML = all.map(n => `
     <div class="tree-wallet-row is-${n.side}" onclick="window.open('https://solscan.io/account/${n.wallet||''}','_blank')" title="${n.wallet||''}">
       <div class="tree-wallet-dot" style="background:${n.side==='buy'?'#14c784':'#f23645'}"></div>
       <div class="tree-wallet-addr">${n.label||'?'}</div>
-      <div class="tree-wallet-sol">${(n.sol||0).toFixed(4)}◎</div>
+      <div class="tree-wallet-sol">${(n.sol||0).toFixed(4)}\u25ce</div>
     </div>`).join('');
 }
 
@@ -4158,7 +4370,6 @@ async function pollFeed() {
   } catch(e) {}
 }
 
-// ── Ticker ────────────────────────────────────────────────────────────────────
 function updateTicker() {
   const items = allTokens.slice(0, 20).map(t => {
     const chg = t.change || 0;
@@ -4170,7 +4381,7 @@ function updateTicker() {
     </span>`;
   });
   const html = [...items, ...items].join('');
-  document.getElementById('ticker-inner').innerHTML = html || 'Loading market data…';
+  document.getElementById('ticker-inner').innerHTML = html || 'Loading market data\u2026';
 }
 
 // ── CEX Listing alerts ────────────────────────────────────────────────────────
@@ -4189,30 +4400,21 @@ async function pollListings() {
       const row = document.createElement('div');
       row.style.cssText = 'padding:7px 10px;border-bottom:1px solid rgba(245,158,11,.12);font-size:11px';
       row.innerHTML = `<div style="display:flex;justify-content:space-between">
-        <span><b style="color:#f59e0b;font-size:10px">${a.exchange}</b> &nbsp;<b style="color:var(--t1)">${a.symbol}</b> <span style="color:var(--t3)">${a.name}</span></span>
+        <span><b style="color:#f59e0b;font-size:10px">${a.exchange}</b> &nbsp;<b style="color:var(--t1)">${a.symbol}</b></span>
         <span style="color:var(--t3);font-size:10px">${new Date(a.ts*1000).toLocaleTimeString()}</span>
-      </div><div style="color:#14c784;font-weight:600;font-size:10px;margin-top:2px">⚡ Buying via Jito — TP +40%</div>`;
+      </div>`;
       if (feed.children[0]?.textContent.includes('Monitoring')) feed.innerHTML = '';
       feed.insertBefore(row, feed.firstChild);
       added = true;
     });
     if (added) {
       document.getElementById('listing-stat').textContent = listingCatchCount;
-      document.getElementById('listing-count-badge').textContent = listingCatchCount + ' listing' + (listingCatchCount===1?'':'s') + ' caught';
+      document.getElementById('listing-count-badge').textContent = listingCatchCount + ' caught';
     }
   } catch(e) {}
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-function toggleStop(v) {
-  document.getElementById('f-dur').style.display = v==='duration' ? 'block':'none';
-  document.getElementById('f-pft').style.display = v==='profit'   ? 'block':'none';
-}
-const PRESET_SETTINGS = {
-  safe:     {maxpos:2, cooldown:10, tp1:1.2, tp2:1.5, sl:0.85, trail:0.15, buy:0.02, dd:0.3},
-  balanced: {maxpos:5, cooldown:10, tp1:1.2, tp2:1.5, sl:0.75, trail:0.20, buy:0.04, dd:0.5},
-  degen:    {maxpos:5, cooldown:5,  tp1:2.0, tp2:10.0, sl:0.60, trail:0.30, buy:0.10, dd:1.0},
-};
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('pc-' + name);
@@ -4234,9 +4436,6 @@ async function saveSettings() {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       preset:              document.getElementById('s-preset').value,
-      run_mode:            document.getElementById('s-mode').value,
-      run_duration_min:    document.getElementById('s-dur')?.value || 0,
-      profit_target_sol:   document.getElementById('s-pft')?.value || 0,
       max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
       cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
       tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 1.5),
@@ -4247,7 +4446,7 @@ async function saveSettings() {
       drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
     })
   }).then(r => r.json()).catch(() => null);
-  showToast(res && res.ok !== false ? '✓ Settings saved' : '⚠ Save failed', res && res.ok !== false);
+  showToast(res && res.ok !== false ? '\u2713 Settings saved' : '\u26a0 Save failed', res && res.ok !== false);
   setTimeout(refresh, 300);
 }
 
@@ -4257,19 +4456,26 @@ async function refresh() {
     if (r.status === 401 || r.status === 302) { window.location = '/login'; return null; }
     return r.json();
   }).catch(() => null);
-  if (!d) { document.getElementById('stxt').textContent = 'Connection error — retrying…'; return; }
+  if (!d) { document.getElementById('stxt').textContent = 'Connection error \u2014 retrying\u2026'; return; }
   running = d.running;
   document.getElementById('balance').textContent   = d.balance.toFixed(4);
   document.getElementById('pos-count').textContent = d.positions.length;
   document.getElementById('wins').textContent      = d.stats.wins;
   document.getElementById('losses').textContent    = d.stats.losses;
+  const wr = d.stats.win_rate;
+  document.getElementById('win-rate').textContent = wr > 0 ? wr + '%' : '\u2014';
+  const streak = d.stats.streak;
+  const streakEl = document.getElementById('streak');
+  if (streak > 0) { streakEl.textContent = '+' + streak; streakEl.className = 'sval c-grn'; }
+  else if (streak < 0) { streakEl.textContent = streak; streakEl.className = 'sval c-red'; }
+  else { streakEl.textContent = '\u2014'; streakEl.className = 'sval'; }
   const pnl = d.stats.total_pnl_sol;
   const pnlEl = document.getElementById('pnl');
   pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
   pnlEl.className   = 'sval ' + (pnl>=0?'c-grn':'c-red');
   const dot = document.getElementById('sdot'), txt = document.getElementById('stxt'), btn = document.getElementById('toggle-btn');
-  if (running) { dot.className='sdot sdot-on'; txt.textContent='Bot Running'; btn.textContent='⏸ Stop Bot'; btn.className='btn btn-danger'; }
-  else          { dot.className='sdot sdot-off'; txt.textContent='Bot Stopped'; btn.textContent='▶ Start Bot'; btn.className='btn btn-success'; }
+  if (running) { dot.className='sdot sdot-on'; txt.textContent='Bot Running'; btn.textContent='\u23f8 Stop Bot'; btn.className='btn btn-danger btn-full'; }
+  else          { dot.className='sdot sdot-off'; txt.textContent='Bot Stopped'; btn.textContent='\u25b6 Start Bot'; btn.className='btn btn-success btn-full'; }
 
   document.getElementById('pos-tbl').innerHTML = d.positions.length
     ? d.positions.map(p => {
@@ -4277,7 +4483,6 @@ async function refresh() {
         return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
           <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
           <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
-          <a href="https://dexscreener.com/solana/${p.address}" target="_blank" style="font-size:10px;color:var(--blue2)">↗</a>
         </div>`;
       }).join('')
     : '<div style="font-size:12px;color:var(--t3)">No open positions</div>';
@@ -4286,23 +4491,22 @@ async function refresh() {
   document.getElementById('log-count').textContent = logs.length + ' entries';
   document.getElementById('log').innerHTML = logs.map(l => {
     let c = '';
-    if (l.includes('BUY'))                              c = 'lbuy';
+    if (l.includes('BUY')) c = 'lbuy';
     else if (l.includes('SELL')||l.includes('CASHOUT')) c = 'lsell';
-    else if (l.includes('WHALE')||l.includes('COPY'))   c = 'lsig';
-    else if (l.includes('SNIPE')||l.includes('LISTING'))c = 'lsig';
-    else if (l.includes('SCAN')||l.includes('CHECK'))   c = 'lscan';
+    else if (l.includes('WHALE')||l.includes('COPY')) c = 'lsig';
+    else if (l.includes('SNIPE')||l.includes('LISTING')) c = 'lsig';
+    else if (l.includes('SCAN')||l.includes('CHECK')) c = 'lscan';
     else if (l.includes('Bot ')||l.includes('ERROR')||l.includes('WARN')) c = 'linfo';
     return `<div class="lline ${c}">${l}</div>`;
   }).join('');
   if (d.filter_log) {
     document.getElementById('filter-pipe').innerHTML = d.filter_log.map(f => `
       <div class="fp-item">
-        <span class="${f.passed?'fp-pass':'fp-fail'}">${f.passed?'✓':'✗'}</span>
+        <span class="${f.passed?'fp-pass':'fp-fail'}">${f.passed?'\u2713':'\u2717'}</span>
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
-      </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning…</div>';
+      </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
   }
-  // Populate settings fields from live bot settings (only once, don't overwrite if user is editing)
   if (d.settings && Object.keys(d.settings).length && !document._settingsFocused) {
     const s = d.settings;
     const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
@@ -4319,8 +4523,8 @@ async function refresh() {
 
 async function toggleBot() {
   const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>null);
-  if (!res) { document.getElementById('stxt').textContent = '⚠️ Server error'; return; }
-  if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '⚠️ ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
+  if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
+  if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
   setTimeout(refresh, 800);
 }
@@ -4339,6 +4543,310 @@ function showToast(msg, ok=true) {
   el._timer = setTimeout(() => el.classList.remove('show'), 3000);
 }
 
+// ══════════════════════════ SIGNAL EXPLORER ══════════════════════════
+async function pollSignals() {
+  try {
+    const data = await fetch('/api/signal-explorer').then(r => r.json());
+    _sigData = data.recent || [];
+    document.getElementById('sig-total').textContent = data.stats.total_evaluated;
+    document.getElementById('sig-pass-rate').textContent = data.stats.pass_rate + '%';
+    const topR = data.stats.top_reject_reasons;
+    document.getElementById('sig-top-reject').textContent = topR.length ? topR[0].reason.slice(0,30) : '\u2014';
+    renderSignals();
+  } catch(e) {}
+}
+
+function renderSignals() {
+  let items = _sigData;
+  if (sigFilter === 'pass') items = items.filter(s => s.passed);
+  if (sigFilter === 'fail') items = items.filter(s => !s.passed);
+  const container = document.getElementById('sig-list');
+  if (!items.length) { container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">No signals yet \u2014 start the bot</div>'; return; }
+  container.innerHTML = items.slice(0, 80).map((s, i) => {
+    const sc = s.score?.total || 0;
+    const col = scoreColor(sc);
+    return `<div class="sig-row${_sigSelected===i?' active':''}" onclick="showSignalDetail(${i})">
+      <div style="width:6px;height:6px;border-radius:50%;background:${s.passed?'var(--grn)':'var(--red2)'};flex-shrink:0"></div>
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;color:var(--t1);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${s.name||'?'}</div>
+        <div style="font-size:10px;color:var(--t3)">${s.reason||''}</div>
+      </div>
+      <div class="score-bar"><div class="score-bar-fill" style="width:${sc}%;background:${col}"></div></div>
+      <span style="font-size:10px;font-weight:700;color:${col};font-family:monospace;width:22px;text-align:right">${sc}</span>
+      <span class="sig-badge ${s.passed?'sig-pass':'sig-fail'}">${s.passed?'PASS':'FAIL'}</span>
+      <span style="font-size:10px;color:var(--t3)">${s.ts||''}</span>
+    </div>`;
+  }).join('');
+}
+
+function showSignalDetail(idx) {
+  _sigSelected = idx;
+  renderSignals();
+  const s = _sigData[idx];
+  if (!s) return;
+  const sc = s.score || {};
+  const detail = document.getElementById('sig-detail');
+  // Radar chart + filter pipeline + score breakdown
+  detail.innerHTML = `
+    <div style="font-weight:700;font-size:14px;margin-bottom:4px">${s.name||'?'}</div>
+    <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:12px">${s.mint||''}</div>
+    <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap">
+      <div style="font-size:11px"><span style="color:var(--t3)">Price</span> <b>${fmtPrice(s.price)}</b></div>
+      <div style="font-size:11px"><span style="color:var(--t3)">MCap</span> <b>${fmtK(s.mc)}</b></div>
+      <div style="font-size:11px"><span style="color:var(--t3)">Vol</span> <b>${fmtK(s.vol)}</b></div>
+      <div style="font-size:11px"><span style="color:var(--t3)">Liq</span> <b>${fmtK(s.liq)}</b></div>
+      <div style="font-size:11px"><span style="color:var(--t3)">Age</span> <b>${fmtAge(s.age_min||0)}</b></div>
+      <div style="font-size:11px"><span style="color:var(--t3)">Chg</span> <b class="${chgClass(s.change)}">${chgStr(s.change||0)}</b></div>
+    </div>
+    <div class="sec-label">AI Score Breakdown (${sc.total||0}/100)</div>
+    <canvas id="sig-radar" height="200" style="margin-bottom:14px"></canvas>
+    <div class="sec-label">Filter Pipeline</div>
+    ${(s.filters||[]).map(f => `<div class="filter-step">
+      <div class="filter-dot ${f.passed?'pass':'fail'}"></div>
+      <span style="flex:1">${f.name}</span>
+      <span style="color:var(--t1);font-weight:600;font-size:11px">${f.value}</span>
+      <span style="color:var(--t3);font-size:10px">${f.threshold}</span>
+    </div>`).join('')}
+    <div class="sec-label" style="margin-top:14px">Score Components</div>
+    <div style="display:flex;gap:4px;height:16px;border-radius:4px;overflow:hidden">
+      <div style="flex:${sc.volume||0};background:#3b82f6" title="Volume: ${sc.volume||0}"></div>
+      <div style="flex:${sc.liquidity||0};background:#14c784" title="Liquidity: ${sc.liquidity||0}"></div>
+      <div style="flex:${sc.age||0};background:#a855f7" title="Age: ${sc.age||0}"></div>
+      <div style="flex:${Math.max(0,sc.price_change||0)};background:#f59e0b" title="Change: ${sc.price_change||0}"></div>
+      <div style="flex:${sc.momentum||0};background:#06b6d4" title="Momentum: ${sc.momentum||0}"></div>
+    </div>
+    <div style="display:flex;gap:12px;margin-top:6px;font-size:10px;color:var(--t3);flex-wrap:wrap">
+      <span style="color:#3b82f6">\u25cf Vol ${sc.volume||0}</span>
+      <span style="color:#14c784">\u25cf Liq ${sc.liquidity||0}</span>
+      <span style="color:#a855f7">\u25cf Age ${sc.age||0}</span>
+      <span style="color:#f59e0b">\u25cf Chg ${sc.price_change||0}</span>
+      <span style="color:#06b6d4">\u25cf Mom ${sc.momentum||0}</span>
+    </div>
+  `;
+  // Draw radar chart
+  setTimeout(() => {
+    const canvas = document.getElementById('sig-radar');
+    if (!canvas || !window.Chart) return;
+    if (_charts.sigRadar) _charts.sigRadar.destroy();
+    _charts.sigRadar = new Chart(canvas, {
+      type: 'radar',
+      data: {
+        labels: ['Volume', 'Liquidity', 'Age', 'Change', 'Momentum'],
+        datasets: [{
+          data: [sc.volume||0, sc.liquidity||0, sc.age||0, Math.max(0,sc.price_change||0), sc.momentum||0],
+          backgroundColor: 'rgba(37,99,235,.15)',
+          borderColor: '#3b82f6',
+          borderWidth: 2,
+          pointBackgroundColor: '#3b82f6',
+          pointRadius: 3,
+        }]
+      },
+      options: {
+        scales: { r: { beginAtZero: true, max: 25, ticks: { display: false }, grid: { color: 'rgba(255,255,255,.06)' }, pointLabels: { color: '#94a3b8', font: { size: 10 } } } },
+        plugins: { legend: { display: false } },
+        animation: { duration: 300 },
+      }
+    });
+  }, 50);
+}
+
+// ══════════════════════════ WHALE DASHBOARD ══════════════════════════
+async function pollWhales() {
+  try {
+    const data = await fetch('/api/whale-activity').then(r => r.json());
+    // Render whale stat cards
+    const cardsEl = document.getElementById('whale-cards');
+    cardsEl.innerHTML = (data.whale_stats||[]).map(w => `
+      <div class="whale-card">
+        <div style="font-weight:700;font-size:13px;margin-bottom:4px">\ud83d\udc0b ${w.label}</div>
+        <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:8px">${w.address.slice(0,8)}\u2026</div>
+        <div style="display:flex;gap:12px">
+          <div style="font-size:11px"><span style="color:var(--t3)">Buys</span> <b>${w.buys_24h}</b></div>
+          <div style="font-size:11px"><span style="color:var(--t3)">Avg P&L</span> <b class="${w.avg_pnl>=0?'c-grn':'c-red'}">${w.avg_pnl>0?'+':''}${w.avg_pnl}%</b></div>
+        </div>
+      </div>
+    `).join('') || '<div style="color:var(--t3);font-size:12px;padding:12px">No whale wallets configured</div>';
+    // Render whale feed
+    const feed = document.getElementById('whale-feed');
+    const buys = data.recent_buys || [];
+    if (!buys.length) { feed.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">Waiting for whale activity\u2026</div>'; return; }
+    feed.innerHTML = buys.slice(0, 30).map(b => {
+      const pnlStr = b.pnl_pct != null ? `<span class="${b.pnl_pct>=0?'c-grn':'c-red'}" style="font-weight:700">${b.pnl_pct>0?'+':''}${b.pnl_pct}%</span>` : '<span style="color:var(--t3)">-</span>';
+      return `<div class="whale-entry">
+        <div style="width:8px;height:8px;border-radius:50%;background:var(--grn);flex-shrink:0"></div>
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:600;font-size:12px;color:var(--t1)">${b.name||'?'}</div>
+          <div style="font-size:10px;color:var(--t3)">${b.label} \u2022 ${fmtK(b.mc)} MCap</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:11px">${pnlStr}</div>
+          <div style="font-size:10px;color:var(--t3)">${b.ts||''}</div>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+// ══════════════════════════ POSITION ANALYTICS ══════════════════════════
+async function pollPositions() {
+  try {
+    const data = await fetch('/api/position-analytics').then(r => r.json());
+    const positions = data.positions || [];
+    const risk = data.risk || {};
+    // Render position cards
+    const container = document.getElementById('pos-cards');
+    if (!positions.length) { container.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:13px;padding:40px">No open positions</div>'; } else {
+      container.innerHTML = positions.map((p, i) => {
+        const pnlCls = p.pnl_pct >= 0 ? 'c-grn' : 'c-red';
+        return `<div class="pos-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div>
+              <div style="font-weight:700;font-size:14px">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:6px;font-size:9px">TP1</span>':''}</div>
+              <div style="font-size:10px;color:var(--t3)">${fmtAge(p.age_min)} old \u2022 ${p.entry_sol} SOL</div>
+            </div>
+            <div style="text-align:right">
+              <div class="${pnlCls}" style="font-size:18px;font-weight:700">${p.pnl_pct>0?'+':''}${p.pnl_pct}%</div>
+              <div style="font-size:10px;color:var(--t3)">${fmtPrice(p.current_price)}</div>
+            </div>
+          </div>
+          <div class="pos-chart-mini"><canvas id="pos-chart-${i}" height="70"></canvas></div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <div style="flex:1;font-size:10px;color:var(--t3)">Entry: ${fmtPrice(p.entry_price)}</div>
+            <div style="flex:1;font-size:10px;color:var(--t3)">Peak: ${fmtPrice(p.peak_price)}</div>
+            <div style="flex:1;font-size:10px;color:var(--t3)">TP1: ${fmtPrice(p.tp1_price)}</div>
+            <div style="flex:1;font-size:10px;color:var(--t3)">SL: ${fmtPrice(p.sl_price)}</div>
+          </div>
+          ${p.dev_wallet ? '<div style="font-size:10px;color:var(--t3);margin-top:6px">Dev: <span style="font-family:monospace">'+p.dev_wallet.slice(0,12)+'\u2026</span></div>' : ''}
+          <div style="display:flex;gap:6px;margin-top:10px">
+            <button class="btn btn-ghost" style="flex:1;font-size:11px;padding:6px" onclick="fetch('/api/manual-sell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mint:'${p.mint}',pct:0.5})}).then(()=>setTimeout(pollPositions,1500))">Sell 50%</button>
+            <button class="btn btn-danger" style="flex:1;font-size:11px;padding:6px" onclick="fetch('/api/manual-sell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mint:'${p.mint}',pct:1.0})}).then(()=>setTimeout(pollPositions,1500))">Sell 100%</button>
+          </div>
+        </div>`;
+      }).join('');
+      // Draw mini charts
+      setTimeout(() => {
+        positions.forEach((p, i) => {
+          const canvas = document.getElementById('pos-chart-' + i);
+          if (!canvas || !p.chart || !p.chart.length || !window.Chart) return;
+          const key = 'posChart' + i;
+          if (_charts[key]) _charts[key].destroy();
+          const prices = p.chart.map(c => c.price);
+          const labels = p.chart.map(c => '');
+          _charts[key] = new Chart(canvas, {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [{
+                data: prices,
+                borderColor: p.pnl_pct >= 0 ? '#14c784' : '#f23645',
+                borderWidth: 1.5,
+                fill: true,
+                backgroundColor: p.pnl_pct >= 0 ? 'rgba(20,199,132,.08)' : 'rgba(248,113,113,.08)',
+                pointRadius: 0, tension: 0.3,
+              }]
+            },
+            options: {
+              scales: { x: { display: false }, y: { display: false } },
+              plugins: { legend: { display: false }, tooltip: { enabled: false } },
+              animation: false,
+              maintainAspectRatio: false,
+            }
+          });
+        });
+      }, 100);
+    }
+    // Render risk dashboard
+    const ddPct = risk.drawdown_limit > 0 ? Math.min(100, risk.session_drawdown / risk.drawdown_limit * 100) : 0;
+    const posPct = risk.max_positions > 0 ? Math.min(100, risk.positions_count / risk.max_positions * 100) : 0;
+    document.getElementById('risk-dd-val').textContent = `${risk.session_drawdown} / ${risk.drawdown_limit} SOL`;
+    document.getElementById('risk-dd-bar').style.width = ddPct + '%';
+    document.getElementById('risk-pos-val').textContent = `${risk.positions_count} / ${risk.max_positions}`;
+    document.getElementById('risk-pos-bar').style.width = posPct + '%';
+    document.getElementById('risk-losses').textContent = risk.consecutive_losses;
+    document.getElementById('risk-cooldown').textContent = risk.cooldown_remaining > 0 ? Math.ceil(risk.cooldown_remaining) + 's' : 'None';
+    document.getElementById('risk-peak').textContent = risk.peak_balance;
+    document.getElementById('risk-now').textContent = risk.current_balance;
+  } catch(e) {}
+}
+
+// ══════════════════════════ P&L CHARTS ══════════════════════════
+async function loadPnl(range) {
+  try {
+    const data = await fetch('/api/pnl-history?days=' + range).then(r => r.json());
+    const s = data.stats || {};
+    const pnlTotalEl = document.getElementById('pnl-total');
+    pnlTotalEl.textContent = (s.total_pnl >= 0 ? '+' : '') + s.total_pnl + ' SOL';
+    pnlTotalEl.className = 'sval ' + (s.total_pnl >= 0 ? 'c-grn' : 'c-red');
+    document.getElementById('pnl-winrate').textContent = s.win_rate + '%';
+    document.getElementById('pnl-best').textContent = '+' + s.best_trade + ' SOL';
+    document.getElementById('pnl-worst').textContent = s.worst_trade + ' SOL';
+    document.getElementById('pnl-dd').textContent = '-' + s.max_drawdown + ' SOL';
+    document.getElementById('pnl-trades').textContent = s.total_trades;
+    // Cumulative P&L chart
+    const cum = data.cumulative || [];
+    if (cum.length && window.Chart) {
+      const labels = cum.map(c => c.ts.split('T')[0] || '');
+      const pnls = cum.map(c => c.pnl);
+      const dds = cum.map(c => -c.drawdown);
+      if (_charts.pnlLine) _charts.pnlLine.destroy();
+      _charts.pnlLine = new Chart(document.getElementById('pnl-chart'), {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Cumulative P&L (SOL)',
+            data: pnls,
+            borderColor: '#14c784',
+            borderWidth: 2,
+            fill: true,
+            backgroundColor: ctx => {
+              const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 220);
+              g.addColorStop(0, 'rgba(20,199,132,.15)');
+              g.addColorStop(1, 'rgba(20,199,132,0)');
+              return g;
+            },
+            pointRadius: 0, tension: 0.3,
+          }]
+        },
+        options: {
+          scales: {
+            x: { display: true, ticks: { color: '#475569', font: { size: 9 }, maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,.03)' } },
+            y: { ticks: { color: '#475569', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.05)' } }
+          },
+          plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
+          interaction: { mode: 'index', intersect: false },
+          animation: { duration: 400 },
+        }
+      });
+      // Drawdown chart
+      if (_charts.ddLine) _charts.ddLine.destroy();
+      _charts.ddLine = new Chart(document.getElementById('dd-chart'), {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Drawdown (SOL)',
+            data: dds,
+            borderColor: '#f23645',
+            borderWidth: 1.5,
+            fill: true,
+            backgroundColor: 'rgba(242,54,69,.1)',
+            pointRadius: 0, tension: 0.3,
+          }]
+        },
+        options: {
+          scales: {
+            x: { display: true, ticks: { color: '#475569', font: { size: 9 }, maxTicksLimit: 8 }, grid: { display: false } },
+            y: { ticks: { color: '#475569', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.03)' } }
+          },
+          plugins: { legend: { display: false } },
+          animation: { duration: 400 },
+        }
+      });
+    }
+  } catch(e) {}
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function() { selectPreset('{{PRESET}}' || 'balanced'); })();
 window.addEventListener('resize', () => {
@@ -4352,6 +4860,7 @@ pollFeed(); setInterval(pollFeed, 4000);
 pollListings(); setInterval(pollListings, 6000);
 </script>
 """
+
 
 # ── Admin Page ─────────────────────────────────────────────────────────────────
 ADMIN_HTML = _CSS + """
