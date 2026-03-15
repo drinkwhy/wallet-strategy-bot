@@ -588,6 +588,7 @@ class BotInstance:
         self.hour_start         = time.time()
         self.consecutive_losses = 0
         self.cooldown_until     = 0.0   # epoch — no buys before this time
+        self.loss_mints         = {}    # mint -> epoch when loss occurred (1h cooldown)
 
     def log_msg(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -1087,6 +1088,7 @@ class BotInstance:
                 else:
                     self.stats["losses"] += 1
                     self.consecutive_losses += 1
+                    self.loss_mints[mint] = time.time()  # block this mint for 1h
                     # Cooldown: 10m after 1 loss, 1h after 3+ consecutive losses
                     cooldown_sec = 3600 if self.consecutive_losses >= 3 else 600
                     self.cooldown_until = time.time() + cooldown_sec
@@ -1196,6 +1198,10 @@ class BotInstance:
 
     def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change):
         if mint in self.positions:
+            return
+        # Block mints we lost on within the last hour
+        lost_at = self.loss_mints.get(mint)
+        if lost_at and time.time() - lost_at < 3600:
             return
         s = self.settings
         min_mc  = s.get("min_mc", 0)
