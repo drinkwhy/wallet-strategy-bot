@@ -1118,7 +1118,7 @@ class BotInstance:
                 self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
 
     def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change):
-        if mint in self.positions or mint in seen_tokens:
+        if mint in self.positions:
             return
         s = self.settings
         if not (s.get("min_mc",0) <= mc <= s.get("max_mc",999999)):
