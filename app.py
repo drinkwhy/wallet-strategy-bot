@@ -4244,8 +4244,8 @@ function renderTokenRows() {
           <div style="display:flex;align-items:center">
             <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
             <div>
-              <div class="tok-name">${t.name||sym}${sc>=80?' \ud83d\udd25':''}</div>
-              <div class="tok-sym">${sym}${t.whale?' \ud83d\udc0b':''}</div>
+              <div class="tok-name">${t.name||sym}${sc>=80?' &#x1f525;':''}</div>
+              <div class="tok-sym">${sym}${t.whale?' &#x1f40b;':''}</div>
             </div>
           </div>
         </td>
@@ -4684,7 +4684,7 @@ async function pollWhales() {
     const cardsEl = document.getElementById('whale-cards');
     cardsEl.innerHTML = (data.whale_stats||[]).map(w => `
       <div class="whale-card">
-        <div style="font-weight:700;font-size:13px;margin-bottom:4px">\ud83d\udc0b ${w.label}</div>
+        <div style="font-weight:700;font-size:13px;margin-bottom:4px">&#x1f40b; ${w.label}</div>
         <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:8px">${w.address.slice(0,8)}\u2026</div>
         <div style="display:flex;gap:12px">
           <div style="font-size:11px"><span style="color:var(--t3)">Buys</span> <b>${w.buys_24h}</b></div>
