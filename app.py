@@ -105,7 +105,7 @@ PRESETS = {
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
         "description":"Moderate positions, balanced take-profits. Best for most markets.",
-        "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":2.0,
+        "max_buy_sol":0.04,"tp1_mult":1.2,"tp2_mult":1.5,
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
         "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
@@ -1089,10 +1089,10 @@ class BotInstance:
                     self.stats["losses"] += 1
                     self.consecutive_losses += 1
                     self.loss_mints[mint] = time.time()  # block this mint for 1h
-                    # Cooldown: 10m after 1 loss, 1h after 3+ consecutive losses
-                    cooldown_sec = 3600 if self.consecutive_losses >= 3 else 600
+                    cooldown_min = self.settings.get("cooldown_min", 10)
+                    cooldown_sec = cooldown_min * 60
                     self.cooldown_until = time.time() + cooldown_sec
-                    self.log_msg(f"⏸ Cooldown {cooldown_sec//60}m after {self.consecutive_losses} consecutive loss(es)")
+                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {name}")
                 # Telegram alert
                 try:
                     conn = db()
@@ -2371,6 +2371,7 @@ def api_state():
         "log":        bot.log[:120] if bot else [],
         "stats":      bot.stats if bot else {"wins":0,"losses":0,"total_pnl_sol":0},
         "filter_log": list(bot.filter_log)[:10] if bot else [],
+        "settings":   bot.settings if bot else {},
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -2459,19 +2460,33 @@ def api_settings():
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
+    # Extra live settings
+    overrides = {}
+    for key, cast in [
+        ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
+        ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
+        ("drawdown_limit_sol", float), ("cooldown_min", int),
+    ]:
+        if key in data:
+            try: overrides[key] = cast(data[key])
+            except: pass
     conn = db()
     try:
         cur = conn.cursor()
         cur.execute("""
-            UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s
+            UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
+            max_correlated=%s,drawdown_limit_sol=%s
             WHERE user_id=%s
-        """, (preset, run_mode, duration, profit, uid))
+        """, (preset, run_mode, duration, profit,
+              overrides.get("max_correlated", 5),
+              overrides.get("drawdown_limit_sol", 0.5), uid))
         conn.commit()
     finally:
         conn.close()
     bot = user_bots.get(uid)
     if bot:
         bot.settings.update(PRESETS.get(preset, bot.settings))
+        bot.settings.update(overrides)
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
         bot.profit_target    = profit
@@ -3509,7 +3524,41 @@ DASHBOARD_HTML = _CSS + """
           <label class="flabel">Profit Target (SOL)</label>
           <input class="finput" type="number" id="s-pft" placeholder="e.g. 0.5" step="0.01">
         </div>
-        <button class="btn btn-primary btn-full" onclick="saveSettings()" style="margin-top:6px">Save Settings</button>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">Max Positions</label>
+            <input class="finput" type="number" id="s-maxpos" value="5" min="1" max="20" step="1">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">Loss Cooldown (min)</label>
+            <input class="finput" type="number" id="s-cooldown" value="10" min="0" step="1">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">TP1 Mult</label>
+            <input class="finput" type="number" id="s-tp1" value="1.5" step="0.1" min="1.1">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">TP2 Mult</label>
+            <input class="finput" type="number" id="s-tp2" value="2.0" step="0.1" min="1.1">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">Stop Loss Mult</label>
+            <input class="finput" type="number" id="s-sl" value="0.75" step="0.05" min="0.1" max="1.0">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">Trail Stop %</label>
+            <input class="finput" type="number" id="s-trail" value="0.20" step="0.05" min="0.05" max="0.9">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">Buy Size (SOL)</label>
+            <input class="finput" type="number" id="s-buy" value="0.04" step="0.01" min="0.01">
+          </div>
+          <div class="fgroup" style="margin-bottom:0">
+            <label class="flabel">Drawdown Limit (SOL)</label>
+            <input class="finput" type="number" id="s-dd" value="0.5" step="0.1" min="0">
+          </div>
+        </div>
+        <button class="btn btn-primary btn-full" onclick="saveSettings()" style="margin-top:10px">Save Settings</button>
       </div>
 
       <div class="panel" style="margin-bottom:10px">
@@ -3979,10 +4028,18 @@ async function saveSettings() {
   const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      preset:            document.getElementById('s-preset').value,
-      run_mode:          document.getElementById('s-mode').value,
-      run_duration_min:  document.getElementById('s-dur')?.value || 0,
-      profit_target_sol: document.getElementById('s-pft')?.value || 0,
+      preset:              document.getElementById('s-preset').value,
+      run_mode:            document.getElementById('s-mode').value,
+      run_duration_min:    document.getElementById('s-dur')?.value || 0,
+      profit_target_sol:   document.getElementById('s-pft')?.value || 0,
+      max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
+      cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
+      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 1.5),
+      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 2.0),
+      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.75),
+      trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
+      max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
+      drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
     })
   }).then(r => r.json()).catch(() => null);
   showToast(res && res.ok !== false ? '✓ Settings saved' : '⚠ Save failed', res && res.ok !== false);
@@ -4039,6 +4096,19 @@ async function refresh() {
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning…</div>';
+  }
+  // Populate settings fields from live bot settings (only once, don't overwrite if user is editing)
+  if (d.settings && Object.keys(d.settings).length && !document._settingsFocused) {
+    const s = d.settings;
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
+    setVal('s-maxpos',   s.max_correlated   ?? 5);
+    setVal('s-cooldown', s.cooldown_min     ?? 10);
+    setVal('s-tp1',      s.tp1_mult         ?? 1.2);
+    setVal('s-tp2',      s.tp2_mult         ?? 1.5);
+    setVal('s-sl',       s.stop_loss        ?? 0.75);
+    setVal('s-trail',    s.trail_pct        ?? 0.20);
+    setVal('s-buy',      s.max_buy_sol      ?? 0.04);
+    setVal('s-dd',       s.drawdown_limit_sol ?? 0.5);
   }
 }
 
