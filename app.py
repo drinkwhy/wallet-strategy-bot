@@ -3887,12 +3887,7 @@ def api_start():
         conn.commit()
     finally:
         db_return(conn)
-    return jsonify({
-        "ok": True,
-        "preset": preset,
-        "overrides_count": len(overrides),
-        "saved_fields": sorted(overrides.keys()),
-    })
+    return jsonify({"ok": True})
 
 @app.route("/api/stop", methods=["POST"])
 @login_required
@@ -3988,7 +3983,12 @@ def api_settings():
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
         bot.profit_target    = profit
-    return jsonify({"ok":True})
+    return jsonify({
+        "ok": True,
+        "preset": preset,
+        "overrides_count": len(overrides),
+        "saved_fields": sorted(overrides.keys()),
+    })
 
 @app.route("/api/chart/<mint>")
 @login_required
