@@ -108,6 +108,57 @@ class _RateLimiter:
 
 _dex_limiter = _RateLimiter(rate_per_sec=4)
 _dex_backoff_until = 0  # epoch timestamp — skip requests until this time
+_rpc_health = deque(maxlen=600)
+
+
+def record_rpc_health(source, ok, latency_ms, method=""):
+    _rpc_health.appendleft({
+        "source": source,
+        "ok": bool(ok),
+        "latency_ms": int(latency_ms or 0),
+        "method": method or "",
+        "ts": time.time(),
+    })
+
+
+def rpc_health_snapshot(window_sec=900):
+    now = time.time()
+    rows = [row for row in list(_rpc_health) if now - float(row.get("ts") or 0) <= window_sec]
+    if not rows:
+        return {
+            "total": 0,
+            "ok": 0,
+            "fail_rate": 0.0,
+            "avg_ms": 0.0,
+            "p95_ms": 0.0,
+            "by_source": [],
+        }
+    latencies = sorted(int(row.get("latency_ms") or 0) for row in rows)
+    idx = min(len(latencies) - 1, max(0, math.ceil(len(latencies) * 0.95) - 1))
+    ok_count = sum(1 for row in rows if row.get("ok"))
+    by_source = {}
+    for row in rows:
+        src = row.get("source") or "unknown"
+        bucket = by_source.setdefault(src, {"source": src, "total": 0, "ok": 0, "latencies": []})
+        bucket["total"] += 1
+        if row.get("ok"):
+            bucket["ok"] += 1
+        bucket["latencies"].append(int(row.get("latency_ms") or 0))
+    source_rows = []
+    for src, bucket in by_source.items():
+        lats = bucket.pop("latencies")
+        bucket["avg_ms"] = round(sum(lats) / len(lats), 1) if lats else 0.0
+        bucket["fail_rate"] = round((1 - (bucket["ok"] / bucket["total"])) * 100, 1) if bucket["total"] else 0.0
+        source_rows.append(bucket)
+    source_rows.sort(key=lambda row: (-row["fail_rate"], row["source"]))
+    return {
+        "total": len(rows),
+        "ok": ok_count,
+        "fail_rate": round((1 - (ok_count / len(rows))) * 100, 1) if rows else 0.0,
+        "avg_ms": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
+        "p95_ms": float(latencies[idx]) if latencies else 0.0,
+        "by_source": source_rows,
+    }
 
 def dex_get(url, **kwargs):
     """Rate-limited GET to DexScreener API with 429 backoff."""
@@ -119,11 +170,14 @@ def dex_get(url, **kwargs):
             status_code = 429
             text = ""
             def json(self): return {}
+        record_rpc_health("dexscreener", False, 0, "backoff")
         return _Fake429()
     _dex_limiter.acquire()
     kwargs.setdefault("headers", HEADERS)
     kwargs.setdefault("timeout", 8)
+    started = time.perf_counter()
     resp = requests.get(url, **kwargs)
+    record_rpc_health("dexscreener", resp.ok, round((time.perf_counter() - started) * 1000), "GET")
     if resp.status_code == 429:
         _dex_backoff_until = time.time() + 30  # back off 30s on any 429
     return resp
@@ -1093,6 +1147,16 @@ class BotInstance:
         )
         return changed
 
+    def persist_runtime_settings(self):
+        persist_bot_settings(
+            self.user_id,
+            self.preset_name,
+            self.run_mode,
+            self.run_duration_min,
+            self.profit_target,
+            self.settings,
+        )
+
     def maybe_relax_guards(self):
         now = time.time()
         if now - self.hour_start < 3600:
@@ -1104,6 +1168,7 @@ class BotInstance:
         self.evals_this_hour = 0
         if buys > 0:
             self.settings["adaptive_zero_buy_hours"] = 0
+            self.persist_runtime_settings()
             self.log_msg(f"Hourly check — {buys} buys across {evals} evaluated coins. Guards unchanged.")
             return
         if evals <= 0:
@@ -1118,6 +1183,24 @@ class BotInstance:
         self.log_msg(
             f"Hourly check — 0 buys across {evals} evaluated coins. Relaxed {label}: {old_value} → {new_value}. Replayed {replayed} recent candidates."
         )
+
+    def execution_health_alert(self):
+        now = time.time()
+        recent_exec = [
+            row for row in list(self.execution_events)
+            if now - float(row.get("timestamp") or 0) <= 1200 and row.get("phase") in ("quote", "send", "exit-check")
+        ]
+        if len(recent_exec) >= 8:
+            fail_rate = round(sum(1 for row in recent_exec if not row.get("ok")) / len(recent_exec) * 100, 1)
+            exit_checks = [row for row in recent_exec if row.get("phase") == "exit-check"]
+            if fail_rate >= 75:
+                return f"Execution failure rate {fail_rate:.0f}% over last {len(recent_exec)} attempts"
+            if len(exit_checks) >= 5 and all(not row.get("ok") for row in exit_checks):
+                return "Recent exit simulations all failed"
+        rpc_stats = rpc_health_snapshot(window_sec=900)
+        if rpc_stats["total"] >= 12 and (rpc_stats["fail_rate"] >= 55 or rpc_stats["p95_ms"] >= 4500):
+            return f"RPC degraded — fail {rpc_stats['fail_rate']:.0f}% / p95 {rpc_stats['p95_ms']:.0f}ms"
+        return None
 
     def log_msg(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -1533,6 +1616,9 @@ class BotInstance:
             drawdown_pct = (self.peak_balance - self.sol_balance) / self.peak_balance
             if drawdown_pct >= 0.50:
                 return f"Max drawdown −50% hit ({drawdown_pct*100:.1f}%)"
+        health_alert = self.execution_health_alert()
+        if health_alert:
+            return health_alert
         return None
 
     def check_rate_limit(self, name, mint):
@@ -1730,6 +1816,7 @@ class BotInstance:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
             self.settings["adaptive_zero_buy_hours"] = 0
+            self.persist_runtime_settings()
             self.consecutive_losses  = 0   # reset on successful buy
             self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
             self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
@@ -2384,6 +2471,7 @@ def get_helius_api_key():
 
 
 def rpc_call(method, params=None, timeout=10):
+    started = time.perf_counter()
     try:
         resp = requests.post(HELIUS_RPC, json={
             "jsonrpc": "2.0",
@@ -2393,8 +2481,11 @@ def rpc_call(method, params=None, timeout=10):
         }, headers=HEADERS, timeout=timeout)
         if resp.ok:
             body = resp.json()
+            record_rpc_health("helius", True, round((time.perf_counter() - started) * 1000), method)
             return body.get("result")
+        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
     except Exception as e:
+        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
         print(f"[RPC] {method} failed: {e}", flush=True)
     return None
 
@@ -4439,6 +4530,11 @@ def api_state():
         "stats":      stats,
         "filter_log": list(bot.filter_log)[:10] if bot else [],
         "settings":   bot.settings if bot else {},
+        "adaptive": {
+            "relax_level": int((bot.settings if bot else {}).get("adaptive_relax_level") or 0),
+            "zero_buy_hours": int((bot.settings if bot else {}).get("adaptive_zero_buy_hours") or 0),
+            "offpeak_min_change": float((bot.settings if bot else {}).get("offpeak_min_change") or 0),
+        } if bot else {},
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -4905,6 +5001,7 @@ def api_pattern_lab():
 @login_required
 def api_ops_metrics():
     uid = session["user_id"]
+    bot = user_bots.get(uid)
     conn = db()
     try:
         cur = conn.cursor()
@@ -5002,6 +5099,13 @@ def api_ops_metrics():
             "avg_fill_slippage_bps": round(sum(fill_slips) / len(fill_slips), 1) if fill_slips else 0.0,
             "transfer_hook_count": transfer_hook_count,
             "no_exit_count": no_exit_count,
+        },
+        "rpc_health": rpc_health_snapshot(window_sec=900),
+        "adaptive": {
+            "relax_level": int((bot.settings if bot else {}).get("adaptive_relax_level") or 0),
+            "zero_buy_hours": int((bot.settings if bot else {}).get("adaptive_zero_buy_hours") or 0),
+            "offpeak_min_change": float((bot.settings if bot else {}).get("offpeak_min_change") or 0),
+            "last_relax_at": (bot.settings if bot else {}).get("adaptive_last_relax_at"),
         },
         "top_whales": top_whales,
         "threat_map": threat_map,
@@ -6986,6 +7090,8 @@ function renderOpsRadar() {
   const box = document.getElementById('ops-radar');
   if (!box) return;
   const stats = _opsMetrics.stats || {};
+  const rpc = _opsMetrics.rpc_health || {};
+  const adaptive = _opsMetrics.adaptive || {};
   const whales = _opsMetrics.top_whales || [];
   const threats = _opsMetrics.threat_map || [];
   const liquidity = _opsMetrics.liquidity_risks || [];
@@ -7013,6 +7119,16 @@ function renderOpsRadar() {
         <div style="font-size:10px;color:var(--t3)">Exit Risks</div>
         <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.no_exit_count||0}</div>
         <div style="font-size:10px;color:var(--t3)">${stats.transfer_hook_count||0} hooks</div>
+      </div>
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">RPC Health</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">${rpc.fail_rate||0}% fail</div>
+        <div style="font-size:10px;color:var(--t3)">p95 ${rpc.p95_ms||0} ms</div>
+      </div>
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">Adaptive Guard</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">L${adaptive.relax_level||0}</div>
+        <div style="font-size:10px;color:var(--t3)">${adaptive.zero_buy_hours||0} zero-buy hrs</div>
       </div>
     </div>
     <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Whale Radar</div>
