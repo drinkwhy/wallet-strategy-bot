@@ -207,6 +207,51 @@ def normalize_preset_name(preset):
     preset = aliases.get(preset, preset)
     return preset if preset in PRESETS else "balanced"
 
+
+ADMIN_PRESET_FIELDS = {
+    "max_buy_sol": "buy",
+    "tp1_mult": "tp1",
+    "tp2_mult": "tp2",
+    "stop_loss": "sl",
+    "trail_pct": "trail",
+    "max_age_min": "age",
+    "time_stop_min": "tstop",
+    "min_liq": "liq",
+    "min_mc": "minmc",
+    "max_mc": "maxmc",
+    "priority_fee": "prio",
+    "drawdown_limit_sol": "dd",
+    "max_correlated": "maxpos",
+    "min_vol": "minvol",
+    "min_score": "minscore",
+    "risk_per_trade_pct": "risk",
+    "min_holder_growth_pct": "holders",
+    "min_narrative_score": "narr",
+    "min_green_lights": "lights",
+    "min_volume_spike_mult": "volspike",
+    "late_entry_mult": "latemult",
+    "nuclear_narrative_score": "nuclear",
+}
+
+
+def admin_preset_defaults():
+    defaults = {}
+    for preset_name, preset in PRESETS.items():
+        if preset_name in {"steady", "max"}:
+            continue
+        defaults[preset_name] = {
+            admin_key: preset.get(source_key)
+            for source_key, admin_key in ADMIN_PRESET_FIELDS.items()
+        }
+    return defaults
+
+
+def dashboard_preset_settings():
+    return {
+        preset_name: dict(PRESETS[preset_name])
+        for preset_name in ("safe", "balanced", "aggressive", "degen")
+    }
+
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -325,6 +370,23 @@ def init_db():
             ts TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_explorer_log (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            mint TEXT,
+            name TEXT,
+            passed INTEGER DEFAULT 0,
+            reason TEXT,
+            payload_json TEXT,
+            ts TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS preset_overrides (
+            preset TEXT PRIMARY KEY,
+            overrides_json TEXT,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS deployer_stats (
             deployer_wallet TEXT PRIMARY KEY,
             launches_total INTEGER DEFAULT 0,
@@ -375,6 +437,7 @@ def init_db():
         # indexes on columns added by migrate_db — safe to skip if column not yet present
         for _idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
             "CREATE INDEX IF NOT EXISTS idx_trades_user_id_ts ON trades (user_id, timestamp DESC)",
@@ -418,6 +481,13 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
             "ALTER TABLE perf_fees ADD COLUMN IF NOT EXISTS session_id TEXT",
             "ALTER TABLE filter_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS mint TEXT",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS name TEXT",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS passed INTEGER DEFAULT 0",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS reason TEXT",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS payload_json TEXT",
+            "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS ts TIMESTAMP DEFAULT NOW()",
         ]
         for m in migrations:
             try:
@@ -427,6 +497,7 @@ def migrate_db():
         try:
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_perf_fees_session_id ON perf_fees (session_id) WHERE session_id IS NOT NULL")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
@@ -482,6 +553,19 @@ def migrate_db():
                 checklist_json TEXT,
                 milestones_json TEXT,
                 last_updated TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS signal_explorer_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER,
+                mint TEXT,
+                name TEXT,
+                passed INTEGER DEFAULT 0,
+                reason TEXT,
+                payload_json TEXT,
+                ts TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS preset_overrides (
+                preset TEXT PRIMARY KEY,
+                overrides_json TEXT,
+                updated_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
         except Exception:
@@ -490,6 +574,31 @@ def migrate_db():
     finally:
         db_return(conn)
 migrate_db()
+
+
+def load_preset_overrides():
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT preset, overrides_json FROM preset_overrides")
+        rows = cur.fetchall()
+    except Exception:
+        return
+    finally:
+        db_return(conn)
+    for row in rows or []:
+        preset = normalize_preset_name(row.get("preset"))
+        if preset not in PRESETS:
+            continue
+        try:
+            overrides = json.loads(row.get("overrides_json") or "{}")
+        except Exception:
+            overrides = {}
+        if isinstance(overrides, dict):
+            PRESETS[preset].update(overrides)
+
+
+load_preset_overrides()
 
 def make_referral_code():
     return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
@@ -708,13 +817,20 @@ def ai_suggest_settings(stats):
     """Given market stats, return suggested preset name + rationale."""
     if not stats:
         return {"preset":"balanced","reason":"Not enough data yet — using balanced defaults."}
-    wr = stats.get("win_rate", 50)
-    if wr >= 60:
-        return {"preset":"degen","reason":f"Win rate is {wr}% — market is hot. Degen mode for max returns."}
-    elif wr >= 45:
-        return {"preset":"balanced","reason":f"Win rate is {wr}% — steady market. Balanced preset recommended."}
-    else:
-        return {"preset":"safe","reason":f"Win rate is {wr}% — choppy market. Safe preset to protect capital."}
+    trades = int(stats.get("total_trades", 0) or 0)
+    wr = float(stats.get("win_rate", 50) or 50)
+    avg_win = float(stats.get("avg_win_sol", 0) or 0)
+    avg_loss = abs(float(stats.get("avg_loss_sol", 0) or 0))
+    expectancy = (wr / 100.0) * avg_win - ((100.0 - wr) / 100.0) * avg_loss
+    if trades < 8:
+        return {"preset":"balanced","reason":"Not enough 24h trade data yet — balanced stays the safest default."}
+    if wr < 40 or expectancy <= 0:
+        return {"preset":"safe","reason":f"Win rate {wr:.1f}% and expectancy {expectancy:+.4f} SOL suggest defensive settings."}
+    if wr >= 62 and expectancy >= 0.03 and avg_win > max(avg_loss, 0.0001) * 1.8:
+        return {"preset":"degen","reason":f"Win rate {wr:.1f}% with strong expectancy {expectancy:+.4f} SOL points to a very hot tape."}
+    if wr >= 52 and expectancy >= 0.015:
+        return {"preset":"aggressive","reason":f"Win rate {wr:.1f}% and positive expectancy {expectancy:+.4f} SOL support a more aggressive preset."}
+    return {"preset":"balanced","reason":f"Win rate {wr:.1f}% is workable but not strong enough for max aggression."}
 
 # ── SOL transfer (for fee collection) ─────────────────────────────────────────
 def send_sol(keypair, to_address, amount_sol):
@@ -799,6 +915,33 @@ class BotInstance:
                 cur.execute(
                     "INSERT INTO filter_log (user_id,mint,name,passed,reason,score) VALUES (%s,%s,%s,%s,%s,%s)",
                     (self.user_id, mint, name, int(passed), reason, score)
+                )
+                conn.commit()
+            finally:
+                db_return(conn)
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
+
+    def log_signal_entry(self, entry):
+        payload = dict(entry or {})
+        self.signal_explorer_log.appendleft(payload)
+        try:
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO signal_explorer_log (user_id,mint,name,passed,reason,payload_json)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        self.user_id,
+                        payload.get("mint"),
+                        payload.get("name"),
+                        int(bool(payload.get("passed"))),
+                        payload.get("reason", ""),
+                        json.dumps(payload),
+                    )
                 )
                 conn.commit()
             finally:
@@ -1502,39 +1645,39 @@ class BotInstance:
         print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if liq > 0 and liq < min_liq:
             sig_entry["reason"] = f"Liq ${liq:,.0f} < min ${min_liq:,}"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if age_min > max_age:
             sig_entry["reason"] = f"Age {age_min:.0f}m > max {max_age}m"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if change < -10:
             sig_entry["reason"] = f"1h change {change:.0f}% too negative"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if vol < min_vol:
             sig_entry["reason"] = f"Volume ${vol:,.0f} < min ${min_vol:,}"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if score_total < min_score:
             sig_entry["reason"] = f"AI Score {score_total} < min {min_score}"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         utc_hour = time.gmtime().tm_hour
         if not (10 <= utc_hour < 23):
             if change < 30:
                 sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < 30%"
-                self.signal_explorer_log.appendleft(sig_entry)
+                self.log_signal_entry(sig_entry)
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
         intel = ensure_token_intel(mint, base_info={
@@ -1586,17 +1729,17 @@ class BotInstance:
         ])
         if checklist["green_lights"] < min_green_lights:
             sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         if float(intel.get("max_multiple") or 1) > late_entry_mult and int(intel.get("narrative_score") or 0) < nuclear_narrative_score:
             sig_entry["reason"] = f"Late entry ({float(intel.get('max_multiple') or 1):.2f}x) without nuclear narrative"
-            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
         sig_entry["passed"] = True
         sig_entry["reason"] = f"Passed all filters (score {score_total})"
-        self.signal_explorer_log.appendleft(sig_entry)
+        self.log_signal_entry(sig_entry)
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, f"Signal passed all filters (score {score_total})")
         self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
@@ -3622,13 +3765,15 @@ def dashboard():
             upgrade_btn = '<a href="/subscribe/basic" class="nbtn">Subscribe</a>'
         else:
             upgrade_btn = '<a href="/subscribe/free" class="nbtn" style="background:var(--bg3);border:1px solid var(--grn);color:var(--grn)">Profit Only</a>'
+        preset_settings_json = json.dumps(dashboard_preset_settings())
         return Response(DASHBOARD_HTML
             .replace("{{EMAIL}}", user.get("email", ""))
             .replace("{{PLAN_LABEL}}", plan_info.get("label", ""))
             .replace("{{UPGRADE_BTN}}", upgrade_btn)
             .replace("{{PLAN}}", plan_info.get("label", ""))
             .replace("{{WALLET}}", wallet.get("public_key", ""))
-            .replace("{{PRESET}}", normalize_preset_name((bsettings or {}).get("preset", "balanced"))),
+            .replace("{{PRESET}}", normalize_preset_name((bsettings or {}).get("preset", "balanced")))
+            .replace("{{PRESET_SETTINGS}}", preset_settings_json),
             mimetype="text/html"
         )
     except Exception as e:
@@ -3742,7 +3887,12 @@ def api_start():
         conn.commit()
     finally:
         db_return(conn)
-    return jsonify({"ok":True})
+    return jsonify({
+        "ok": True,
+        "preset": preset,
+        "overrides_count": len(overrides),
+        "saved_fields": sorted(overrides.keys()),
+    })
 
 @app.route("/api/stop", methods=["POST"])
 @login_required
@@ -3804,6 +3954,8 @@ def api_settings():
         ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
         ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
         ("drawdown_limit_sol", float), ("cooldown_min", int),
+        ("max_age_min", int), ("time_stop_min", int), ("min_liq", float),
+        ("min_mc", float), ("max_mc", float), ("priority_fee", int),
         ("min_vol", float), ("min_score", int), ("risk_per_trade_pct", float),
         ("min_holder_growth_pct", float), ("min_narrative_score", int),
         ("min_green_lights", int), ("min_volume_spike_mult", float),
@@ -4036,10 +4188,28 @@ def api_listing_alerts():
 @login_required
 def api_signal_explorer():
     uid = session["user_id"]
-    bot = user_bots.get(uid)
-    if not bot:
-        return jsonify({"recent": [], "stats": {"total_evaluated": 0, "pass_rate": 0, "top_reject_reasons": []}})
-    recent = list(bot.signal_explorer_log)[:100]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT payload_json, ts
+            FROM signal_explorer_log
+            WHERE user_id=%s
+            ORDER BY ts DESC
+        """, (uid,))
+        rows = cur.fetchall()
+    finally:
+        db_return(conn)
+    recent = []
+    for row in rows:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and payload:
+            if row.get("ts") and not payload.get("logged_at"):
+                payload["logged_at"] = row["ts"].isoformat()
+            recent.append(payload)
     total = len(recent)
     passed = sum(1 for s in recent if s.get("passed"))
     reasons = {}
@@ -4260,12 +4430,22 @@ def api_whale_activity():
         })
     return jsonify({"recent_buys": recent, "whale_stats": whale_stats})
 
+@app.route("/api/ai-recommendation")
+@login_required
+def api_ai_recommendation():
+    stats = get_market_stats()
+    suggestion = ai_suggest_settings(stats)
+    return jsonify({
+        "stats": stats,
+        "suggestion": suggestion,
+        "logic": "Uses last 24h realized trade outcomes: trade count, win rate, average win, average loss, and expectancy."
+    })
+
+
 @app.route("/api/admin/suggest-settings")
 @admin_required
 def api_suggest_settings():
-    stats = get_market_stats()
-    suggestion = ai_suggest_settings(stats)
-    return jsonify({"stats": stats, "suggestion": suggestion})
+    return api_ai_recommendation()
 
 @app.route("/api/admin/blacklist-dev", methods=["POST"])
 @admin_required
@@ -4292,18 +4472,26 @@ def api_dev_blacklist():
 @admin_required
 def api_override_preset():
     data   = request.json or {}
-    preset = data.get("preset","balanced")
+    preset = normalize_preset_name(data.get("preset", "balanced"))
     if preset in PRESETS:
-        # merge incoming settings into PRESETS dict in memory
+        overrides = {}
         for k, v in data.items():
-            if k != "preset":
-                PRESETS[preset][k] = v
-        # propagate to running bots on this preset
+            if k == "preset" or k not in PRESETS[preset]:
+                continue
+            PRESETS[preset][k] = v
+            overrides[k] = v
         conn = db()
         try:
             cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO preset_overrides (preset, overrides_json, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (preset)
+                DO UPDATE SET overrides_json=EXCLUDED.overrides_json, updated_at=NOW()
+            """, (preset, json.dumps(overrides)))
             cur.execute("SELECT user_id FROM bot_settings WHERE preset=%s AND is_running=1", (preset,))
             rows = cur.fetchall()
+            conn.commit()
         finally:
             db_return(conn)
         for row in rows:
@@ -4470,39 +4658,8 @@ def subscribe_success():
 # ── Admin ──────────────────────────────────────────────────────────────────────
 @app.route("/admin")
 @login_required
-@admin_required
 def admin():
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM users ORDER BY created_at DESC")
-        users = cur.fetchall()
-        cur.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 100")
-        trades = cur.fetchall()
-        cur.execute("SELECT * FROM perf_fees ORDER BY created_at DESC")
-        fees = cur.fetchall()
-    finally:
-        db_return(conn)
-    active        = sum(1 for b in user_bots.values() if b.running)
-    total_fee_sol = sum(f["fee_sol"] for f in fees)
-    return Response(
-        ADMIN_HTML
-            .replace("{{USERS}}", str(len(users)))
-            .replace("{{ACTIVE}}", str(active))
-            .replace("{{FEE_SOL}}", f"{total_fee_sol:.4f}")
-            .replace("{{USER_ROWS}}", "".join(
-                f"<tr><td>{u['email']}</td><td>{u['plan']}</td>"
-                f"<td>{'<span class=\"badge bg-grn\">Running</span>' if user_bots.get(u['id']) and user_bots[u['id']].running else '<span class=\"badge bg-muted\">Idle</span>'}</td>"
-                f"<td>{str(u['created_at'])[:10]}</td></tr>"
-                for u in users
-            ))
-            .replace("{{FEE_ROWS}}", "".join(
-                f"<tr><td>{f['user_id']}</td><td>{f['pnl_sol']:.4f}</td>"
-                f"<td class=\"c-gold\">{f['fee_sol']:.4f}</td><td>{str(f['created_at'])[:10]}</td></tr>"
-                for f in fees
-            ) or "<tr><td colspan='4' style='color:var(--t3);padding:16px 10px'>No fees recorded yet</td></tr>"),
-        mimetype="text/html"
-    )
+    return redirect(url_for("dashboard"))
 
 # ── HTML Templates ─────────────────────────────────────────────────────────────
 _CSS = """<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -5016,10 +5173,29 @@ DASHBOARD_HTML = _CSS + """
 .preset-card{background:var(--surf);border:1px solid var(--b1);border-radius:10px;padding:12px 14px;cursor:pointer;transition:.15s}
 .preset-card:hover{border-color:var(--blue)}.preset-card.active{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
 .preset-name{font-size:12px;font-weight:700;margin-bottom:2px}.preset-desc{font-size:10px;color:var(--t3)}
-.sig-list{max-height:480px;overflow-y:auto}
-.sig-row{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid rgba(26,46,69,.4);cursor:pointer;transition:.12s;font-size:12px}
-.sig-row:hover{background:rgba(255,255,255,.03)}
-.sig-row.active{background:rgba(37,99,235,.08);border-left:2px solid var(--blue2)}
+.ai-panel{background:linear-gradient(135deg,rgba(20,199,132,.14),rgba(59,130,246,.08));border:1px solid rgba(20,199,132,.24);border-radius:14px;padding:18px;margin-bottom:18px}
+.ai-panel h3{margin:0 0 6px;font-size:16px;color:var(--t1)}
+.ai-panel p{margin:0;color:var(--t2);font-size:12px;line-height:1.5}
+.ai-stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin:14px 0}
+.ai-stat{background:rgba(7,13,23,.45);border:1px solid var(--b1);border-radius:10px;padding:12px}
+.ai-stat-value{font-size:20px;font-weight:800;color:var(--t1)}
+.ai-stat-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-top:4px}
+.sig-table-wrap{max-height:640px;overflow:auto}
+.sig-table{width:100%;border-collapse:collapse;font-size:11px;min-width:1380px}
+.sig-table th{position:sticky;top:0;background:#0c1522;color:var(--t3);font-size:10px;text-transform:uppercase;letter-spacing:.08em;padding:10px 8px;border-bottom:1px solid var(--b1);z-index:1}
+.sig-table td{padding:10px 8px;border-bottom:1px solid rgba(26,46,69,.5);vertical-align:top}
+.sig-table tbody tr{cursor:pointer;transition:.12s}
+.sig-table tbody tr:hover{background:rgba(255,255,255,.025)}
+.sig-table tbody tr.active{background:rgba(37,99,235,.08)}
+.sig-cell-token{min-width:180px}
+.sig-token-name{font-weight:700;color:var(--t1);font-size:12px}
+.sig-token-meta{font-size:10px;color:var(--t3);font-family:monospace}
+.sig-checks{display:flex;gap:4px;flex-wrap:wrap;min-width:180px}
+.sig-check{padding:3px 6px;border-radius:999px;font-size:9px;font-weight:700;border:1px solid transparent;white-space:nowrap}
+.sig-check.pass{color:var(--grn);border-color:rgba(20,199,132,.35);background:rgba(20,199,132,.08)}
+.sig-check.fail{color:var(--red2);border-color:rgba(220,38,38,.35);background:rgba(220,38,38,.08)}
+.sig-reason{max-width:300px;color:var(--t2);line-height:1.35}
+.sig-mini-muted{font-size:10px;color:var(--t3)}
 .sig-badge{padding:2px 8px;border-radius:12px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px}
 .sig-pass{background:rgba(20,199,132,.15);color:var(--grn)}.sig-fail{background:rgba(220,38,38,.15);color:var(--red2)}
 .score-bar{height:6px;border-radius:3px;background:var(--b1);overflow:hidden;width:60px;flex-shrink:0}
@@ -5043,13 +5219,18 @@ DASHBOARD_HTML = _CSS + """
 .fp-item{display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px}
 .fp-pass{color:var(--grn);font-weight:700;font-size:10px}.fp-fail{color:var(--red2);font-weight:700;font-size:10px}
 .fp-name{color:var(--t2);font-weight:500}.fp-reason{color:var(--t3);font-size:10px;flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.confirm-modal{position:fixed;inset:0;background:rgba(2,6,23,.72);display:none;align-items:center;justify-content:center;z-index:260;padding:20px}
+.confirm-modal.show{display:flex}
+.confirm-card{width:min(420px,100%);background:linear-gradient(180deg,#0c1522,#08101a);border:1px solid rgba(59,130,246,.28);border-radius:16px;padding:20px;box-shadow:0 24px 80px rgba(0,0,0,.45)}
+.confirm-title{font-size:18px;font-weight:800;color:var(--t1);margin-bottom:8px}
+.confirm-body{font-size:13px;line-height:1.55;color:var(--t2);margin-bottom:16px}
+.confirm-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
 </style>
 
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
     <div class="status"><div id="sdot" class="sdot sdot-off"></div><span id="stxt" class="stxt">Loading…</span></div>
-    <a href="/admin">Admin</a>
     <a href="/logout">Sign Out</a>
   </div>
 </nav>
@@ -5059,7 +5240,7 @@ DASHBOARD_HTML = _CSS + """
 </div>
 <style>.tick-item{display:inline-flex;gap:6px;align-items:center}.tick-name{font-weight:700;color:var(--t1);font-size:11px}@keyframes tickscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}</style>
 
-<div class="wrap" style="max-width:1200px">
+<div class="wrap" style="max-width:1480px">
   <!-- Stats Row -->
   <div class="stats" style="grid-template-columns:repeat(7,1fr);margin-top:16px">
     <div class="stat"><div class="slabel">Balance</div><div class="sval"><span id="balance">—</span> <span style="font-size:12px;color:var(--t3)">SOL</span></div></div>
@@ -5163,20 +5344,28 @@ DASHBOARD_HTML = _CSS + """
       <div class="stat"><div class="slabel">Pass Rate</div><div class="sval c-grn" id="sig-pass-rate">0%</div></div>
       <div class="stat"><div class="slabel">Top Rejection</div><div class="sval" id="sig-top-reject" style="font-size:13px;color:var(--t2)">—</div></div>
     </div>
-    <div style="display:flex;gap:8px;margin-bottom:12px">
+    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap">
       <button class="sort-pill active" onclick="sigFilter='all';renderSignals();this.classList.add('active');this.nextElementSibling.classList.remove('active');this.nextElementSibling.nextElementSibling.classList.remove('active')">All</button>
       <button class="sort-pill" onclick="sigFilter='pass';renderSignals();this.classList.add('active');this.previousElementSibling.classList.remove('active');this.nextElementSibling.classList.remove('active')">Passed</button>
       <button class="sort-pill" onclick="sigFilter='fail';renderSignals();this.classList.add('active');this.previousElementSibling.classList.remove('active');this.previousElementSibling.previousElementSibling.classList.remove('active')">Rejected</button>
+      <input id="sig-search" type="text" placeholder="Search token, mint, reason, tag…" oninput="renderSignals()" style="margin-left:auto;background:var(--surf);border:1px solid var(--b1);color:var(--t1);padding:7px 12px;border-radius:8px;font-size:11px;min-width:260px">
     </div>
-    <div style="display:flex;gap:16px">
+    <div style="display:flex;gap:16px;align-items:flex-start">
       <div style="flex:1;min-width:0">
-        <div class="glass" style="padding:0">
-          <div id="sig-list" class="sig-list"></div>
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b1)">
+            <div>
+              <div style="font-weight:700;font-size:13px;color:var(--t1)">All Evaluated Coins</div>
+              <div style="font-size:11px;color:var(--t3)">Every evaluated token is logged here with the three-signal checklist, timing, and reject reason.</div>
+            </div>
+            <div id="sig-visible-count" style="font-size:11px;color:var(--t3)">0 rows</div>
+          </div>
+          <div id="sig-list" class="sig-table-wrap"></div>
         </div>
       </div>
-      <div style="width:340px;flex-shrink:0">
+      <div style="width:420px;flex-shrink:0;position:sticky;top:78px">
         <div class="glass" id="sig-detail">
-          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Click a signal to view details</div>
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Click any evaluated coin row to inspect the full checklist and score breakdown.</div>
         </div>
         <div class="glass" id="pattern-lab" style="margin-top:14px">
           <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Pattern lab loading…</div>
@@ -5250,6 +5439,22 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
   <div id="tab-settings" class="tab-pane">
+    <div class="ai-panel">
+      <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:260px">
+          <h3>AI Market Recommendation</h3>
+          <p id="ai-reason">Loading market analysis…</p>
+          <div style="font-size:11px;color:var(--t3);margin-top:8px" id="ai-logic">Uses your last 24h realized trades to map the market to a preset.</div>
+        </div>
+        <button class="btn btn-primary" onclick="applyAISuggestion()" id="ai-apply-btn">Apply AI Recommendation</button>
+      </div>
+      <div class="ai-stats-grid" id="ai-stats">
+        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Trades (24h)</div></div>
+        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Win Rate</div></div>
+        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Avg Win</div></div>
+        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Avg Loss</div></div>
+      </div>
+    </div>
     <div class="sec-label" style="margin-bottom:14px">Strategy Preset</div>
     <div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">
       <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
@@ -5290,6 +5495,16 @@ DASHBOARD_HTML = _CSS + """
         <div class="fgroup"><label class="flabel">Min AI Score (0-100)</label><input class="finput" id="s-minscore" type="number" min="0" max="100" value="30"></div>
       </div>
       <div class="glass">
+        <div class="fgroup"><label class="flabel">Max Token Age (min)</label><input class="finput" id="s-age" type="number" step="1" value="240"></div>
+        <div class="fgroup"><label class="flabel">Time Stop (min)</label><input class="finput" id="s-tstop" type="number" step="1" value="30"></div>
+        <div class="fgroup"><label class="flabel">Priority Fee</label><input class="finput" id="s-prio" type="number" step="10000" value="30000"></div>
+      </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Min Liquidity ($)</label><input class="finput" id="s-liq" type="number" step="1000" value="8000"></div>
+        <div class="fgroup"><label class="flabel">Min Market Cap ($)</label><input class="finput" id="s-minmc" type="number" step="1000" value="5000"></div>
+        <div class="fgroup"><label class="flabel">Max Market Cap ($)</label><input class="finput" id="s-maxmc" type="number" step="10000" value="250000"></div>
+      </div>
+      <div class="glass">
         <div class="fgroup"><label class="flabel">Risk Per Trade %</label><input class="finput" id="s-risk" type="number" step="0.1" value="2.0"></div>
         <div class="fgroup"><label class="flabel">Holder Growth % (1h)</label><input class="finput" id="s-holders" type="number" step="5" value="50"></div>
       </div>
@@ -5313,6 +5528,14 @@ DASHBOARD_HTML = _CSS + """
 <!-- Toast -->
 <div id="toast" style="position:fixed;bottom:230px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:8px;font-size:13px;font-weight:600;z-index:200;opacity:0;transition:opacity .3s;pointer-events:none"></div>
 <style>#toast.show{opacity:1}</style>
+<div id="confirm-modal" class="confirm-modal" onclick="if(event.target===this)hideConfirmModal()">
+  <div class="confirm-card">
+    <div class="confirm-title" id="confirm-title">Settings Saved</div>
+    <div class="confirm-body" id="confirm-body">Your settings were saved successfully.</div>
+    <div class="confirm-meta" id="confirm-meta"></div>
+    <button class="btn btn-primary btn-full" onclick="hideConfirmModal()">OK</button>
+  </div>
+</div>
 
 <!-- Activity Bar -->
 <div id="activity-bar" style="position:fixed;bottom:0;left:0;right:0;height:200px;background:rgba(7,16,30,.98);border-top:1px solid var(--b1);display:flex;flex-direction:column;z-index:90;backdrop-filter:blur(10px);transition:height .2s">
@@ -5346,9 +5569,11 @@ let selectedMint = null, logBarExpanded = true;
 let treeCanvas = null, treeCtx = null;
 let _charts = {};
 let _activeTab = 'scanner';
-let _sigData = [], _sigView = [], _sigSelected = null, sigFilter = 'all';
+let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _tabPollers = {};
+let _settingsDirty = false;
+let aiSuggestion = null;
 
 // ── Tab System ────────────────────────────────────────────────────────────────
 function switchTab(tab, btn) {
@@ -5396,6 +5621,30 @@ function chgClass(v) { return v > 0 ? 'chg-pos' : v < 0 ? 'chg-neg' : 'chg-0'; }
 function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
 function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
+function markSettingsDirty() { _settingsDirty = true; }
+function signalKey(s) { return `${s.mint || ''}|${s.logged_at || s.ts || ''}|${s.passed ? 1 : 0}|${s.reason || ''}`; }
+function fmtDateTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? (ts || '—') : d.toLocaleString();
+}
+function getSignalChecklist(s) {
+  const checklist = s.intel?.checklist;
+  return Array.isArray(checklist) && checklist.length ? checklist : [];
+}
+function signalSearchText(s) {
+  const tags = (s.intel?.narrative_tags || []).join(' ');
+  const links = (s.intel?.social_links || []).join(' ');
+  return [
+    s.name, s.mint, s.reason, tags, links,
+    s.intel?.deployer_wallet, s.intel?.deployer_score,
+  ].join(' ').toLowerCase();
+}
+function renderChecklistMini(s) {
+  const checklist = getSignalChecklist(s);
+  if (!checklist.length) return '<span class="sig-mini-muted">Waiting for intel</span>';
+  return checklist.slice(0, 3).map(c => `<span class="sig-check ${c.passed ? 'pass' : 'fail'}">${c.passed ? '✓' : '✕'} ${c.name}</span>`).join('');
+}
 function tokColor(name) {
   const h = [...(name||'?')].reduce((a,c) => a + c.charCodeAt(0), 0);
   return ['#14c784','#3b82f6','#f59e0b','#a855f7','#06b6d4','#f43f5e','#84cc16','#f97316'][h % 8];
@@ -5646,22 +5895,19 @@ async function pollListings() {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-const PRESET_SETTINGS = {
-  safe:       { max_buy_sol:0.02, tp1_mult:2.0, tp2_mult:3.0, stop_loss:0.70, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3, min_vol:5000, min_score:40, risk_per_trade_pct:2.0, min_holder_growth_pct:50, min_narrative_score:22, min_green_lights:3, min_volume_spike_mult:12, late_entry_mult:5.0, nuclear_narrative_score:42 },
-  balanced:   { max_buy_sol:0.04, tp1_mult:2.0, tp2_mult:4.0, stop_loss:0.70, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5, min_vol:3000, min_score:30, risk_per_trade_pct:2.0, min_holder_growth_pct:50, min_narrative_score:20, min_green_lights:3, min_volume_spike_mult:10, late_entry_mult:5.0, nuclear_narrative_score:40 },
-  aggressive: { max_buy_sol:0.07, tp1_mult:2.0, tp2_mult:6.0, stop_loss:0.70, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8, min_vol:1000, min_score:20, risk_per_trade_pct:2.0, min_holder_growth_pct:40, min_narrative_score:18, min_green_lights:3, min_volume_spike_mult:8,  late_entry_mult:5.0, nuclear_narrative_score:38 },
-  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.70, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0, min_vol:500,  min_score:15, risk_per_trade_pct:2.0, min_holder_growth_pct:30, min_narrative_score:15, min_green_lights:3, min_volume_spike_mult:6,  late_entry_mult:5.0, nuclear_narrative_score:35 }
-};
+const PRESET_SETTINGS = {{PRESET_SETTINGS}};
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('pc-' + name);
   if (el) el.classList.add('active');
   document.getElementById('s-preset').value = name;
+  _settingsDirty = true;
   const p = PRESET_SETTINGS[name];
   if (!p) return;
   const m = { 's-buy':p.max_buy_sol, 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss,
               's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol,
-              's-minvol':p.min_vol, 's-minscore':p.min_score, 's-risk':p.risk_per_trade_pct,
+              's-minvol':p.min_vol, 's-minscore':p.min_score, 's-age':p.max_age_min, 's-tstop':p.time_stop_min,
+              's-liq':p.min_liq, 's-minmc':p.min_mc, 's-maxmc':p.max_mc, 's-prio':p.priority_fee, 's-risk':p.risk_per_trade_pct,
               's-holders':p.min_holder_growth_pct, 's-narr':p.min_narrative_score, 's-lights':p.min_green_lights,
               's-volspike':p.min_volume_spike_mult, 's-latemult':p.late_entry_mult, 's-nuclear':p.nuclear_narrative_score };
   for (const [id, val] of Object.entries(m)) {
@@ -5684,6 +5930,12 @@ async function saveSettings() {
       drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
       min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
       min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
+      max_age_min:         parseInt(document.getElementById('s-age')?.value || 240),
+      time_stop_min:       parseInt(document.getElementById('s-tstop')?.value || 30),
+      min_liq:             parseFloat(document.getElementById('s-liq')?.value || 8000),
+      min_mc:              parseFloat(document.getElementById('s-minmc')?.value || 5000),
+      max_mc:              parseFloat(document.getElementById('s-maxmc')?.value || 250000),
+      priority_fee:        parseInt(document.getElementById('s-prio')?.value || 30000),
       risk_per_trade_pct:  parseFloat(document.getElementById('s-risk')?.value || 2.0),
       min_holder_growth_pct: parseFloat(document.getElementById('s-holders')?.value || 50),
       min_narrative_score: parseInt(document.getElementById('s-narr')?.value || 20),
@@ -5693,8 +5945,52 @@ async function saveSettings() {
       nuclear_narrative_score: parseInt(document.getElementById('s-nuclear')?.value || 40),
     })
   }).then(r => r.json()).catch(() => null);
-  showToast(res && res.ok !== false ? '\u2713 Settings saved' : '\u26a0 Save failed', res && res.ok !== false);
+  if (res && res.ok !== false) {
+    _settingsDirty = false;
+    const presetName = String(res.preset || document.getElementById('s-preset')?.value || 'balanced');
+    showToast('\u2713 Settings saved', true);
+    showConfirmModal(
+      'Settings Saved',
+      `Your dashboard settings were saved successfully. Current mode: ${presetName}.`,
+      [
+        `Mode: ${presetName}`,
+        `${res.overrides_count ?? 0} overrides saved`,
+        'Server confirmed',
+      ]
+    );
+  } else {
+    showToast('\u26a0 Save failed', false);
+  }
   setTimeout(refresh, 300);
+  return res;
+}
+
+async function loadAI() {
+  const r = await fetch('/api/ai-recommendation').then(resp => resp.json()).catch(() => null);
+  if (!r) return;
+  aiSuggestion = r.suggestion || null;
+  const reasonEl = document.getElementById('ai-reason');
+  const logicEl = document.getElementById('ai-logic');
+  if (reasonEl) reasonEl.textContent = aiSuggestion?.reason || 'No recommendation available yet.';
+  if (logicEl) logicEl.textContent = r.logic || 'Uses your last 24h realized trades to map the market to a preset.';
+  const stats = r.stats || {};
+  const statsEl = document.getElementById('ai-stats');
+  if (!statsEl) return;
+  statsEl.innerHTML = `
+    <div class="ai-stat"><div class="ai-stat-value">${stats.total_trades ?? '—'}</div><div class="ai-stat-label">Trades (24h)</div></div>
+    <div class="ai-stat"><div class="ai-stat-value">${stats.win_rate != null ? stats.win_rate + '%' : '—'}</div><div class="ai-stat-label">Win Rate</div></div>
+    <div class="ai-stat"><div class="ai-stat-value">${stats.avg_win_sol != null ? '+' + stats.avg_win_sol : '—'}</div><div class="ai-stat-label">Avg Win (SOL)</div></div>
+    <div class="ai-stat"><div class="ai-stat-value">${stats.avg_loss_sol != null ? stats.avg_loss_sol : '—'}</div><div class="ai-stat-label">Avg Loss (SOL)</div></div>
+  `;
+}
+
+async function applyAISuggestion() {
+  if (!aiSuggestion || !aiSuggestion.preset || !PRESET_SETTINGS[aiSuggestion.preset]) {
+    showToast('AI recommendation unavailable', false);
+    return;
+  }
+  selectPreset(aiSuggestion.preset);
+  await saveSettings();
 }
 
 // ── Bot state refresh ─────────────────────────────────────────────────────────
@@ -5767,6 +6063,12 @@ async function refresh() {
     setVal('s-dd',       s.drawdown_limit_sol ?? 0.5);
     setVal('s-minvol',   s.min_vol          ?? 3000);
     setVal('s-minscore', s.min_score        ?? 30);
+    setVal('s-age',      s.max_age_min      ?? 240);
+    setVal('s-tstop',    s.time_stop_min    ?? 30);
+    setVal('s-liq',      s.min_liq          ?? 8000);
+    setVal('s-minmc',    s.min_mc           ?? 5000);
+    setVal('s-maxmc',    s.max_mc           ?? 250000);
+    setVal('s-prio',     s.priority_fee     ?? 30000);
     setVal('s-risk',     s.risk_per_trade_pct ?? 2.0);
     setVal('s-holders',  s.min_holder_growth_pct ?? 50);
     setVal('s-narr',     s.min_narrative_score ?? 20);
@@ -5774,11 +6076,12 @@ async function refresh() {
     setVal('s-volspike', s.min_volume_spike_mult ?? 10);
     setVal('s-latemult', s.late_entry_mult ?? 5.0);
     setVal('s-nuclear',  s.nuclear_narrative_score ?? 40);
+    _settingsDirty = false;
   }
 }
 
 async function toggleBot() {
-  if (!running) { await saveSettings(); }  // persist current preset + params before starting
+  if (!running && _settingsDirty) { await saveSettings(); }
   const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>null);
   if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
@@ -5798,6 +6101,20 @@ function showToast(msg, ok=true) {
   el.classList.add('show');
   clearTimeout(el._timer);
   el._timer = setTimeout(() => el.classList.remove('show'), 3000);
+}
+function showConfirmModal(title, body, meta=[]) {
+  const modal = document.getElementById('confirm-modal');
+  const titleEl = document.getElementById('confirm-title');
+  const bodyEl = document.getElementById('confirm-body');
+  const metaEl = document.getElementById('confirm-meta');
+  if (!modal || !titleEl || !bodyEl || !metaEl) return;
+  titleEl.textContent = title || 'Saved';
+  bodyEl.textContent = body || '';
+  metaEl.innerHTML = (meta || []).map(item => `<span class="badge bg-blue">${item}</span>`).join('');
+  modal.classList.add('show');
+}
+function hideConfirmModal() {
+  document.getElementById('confirm-modal')?.classList.remove('show');
 }
 
 // ══════════════════════════ SIGNAL EXPLORER ══════════════════════════
@@ -5821,27 +6138,81 @@ async function pollSignals() {
 
 function renderSignals() {
   let items = _sigData;
+  const query = (document.getElementById('sig-search')?.value || '').trim().toLowerCase();
   if (sigFilter === 'pass') items = items.filter(s => s.passed);
   if (sigFilter === 'fail') items = items.filter(s => !s.passed);
+  if (query) items = items.filter(s => signalSearchText(s).includes(query));
   const container = document.getElementById('sig-list');
-  _sigView = items.slice(0, 80);
-  if (!_sigView.length) { container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">No signals yet \u2014 start the bot</div>'; return; }
-  container.innerHTML = _sigView.map((s, i) => {
-    const sc = s.score?.total || 0;
-    const col = scoreColor(sc);
-    const greens = s.intel?.green_lights || 0;
-    return `<div class="sig-row${_sigSelected===i?' active':''}" onclick="showSignalDetail(${i})">
-      <div style="width:6px;height:6px;border-radius:50%;background:${s.passed?'var(--grn)':'var(--red2)'};flex-shrink:0"></div>
-      <div style="flex:1;min-width:0">
-        <div style="font-weight:600;color:var(--t1);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${s.name||'?'}</div>
-        <div style="font-size:10px;color:var(--t3)">${greens}/3 lights · ${s.reason||''}</div>
-      </div>
-      <div class="score-bar"><div class="score-bar-fill" style="width:${sc}%;background:${col}"></div></div>
-      <span style="font-size:10px;font-weight:700;color:${col};font-family:monospace;width:22px;text-align:right">${sc}</span>
-      <span class="sig-badge ${s.passed?'sig-pass':'sig-fail'}">${s.passed?'PASS':'FAIL'}</span>
-      <span style="font-size:10px;color:var(--t3)">${s.ts||''}</span>
-    </div>`;
-  }).join('');
+  _sigView = items;
+  document.getElementById('sig-visible-count').textContent = `${_sigView.length} rows`;
+  if (!_sigView.length) {
+    container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">No evaluated coins match this filter yet.</div>';
+    return;
+  }
+  if (!_sigSelectedKey || !_sigView.some(s => signalKey(s) === _sigSelectedKey)) {
+    _sigSelected = 0;
+    _sigSelectedKey = signalKey(_sigView[0]);
+  } else {
+    _sigSelected = _sigView.findIndex(s => signalKey(s) === _sigSelectedKey);
+  }
+  container.innerHTML = `
+    <table class="sig-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Result</th>
+          <th>Token</th>
+          <th>Reason</th>
+          <th>3-Point Checklist</th>
+          <th>Score</th>
+          <th>Price</th>
+          <th>1h</th>
+          <th>Age</th>
+          <th>Vol</th>
+          <th>Liq</th>
+          <th>MC</th>
+          <th>Deployer</th>
+          <th>Narrative</th>
+          <th>Vol Spike</th>
+          <th>Holder Growth</th>
+          <th>Smart First 10</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${_sigView.map((s, i) => {
+          const sc = s.score?.total || 0;
+          const col = scoreColor(sc);
+          const intel = s.intel || {};
+          return `<tr class="${_sigSelected===i?'active':''}" onclick="showSignalDetail(${i})">
+            <td><div>${fmtDateTime(s.logged_at || s.ts)}</div><div class="sig-mini-muted">${s.ts || ''}</div></td>
+            <td><span class="sig-badge ${s.passed?'sig-pass':'sig-fail'}">${s.passed?'PASS':'FAIL'}</span></td>
+            <td class="sig-cell-token">
+              <div class="sig-token-name">${s.name||'?'}</div>
+              <div class="sig-token-meta">${(s.mint||'').slice(0,10)}…</div>
+            </td>
+            <td class="sig-reason">${s.reason || '—'}</td>
+            <td><div class="sig-checks">${renderChecklistMini(s)}</div></td>
+            <td>
+              <div class="score-bar" style="margin-bottom:4px"><div class="score-bar-fill" style="width:${sc}%;background:${col}"></div></div>
+              <div style="color:${col};font-weight:800;font-family:monospace">${sc}</div>
+            </td>
+            <td>${fmtPrice(s.price)}</td>
+            <td class="${chgClass(s.change||0)}">${chgStr(s.change||0)}</td>
+            <td>${fmtAge(s.age_min||0)}</td>
+            <td>${fmtK(s.vol)}</td>
+            <td>${fmtK(s.liq)}</td>
+            <td>${fmtK(s.mc)}</td>
+            <td><div style="font-family:monospace">${shortWallet(intel.deployer_wallet)}</div><div class="sig-mini-muted">rep ${intel.deployer_score||0}</div></td>
+            <td><div>${intel.narrative_score||0}</div><div class="sig-mini-muted">${(intel.narrative_tags||[]).slice(0,2).join(' · ') || 'no tags'}</div></td>
+            <td>${Number(intel.volume_spike_ratio || 0).toFixed(1)}x</td>
+            <td>${Math.round(Number(intel.holder_growth_1h || 0))}%</td>
+            <td>${intel.smart_wallet_first10||0}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+  `;
+  if (_sigSelected >= 0) showSignalDetail(_sigSelected, true);
 }
 
 function renderPatternLab() {
@@ -5886,11 +6257,12 @@ function renderPatternLab() {
   `;
 }
 
-function showSignalDetail(idx) {
+function showSignalDetail(idx, fromRender=false) {
   _sigSelected = idx;
-  renderSignals();
   const s = _sigView[idx];
   if (!s) return;
+  _sigSelectedKey = signalKey(s);
+  if (!fromRender) renderSignals();
   const sc = s.score || {};
   const intel = s.intel || {};
   const checklist = intel.checklist || [];
@@ -5900,6 +6272,13 @@ function showSignalDetail(idx) {
   detail.innerHTML = `
     <div style="font-weight:700;font-size:14px;margin-bottom:4px">${s.name||'?'}</div>
     <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:12px">${s.mint||''}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+      <span class="sig-badge ${s.passed?'sig-pass':'sig-fail'}">${s.passed?'PASS':'FAIL'}</span>
+      <span class="badge bg-muted">${fmtDateTime(s.logged_at || s.ts)}</span>
+      <span class="badge bg-blue">${intel.green_lights||0}/3 green lights</span>
+      <span class="badge bg-gold">Narrative ${intel.narrative_score||0}</span>
+      <span class="badge bg-grn">Deployer ${intel.deployer_score||0}</span>
+    </div>
     <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap">
       <div style="font-size:11px"><span style="color:var(--t3)">Price</span> <b>${fmtPrice(s.price)}</b></div>
       <div style="font-size:11px"><span style="color:var(--t3)">MCap</span> <b>${fmtK(s.mc)}</b></div>
@@ -5913,13 +6292,13 @@ function showSignalDetail(idx) {
       <div class="filter-dot ${c.passed?'pass':'fail'}"></div>
       <span style="flex:1">${c.name}</span>
       <span style="color:var(--t1);font-weight:600;font-size:11px">${c.value||''}</span>
+      <span style="color:var(--t3);font-size:10px">${c.threshold||''}</span>
     </div>`).join('') || '<div style="font-size:11px;color:var(--t3);margin-bottom:10px">Waiting for deployer and holder intel…</div>'}
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 14px">
-      <span class="badge bg-blue">${intel.green_lights||0}/3 green lights</span>
-      <span class="badge bg-gold">Narrative ${intel.narrative_score||0}</span>
-      <span class="badge bg-grn">Deployer ${intel.deployer_score||0}</span>
       <span class="badge bg-muted">${(intel.volume_spike_ratio||0).toFixed ? intel.volume_spike_ratio.toFixed(1) : intel.volume_spike_ratio || 0}x vol</span>
       <span class="badge bg-muted">${intel.holder_growth_1h||0}% holders</span>
+      <span class="badge bg-muted">${intel.first_buyer_count||0} first buyers</span>
+      <span class="badge bg-muted">${intel.smart_wallet_first10||0} smart first 10</span>
     </div>
     <div class="sec-label">Deployer / Social Intent</div>
     <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Deployer: <span style="font-family:monospace;color:var(--t1)">${shortWallet(intel.deployer_wallet)}</span></div>
@@ -6187,6 +6566,7 @@ window.addEventListener('resize', () => {
   }
 });
 refresh();
+loadAI();
 setInterval(refresh, 5000);
 pollFeed(); setInterval(pollFeed, 4000);
 pollListings(); setInterval(pollListings, 6000);
@@ -6247,6 +6627,7 @@ ADMIN_HTML = _CSS + """
         <select class="finput" id="edit-preset" onchange="loadPreset(this.value)">
           <option value="safe">Safe</option>
           <option value="balanced" selected>Balanced</option>
+          <option value="aggressive">Aggressive</option>
           <option value="degen">Degen</option>
         </select>
       </div>
@@ -6327,6 +6708,41 @@ ADMIN_HTML = _CSS + """
           <input class="setting-input" id="s-minscore" type="number" min="0" max="100" step="5" value="30">
           <div class="setting-unit">/100</div>
         </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Risk Per Trade</div><div class="setting-desc">Caps entry size as % of wallet</div></div>
+          <input class="setting-input" id="s-risk" type="number" step="0.1" value="2.0">
+          <div class="setting-unit">%</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Holder Growth (1h)</div><div class="setting-desc">Minimum holder growth for acceleration</div></div>
+          <input class="setting-input" id="s-holders" type="number" step="5" value="50">
+          <div class="setting-unit">%</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Min Narrative Score</div><div class="setting-desc">Required narrative timing score</div></div>
+          <input class="setting-input" id="s-narr" type="number" step="1" value="20">
+          <div class="setting-unit">pts</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Green Lights Required</div><div class="setting-desc">Minimum checklist confirmations before buy</div></div>
+          <input class="setting-input" id="s-lights" type="number" min="1" max="3" step="1" value="3">
+          <div class="setting-unit">#</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Volume Spike Multiple</div><div class="setting-desc">Minimum volume expansion for signal strength</div></div>
+          <input class="setting-input" id="s-volspike" type="number" step="0.5" value="10">
+          <div class="setting-unit">×</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Late Entry Limit</div><div class="setting-desc">Reject coins already extended beyond this multiple</div></div>
+          <input class="setting-input" id="s-latemult" type="number" step="0.5" value="5.0">
+          <div class="setting-unit">×</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Nuclear Narrative Score</div><div class="setting-desc">Narrative score needed to override late-entry guard</div></div>
+          <input class="setting-input" id="s-nuclear" type="number" step="1" value="40">
+          <div class="setting-unit">pts</div>
+        </div>
       </div>
       <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="savePreset()">💾 Save Preset Override</button>
     </div>
@@ -6362,11 +6778,7 @@ ADMIN_HTML = _CSS + """
 </div>
 
 <script>
-const PRESET_DEFAULTS = {
-  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:20,tstop:20,liq:10000,minmc:10000,maxmc:150000,prio:10000,dd:0.3,maxpos:2,minvol:5000,minscore:40},
-  balanced: {buy:0.04,tp1:1.5,tp2:2.5,sl:0.75,trail:0.20,age:30,tstop:30,liq:8000,minmc:5000,maxmc:250000,prio:30000,dd:0.5,maxpos:5,minvol:3000,minscore:30},
-  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:10,tstop:60,liq:3000,minmc:2000,maxmc:500000,prio:100000,dd:1.0,maxpos:5,minvol:500,minscore:15},
-};
+const PRESET_DEFAULTS = {{PRESET_DEFAULTS}};
 let aiSuggestion = null;
 
 function loadPreset(name) {
@@ -6387,11 +6799,17 @@ function loadPreset(name) {
   document.getElementById('s-maxpos').value   = p.maxpos;
   document.getElementById('s-minvol').value   = p.minvol;
   document.getElementById('s-minscore').value = p.minscore;
+  document.getElementById('s-risk').value     = p.risk;
+  document.getElementById('s-holders').value  = p.holders;
+  document.getElementById('s-narr').value     = p.narr;
+  document.getElementById('s-lights').value   = p.lights;
+  document.getElementById('s-volspike').value = p.volspike;
+  document.getElementById('s-latemult').value = p.latemult;
+  document.getElementById('s-nuclear').value  = p.nuclear;
 }
 
-async function savePreset() {
-  const preset = document.getElementById('edit-preset').value;
-  const settings = {
+function collectPresetSettings(preset) {
+  return {
     preset,
     max_buy_sol:      parseFloat(document.getElementById('s-max-buy').value),
     tp1_mult:         parseFloat(document.getElementById('s-tp1').value),
@@ -6408,7 +6826,19 @@ async function savePreset() {
     max_correlated:   parseInt(document.getElementById('s-maxpos').value),
     min_vol:          parseFloat(document.getElementById('s-minvol').value),
     min_score:        parseInt(document.getElementById('s-minscore').value),
+    risk_per_trade_pct: parseFloat(document.getElementById('s-risk').value),
+    min_holder_growth_pct: parseFloat(document.getElementById('s-holders').value),
+    min_narrative_score: parseInt(document.getElementById('s-narr').value),
+    min_green_lights: parseInt(document.getElementById('s-lights').value),
+    min_volume_spike_mult: parseFloat(document.getElementById('s-volspike').value),
+    late_entry_mult:  parseFloat(document.getElementById('s-latemult').value),
+    nuclear_narrative_score: parseInt(document.getElementById('s-nuclear').value),
   };
+}
+
+async function savePreset() {
+  const preset = document.getElementById('edit-preset').value;
+  const settings = collectPresetSettings(preset);
   const r = await fetch('/api/admin/override-preset', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(settings)
@@ -6443,11 +6873,16 @@ async function loadAI() {
   }
 }
 
-function applyAISuggestion() {
+async function applyAISuggestion() {
   if (!aiSuggestion) return;
   document.getElementById('edit-preset').value = aiSuggestion.preset;
   loadPreset(aiSuggestion.preset);
-  alert('✅ AI-recommended settings loaded. Review and click Save to apply.');
+  const r = await fetch('/api/admin/override-preset', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(collectPresetSettings(aiSuggestion.preset))
+  }).then(r => r.json()).catch(() => ({ok:false}));
+  alert(r.ok ? '✅ AI recommendation applied globally to that preset.' : '❌ Could not apply AI recommendation');
 }
 
 async function addBlacklist() {
