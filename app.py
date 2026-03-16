@@ -140,51 +140,147 @@ for _plan_name, _price_id in (("basic", STRIPE_PRICE_BASIC), ("pro", STRIPE_PRIC
     if _price_id:
         PRICE_TO_PLAN[_price_id] = _plan_name
 
+DEFAULT_PRESET = "runner"
+
 PRESETS = {
-    "safe": {
-        "label":"Safe — Low Risk / Consistent",
-        "description":"Small positions, tight stops. Capital preservation first.",
-        "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":2.0,
-        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":720,"time_stop_min":20,
-        "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
-        "min_vol":5000,"min_score":40,"cooldown_min":15,
-        "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
-        "listing_sniper":True,
+    "scalp": {
+        "label": "Scalp — Small Fast Trades",
+        "description": "Tight risk, fast exits, and high-conviction entries only.",
+        "max_buy_sol": 0.03,
+        "tp1_mult": 1.16,
+        "tp2_mult": 1.34,
+        "trail_pct": 0.08,
+        "stop_loss": 0.92,
+        "max_age_min": 45,
+        "time_stop_min": 8,
+        "min_liq": 18000,
+        "min_mc": 9000,
+        "max_mc": 160000,
+        "priority_fee": 70000,
+        "min_vol": 15000,
+        "min_score": 68,
+        "cooldown_min": 12,
+        "anti_rug": True,
+        "check_holders": True,
+        "max_correlated": 2,
+        "drawdown_limit_sol": 0.20,
+        "listing_sniper": True,
+        "max_buys_per_hour": 7,
+        "max_consecutive_losses": 3,
+        "min_buy_fraction": 0.55,
+        "tp1_sell_pct": 0.65,
+        "breakeven_mult": 1.01,
+        "early_exit_min": 4,
+        "early_exit_ratio": 0.98,
+        "trail_activation_mult": 1.12,
+        "min_liq_mc_ratio": 0.06,
+        "min_vol_liq_ratio": 0.35,
+        "max_chase_change": 85,
+        "min_slippage_bps": 250,
+        "max_slippage_bps": 1200,
     },
-    "balanced": {
-        "label":"Balanced — Medium Risk / Steady Profit",
-        "description":"Moderate positions, balanced take-profits. Best for most markets.",
-        "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":2.5,
-        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
-        "min_liq":8000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
-        "min_vol":3000,"min_score":30,"cooldown_min":10,
-        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
-        "listing_sniper":True,
+    "runner": {
+        "label": "Runner — Bigger Higher Profit Trades",
+        "description": "Lets winners run while still cutting weak setups quickly.",
+        "max_buy_sol": 0.06,
+        "tp1_mult": 1.45,
+        "tp2_mult": 2.75,
+        "trail_pct": 0.16,
+        "stop_loss": 0.82,
+        "max_age_min": 180,
+        "time_stop_min": 22,
+        "min_liq": 12000,
+        "min_mc": 6000,
+        "max_mc": 320000,
+        "priority_fee": 95000,
+        "min_vol": 8000,
+        "min_score": 56,
+        "cooldown_min": 8,
+        "anti_rug": True,
+        "check_holders": True,
+        "max_correlated": 3,
+        "drawdown_limit_sol": 0.40,
+        "listing_sniper": True,
+        "max_buys_per_hour": 4,
+        "max_consecutive_losses": 3,
+        "min_buy_fraction": 0.70,
+        "tp1_sell_pct": 0.50,
+        "breakeven_mult": 1.03,
+        "early_exit_min": 8,
+        "early_exit_ratio": 0.96,
+        "trail_activation_mult": 1.20,
+        "min_liq_mc_ratio": 0.05,
+        "min_vol_liq_ratio": 0.25,
+        "max_chase_change": 115,
+        "min_slippage_bps": 300,
+        "max_slippage_bps": 1500,
     },
-    "aggressive": {
-        "label":"Aggressive — Higher Risk / Bigger Swings",
-        "description":"Larger positions, wider stops. More exposure for trending markets.",
-        "max_buy_sol":0.07,"tp1_mult":1.8,"tp2_mult":4.0,
-        "trail_pct":0.25,"stop_loss":0.65,"max_age_min":2880,"time_stop_min":45,
-        "min_liq":5000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
-        "min_vol":1000,"min_score":20,"cooldown_min":7,
-        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
-        "listing_sniper":True,
-    },
-    "degen": {
-        "label":"Degen — High Risk / Max Profit",
-        "description":"Larger positions, wide stops. For hot markets only.",
-        "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
-        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":4320,"time_stop_min":60,
-        "min_liq":3000,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
-        "min_vol":500,"min_score":15,"cooldown_min":5,
-        "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
-        "listing_sniper":True,
+    "all_in": {
+        "label": "All-In — Maximum Exposure",
+        "description": "One high-conviction trade at a time with wider profit targets.",
+        "max_buy_sol": 0.15,
+        "tp1_mult": 1.85,
+        "tp2_mult": 4.50,
+        "trail_pct": 0.23,
+        "stop_loss": 0.74,
+        "max_age_min": 240,
+        "time_stop_min": 30,
+        "min_liq": 10000,
+        "min_mc": 4000,
+        "max_mc": 500000,
+        "priority_fee": 140000,
+        "min_vol": 6000,
+        "min_score": 52,
+        "cooldown_min": 12,
+        "anti_rug": True,
+        "check_holders": True,
+        "max_correlated": 1,
+        "drawdown_limit_sol": 0.60,
+        "listing_sniper": True,
+        "max_buys_per_hour": 2,
+        "max_consecutive_losses": 2,
+        "min_buy_fraction": 0.88,
+        "tp1_sell_pct": 0.35,
+        "breakeven_mult": 1.07,
+        "early_exit_min": 10,
+        "early_exit_ratio": 0.95,
+        "trail_activation_mult": 1.30,
+        "min_liq_mc_ratio": 0.04,
+        "min_vol_liq_ratio": 0.20,
+        "max_chase_change": 140,
+        "min_slippage_bps": 400,
+        "max_slippage_bps": 1800,
     },
 }
-# keep backward compat
-PRESETS["steady"] = PRESETS["balanced"]
-PRESETS["max"]    = PRESETS["degen"]
+
+PRESET_ALIASES = {
+    "scalp": "scalp",
+    "safe": "scalp",
+    "steady": "scalp",
+    "small_fast": "scalp",
+    "runner": "runner",
+    "balanced": "runner",
+    "aggressive": "runner",
+    "swing": "runner",
+    "profit": "runner",
+    "all_in": "all_in",
+    "allin": "all_in",
+    "degen": "all_in",
+    "max": "all_in",
+}
+
+
+def normalize_preset_name(name):
+    key = str(name or DEFAULT_PRESET).strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = PRESET_ALIASES.get(key, key)
+    return normalized if normalized in PRESETS else DEFAULT_PRESET
+
+
+def preset_settings(name):
+    preset = normalize_preset_name(name)
+    settings = dict(PRESETS[preset])
+    settings["preset"] = preset
+    return settings
 
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -247,7 +343,7 @@ def init_db():
         cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_settings (
             user_id INTEGER PRIMARY KEY,
-            preset TEXT DEFAULT 'steady',
+            preset TEXT DEFAULT 'runner',
             custom_settings TEXT,
             run_mode TEXT DEFAULT 'indefinite',
             run_duration_min INTEGER DEFAULT 0,
@@ -267,6 +363,7 @@ def init_db():
             entry_sol REAL,
             tp1_hit INTEGER DEFAULT 0,
             dev_wallet TEXT,
+            remaining_pct REAL DEFAULT 1.0,
             opened_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(user_id, mint)
         )""")
@@ -338,7 +435,7 @@ def migrate_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings_sol REAL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
-            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS preset TEXT DEFAULT 'steady'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS preset TEXT DEFAULT 'runner'",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS custom_settings TEXT",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS run_mode TEXT DEFAULT 'indefinite'",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS run_duration_min INTEGER DEFAULT 0",
@@ -348,6 +445,7 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
             "ALTER TABLE perf_fees ADD COLUMN IF NOT EXISTS session_id TEXT",
             "ALTER TABLE filter_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
+            "ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS remaining_pct REAL DEFAULT 1.0",
         ]
         for m in migrations:
             try:
@@ -486,18 +584,56 @@ _UNSET = object()
 
 def ai_score_detailed(info):
     """Score a token 0-100 with component breakdown."""
-    vol = info.get("vol", 0)
-    liq = info.get("liq", 0)
-    age = info.get("age_min", 9999)
-    chg = info.get("change", 0)
-    mom = info.get("momentum", 0)
-    vol_s = 25 if vol > 100000 else 18 if vol > 50000 else 10 if vol > 10000 else 5 if vol > 1000 else 0
-    liq_s = 20 if liq > 50000 else 14 if liq > 20000 else 8 if liq > 5000 else 3 if liq > 1000 else 0
-    age_s = 20 if age < 5 else 14 if age < 15 else 8 if age < 30 else 3 if age < 60 else 0
-    chg_s = 20 if chg > 100 else 15 if chg > 50 else 10 if chg > 20 else 5 if chg > 5 else -10 if chg < -20 else 0
-    mom_s = min(15, int(mom * 0.15))
-    total = max(0, min(100, vol_s + liq_s + age_s + chg_s + mom_s))
-    return {"total": total, "volume": vol_s, "liquidity": liq_s, "age": age_s, "price_change": chg_s, "momentum": mom_s}
+    vol = max(0, float(info.get("vol", 0) or 0))
+    liq = max(0, float(info.get("liq", 0) or 0))
+    mc = max(1.0, float(info.get("mc", 0) or 1))
+    age = max(0, float(info.get("age_min", 9999) or 9999))
+    chg = float(info.get("change", 0) or 0)
+    mom = max(0, float(info.get("momentum", 0) or 0))
+    vol_liq_ratio = vol / max(liq, 1.0)
+    liq_mc_ratio = liq / mc
+
+    vol_s = 22 if vol >= 150000 else 18 if vol >= 75000 else 14 if vol >= 30000 else 9 if vol >= 12000 else 4 if vol >= 5000 else 0
+    liq_s = 18 if liq >= 100000 else 14 if liq >= 40000 else 10 if liq >= 15000 else 6 if liq >= 7000 else 2 if liq >= 3000 else 0
+    age_s = 16 if 2 <= age <= 20 else 12 if age <= 60 else 7 if age <= 180 else 3 if age <= 360 else 0
+    if 8 <= chg <= 60:
+        chg_s = 16
+    elif 60 < chg <= 120:
+        chg_s = 12
+    elif 0 <= chg < 8:
+        chg_s = 8
+    elif -5 <= chg < 0:
+        chg_s = 3
+    elif chg > 120:
+        chg_s = 5
+    elif chg < -18:
+        chg_s = -18
+    else:
+        chg_s = -6
+    structure_s = 0
+    if liq_mc_ratio >= 0.20:
+        structure_s += 8
+    elif liq_mc_ratio >= 0.10:
+        structure_s += 6
+    elif liq_mc_ratio >= 0.05:
+        structure_s += 3
+    if 0.5 <= vol_liq_ratio <= 8:
+        structure_s += 6
+    elif 0.25 <= vol_liq_ratio <= 12:
+        structure_s += 3
+    mom_s = min(14, int(mom * 0.14))
+    total = max(0, min(100, vol_s + liq_s + age_s + chg_s + structure_s + mom_s))
+    return {
+        "total": total,
+        "volume": vol_s,
+        "liquidity": liq_s,
+        "age": age_s,
+        "price_change": chg_s,
+        "structure": structure_s,
+        "momentum": mom_s,
+        "vol_liq_ratio": round(vol_liq_ratio, 2),
+        "liq_mc_ratio": round(liq_mc_ratio, 3),
+    }
 
 def ai_score(info):
     """Score a token 0-100 based on multiple signals."""
@@ -529,12 +665,27 @@ def check_social_signals(info):
     if "twitter" in urls or "x.com" in urls: bonus += 5
     return bonus
 
-def dynamic_slippage_bps(liq_usd):
+def dynamic_slippage_bps(liq_usd, change_pct=0, conviction=0, settings=None):
     """Returns slippage in bps based on pool liquidity."""
-    if liq_usd > 100000: return 300
-    if liq_usd > 50000:  return 800
-    if liq_usd > 10000:  return 1500
-    return 2500
+    liq_usd = float(liq_usd or 0)
+    if liq_usd >= 100000:
+        bps = 250
+    elif liq_usd >= 50000:
+        bps = 450
+    elif liq_usd >= 20000:
+        bps = 700
+    elif liq_usd >= 10000:
+        bps = 1000
+    else:
+        bps = 1400
+    if abs(change_pct) >= 50:
+        bps += 100
+    if conviction >= 85:
+        bps += 100
+    if settings:
+        bps = max(int(settings.get("min_slippage_bps", 250)), bps)
+        bps = min(int(settings.get("max_slippage_bps", 1800)), bps)
+    return int(bps)
 
 def check_dev_blacklist(dev_wallet):
     if not dev_wallet: return True
@@ -588,15 +739,17 @@ def get_market_stats():
 
 def ai_suggest_settings(stats):
     """Given market stats, return suggested preset name + rationale."""
-    if not stats:
-        return {"preset":"balanced","reason":"Not enough data yet — using balanced defaults."}
-    wr = stats.get("win_rate", 50)
-    if wr >= 60:
-        return {"preset":"degen","reason":f"Win rate is {wr}% — market is hot. Degen mode for max returns."}
-    elif wr >= 45:
-        return {"preset":"balanced","reason":f"Win rate is {wr}% — steady market. Balanced preset recommended."}
-    else:
-        return {"preset":"safe","reason":f"Win rate is {wr}% — choppy market. Safe preset to protect capital."}
+    if not stats or stats.get("total_trades", 0) < 8:
+        return {"preset": DEFAULT_PRESET, "reason": "Not enough fresh trade data yet. Defaulting to the runner profile."}
+    wr = float(stats.get("win_rate", 50) or 50)
+    avg_win = float(stats.get("avg_win_sol", 0) or 0)
+    avg_loss = abs(float(stats.get("avg_loss_sol", 0) or 0))
+    reward_ratio = (avg_win / avg_loss) if avg_loss > 0 else 0
+    if wr >= 60 and reward_ratio >= 1.4:
+        return {"preset": "all_in", "reason": f"Win rate is {wr:.1f}% with {reward_ratio:.2f}x average reward/risk. All-In fits the current tape."}
+    if wr >= 48 and avg_win >= avg_loss:
+        return {"preset": "runner", "reason": f"Win rate is {wr:.1f}% and winners are paying for losers. Runner gives more upside without full-send exposure."}
+    return {"preset": "scalp", "reason": f"Win rate is {wr:.1f}% and the market is less forgiving. Scalp preserves capital and exits weak moves faster."}
 
 # ── SOL transfer (for fee collection) ─────────────────────────────────────────
 def send_sol(keypair, to_address, amount_sol):
@@ -1008,10 +1161,17 @@ class BotInstance:
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
         now = time.time()
+        if now - self.hour_start >= 3600:
+            self.hour_start = now
+            self.buys_this_hour = 0
         # Cooldown after losses
         if now < self.cooldown_until:
             mins = int((self.cooldown_until - now) / 60) + 1
             return f"Loss cooldown active ({mins}m remaining)"
+        max_buys = int(self.settings.get("max_buys_per_hour", 0) or 0)
+        if max_buys and self.buys_this_hour >= max_buys:
+            mins = int(max(60 - ((now - self.hour_start) / 60), 1))
+            return f"Hourly buy cap reached ({max_buys}, resets in {mins}m)"
         return None
 
     def check_honeypot(self, mint, age_min=0):
@@ -1025,9 +1185,74 @@ class BotInstance:
             print(f"[ERROR] {_e}", flush=True)
             return True
 
-    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
+    def build_trade_plan(self, score_total, age_min, change, liq, vol):
         s = self.settings
-        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={s['max_buy_sol']+0.01:.4f}", flush=True)
+        conviction = int(score_total)
+        if 2 <= age_min <= 25:
+            conviction += 6
+        elif age_min > max(30, s.get("max_age_min", 180) * 0.6):
+            conviction -= 8
+        if 8 <= change <= 60:
+            conviction += 5
+        elif change < 0:
+            conviction -= 10
+        if liq >= s.get("min_liq", 0) * 2:
+            conviction += 5
+        if vol >= s.get("min_vol", 0) * 2:
+            conviction += 4
+        conviction = max(40, min(95, conviction))
+
+        min_fraction = float(s.get("min_buy_fraction", 0.6) or 0.6)
+        buy_fraction = min(1.0, max(min_fraction, min_fraction + ((conviction - 50) / 80)))
+        buy_sol = round(max(0.01, s["max_buy_sol"] * buy_fraction), 4)
+
+        if conviction >= 82:
+            time_stop = int(round(s["time_stop_min"] * 1.05))
+            trail_pct = round(max(0.05, s["trail_pct"] * 0.88), 4)
+            tp2_mult = round(s["tp2_mult"] * 1.12, 3)
+            stop_loss = round(s["stop_loss"], 4)
+        elif conviction < 60:
+            time_stop = int(round(max(5, s["time_stop_min"] * 0.75)))
+            trail_pct = round(max(0.05, s["trail_pct"]), 4)
+            tp2_mult = round(max(s["tp1_mult"] + 0.05, s["tp2_mult"] * 0.92), 3)
+            stop_loss = round(min(0.97, s["stop_loss"] + 0.02), 4)
+        else:
+            time_stop = int(round(max(5, s["time_stop_min"] * 0.9)))
+            trail_pct = round(max(0.05, s["trail_pct"] * 0.95), 4)
+            tp2_mult = round(s["tp2_mult"], 3)
+            stop_loss = round(s["stop_loss"], 4)
+
+        return {
+            "score_total": int(score_total),
+            "conviction": conviction,
+            "buy_sol": buy_sol,
+            "time_stop_min": max(5, time_stop),
+            "trail_pct": trail_pct,
+            "tp1_mult": round(s["tp1_mult"], 3),
+            "tp2_mult": tp2_mult,
+            "stop_loss": stop_loss,
+            "tp1_sell_pct": float(s.get("tp1_sell_pct", 0.5) or 0.5),
+            "breakeven_mult": float(s.get("breakeven_mult", 1.02) or 1.02),
+            "early_exit_min": int(s.get("early_exit_min", max(4, s["time_stop_min"] // 2)) or max(4, s["time_stop_min"] // 2)),
+            "early_exit_ratio": float(s.get("early_exit_ratio", 0.97) or 0.97),
+            "trail_activation_mult": float(s.get("trail_activation_mult", 1.2) or 1.2),
+        }
+
+    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, signal_meta=None):
+        s = self.settings
+        trade_plan = dict((signal_meta or {}).get("trade_plan") or {})
+        if not trade_plan:
+            trade_plan = self.build_trade_plan(
+                score_total=(signal_meta or {}).get("score_total", s.get("min_score", 50)),
+                age_min=age_min,
+                change=(signal_meta or {}).get("change", 0),
+                liq=liq,
+                vol=(signal_meta or {}).get("vol", 0),
+            )
+        buy_sol = min(s["max_buy_sol"], max(0.01, float(trade_plan.get("buy_sol", s["max_buy_sol"]) or s["max_buy_sol"])))
+        conviction = int(trade_plan.get("conviction", s.get("min_score", 50)))
+        score_total = int(trade_plan.get("score_total", conviction))
+        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={buy_sol+0.01:.4f}", flush=True)
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
         if cb:
@@ -1057,8 +1282,8 @@ class BotInstance:
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
             return
-        if self.sol_balance < s["max_buy_sol"] + 0.01:
-            reason = f"Low balance ({self.sol_balance:.4f} SOL, need {s['max_buy_sol']+0.01:.4f})"
+        if self.sol_balance < buy_sol + 0.01:
+            reason = f"Low balance ({self.sol_balance:.4f} SOL, need {buy_sol+0.01:.4f})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
             return
@@ -1082,9 +1307,14 @@ class BotInstance:
             self.log_msg(f"SKIP {name} — holder concentration too high")
             return
         # Dynamic slippage
-        slippage = dynamic_slippage_bps(liq)
-        self.log_msg(f"Quoting {name} | slippage={slippage}bps ...")
-        quote = self.jupiter_quote(SOL_MINT, mint, int(s["max_buy_sol"]*1e9), slippage)
+        slippage = dynamic_slippage_bps(
+            liq,
+            change_pct=(signal_meta or {}).get("change", 0),
+            conviction=conviction,
+            settings=s,
+        )
+        self.log_msg(f"Quoting {name} | size={buy_sol:.4f} SOL | score={score_total} | conviction={conviction} | slippage={slippage}bps ...")
+        quote = self.jupiter_quote(SOL_MINT, mint, int(buy_sol * 1e9), slippage)
         if not quote:
             self.log_filter(name, mint, False, "No Jupiter quote available")
             self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
@@ -1119,21 +1349,35 @@ class BotInstance:
 
             self.positions[mint] = {
                 "name":name,"entry_price":real_price,"peak_price":real_price,
-                "timestamp":time.time(),"tp1_hit":False,"entry_sol":s["max_buy_sol"],
+                "timestamp":time.time(),"tp1_hit":False,"entry_sol":buy_sol,
                 "dev_wallet": dev_wallet,
+                "remaining_pct": 1.0,
+                "signal_score": score_total,
+                "conviction": conviction,
+                "time_stop_min": trade_plan.get("time_stop_min", s["time_stop_min"]),
+                "trail_pct": trade_plan.get("trail_pct", s["trail_pct"]),
+                "tp1_mult": trade_plan.get("tp1_mult", s["tp1_mult"]),
+                "tp2_mult": trade_plan.get("tp2_mult", s["tp2_mult"]),
+                "stop_loss": trade_plan.get("stop_loss", s["stop_loss"]),
+                "tp1_sell_pct": trade_plan.get("tp1_sell_pct", s.get("tp1_sell_pct", 0.5)),
+                "breakeven_mult": trade_plan.get("breakeven_mult", s.get("breakeven_mult", 1.02)),
+                "early_exit_min": trade_plan.get("early_exit_min", s.get("early_exit_min", 5)),
+                "early_exit_ratio": trade_plan.get("early_exit_ratio", s.get("early_exit_ratio", 0.97)),
+                "trail_activation_mult": trade_plan.get("trail_activation_mult", s.get("trail_activation_mult", 1.2)),
             }
             try:
                 _conn = db()
                 try:
                     _c = _conn.cursor()
                     _c.execute("""INSERT INTO open_positions
-                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet)
-                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet,remaining_pct)
+                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                                   ON CONFLICT (user_id,mint) DO UPDATE
                                   SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
                                       peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
-                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
-                               (self.user_id, mint, name, real_price, real_price, s["max_buy_sol"], 0, dev_wallet))
+                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet,
+                                      remaining_pct=EXCLUDED.remaining_pct""",
+                               (self.user_id, mint, name, real_price, real_price, buy_sol, 0, dev_wallet, 1.0))
                     _conn.commit()
                 finally:
                     db_return(_conn)
@@ -1141,8 +1385,8 @@ class BotInstance:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
             self.consecutive_losses  = 0   # reset on successful buy
-            self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
-            self.log_msg(f"BUY {name} @ ${real_price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
+            self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | size={buy_sol:.4f} SOL | slip={slippage}bps", score=score_total)
+            self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={buy_sol:.4f} SOL | score={score_total} | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
                 conn = db()
@@ -1154,7 +1398,7 @@ class BotInstance:
                     db_return(conn)
                 if u and u["telegram_chat_id"]:
                     send_telegram(u["telegram_chat_id"],
-                        f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {s['max_buy_sol']} SOL\n🔗 solscan.io/tx/{sig}")
+                        f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {buy_sol:.4f} SOL\n🎯 Score {score_total}\n🔗 solscan.io/tx/{sig}")
             except Exception as _e:
                 print(f"[ERROR] {_e}", flush=True)
         else:
@@ -1191,7 +1435,9 @@ class BotInstance:
             if sig:
                 cur     = self.get_token_price(mint) or pos["entry_price"]
                 pnl_pct = (cur / pos["entry_price"] - 1) * 100 if pos["entry_price"] else 0
-                pnl_sol = pos["entry_sol"] * pct * (pnl_pct / 100)
+                remaining_pct = float(pos.get("remaining_pct", 1.0) or 1.0)
+                sold_fraction = min(remaining_pct, max(0.0, remaining_pct * pct))
+                pnl_sol = pos["entry_sol"] * sold_fraction * (pnl_pct / 100)
                 self.log_msg(f"SELL {pos['name']} {int(pct*100)}% — {reason} | {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL)")
                 self.stats["total_pnl_sol"] += pnl_sol
                 if pnl_sol < 0:
@@ -1209,9 +1455,12 @@ class BotInstance:
                     self.consecutive_losses += 1
                     self.loss_mints[mint] = time.time()  # block this mint for 1h
                     cooldown_min = self.settings.get("cooldown_min", 10)
+                    max_losses = int(self.settings.get("max_consecutive_losses", 0) or 0)
+                    if max_losses and self.consecutive_losses >= max_losses:
+                        cooldown_min = max(cooldown_min, 30)
                     cooldown_sec = cooldown_min * 60
                     self.cooldown_until = time.time() + cooldown_sec
-                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {name}")
+                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {pos['name']}")
                 # Telegram alert
                 try:
                     conn = db()
@@ -1252,10 +1501,14 @@ class BotInstance:
                         print(f"[ERROR] {_e}", flush=True)
                 else:
                     self.positions[mint]["tp1_hit"] = True
+                    self.positions[mint]["remaining_pct"] = max(0.0, remaining_pct - sold_fraction)
                     try:
                         _conn = db()
                         try:
-                            _conn.cursor().execute("UPDATE open_positions SET tp1_hit=1 WHERE user_id=%s AND mint=%s", (self.user_id, mint))
+                            _conn.cursor().execute(
+                                "UPDATE open_positions SET tp1_hit=1, remaining_pct=%s WHERE user_id=%s AND mint=%s",
+                                (self.positions[mint]["remaining_pct"], self.user_id, mint),
+                            )
                             _conn.commit()
                         finally:
                             db_return(_conn)
@@ -1303,7 +1556,18 @@ class BotInstance:
             ratio      = cur / pos["entry_price"]
             peak_ratio = pos["peak_price"] / pos["entry_price"]
             age_min    = (time.time() - pos["timestamp"]) / 60
-            trail_line = pos["peak_price"] * (1 - s["trail_pct"])
+            stop_loss = pos.get("stop_loss", s["stop_loss"])
+            tp1_mult = pos.get("tp1_mult", s["tp1_mult"])
+            tp2_mult = pos.get("tp2_mult", s["tp2_mult"])
+            time_stop_min = pos.get("time_stop_min", s["time_stop_min"])
+            trail_pct = pos.get("trail_pct", s["trail_pct"])
+            tp1_sell_pct = pos.get("tp1_sell_pct", s.get("tp1_sell_pct", 0.5))
+            breakeven_mult = pos.get("breakeven_mult", s.get("breakeven_mult", 1.02))
+            early_exit_min = pos.get("early_exit_min", s.get("early_exit_min", 5))
+            early_exit_ratio = pos.get("early_exit_ratio", s.get("early_exit_ratio", 0.97))
+            trail_activation_mult = pos.get("trail_activation_mult", s.get("trail_activation_mult", 1.2))
+            trail_floor = pos["entry_price"] * breakeven_mult if pos["tp1_hit"] else 0
+            trail_line = max(trail_floor, pos["peak_price"] * (1 - trail_pct))
 
             # ── Listing sniper exit logic ──────────────────────────────────
             if pos.get("listing"):
@@ -1324,15 +1588,17 @@ class BotInstance:
                     continue
                 continue   # skip regular TP/SL logic for listing positions
 
-            if ratio <= s["stop_loss"]:
+            if ratio <= stop_loss:
                 self.sell(mint, 1.0, f"SL {ratio:.2f}x")
-            elif age_min >= s["time_stop_min"] and ratio < 1.10:
+            elif age_min >= early_exit_min and peak_ratio < 1.05 and ratio <= early_exit_ratio:
+                self.sell(mint, 1.0, f"WEAK {ratio:.2f}x")
+            elif age_min >= time_stop_min and ratio < 1.08:
                 self.sell(mint, 1.0, f"TIME {age_min:.0f}m")
-            elif not pos["tp1_hit"] and ratio >= s["tp1_mult"]:
-                self.sell(mint, 0.5, f"TP1 {ratio:.2f}x")
-            elif pos["tp1_hit"] and ratio >= s["tp2_mult"]:
+            elif not pos["tp1_hit"] and ratio >= tp1_mult:
+                self.sell(mint, tp1_sell_pct, f"TP1 {ratio:.2f}x")
+            elif pos["tp1_hit"] and ratio >= tp2_mult:
                 self.sell(mint, 1.0, f"TP2 {ratio:.2f}x")
-            elif (pos["tp1_hit"] or peak_ratio >= 1.3) and cur < trail_line:
+            elif (pos["tp1_hit"] or peak_ratio >= trail_activation_mult) and cur < trail_line:
                 self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
 
     def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change):
@@ -1349,6 +1615,11 @@ class BotInstance:
         max_age = s.get("max_age_min", 999)
         min_vol = s.get("min_vol", 0)
         min_score = s.get("min_score", 0)
+        min_liq_mc_ratio = s.get("min_liq_mc_ratio", 0)
+        min_vol_liq_ratio = s.get("min_vol_liq_ratio", 0)
+        max_chase_change = s.get("max_chase_change", 999)
+        liq_mc_ratio = (liq / mc) if mc else 0
+        vol_liq_ratio = (vol / liq) if liq else 0
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
@@ -1363,6 +1634,8 @@ class BotInstance:
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
                 {"name": "Price Change", "passed": change >= -10, "value": f"{change:+.0f}%", "threshold": "> -10%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
+                {"name": "Liq/MC", "passed": liq_mc_ratio >= min_liq_mc_ratio, "value": f"{liq_mc_ratio:.2f}", "threshold": f"\u2265 {min_liq_mc_ratio:.2f}"},
+                {"name": "Vol/Liq", "passed": liq == 0 or vol_liq_ratio >= min_vol_liq_ratio, "value": f"{vol_liq_ratio:.2f}", "threshold": f"\u2265 {min_vol_liq_ratio:.2f}"},
                 {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
@@ -1393,8 +1666,23 @@ class BotInstance:
             self.signal_explorer_log.appendleft(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
+        if liq > 0 and liq_mc_ratio < min_liq_mc_ratio:
+            sig_entry["reason"] = f"Liq/MC {liq_mc_ratio:.2f} < min {min_liq_mc_ratio:.2f}"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if liq > 0 and age_min > 5 and vol_liq_ratio < min_vol_liq_ratio:
+            sig_entry["reason"] = f"Vol/Liq {vol_liq_ratio:.2f} < min {min_vol_liq_ratio:.2f}"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
         if score_total < min_score:
             sig_entry["reason"] = f"AI Score {score_total} < min {min_score}"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if change > max_chase_change:
+            sig_entry["reason"] = f"Move already extended at +{change:.0f}%"
             self.signal_explorer_log.appendleft(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
@@ -1405,12 +1693,21 @@ class BotInstance:
                 self.signal_explorer_log.appendleft(sig_entry)
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
+        trade_plan = self.build_trade_plan(score_total, age_min, change, liq, vol)
         sig_entry["passed"] = True
-        sig_entry["reason"] = f"Passed all filters (score {score_total})"
+        sig_entry["reason"] = f"Passed all filters (score {score_total}, conviction {trade_plan['conviction']}, size {trade_plan['buy_sol']:.4f} SOL)"
         self.signal_explorer_log.appendleft(sig_entry)
-        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
-        self.log_filter(name, mint, True, f"Signal passed all filters (score {score_total})")
-        self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
+        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total} Conv:{trade_plan['conviction']} Size:{trade_plan['buy_sol']:.4f}")
+        self.log_filter(name, mint, True, f"Signal passed all filters (score {score_total}, conviction {trade_plan['conviction']})", score=score_total)
+        self.buy(
+            mint,
+            name,
+            price,
+            liq=liq,
+            dev_wallet=None,
+            age_min=age_min,
+            signal_meta={"score_total": score_total, "trade_plan": trade_plan, "change": change, "vol": vol},
+        )
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -1431,10 +1728,10 @@ class BotInstance:
                     break
                 if self.positions:
                     self.check_positions()
-                time.sleep(3)
+                time.sleep(2)
             except Exception as e:
                 self.log_msg(f"Loop error: {e}")
-                time.sleep(3)
+                time.sleep(2)
 
     def record_perf_fee(self):
         if self.perf_fee_recorded:
@@ -1659,6 +1956,37 @@ def _process_dex_pair(p):
         print(f"[ERROR] {_e}", flush=True)
         return None
 
+
+def _fetch_signal_info_for_mint(mint):
+    try:
+        resp = dex_get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+            timeout=5
+        )
+        if resp.status_code != 200:
+            return None
+        pairs = resp.json().get("pairs") or []
+        if not pairs:
+            return None
+        return _process_dex_pair(pairs[0])
+    except Exception:
+        return None
+
+
+def _broadcast_new_mints(mints):
+    if not mints:
+        return
+    max_workers = min(4, max(1, len(mints)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_fetch_signal_info_for_mint, mint) for mint in mints]
+        for fut in as_completed(futures):
+            try:
+                info = fut.result()
+                if info:
+                    _broadcast_signal(info)
+            except Exception:
+                pass
+
 def _broadcast_signal(info):
     """Push info to market_feed and evaluate against all running bots."""
     mint = info["mint"]
@@ -1706,24 +2034,7 @@ def global_scanner():
                     seen_tokens.add(t["tokenAddress"])
             if new_tokens:
                 print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
-            for t in new_tokens:
-                mint = t["tokenAddress"]
-                try:
-                    resp = dex_get(
-                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        timeout=5
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    pairs = resp.json().get("pairs") or []
-                    if not pairs:
-                        continue
-                    info = _process_dex_pair(pairs[0])
-                    if info:
-                        _broadcast_signal(info)
-                    time.sleep(0.3)  # small delay between per-token lookups
-                except Exception:
-                    pass
+            _broadcast_new_mints([t["tokenAddress"] for t in new_tokens if t.get("tokenAddress")])
             time.sleep(20)
         except Exception as e:
             print(f"[SCANNER] error: {e}", flush=True)
@@ -1761,23 +2072,7 @@ def new_pairs_scanner():
                             seen_tokens.add(item["tokenAddress"])
                     if new:
                         print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
-                    for item in new:
-                        mint = item["tokenAddress"]
-                        try:
-                            r2 = dex_get(
-                                f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                timeout=5
-                            )
-                            if r2.status_code != 200:
-                                continue
-                            pairs = r2.json().get("pairs") or []
-                            if pairs:
-                                info = _process_dex_pair(pairs[0])
-                                if info:
-                                    _broadcast_signal(info)
-                            time.sleep(0.3)
-                        except Exception:
-                            pass
+                    _broadcast_new_mints([item["tokenAddress"] for item in new if item.get("tokenAddress")])
                     time.sleep(1)  # pause between the two URLs
                 except Exception as e2:
                     print(f"[SCANNER2] {label} error: {e2}", flush=True)
@@ -1917,25 +2212,13 @@ def auto_restart_bots():
             uid = row["user_id"]
             try:
                 kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
-                settings = dict(PRESETS.get(row["preset"], PRESETS["balanced"]))
-                if row.get("max_correlated") is not None:
-                    settings["max_correlated"] = row["max_correlated"]
-                if row.get("drawdown_limit_sol") is not None:
-                    settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
-                if row.get("custom_settings"):
-                    try:
-                        import json as _json
-                        custom = _json.loads(row["custom_settings"])
-                        if isinstance(custom, dict):
-                            settings.update(custom)
-                    except Exception:
-                        pass
+                settings = preset_settings(row["preset"])
                 max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email","")), PLAN_LIMITS["basic"])["max_buy_sol"]
                 settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
                 bot = BotInstance(uid, kp, settings,
-                    run_mode=row["run_mode"],
-                    run_duration_min=row["run_duration_min"],
-                    profit_target_sol=row["profit_target_sol"])
+                    run_mode="indefinite",
+                    run_duration_min=0,
+                    profit_target_sol=0)
                 with user_bots_lock:
                     user_bots[uid] = bot
                 # Reload open positions from DB so they survive Railway restarts
@@ -1957,6 +2240,7 @@ def auto_restart_bots():
                             "tp1_hit":     bool(p["tp1_hit"]),
                             "entry_sol":   p["entry_sol"],
                             "dev_wallet":  p["dev_wallet"],
+                            "remaining_pct": float(p.get("remaining_pct") or (0.5 if p.get("tp1_hit") else 1.0)),
                         }
                     if saved_pos:
                         print(f"[U{uid}] Restored {len(saved_pos)} open position(s) from DB")
@@ -2579,10 +2863,10 @@ def setup():
     error = ""
     if request.method == "POST":
         private_key = request.form.get("private_key","").strip()
-        preset      = request.form.get("preset","steady")
-        run_mode    = request.form.get("run_mode","indefinite")
-        duration    = int(request.form.get("run_duration_min",0) or 0)
-        profit      = float(request.form.get("profit_target_sol",0) or 0)
+        preset      = normalize_preset_name(request.form.get("preset", DEFAULT_PRESET))
+        run_mode    = "indefinite"
+        duration    = 0
+        profit      = 0.0
         try:
             kp  = Keypair.from_bytes(base58.b58decode(private_key))
             pub = str(kp.pubkey())
@@ -2646,7 +2930,7 @@ def dashboard():
             .replace("{{UPGRADE_BTN}}", upgrade_btn)
             .replace("{{PLAN}}", plan_info.get("label", ""))
             .replace("{{WALLET}}", wallet.get("public_key", ""))
-            .replace("{{PRESET}}", (bsettings or {}).get("preset", "balanced")),
+            .replace("{{PRESET}}", normalize_preset_name((bsettings or {}).get("preset", DEFAULT_PRESET))),
             mimetype="text/html"
         )
     except Exception as e:
@@ -2723,30 +3007,15 @@ def api_start():
         kp = Keypair.from_bytes(base58.b58decode(decrypt_key(w["encrypted_key"])))
     except Exception:
         return jsonify({"ok":False,"msg":"Wallet key could not be decrypted — please re-enter your private key at /setup"})
-    preset   = bs["preset"] if bs else "balanced"
-    settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
-    # Apply user-specific overrides saved in DB on top of preset defaults
-    if bs:
-        if bs.get("max_correlated") is not None:
-            settings["max_correlated"] = bs["max_correlated"]
-        if bs.get("drawdown_limit_sol") is not None:
-            settings["drawdown_limit_sol"] = bs["drawdown_limit_sol"]
-        # Apply custom_settings JSON overrides (tp1_mult, stop_loss, etc.)
-        if bs.get("custom_settings"):
-            try:
-                import json as _json
-                custom = _json.loads(bs["custom_settings"])
-                if isinstance(custom, dict):
-                    settings.update(custom)
-            except Exception:
-                pass
+    preset   = normalize_preset_name(bs["preset"] if bs else DEFAULT_PRESET)
+    settings = preset_settings(preset)
     max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
     settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
         uid, kp, settings,
-        run_mode          = bs["run_mode"] if bs else "indefinite",
-        run_duration_min  = bs["run_duration_min"] if bs else 0,
-        profit_target_sol = bs["profit_target_sol"] if bs else 0,
+        run_mode          = "indefinite",
+        run_duration_min  = 0,
+        profit_target_sol = 0,
     )
     with user_bots_lock:
         user_bots[uid] = bot
@@ -2811,24 +3080,9 @@ def api_manual_sell():
 @login_required
 def api_settings():
     uid  = session["user_id"]
-    data = request.json
-    preset   = data.get("preset","balanced")
-    run_mode = data.get("run_mode","indefinite")
-    duration = int(data.get("run_duration_min",0) or 0)
-    profit   = float(data.get("profit_target_sol",0) or 0)
-    # Extra live settings
-    overrides = {}
-    for key, cast in [
-        ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
-        ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
-        ("drawdown_limit_sol", float), ("cooldown_min", int),
-        ("min_vol", float), ("min_score", int),
-    ]:
-        if key in data:
-            try: overrides[key] = cast(data[key])
-            except Exception as _e:
-                print(f"[ERROR] {_e}", flush=True)
-    import json as _json
+    data = request.json or {}
+    preset = normalize_preset_name(data.get("preset", DEFAULT_PRESET))
+    preset_cfg = PRESETS[preset]
     conn = db()
     try:
         cur = conn.cursor()
@@ -2836,21 +3090,34 @@ def api_settings():
             UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
             max_correlated=%s,drawdown_limit_sol=%s,custom_settings=%s
             WHERE user_id=%s
-        """, (preset, run_mode, duration, profit,
-              overrides.get("max_correlated", 5),
-              overrides.get("drawdown_limit_sol", 0.5),
-              _json.dumps(overrides) if overrides else None,
+        """, (preset, "indefinite", 0, 0,
+              preset_cfg.get("max_correlated", 1),
+              preset_cfg.get("drawdown_limit_sol", 0.5),
+              None,
               uid))
         conn.commit()
     finally:
         db_return(conn)
     bot = user_bots.get(uid)
     if bot:
-        bot.settings.update(PRESETS.get(preset, bot.settings))
-        bot.settings.update(overrides)
-        bot.run_mode         = run_mode
-        bot.run_duration_min = duration
-        bot.profit_target    = profit
+        bot.settings = preset_settings(preset)
+        bot.run_mode = "indefinite"
+        bot.run_duration_min = 0
+        bot.profit_target = 0
+        try:
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT plan, email FROM users WHERE id=%s", (uid,))
+                user = cur.fetchone()
+            finally:
+                db_return(conn)
+            if user:
+                plan = effective_plan(user["plan"], user.get("email"))
+                max_sol = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
+                bot.settings["max_buy_sol"] = min(bot.settings["max_buy_sol"], max_sol)
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
     return jsonify({"ok":True})
 
 @app.route("/api/chart/<mint>")
@@ -3218,27 +3485,7 @@ def api_dev_blacklist():
 @app.route("/api/admin/override-preset", methods=["POST"])
 @admin_required
 def api_override_preset():
-    data   = request.json or {}
-    preset = data.get("preset","balanced")
-    if preset in PRESETS:
-        # merge incoming settings into PRESETS dict in memory
-        for k, v in data.items():
-            if k != "preset":
-                PRESETS[preset][k] = v
-        # propagate to running bots on this preset
-        conn = db()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT user_id FROM bot_settings WHERE preset=%s AND is_running=1", (preset,))
-            rows = cur.fetchall()
-        finally:
-            db_return(conn)
-        for row in rows:
-            bot = user_bots.get(row["user_id"])
-            if bot:
-                bot.settings.update(PRESETS[preset])
-        return jsonify({"ok": True})
-    return jsonify({"ok": False})
+    return jsonify({"ok": False, "msg": "Preset overrides are disabled. Use the fixed profiles."}), 400
 
 @app.route("/api/referral")
 @login_required
@@ -3726,7 +3973,7 @@ LANDING_HTML = _CSS + """
       <div class="plan3-perf">+ 15% performance fee on profits</div>
       <ul>
         <li>Up to 0.1 SOL per trade</li>
-        <li>Safe &amp; Balanced presets</li>
+        <li>Scalp + Runner profiles</li>
         <li>CEX Listing Sniper</li>
         <li>Anti-rug protection</li>
         <li>Whale tracker</li>
@@ -3744,7 +3991,7 @@ LANDING_HTML = _CSS + """
       <div class="plan3-perf">+ 10% performance fee on profits</div>
       <ul>
         <li>Up to 1.0 SOL per trade</li>
-        <li>All presets incl. Degen mode</li>
+        <li>All three fixed AI presets</li>
         <li>CEX Listing Sniper (priority)</li>
         <li>Helius Sender fast execution</li>
         <li>Jito tip priority routing</li>
@@ -3764,7 +4011,7 @@ LANDING_HTML = _CSS + """
       <ul>
         <li class="purple-check">Up to 5.0 SOL per trade</li>
         <li class="purple-check">Full admin panel access</li>
-        <li class="purple-check">AI settings auto-optimization</li>
+        <li class="purple-check">Fixed AI-tuned preset library</li>
         <li class="purple-check">Bundle &amp; snipe detection</li>
         <li class="purple-check">Dev wallet blacklist</li>
         <li class="purple-check">Correlated position limits</li>
@@ -3884,36 +4131,15 @@ SETUP_HTML = _CSS + """
       <div class="fgroup">
         <label class="flabel">Trading Strategy</label>
         <select class="finput" name="preset">
-          <option value="steady">Steady Profit — Conservative (1.5x TP1, 3x TP2, −25% stop)</option>
-          <option value="max">Max Profit — Aggressive (2x TP1, 10x TP2, trailing stop)</option>
+          <option value="runner">Runner — Bigger Higher Profit Trades</option>
+          <option value="scalp">Scalp — Small Fast Trades</option>
+          <option value="all_in">All-In — Maximum Exposure</option>
         </select>
-      </div>
-      <div class="fgroup">
-        <label class="flabel">Stop Condition</label>
-        <select class="finput" name="run_mode" onchange="toggleStop(this.value)">
-          <option value="indefinite">Run indefinitely (manual stop only)</option>
-          <option value="duration">Stop after a set duration</option>
-          <option value="profit">Stop at profit target</option>
-        </select>
-      </div>
-      <div id="f-dur" style="display:none" class="fgroup">
-        <label class="flabel">Duration (minutes)</label>
-        <input class="finput" type="number" name="run_duration_min" placeholder="e.g. 60" min="1">
-      </div>
-      <div id="f-pft" style="display:none" class="fgroup">
-        <label class="flabel">Profit Target (SOL)</label>
-        <input class="finput" type="number" name="profit_target_sol" placeholder="e.g. 0.5" step="0.01" min="0.01">
       </div>
       <button type="submit" class="btn btn-primary btn-full" style="padding:11px;font-size:14px;margin-top:6px">Save & Open Dashboard →</button>
     </form>
   </div>
 </div>
-<script>
-function toggleStop(v){
-  document.getElementById('f-dur').style.display = v==='duration' ? 'block' : 'none';
-  document.getElementById('f-pft').style.display = v==='profit'   ? 'block' : 'none';
-}
-</script>
 """
 
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
@@ -4017,7 +4243,7 @@ DASHBOARD_HTML = _CSS + """
             <button id="toggle-btn" class="btn btn-success btn-full" onclick="toggleBot()">▶ Start Bot</button>
             <button class="btn btn-ghost" onclick="cashout()" style="padding:9px 12px" title="Sell all">💰</button>
           </div>
-          <input type="hidden" id="s-preset" value="balanced">
+          <input type="hidden" id="s-preset" value="runner">
         </div>
         <div class="glass">
           <div class="sec-label">Open Positions</div>
@@ -4174,48 +4400,36 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
   <div id="tab-settings" class="tab-pane">
-    <div class="sec-label" style="margin-bottom:14px">Strategy Preset</div>
+    <div class="sec-label" style="margin-bottom:14px">Fixed AI-Tuned Trading Profiles</div>
+    <div style="font-size:12px;color:var(--t2);margin-bottom:16px;max-width:760px;line-height:1.6">
+      The bot now runs from three locked profiles only. Each profile controls entry sizing, signal filtering, exits, cooldowns, and risk limits automatically.
+    </div>
     <div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">
-      <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
-        <div class="preset-name">🛡️ Safe</div>
-        <div class="preset-desc">Conservative — low risk, steady gains</div>
+      <div class="preset-card" id="pc-scalp" onclick="selectPreset('scalp')">
+        <div class="preset-name">⚡ Scalp</div>
+        <div class="preset-desc">Small fast trades with tight stops and quick exits</div>
       </div>
-      <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
-        <div class="preset-name">⚖️ Balanced</div>
-        <div class="preset-desc">Mix of safety and opportunity</div>
+      <div class="preset-card active" id="pc-runner" onclick="selectPreset('runner')">
+        <div class="preset-name">📈 Runner</div>
+        <div class="preset-desc">Bigger higher profit trades that still cut weak setups</div>
       </div>
-      <div class="preset-card" id="pc-aggressive" onclick="selectPreset('aggressive')">
-        <div class="preset-name">🔥 Aggressive</div>
-        <div class="preset-desc">Higher risk, bigger swings</div>
-      </div>
-      <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
-        <div class="preset-name">💀 Degen</div>
-        <div class="preset-desc">Full send — maximum exposure</div>
+      <div class="preset-card" id="pc-all_in" onclick="selectPreset('all_in')">
+        <div class="preset-name">💥 All-In</div>
+        <div class="preset-desc">Maximum exposure with one high-conviction trade at a time</div>
       </div>
     </div>
-    <div class="sec-label">Trading Parameters</div>
-    <div class="settings-grid">
+    <div class="settings-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:16px">
       <div class="glass">
-        <div class="fgroup"><label class="flabel">Max Buy (SOL)</label><input class="finput" id="s-buy" type="number" step="0.01" value="0.04"></div>
-        <div class="fgroup"><label class="flabel">Max Positions</label><input class="finput" id="s-maxpos" type="number" value="5"></div>
-        <div class="fgroup"><label class="flabel">Cooldown (min)</label><input class="finput" id="s-cooldown" type="number" value="10"></div>
+        <div class="sec-label" style="margin-bottom:10px">Profile Specs</div>
+        <div id="preset-summary-grid" style="display:grid;gap:8px;font-size:12px;color:var(--t2)"></div>
       </div>
       <div class="glass">
-        <div class="fgroup"><label class="flabel">TP1 Multiplier</label><input class="finput" id="s-tp1" type="number" step="0.1" value="1.5"></div>
-        <div class="fgroup"><label class="flabel">TP2 Multiplier</label><input class="finput" id="s-tp2" type="number" step="0.1" value="2.0"></div>
-        <div class="fgroup"><label class="flabel">Stop Loss</label><input class="finput" id="s-sl" type="number" step="0.05" value="0.75"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Trailing Stop %</label><input class="finput" id="s-trail" type="number" step="0.05" value="0.20"></div>
-        <div class="fgroup"><label class="flabel">Session Drawdown Limit (SOL)</label><input class="finput" id="s-dd" type="number" step="0.1" value="0.5"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Min Volume ($)</label><input class="finput" id="s-minvol" type="number" step="100" value="3000"></div>
-        <div class="fgroup"><label class="flabel">Min AI Score (0-100)</label><input class="finput" id="s-minscore" type="number" min="0" max="100" value="30"></div>
+        <div class="sec-label" style="margin-bottom:10px">What The Bot Does</div>
+        <div id="preset-logic-copy" style="font-size:12px;color:var(--t2);line-height:1.65"></div>
       </div>
     </div>
     <div style="margin-top:16px;display:flex;gap:10px">
-      <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+      <button class="btn btn-primary" onclick="saveSettings()">Save Profile</button>
       <button class="btn btn-ghost" onclick="switchTab('scanner',document.querySelector('.tab-btn'))">Back to Scanner</button>
     </div>
   </div>
@@ -4553,44 +4767,66 @@ async function pollListings() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {
-  safe:       { max_buy_sol:0.02, tp1_mult:1.3, tp2_mult:2.0, stop_loss:0.85, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3, min_vol:5000, min_score:40 },
-  balanced:   { max_buy_sol:0.04, tp1_mult:1.5, tp2_mult:2.5, stop_loss:0.75, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5, min_vol:3000, min_score:30 },
-  aggressive: { max_buy_sol:0.07, tp1_mult:1.8, tp2_mult:4.0, stop_loss:0.65, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8, min_vol:1000, min_score:20 },
-  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.60, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0, min_vol:500,  min_score:15 }
+  scalp: {
+    label:'Scalp',
+    max_buy_sol:0.03, tp1_mult:1.16, tp2_mult:1.34, stop_loss:0.92, trail_pct:0.08,
+    max_correlated:2, cooldown_min:12, drawdown_limit_sol:0.20, min_vol:15000, min_score:68,
+    logic:'Targets fast momentum only, sizes down weak conviction, locks gains early, and cuts flat trades fast.',
+  },
+  runner: {
+    label:'Runner',
+    max_buy_sol:0.06, tp1_mult:1.45, tp2_mult:2.75, stop_loss:0.82, trail_pct:0.16,
+    max_correlated:3, cooldown_min:8, drawdown_limit_sol:0.40, min_vol:8000, min_score:56,
+    logic:'Balances win rate and upside. Lets strong trends breathe while still forcing weak trades out before they drift.',
+  },
+  all_in: {
+    label:'All-In',
+    max_buy_sol:0.15, tp1_mult:1.85, tp2_mult:4.5, stop_loss:0.74, trail_pct:0.23,
+    max_correlated:1, cooldown_min:12, drawdown_limit_sol:0.60, min_vol:6000, min_score:52,
+    logic:'Takes one high-conviction trade at a time, keeps more size on the table, and trails aggressively after expansion.',
+  }
 };
+function renderPresetSummary(name) {
+  const p = PRESET_SETTINGS[name];
+  if (!p) return;
+  const items = [
+    ['Max buy cap', p.max_buy_sol.toFixed(2) + ' SOL'],
+    ['TP1 / TP2', p.tp1_mult.toFixed(2) + 'x / ' + p.tp2_mult.toFixed(2) + 'x'],
+    ['Hard stop', '-' + Math.round((1 - p.stop_loss) * 100) + '%'],
+    ['Trail stop', Math.round(p.trail_pct * 100) + '%'],
+    ['Max positions', String(p.max_correlated)],
+    ['Cooldown', p.cooldown_min + ' min'],
+    ['Drawdown cap', p.drawdown_limit_sol.toFixed(2) + ' SOL'],
+    ['Min score', String(p.min_score) + '/100'],
+  ];
+  const grid = document.getElementById('preset-summary-grid');
+  if (grid) {
+    grid.innerHTML = items.map(([label, value]) => `
+      <div style="display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--b1)">
+        <span style="color:var(--t3)">${label}</span>
+        <span style="font-weight:700;color:var(--t1)">${value}</span>
+      </div>`).join('');
+  }
+  const logic = document.getElementById('preset-logic-copy');
+  if (logic) {
+    logic.textContent = p.logic;
+  }
+}
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('pc-' + name);
   if (el) el.classList.add('active');
   document.getElementById('s-preset').value = name;
-  const p = PRESET_SETTINGS[name];
-  if (!p) return;
-  const m = { 's-buy':p.max_buy_sol, 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss,
-              's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol,
-              's-minvol':p.min_vol, 's-minscore':p.min_score };
-  for (const [id, val] of Object.entries(m)) {
-    const inp = document.getElementById(id);
-    if (inp) inp.value = val;
-  }
+  renderPresetSummary(name);
 }
 async function saveSettings() {
   const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      preset:              document.getElementById('s-preset').value,
-      max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
-      cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
-      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 1.5),
-      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 2.0),
-      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.75),
-      trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
-      max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
-      drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
-      min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
-      min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
+      preset: document.getElementById('s-preset').value,
     })
   }).then(r => r.json()).catch(() => null);
-  showToast(res && res.ok !== false ? '\u2713 Settings saved' : '\u26a0 Save failed', res && res.ok !== false);
+  showToast(res && res.ok !== false ? '\u2713 Profile saved' : '\u26a0 Save failed', res && res.ok !== false);
   setTimeout(refresh, 300);
 }
 
@@ -4653,17 +4889,12 @@ async function refresh() {
   }
   if (d.settings && Object.keys(d.settings).length && !document._settingsFocused) {
     const s = d.settings;
-    const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
-    setVal('s-maxpos',   s.max_correlated   ?? 5);
-    setVal('s-cooldown', s.cooldown_min     ?? 10);
-    setVal('s-tp1',      s.tp1_mult         ?? 1.5);
-    setVal('s-tp2',      s.tp2_mult         ?? 2.5);
-    setVal('s-sl',       s.stop_loss        ?? 0.75);
-    setVal('s-trail',    s.trail_pct        ?? 0.20);
-    setVal('s-buy',      s.max_buy_sol      ?? 0.04);
-    setVal('s-dd',       s.drawdown_limit_sol ?? 0.5);
-    setVal('s-minvol',   s.min_vol          ?? 3000);
-    setVal('s-minscore', s.min_score        ?? 30);
+    const preset = s.preset || document.getElementById('s-preset').value || 'runner';
+    if (document.getElementById('s-preset').value !== preset) {
+      selectPreset(preset);
+    } else {
+      renderPresetSummary(preset);
+    }
   }
 }
 
@@ -4995,7 +5226,7 @@ async function loadPnl(range) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-(function() { selectPreset('{{PRESET}}' || 'balanced'); })();
+(function() { selectPreset('{{PRESET}}' || 'runner'); })();
 window.addEventListener('resize', () => {
   if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
     treeCanvas.width = treeCanvas.parentElement.clientWidth;
@@ -5042,7 +5273,7 @@ ADMIN_HTML = _CSS + """
     <h3>🤖 AI Market Analysis</h3>
     <p id="ai-reason">Loading market analysis…</p>
     <div id="ai-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px"></div>
-    <button class="btn btn-primary" onclick="applyAISuggestion()" id="ai-apply-btn">Apply AI Recommendation</button>
+    <button class="btn btn-primary" onclick="applyAISuggestion()" id="ai-apply-btn">Highlight Recommended Profile</button>
   </div>
 
   <!-- Platform Stats -->
@@ -5053,97 +5284,13 @@ ADMIN_HTML = _CSS + """
   </div>
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-    <!-- Global Preset Tuner -->
+    <!-- Fixed Preset Reference -->
     <div class="panel">
-      <div class="sec-label">Global Preset Overrides <span style="font-size:10px;color:var(--t3);font-weight:400">— affects all users on this preset</span></div>
-
-      <div style="margin:12px 0">
-        <label class="flabel">Preset to Edit</label>
-        <select class="finput" id="edit-preset" onchange="loadPreset(this.value)">
-          <option value="safe">Safe</option>
-          <option value="balanced" selected>Balanced</option>
-          <option value="degen">Degen</option>
-        </select>
+      <div class="sec-label">Fixed Trading Profiles <span style="font-size:10px;color:var(--t3);font-weight:400">— overrides disabled</span></div>
+      <div style="font-size:12px;color:var(--t2);line-height:1.6;margin:12px 0 14px">
+        Users can only choose between the three built-in profiles. The panel below is now reference-only so the live product cannot drift away from the preset model.
       </div>
-
-      <div id="preset-settings">
-        <div class="setting-row">
-          <div><div class="setting-label">Max Buy (SOL)</div><div class="setting-desc">SOL spent per trade</div></div>
-          <input class="setting-input" id="s-max-buy" type="number" step="0.01" value="0.04">
-          <div class="setting-unit">SOL</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Take Profit 1</div><div class="setting-desc">Sell 50% at this multiplier</div></div>
-          <input class="setting-input" id="s-tp1" type="number" step="0.1" value="1.5">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Take Profit 2</div><div class="setting-desc">Sell rest at this multiplier</div></div>
-          <input class="setting-input" id="s-tp2" type="number" step="0.1" value="3.0">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Exit if drops below this ratio</div></div>
-          <input class="setting-input" id="s-sl" type="number" step="0.05" value="0.75">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Trailing Stop</div><div class="setting-desc">% drop from peak to exit</div></div>
-          <input class="setting-input" id="s-trail" type="number" step="0.05" value="0.20">
-          <div class="setting-unit">%</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Skip tokens older than this</div></div>
-          <input class="setting-input" id="s-age" type="number" step="1" value="30">
-          <div class="setting-unit">min</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Time Stop</div><div class="setting-desc">Exit if not profitable after</div></div>
-          <input class="setting-input" id="s-tstop" type="number" step="1" value="30">
-          <div class="setting-unit">min</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Skip pools below this</div></div>
-          <input class="setting-input" id="s-liq" type="number" step="1000" value="10000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Market Cap</div><div class="setting-desc">Skip tokens below this MC</div></div>
-          <input class="setting-input" id="s-minmc" type="number" step="1000" value="5000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Max Market Cap</div><div class="setting-desc">Skip tokens above this MC</div></div>
-          <input class="setting-input" id="s-maxmc" type="number" step="10000" value="150000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Lamports to outbid bots</div></div>
-          <input class="setting-input" id="s-prio" type="number" step="10000" value="30000">
-          <div class="setting-unit">λ</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Drawdown Limit</div><div class="setting-desc">Stop bot after losing this</div></div>
-          <input class="setting-input" id="s-dd" type="number" step="0.1" value="0.5">
-          <div class="setting-unit">SOL</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Max Positions</div><div class="setting-desc">Max simultaneous trades</div></div>
-          <input class="setting-input" id="s-maxpos" type="number" step="1" value="3">
-          <div class="setting-unit">#</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Volume</div><div class="setting-desc">Skip tokens below this 24h volume</div></div>
-          <input class="setting-input" id="s-minvol" type="number" step="100" value="3000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min AI Score</div><div class="setting-desc">Skip tokens scoring below this (0-100)</div></div>
-          <input class="setting-input" id="s-minscore" type="number" min="0" max="100" step="5" value="30">
-          <div class="setting-unit">/100</div>
-        </div>
-      </div>
-      <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="savePreset()">💾 Save Preset Override</button>
+      <div id="preset-reference" style="display:grid;gap:12px"></div>
     </div>
 
     <!-- Users + Dev Blacklist -->
@@ -5178,57 +5325,49 @@ ADMIN_HTML = _CSS + """
 
 <script>
 const PRESET_DEFAULTS = {
-  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:20,tstop:20,liq:10000,minmc:10000,maxmc:150000,prio:10000,dd:0.3,maxpos:2,minvol:5000,minscore:40},
-  balanced: {buy:0.04,tp1:1.5,tp2:2.5,sl:0.75,trail:0.20,age:30,tstop:30,liq:8000,minmc:5000,maxmc:250000,prio:30000,dd:0.5,maxpos:5,minvol:3000,minscore:30},
-  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:10,tstop:60,liq:3000,minmc:2000,maxmc:500000,prio:100000,dd:1.0,maxpos:5,minvol:500,minscore:15},
+  scalp: {
+    label: 'Scalp',
+    buy: 0.03, tp1: 1.16, tp2: 1.34, sl: 0.92, trail: 0.08, age: 45, tstop: 8,
+    liq: 18000, minmc: 9000, maxmc: 160000, prio: 70000, dd: 0.20, maxpos: 2, minvol: 15000, minscore: 68,
+    logic: 'High score threshold, fast time stops, tight trail, and reduced size on weaker conviction.'
+  },
+  runner: {
+    label: 'Runner',
+    buy: 0.06, tp1: 1.45, tp2: 2.75, sl: 0.82, trail: 0.16, age: 180, tstop: 22,
+    liq: 12000, minmc: 6000, maxmc: 320000, prio: 95000, dd: 0.40, maxpos: 3, minvol: 8000, minscore: 56,
+    logic: 'Stronger upside profile. Uses adaptive sizing and quick weak-trade exits.'
+  },
+  all_in: {
+    label: 'All-In',
+    buy: 0.15, tp1: 1.85, tp2: 4.5, sl: 0.74, trail: 0.23, age: 240, tstop: 30,
+    liq: 10000, minmc: 4000, maxmc: 500000, prio: 140000, dd: 0.60, maxpos: 1, minvol: 6000, minscore: 52,
+    logic: 'One trade at a time with maximum exposure and longer runners once price expands.'
+  },
 };
 let aiSuggestion = null;
 
-function loadPreset(name) {
-  const p = PRESET_DEFAULTS[name];
-  if (!p) return;
-  document.getElementById('s-max-buy').value  = p.buy;
-  document.getElementById('s-tp1').value      = p.tp1;
-  document.getElementById('s-tp2').value      = p.tp2;
-  document.getElementById('s-sl').value       = p.sl;
-  document.getElementById('s-trail').value    = p.trail;
-  document.getElementById('s-age').value      = p.age;
-  document.getElementById('s-tstop').value    = p.tstop;
-  document.getElementById('s-liq').value      = p.liq;
-  document.getElementById('s-minmc').value    = p.minmc;
-  document.getElementById('s-maxmc').value    = p.maxmc;
-  document.getElementById('s-prio').value     = p.prio;
-  document.getElementById('s-dd').value       = p.dd;
-  document.getElementById('s-maxpos').value   = p.maxpos;
-  document.getElementById('s-minvol').value   = p.minvol;
-  document.getElementById('s-minscore').value = p.minscore;
-}
-
-async function savePreset() {
-  const preset = document.getElementById('edit-preset').value;
-  const settings = {
-    preset,
-    max_buy_sol:      parseFloat(document.getElementById('s-max-buy').value),
-    tp1_mult:         parseFloat(document.getElementById('s-tp1').value),
-    tp2_mult:         parseFloat(document.getElementById('s-tp2').value),
-    stop_loss:        parseFloat(document.getElementById('s-sl').value),
-    trail_pct:        parseFloat(document.getElementById('s-trail').value),
-    max_age_min:      parseInt(document.getElementById('s-age').value),
-    time_stop_min:    parseInt(document.getElementById('s-tstop').value),
-    min_liq:          parseFloat(document.getElementById('s-liq').value),
-    min_mc:           parseFloat(document.getElementById('s-minmc').value),
-    max_mc:           parseFloat(document.getElementById('s-maxmc').value),
-    priority_fee:     parseInt(document.getElementById('s-prio').value),
-    drawdown_limit_sol: parseFloat(document.getElementById('s-dd').value),
-    max_correlated:   parseInt(document.getElementById('s-maxpos').value),
-    min_vol:          parseFloat(document.getElementById('s-minvol').value),
-    min_score:        parseInt(document.getElementById('s-minscore').value),
-  };
-  const r = await fetch('/api/admin/override-preset', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(settings)
-  }).then(r=>r.json()).catch(()=>({ok:false}));
-  alert(r.ok ? '✅ Preset saved and applied to active bots!' : '❌ Save failed');
+function renderPresetReference(selected) {
+  const container = document.getElementById('preset-reference');
+  if (!container) return;
+  container.innerHTML = Object.entries(PRESET_DEFAULTS).map(([key, p]) => `
+    <div style="border:1px solid ${selected === key ? 'rgba(20,199,132,.45)' : 'var(--bdr)'};border-radius:12px;padding:14px;background:${selected === key ? 'rgba(20,199,132,.06)' : 'var(--bg2)'}">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:800;color:var(--t1)">${p.label}</div>
+          <div style="font-size:11px;color:var(--t3);margin-top:2px">${p.logic}</div>
+        </div>
+        <div class="badge ${selected === key ? 'bg-grn' : 'bg-muted'}">${selected === key ? 'Recommended' : 'Fixed'}</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-size:11px;color:var(--t2)">
+        <div>Buy cap: <b style="color:var(--t1)">${p.buy.toFixed(2)} SOL</b></div>
+        <div>TP1 / TP2: <b style="color:var(--t1)">${p.tp1.toFixed(2)}x / ${p.tp2.toFixed(2)}x</b></div>
+        <div>Hard stop: <b style="color:var(--t1)">-${Math.round((1 - p.sl) * 100)}%</b></div>
+        <div>Trail stop: <b style="color:var(--t1)">${Math.round(p.trail * 100)}%</b></div>
+        <div>Max positions: <b style="color:var(--t1)">${p.maxpos}</b></div>
+        <div>Min score: <b style="color:var(--t1)">${p.minscore}/100</b></div>
+      </div>
+    </div>
+  `).join('');
 }
 
 async function loadAI() {
@@ -5260,9 +5399,7 @@ async function loadAI() {
 
 function applyAISuggestion() {
   if (!aiSuggestion) return;
-  document.getElementById('edit-preset').value = aiSuggestion.preset;
-  loadPreset(aiSuggestion.preset);
-  alert('✅ AI-recommended settings loaded. Review and click Save to apply.');
+  renderPresetReference(aiSuggestion.preset);
 }
 
 async function addBlacklist() {
@@ -5288,7 +5425,7 @@ async function loadBlacklist() {
   ).join('');
 }
 
-loadPreset('balanced');
+renderPresetReference('runner');
 loadAI();
 loadBlacklist();
 </script>
