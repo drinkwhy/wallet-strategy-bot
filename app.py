@@ -10,6 +10,7 @@ Required .env variables:
 
 import atexit
 import os, threading, time, base64, json, requests, base58, secrets, hashlib, random
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import signal
 import psycopg2
@@ -27,6 +28,26 @@ import bcrypt
 import stripe
 
 from dotenv import load_dotenv
+
+# ── Enhanced Trading Systems (Research Paper Implementation) ──────────────────
+# These modules implement whale detection, risk management, MEV protection,
+# and observability as recommended by the research paper
+try:
+    from whale_detection import get_whale_detection_system, WhaleDetectionSystem
+    from risk_engine import get_risk_engine, RiskEngine, RiskLevel
+    from mev_protection import get_mev_protection, MEVProtectionSystem, SubmissionStrategy
+    from observability import get_observability, ObservabilitySystem, AlertSeverity
+    from enhanced_trading import (
+        EnhancedSignalEvaluator,
+        EnhancedExecutionHandler,
+        EnhancedPositionMonitor,
+        EnhancedBotMixin,
+        create_enhanced_systems,
+    )
+    ENHANCED_SYSTEMS_AVAILABLE = True
+except ImportError as _import_err:
+    print(f"[WARN] Enhanced trading systems not available: {_import_err}")
+    ENHANCED_SYSTEMS_AVAILABLE = False
 
 
 def load_environment():
@@ -1108,6 +1129,28 @@ class BotInstance:
         self.cooldown_until     = 0.0   # epoch — no buys before this time
         self.loss_mints         = {}    # mint -> epoch when loss occurred (1h cooldown)
         self.auto_relax_level   = int(self.settings.get("adaptive_relax_level") or 0)
+        
+        # ── Enhanced Trading Systems (Research Paper Implementation) ────────
+        self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
+        if self.enhanced_enabled:
+            try:
+                self.whale_system = get_whale_detection_system()
+                self.risk_engine = get_risk_engine(HELIUS_RPC)
+                self.mev_system = get_mev_protection(HELIUS_RPC)
+                self.observability = get_observability()
+                self.signal_evaluator = EnhancedSignalEvaluator(
+                    self.whale_system, self.risk_engine, self.observability
+                )
+                self.execution_handler = EnhancedExecutionHandler(
+                    self.mev_system, self.risk_engine, self.observability
+                )
+                self.position_monitor = EnhancedPositionMonitor(
+                    self.whale_system, self.risk_engine, self.observability
+                )
+                self.log_msg("🚀 Enhanced trading systems initialized (whale detection, risk engine, MEV protection)")
+            except Exception as _enh_err:
+                self.enhanced_enabled = False
+                print(f"[WARN] Enhanced systems init failed: {_enh_err}")
 
     def relax_entry_guards(self):
         steps = [
@@ -1657,6 +1700,43 @@ class BotInstance:
         trade_sol = min(float(s["max_buy_sol"]), self.sol_balance * (risk_pct / 100.0)) if risk_pct > 0 else float(s["max_buy_sol"])
         trade_sol = round(trade_sol, 4)
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
+        
+        # ── Enhanced pre-trade risk check ─────────────────────────────────────
+        if self.enhanced_enabled:
+            try:
+                can_trade, cb_reason = self.risk_engine.circuit_breaker.is_trading_allowed(self.user_id)
+                if not can_trade:
+                    self.log_msg(f"⛔ ENHANCED CIRCUIT BREAKER — {cb_reason}")
+                    return
+                
+                # Full pre-trade risk assessment
+                risk_ok, risk_reasons, assessment = self.risk_engine.pre_trade_check(
+                    user_id=self.user_id,
+                    mint=mint,
+                    sol_amount=trade_sol,
+                    slippage_bps=int(s.get("slippage_bps", 500)),
+                    priority_fee_sol=float(s.get("priority_fee", 100000)) / 1e9,
+                    position_count=len(self.positions),
+                    max_positions=int(s.get("max_correlated", 3)),
+                    liquidity_usd=liq,
+                    deployer_wallet=dev_wallet,
+                    token_age_sec=age_min * 60,
+                )
+                
+                if not risk_ok:
+                    for reason in risk_reasons[:3]:
+                        self.log_msg(f"⚠️ Risk: {reason}")
+                    self.log_filter(name, mint, False, f"Enhanced risk check failed: {risk_reasons[0] if risk_reasons else 'unknown'}")
+                    return
+                
+                # Log any warnings
+                if assessment.warnings:
+                    for warn in assessment.warnings[:2]:
+                        self.log_msg(f"📋 {warn}")
+                        
+            except Exception as _enh_risk_err:
+                print(f"[WARN] Enhanced risk check error: {_enh_risk_err}")
+        
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
         if cb:
@@ -1841,6 +1921,7 @@ class BotInstance:
         pos = self.positions.get(mint)
         if not pos:
             return
+        sell_start_time = time.perf_counter()
         try:
             total = self.get_token_balance(mint)
             if total == 0:
@@ -1869,6 +1950,16 @@ class BotInstance:
                 failure_reason=None if quote else "no-quote",
             )
             if not quote:
+                # Record failed exit in enhanced risk engine
+                if self.enhanced_enabled:
+                    try:
+                        self.risk_engine.post_trade_update(
+                            user_id=self.user_id, mint=mint,
+                            sol_amount=pos.get("entry_sol", 0),
+                            success=False, is_exit=True, exit_failed=True,
+                        )
+                    except Exception:
+                        pass
                 return
             swap_started = time.perf_counter()
             swap_tx = self.jupiter_swap(quote)
@@ -1880,6 +1971,15 @@ class BotInstance:
                 failure_reason=None if swap_tx else "swap-build-failed",
             )
             if not swap_tx:
+                if self.enhanced_enabled:
+                    try:
+                        self.risk_engine.post_trade_update(
+                            user_id=self.user_id, mint=mint,
+                            sol_amount=pos.get("entry_sol", 0),
+                            success=False, is_exit=True, exit_failed=True,
+                        )
+                    except Exception:
+                        pass
                 return
             send_started = time.perf_counter()
             sig = self.sign_and_send(swap_tx)
@@ -1898,11 +1998,41 @@ class BotInstance:
                 self.stats["total_pnl_sol"] += pnl_sol
                 if pnl_sol < 0:
                     self.session_drawdown += abs(pnl_sol)
+                
+                # ── Enhanced observability tracking ─────────────────────────────
+                if self.enhanced_enabled:
+                    try:
+                        total_latency = time.perf_counter() - sell_start_time
+                        self.observability.record_trade(
+                            user_id=self.user_id,
+                            mint=mint,
+                            side="sell",
+                            sol_amount=pos.get("entry_sol", 0) * pct,
+                            price=cur,
+                            pnl_sol=pnl_sol,
+                            pnl_pct=pnl_pct,
+                            latency_sec=total_latency,
+                            success=True,
+                        )
+                        self.risk_engine.post_trade_update(
+                            user_id=self.user_id, mint=mint,
+                            sol_amount=pos.get("entry_sol", 0),
+                            success=True, pnl_pct=pnl_pct, is_exit=True,
+                        )
+                    except Exception as _obs_err:
+                        print(f"[WARN] Observability record error: {_obs_err}")
+                
                 # blacklist dev if rugged (big loss, fast)
                 pos_age = (time.time() - pos.get("timestamp", time.time())) / 60
                 if pnl_sol < -0.05 and pos_age < 5 and pos.get("dev_wallet"):
                     blacklist_dev(pos["dev_wallet"], "auto-rug-detected")
                     self.log_msg(f"⛔ Dev blacklisted: {pos['dev_wallet'][:8]}...")
+                    # Also record in enhanced rug detector
+                    if self.enhanced_enabled:
+                        try:
+                            self.risk_engine.rug_detector.mark_rugged(mint, "fast-loss-detected")
+                        except Exception:
+                            pass
                 if pnl_pct >= 0:
                     self.stats["wins"] += 1
                     self.consecutive_losses = 0
@@ -1964,6 +2094,17 @@ class BotInstance:
                     except Exception as _e:
                         print(f"[ERROR] {_e}", flush=True)
                 self.refresh_balance()
+            else:
+                # Transaction send failed
+                if self.enhanced_enabled:
+                    try:
+                        self.risk_engine.post_trade_update(
+                            user_id=self.user_id, mint=mint,
+                            sol_amount=pos.get("entry_sol", 0),
+                            success=False, is_exit=True, exit_failed=True,
+                        )
+                    except Exception:
+                        pass
         except Exception as e:
             self.log_msg(f"Sell error {pos['name']}: {e}")
 
@@ -2006,6 +2147,26 @@ class BotInstance:
             peak_ratio = pos["peak_price"] / pos["entry_price"]
             age_min    = (time.time() - pos["timestamp"]) / 60
             trail_line = pos["peak_price"] * (1 - s["trail_pct"])
+
+            # ── Enhanced position monitoring (whale + rug detection) ─────────
+            if self.enhanced_enabled:
+                try:
+                    should_exit, exit_reason, warnings = self.position_monitor.check_position(
+                        mint=mint,
+                        entry_price=pos["entry_price"],
+                        current_price=cur,
+                        entry_sol=pos.get("entry_sol", 0),
+                        deployer_wallet=pos.get("dev_wallet"),
+                    )
+                    if warnings:
+                        for warn in warnings[:2]:
+                            self.log_msg(f"⚠️ {pos['name']}: {warn}")
+                    if should_exit:
+                        self.log_msg(f"🚨 ENHANCED EXIT SIGNAL: {exit_reason}")
+                        self.sell(mint, 1.0, f"ENHANCED_{exit_reason}")
+                        continue
+                except Exception as _enh_err:
+                    print(f"[WARN] Enhanced monitor error: {_enh_err}")
 
             # ── Listing sniper exit logic ──────────────────────────────────
             if pos.get("listing"):
@@ -4849,6 +5010,148 @@ def api_filter_log():
     finally:
         db_return(conn)
     return jsonify([dict(r) for r in rows])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENHANCED TRADING SYSTEM API ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/enhanced/dashboard")
+@login_required
+def api_enhanced_dashboard():
+    """Get enhanced trading dashboard data."""
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+    
+    if not bot or not getattr(bot, 'enhanced_enabled', False):
+        return jsonify({"enabled": False, "msg": "Enhanced systems not available"})
+    
+    try:
+        data = {
+            "enabled": True,
+            "trading_stats": bot.observability.trading_metrics.get_user_stats(uid),
+            "system_health": bot.observability.system_metrics.get_health_summary(),
+            "active_alerts": [a.to_dict() for a in bot.observability.alert_manager.get_active_alerts()],
+            "mev_stats": bot.mev_system.get_health_report(),
+            "circuit_breaker": bot.risk_engine.get_circuit_breaker_state(uid),
+        }
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"enabled": False, "error": str(e)})
+
+
+@app.route("/api/enhanced/whale-activity/<mint>")
+@login_required
+def api_whale_activity(mint):
+    """Get whale activity for a specific token."""
+    if not ENHANCED_SYSTEMS_AVAILABLE:
+        return jsonify({"error": "Enhanced systems not available"})
+    
+    try:
+        whale_system = get_whale_detection_system()
+        activity = whale_system.get_token_whale_activity(mint)
+        entry_signal, entry_reasons = whale_system.check_whale_entry_signal(mint)
+        exit_warning, exit_reasons = whale_system.check_whale_exit_warning(mint)
+        
+        return jsonify({
+            "mint": mint,
+            "activity": activity,
+            "entry_signal": {"triggered": entry_signal, "reasons": entry_reasons},
+            "exit_warning": {"triggered": exit_warning, "reasons": exit_reasons},
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/enhanced/risk-check/<mint>")
+@login_required
+def api_risk_check(mint):
+    """Get risk assessment for a token."""
+    if not ENHANCED_SYSTEMS_AVAILABLE:
+        return jsonify({"error": "Enhanced systems not available"})
+    
+    try:
+        risk_engine = get_risk_engine(HELIUS_RPC)
+        assessment = risk_engine.token_analyzer.analyze_token(mint)
+        return jsonify(assessment.to_dict())
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/enhanced/circuit-breaker", methods=["GET", "POST"])
+@login_required
+def api_circuit_breaker():
+    """Get or reset circuit breaker state."""
+    uid = session["user_id"]
+    
+    if not ENHANCED_SYSTEMS_AVAILABLE:
+        return jsonify({"error": "Enhanced systems not available"})
+    
+    try:
+        risk_engine = get_risk_engine(HELIUS_RPC)
+        
+        if request.method == "POST":
+            action = (request.json or {}).get("action", "")
+            if action == "reset":
+                risk_engine.reset_circuit_breaker(uid)
+                return jsonify({"ok": True, "msg": "Circuit breaker reset"})
+        
+        state = risk_engine.get_circuit_breaker_state(uid)
+        return jsonify(state)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/enhanced/mev-stats")
+@login_required
+def api_mev_stats():
+    """Get MEV protection statistics."""
+    if not ENHANCED_SYSTEMS_AVAILABLE:
+        return jsonify({"error": "Enhanced systems not available"})
+    
+    try:
+        mev_system = get_mev_protection(HELIUS_RPC)
+        return jsonify(mev_system.get_health_report())
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/enhanced/observability")
+@login_required
+def api_observability():
+    """Get observability metrics."""
+    if not ENHANCED_SYSTEMS_AVAILABLE:
+        return jsonify({"error": "Enhanced systems not available"})
+    
+    try:
+        obs = get_observability()
+        return jsonify({
+            "metrics": obs.get_metrics_export(),
+            "alerts": obs.alert_manager.get_alert_history(3600),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/enhanced/smart-money")
+@login_required
+def api_smart_money():
+    """Get smart money wallet stats."""
+    if not ENHANCED_SYSTEMS_AVAILABLE:
+        return jsonify({"error": "Enhanced systems not available"})
+    
+    try:
+        whale_system = get_whale_detection_system()
+        wallets = whale_system.smart_money_tracker.get_smart_money_wallets()
+        return jsonify({
+            "smart_money_count": len(wallets),
+            "wallets": [w[:8] + "..." for w in list(wallets)[:20]],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+
 
 # Price history for candlestick chart — mint → [(unix_ts, price), ...]
 _price_history = {}
