@@ -5042,7 +5042,7 @@ def api_enhanced_dashboard():
 
 @app.route("/api/enhanced/whale-activity/<mint>")
 @login_required
-def api_whale_activity(mint):
+def api_enhanced_whale_activity(mint):
     """Get whale activity for a specific token."""
     if not ENHANCED_SYSTEMS_AVAILABLE:
         return jsonify({"error": "Enhanced systems not available"})
