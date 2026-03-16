@@ -411,6 +411,23 @@ def init_db():
             ts TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS execution_events (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            mint TEXT,
+            name TEXT,
+            side TEXT,
+            phase TEXT,
+            ok INTEGER DEFAULT 0,
+            latency_ms INTEGER DEFAULT 0,
+            slippage_bps INTEGER,
+            expected_out REAL,
+            actual_out REAL,
+            route_source TEXT,
+            failure_reason TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS preset_overrides (
             preset TEXT PRIMARY KEY,
             overrides_json TEXT,
@@ -457,12 +474,17 @@ def init_db():
             social_keys TEXT,
             narrative_score INTEGER DEFAULT 0,
             deployer_score INTEGER DEFAULT 0,
+            whale_score INTEGER DEFAULT 0,
+            whale_action_score INTEGER DEFAULT 0,
+            cluster_confidence INTEGER DEFAULT 0,
+            infra_penalty INTEGER DEFAULT 0,
             token_program TEXT,
             transfer_hook_enabled INTEGER DEFAULT 0,
             can_exit INTEGER,
             threat_risk_score INTEGER DEFAULT 0,
             threat_flags TEXT,
             infra_labels TEXT,
+            liquidity_drop_pct REAL DEFAULT 0,
             max_multiple REAL DEFAULT 1,
             green_lights INTEGER DEFAULT 0,
             checklist_json TEXT,
@@ -475,6 +497,7 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)",
             "CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
             "CREATE INDEX IF NOT EXISTS idx_trades_user_id_ts ON trades (user_id, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_bot_settings_user_id ON bot_settings (user_id)",
@@ -524,12 +547,18 @@ def migrate_db():
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS reason TEXT",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS payload_json TEXT",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS ts TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE execution_events ADD COLUMN IF NOT EXISTS route_source TEXT",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS token_program TEXT",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS transfer_hook_enabled INTEGER DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS can_exit INTEGER",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS threat_risk_score INTEGER DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS threat_flags TEXT",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS infra_labels TEXT",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS whale_score INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS whale_action_score INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS cluster_confidence INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS infra_penalty INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS liquidity_drop_pct REAL DEFAULT 0",
         ]
         for m in migrations:
             try:
@@ -541,6 +570,7 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_filter_log_user_id_ts ON filter_log (user_id, ts DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
         try:
@@ -590,12 +620,17 @@ def migrate_db():
                 social_keys TEXT,
                 narrative_score INTEGER DEFAULT 0,
                 deployer_score INTEGER DEFAULT 0,
+                whale_score INTEGER DEFAULT 0,
+                whale_action_score INTEGER DEFAULT 0,
+                cluster_confidence INTEGER DEFAULT 0,
+                infra_penalty INTEGER DEFAULT 0,
                 token_program TEXT,
                 transfer_hook_enabled INTEGER DEFAULT 0,
                 can_exit INTEGER,
                 threat_risk_score INTEGER DEFAULT 0,
                 threat_flags TEXT,
                 infra_labels TEXT,
+                liquidity_drop_pct REAL DEFAULT 0,
                 max_multiple REAL DEFAULT 1,
                 green_lights INTEGER DEFAULT 0,
                 checklist_json TEXT,
@@ -610,12 +645,28 @@ def migrate_db():
                 reason TEXT,
                 payload_json TEXT,
                 ts TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS execution_events (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER,
+                mint TEXT,
+                name TEXT,
+                side TEXT,
+                phase TEXT,
+                ok INTEGER DEFAULT 0,
+                latency_ms INTEGER DEFAULT 0,
+                slippage_bps INTEGER,
+                expected_out REAL,
+                actual_out REAL,
+                route_source TEXT,
+                failure_reason TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS preset_overrides (
                 preset TEXT PRIMARY KEY,
                 overrides_json TEXT,
                 updated_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
         conn.commit()
@@ -933,6 +984,7 @@ class BotInstance:
         self.perf_fee_recorded = False
         self.filter_log        = deque(maxlen=50)
         self.signal_explorer_log = deque(maxlen=200)
+        self.execution_events  = deque(maxlen=200)
         # ── Risk controls ───────────────────────────────────────────────────
         self.peak_balance       = 0.0   # for max-drawdown circuit breaker
         self.buys_this_hour     = 0
@@ -989,6 +1041,49 @@ class BotInstance:
                         int(bool(payload.get("passed"))),
                         payload.get("reason", ""),
                         json.dumps(payload),
+                    )
+                )
+                conn.commit()
+            finally:
+                db_return(conn)
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
+
+    def log_execution_event(self, mint, name, side, phase, ok, latency_ms=0, slippage_bps=None,
+                            expected_out=None, actual_out=None, route_source=None, failure_reason=None):
+        payload = {
+            "mint": mint,
+            "name": name,
+            "side": side,
+            "phase": phase,
+            "ok": bool(ok),
+            "latency_ms": int(latency_ms or 0),
+            "slippage_bps": None if slippage_bps is None else int(slippage_bps),
+            "expected_out": None if expected_out is None else float(expected_out),
+            "actual_out": None if actual_out is None else float(actual_out),
+            "route_source": route_source,
+            "failure_reason": failure_reason,
+            "ts": time.strftime("%H:%M:%S"),
+            "timestamp": time.time(),
+        }
+        self.execution_events.appendleft(payload)
+        try:
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO execution_events (
+                        user_id,mint,name,side,phase,ok,latency_ms,slippage_bps,
+                        expected_out,actual_out,route_source,failure_reason
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        self.user_id, mint, name, side, phase, int(bool(ok)), int(latency_ms or 0),
+                        None if slippage_bps is None else int(slippage_bps),
+                        None if expected_out is None else float(expected_out),
+                        None if actual_out is None else float(actual_out),
+                        route_source, failure_reason,
                     )
                 )
                 conn.commit()
@@ -1328,9 +1423,19 @@ class BotInstance:
         if age_min < 20:
             return True  # too new for Jupiter to index; rely on authority checks instead
         try:
+            started = time.perf_counter()
             test_quote = self.jupiter_quote(mint, SOL_MINT, 10_000_000, 5000)
+            self.log_execution_event(
+                mint, None, "risk", "exit-check", bool(test_quote),
+                latency_ms=round((time.perf_counter() - started) * 1000),
+                slippage_bps=5000,
+                expected_out=(test_quote or {}).get("outAmount"),
+                route_source=extract_route_label(test_quote),
+                failure_reason=None if test_quote else "no-sell-route",
+            )
             return test_quote is not None
         except Exception as _e:
+            self.log_execution_event(mint, None, "risk", "exit-check", False, failure_reason=str(_e)[:180])
             print(f"[ERROR] {_e}", flush=True)
             return True
 
@@ -1401,20 +1506,52 @@ class BotInstance:
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
+        quote_started = time.perf_counter()
         quote = self.jupiter_quote(SOL_MINT, mint, int(trade_sol*1e9), slippage)
+        route_source = extract_route_label(quote)
+        self.log_execution_event(
+            mint, name, "buy", "quote", bool(quote),
+            latency_ms=round((time.perf_counter() - quote_started) * 1000),
+            slippage_bps=slippage,
+            expected_out=(quote or {}).get("outAmount"),
+            route_source=route_source,
+            failure_reason=None if quote else "no-quote",
+        )
         if not quote:
             self.log_filter(name, mint, False, "No Jupiter quote available")
             self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
             return
+        swap_started = time.perf_counter()
         swap_tx = self.jupiter_swap(quote)
+        self.log_execution_event(
+            mint, name, "buy", "build", bool(swap_tx),
+            latency_ms=round((time.perf_counter() - swap_started) * 1000),
+            slippage_bps=slippage,
+            expected_out=quote.get("outAmount"),
+            route_source=route_source,
+            failure_reason=None if swap_tx else "swap-build-failed",
+        )
         if not swap_tx:
             self.log_filter(name, mint, False, "Jupiter swap build failed")
             self.log_msg(f"SKIP {name} — Jupiter swap build failed")
             return
+        send_started = time.perf_counter()
         sig = self.sign_and_send(swap_tx)
+        self.log_execution_event(
+            mint, name, "buy", "send", bool(sig),
+            latency_ms=round((time.perf_counter() - send_started) * 1000),
+            slippage_bps=slippage,
+            expected_out=quote.get("outAmount"),
+            route_source=route_source,
+            failure_reason=None if sig else "transaction-send-failed",
+        )
         if sig:
             # Compute real entry price from execution instead of DexScreener quote
             real_price = price  # fallback to scanner price
+            fill_started = time.perf_counter()
+            tokens_received = 0
+            expected_out = int(quote.get("outAmount", 0) or 0)
+            realized_slip_bps = None
             try:
                 time.sleep(1.5)  # brief wait for tx to land
                 tokens_received = self.get_token_balance(mint)
@@ -1424,15 +1561,24 @@ class BotInstance:
                     # So entry_price = dexscreener_price * (expected_tokens / actual_tokens)
                     # Expected tokens at quote price = (max_buy_sol * SOL_price) / token_price
                     # Simpler: just derive from the Jupiter quote output vs actual
-                    expected_out = int(quote.get("outAmount", 0))
                     if expected_out > 0:
                         # Adjust entry price by slippage ratio (actual vs quoted)
                         slip_ratio = expected_out / tokens_received if tokens_received > 0 else 1
                         real_price = price * slip_ratio
+                        realized_slip_bps = int(round((1 - (tokens_received / max(expected_out, 1))) * 10000))
                         if abs(slip_ratio - 1) > 0.01:
                             self.log_msg(f"📊 Entry adjusted: ${price:.8f} → ${real_price:.8f} (slip {(slip_ratio-1)*100:+.1f}%)")
             except Exception as _ep:
                 self.log_msg(f"[WARN] Could not compute real entry: {_ep}")
+            self.log_execution_event(
+                mint, name, "buy", "fill", tokens_received > 0,
+                latency_ms=round((time.perf_counter() - fill_started) * 1000),
+                slippage_bps=realized_slip_bps,
+                expected_out=expected_out,
+                actual_out=tokens_received or None,
+                route_source=route_source,
+                failure_reason=None if tokens_received > 0 else "balance-check-unavailable",
+            )
 
             self.positions[mint] = {
                 "name":name,"entry_price":real_price,"peak_price":real_price,
@@ -1498,13 +1644,38 @@ class BotInstance:
             amount = int(total * pct)
             if not amount:
                 return
+            quote_started = time.perf_counter()
             quote = self.jupiter_quote(mint, SOL_MINT, amount)
+            route_source = extract_route_label(quote)
+            self.log_execution_event(
+                mint, pos["name"], "sell", "quote", bool(quote),
+                latency_ms=round((time.perf_counter() - quote_started) * 1000),
+                expected_out=(quote or {}).get("outAmount"),
+                route_source=route_source,
+                failure_reason=None if quote else "no-quote",
+            )
             if not quote:
                 return
+            swap_started = time.perf_counter()
             swap_tx = self.jupiter_swap(quote)
+            self.log_execution_event(
+                mint, pos["name"], "sell", "build", bool(swap_tx),
+                latency_ms=round((time.perf_counter() - swap_started) * 1000),
+                expected_out=quote.get("outAmount"),
+                route_source=route_source,
+                failure_reason=None if swap_tx else "swap-build-failed",
+            )
             if not swap_tx:
                 return
+            send_started = time.perf_counter()
             sig = self.sign_and_send(swap_tx)
+            self.log_execution_event(
+                mint, pos["name"], "sell", "send", bool(sig),
+                latency_ms=round((time.perf_counter() - send_started) * 1000),
+                expected_out=quote.get("outAmount"),
+                route_source=route_source,
+                failure_reason=None if sig else "transaction-send-failed",
+            )
             if sig:
                 cur     = self.get_token_price(mint) or pos["entry_price"]
                 pnl_pct = (cur / pos["entry_price"] - 1) * 100 if pos["entry_price"] else 0
@@ -1767,6 +1938,12 @@ class BotInstance:
                 "threshold": f">= {min_narrative_score}",
             },
             {
+                "name": "Whale / Entity Score",
+                "passed": int(intel.get("whale_score") or 0) >= 35,
+                "value": f"w {intel.get('whale_score', 0)} · a {intel.get('whale_action_score', 0)} · cc {intel.get('cluster_confidence', 0)}",
+                "threshold": "whale >= 35",
+            },
+            {
                 "name": "3 Green Lights",
                 "passed": checklist["green_lights"] >= min_green_lights,
                 "value": f"{checklist['green_lights']}/3",
@@ -2016,6 +2193,19 @@ def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
         except Exception:
             pass
     return None
+
+
+def extract_route_label(quote):
+    try:
+        route = (quote or {}).get("routePlan") or []
+        if route:
+            swap_info = (route[0] or {}).get("swapInfo") or {}
+            label = swap_info.get("label") or swap_info.get("ammKey")
+            if label:
+                return str(label)
+    except Exception:
+        pass
+    return "jupiter"
 
 
 def _now_utc():
@@ -2269,6 +2459,60 @@ def social_reuse_score(keys):
         finally:
             db_return(conn)
     return min(20, hits * 5)
+
+
+def compute_whale_scores(intel):
+    intel = intel or {}
+    deployer_score = int(intel.get("deployer_score") or 0)
+    smart_first10 = int(intel.get("smart_wallet_first10") or 0)
+    first_buyer_count = int(intel.get("first_buyer_count") or 0)
+    holder_growth = max(0.0, float(intel.get("holder_growth_1h") or 0))
+    volume_spike = max(0.0, float(intel.get("volume_spike_ratio") or 0))
+    narrative_score = int(intel.get("narrative_score") or 0)
+    infra_labels = [label for label in (intel.get("infra_labels") or []) if label and label != "tracked-whale"]
+    infra_penalty = min(35, len(infra_labels) * 8)
+    cluster_confidence = min(
+        100,
+        (20 if intel.get("deployer_wallet") else 0) +
+        min(35, deployer_score // 2) +
+        min(25, smart_first10 * 12) +
+        min(20, first_buyer_count * 2),
+    )
+    whale_score = min(
+        100,
+        max(
+            0,
+            round(
+                deployer_score * 0.28 +
+                min(20, volume_spike * 2.2) +
+                min(16, holder_growth / 8.0) +
+                min(18, smart_first10 * 7) +
+                min(10, first_buyer_count) +
+                min(10, narrative_score * 0.18) -
+                infra_penalty
+            )
+        )
+    )
+    whale_action_score = min(
+        100,
+        max(
+            0,
+            round(
+                min(28, volume_spike * 2.8) +
+                min(22, holder_growth / 6.0) +
+                min(20, smart_first10 * 8) +
+                min(12, first_buyer_count * 1.2) +
+                min(10, deployer_score * 0.12) -
+                infra_penalty
+            )
+        )
+    )
+    return {
+        "whale_score": whale_score,
+        "whale_action_score": whale_action_score,
+        "cluster_confidence": cluster_confidence,
+        "infra_penalty": infra_penalty,
+    }
 
 
 def compute_deployer_reputation(stats):
@@ -2533,10 +2777,11 @@ def persist_token_intel(intel):
                 first_price, max_price, first_mc, max_mc, first_vol, latest_vol,
                 first_liq, latest_liq, holder_count, holder_growth_1h, volume_spike_ratio,
                 first_buyer_count, smart_wallet_buys, smart_wallet_first10, narrative_tags,
-                social_links, social_keys, narrative_score, deployer_score, token_program,
-                transfer_hook_enabled, can_exit, threat_risk_score, threat_flags, infra_labels,
+                social_links, social_keys, narrative_score, deployer_score, whale_score,
+                whale_action_score, cluster_confidence, infra_penalty, token_program,
+                transfer_hook_enabled, can_exit, threat_risk_score, threat_flags, infra_labels, liquidity_drop_pct,
                 max_multiple, green_lights, checklist_json, milestones_json, last_updated
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (mint) DO UPDATE SET
                 name=EXCLUDED.name,
                 symbol=EXCLUDED.symbol,
@@ -2557,12 +2802,17 @@ def persist_token_intel(intel):
                 social_keys=EXCLUDED.social_keys,
                 narrative_score=EXCLUDED.narrative_score,
                 deployer_score=EXCLUDED.deployer_score,
+                whale_score=EXCLUDED.whale_score,
+                whale_action_score=EXCLUDED.whale_action_score,
+                cluster_confidence=EXCLUDED.cluster_confidence,
+                infra_penalty=EXCLUDED.infra_penalty,
                 token_program=EXCLUDED.token_program,
                 transfer_hook_enabled=EXCLUDED.transfer_hook_enabled,
                 can_exit=EXCLUDED.can_exit,
                 threat_risk_score=EXCLUDED.threat_risk_score,
                 threat_flags=EXCLUDED.threat_flags,
                 infra_labels=EXCLUDED.infra_labels,
+                liquidity_drop_pct=EXCLUDED.liquidity_drop_pct,
                 max_multiple=GREATEST(COALESCE(token_intel.max_multiple, 1), COALESCE(EXCLUDED.max_multiple, 1)),
                 green_lights=EXCLUDED.green_lights,
                 checklist_json=EXCLUDED.checklist_json,
@@ -2594,12 +2844,17 @@ def persist_token_intel(intel):
             json.dumps(_dedupe_keep_order(intel.get("social_keys") or [])),
             int(intel.get("narrative_score") or 0),
             int(intel.get("deployer_score") or 0),
+            int(intel.get("whale_score") or 0),
+            int(intel.get("whale_action_score") or 0),
+            int(intel.get("cluster_confidence") or 0),
+            int(intel.get("infra_penalty") or 0),
             intel.get("token_program"),
             int(bool(intel.get("transfer_hook_enabled"))),
             None if intel.get("can_exit") is None else int(bool(intel.get("can_exit"))),
             int(intel.get("threat_risk_score") or 0),
             json.dumps(_dedupe_keep_order(intel.get("threat_flags") or [])),
             json.dumps(_dedupe_keep_order(intel.get("infra_labels") or [])),
+            float(intel.get("liquidity_drop_pct") or 0),
             float(intel.get("max_multiple") or 1),
             int(intel.get("green_lights") or 0),
             json.dumps(intel.get("checklist") or []),
@@ -2691,12 +2946,17 @@ def prime_token_intel(info, pair=None, source="scanner"):
             "social_keys": _dedupe_keep_order((cached.get("social_keys") or []) + keys),
             "narrative_score": int(cached.get("narrative_score") or 0),
             "deployer_score": int(cached.get("deployer_score") or 0),
+            "whale_score": int(cached.get("whale_score") or 0),
+            "whale_action_score": int(cached.get("whale_action_score") or 0),
+            "cluster_confidence": int(cached.get("cluster_confidence") or 0),
+            "infra_penalty": int(cached.get("infra_penalty") or 0),
             "token_program": cached.get("token_program"),
             "transfer_hook_enabled": bool(cached.get("transfer_hook_enabled")),
             "can_exit": cached.get("can_exit"),
             "threat_risk_score": int(cached.get("threat_risk_score") or 0),
             "threat_flags": cached.get("threat_flags") or [],
             "infra_labels": cached.get("infra_labels") or [],
+            "liquidity_drop_pct": float(cached.get("liquidity_drop_pct") or 0),
             "max_multiple": float(cached.get("max_multiple") or 1),
             "green_lights": int(cached.get("green_lights") or 0),
             "checklist": cached.get("checklist") or [],
@@ -2784,9 +3044,11 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
         "threat_risk_score": risk.get("threat_risk_score"),
         "threat_flags": risk.get("threat_flags") or [],
         "infra_labels": infra_labels,
+        "liquidity_drop_pct": float(risk.get("liquidity_drop_pct") or 0),
         "last_seen_at": _now_utc(),
         "last_updated": _now_utc(),
     })
+    intel.update(compute_whale_scores(intel))
     checklist = build_three_signal_checklist(base_info, intel)
     intel["checklist"] = checklist["items"]
     intel["green_lights"] = checklist["green_lights"]
@@ -4464,6 +4726,7 @@ def api_pattern_lab():
     ranked = sorted(
         deduped.values(),
         key=lambda token: (
+            int(token.get("whale_score") or 0),
             float(token.get("max_multiple") or 1),
             int(token.get("green_lights") or 0),
             int(token.get("narrative_score") or 0),
@@ -4498,13 +4761,128 @@ def api_pattern_lab():
             "green_lights": int(token.get("green_lights") or 0),
             "deployer_wallet": token.get("deployer_wallet"),
             "deployer_score": int(token.get("deployer_score") or 0),
+            "whale_score": int(token.get("whale_score") or 0),
+            "whale_action_score": int(token.get("whale_action_score") or 0),
+            "cluster_confidence": int(token.get("cluster_confidence") or 0),
+            "infra_penalty": int(token.get("infra_penalty") or 0),
             "narrative_score": int(token.get("narrative_score") or 0),
             "narrative_tags": token.get("narrative_tags") or [],
             "holder_growth_1h": float(token.get("holder_growth_1h") or 0),
             "volume_spike_ratio": float(token.get("volume_spike_ratio") or 0),
+            "threat_risk_score": int(token.get("threat_risk_score") or 0),
         } for token in ranked],
         "deployers": deployers[:6],
         "themes": [{"tag": tag, "count": count} for tag, count in sorted(tag_counts.items(), key=lambda item: -item[1])[:6]],
+    })
+
+
+@app.route("/api/ops-metrics")
+@login_required
+def api_ops_metrics():
+    uid = session["user_id"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT side, phase, ok, latency_ms, slippage_bps, route_source, failure_reason, created_at
+            FROM execution_events
+            WHERE user_id=%s AND created_at >= NOW() - INTERVAL '1 day'
+            ORDER BY created_at DESC
+            LIMIT 300
+        """, (uid,))
+        exec_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint, name, symbol, whale_score, whale_action_score, cluster_confidence, infra_penalty,
+                   deployer_score, max_multiple, narrative_tags, threat_risk_score, threat_flags,
+                   transfer_hook_enabled, can_exit, liquidity_drop_pct, last_updated
+            FROM token_intel
+            ORDER BY whale_score DESC, whale_action_score DESC, last_updated DESC
+            LIMIT 30
+        """)
+        token_rows = [token_intel_payload(row) for row in cur.fetchall()]
+    finally:
+        db_return(conn)
+
+    def _phase_rows(phase):
+        return [row for row in exec_rows if row.get("phase") == phase]
+
+    def _rate(rows):
+        return round(sum(1 for row in rows if row.get("ok")) / len(rows) * 100, 1) if rows else 0.0
+
+    def _avg_latency(rows):
+        vals = [int(row.get("latency_ms") or 0) for row in rows if int(row.get("latency_ms") or 0) > 0]
+        return round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    quote_rows = _phase_rows("quote")
+    send_rows = _phase_rows("send")
+    fill_rows = [row for row in _phase_rows("fill") if row.get("slippage_bps") is not None]
+    fill_slips = [int(row.get("slippage_bps") or 0) for row in fill_rows]
+    route_mix = {}
+    fail_reasons = {}
+    for row in exec_rows:
+        route = row.get("route_source") or "unknown"
+        route_mix[route] = route_mix.get(route, 0) + 1
+        if not row.get("ok") and row.get("failure_reason"):
+            fail_reasons[row["failure_reason"]] = fail_reasons.get(row["failure_reason"], 0) + 1
+
+    top_whales = []
+    threat_map = []
+    liquidity_risks = []
+    transfer_hook_count = 0
+    no_exit_count = 0
+    for token in token_rows:
+        if bool(token.get("transfer_hook_enabled")):
+            transfer_hook_count += 1
+        if token.get("can_exit") is False:
+            no_exit_count += 1
+        top_whales.append({
+            "mint": token.get("mint"),
+            "name": token.get("name") or token.get("symbol") or "?",
+            "whale_score": int(token.get("whale_score") or 0),
+            "whale_action_score": int(token.get("whale_action_score") or 0),
+            "cluster_confidence": int(token.get("cluster_confidence") or 0),
+            "infra_penalty": int(token.get("infra_penalty") or 0),
+            "deployer_score": int(token.get("deployer_score") or 0),
+            "max_multiple": round(float(token.get("max_multiple") or 1), 2),
+        })
+        if int(token.get("threat_risk_score") or 0) > 0 or bool(token.get("transfer_hook_enabled")) or token.get("can_exit") is False:
+            threat_map.append({
+                "mint": token.get("mint"),
+                "name": token.get("name") or token.get("symbol") or "?",
+                "threat_risk_score": int(token.get("threat_risk_score") or 0),
+                "threat_flags": (token.get("threat_flags") or [])[:3],
+                "can_exit": token.get("can_exit"),
+                "transfer_hook_enabled": bool(token.get("transfer_hook_enabled")),
+            })
+        if float(token.get("liquidity_drop_pct") or 0) > 0:
+            liquidity_risks.append({
+                "mint": token.get("mint"),
+                "name": token.get("name") or token.get("symbol") or "?",
+                "liquidity_drop_pct": round(float(token.get("liquidity_drop_pct") or 0), 1),
+                "threat_risk_score": int(token.get("threat_risk_score") or 0),
+            })
+
+    top_whales = sorted(top_whales, key=lambda row: (row["whale_score"], row["whale_action_score"], row["cluster_confidence"]), reverse=True)[:6]
+    threat_map = sorted(threat_map, key=lambda row: row["threat_risk_score"], reverse=True)[:6]
+    liquidity_risks = sorted(liquidity_risks, key=lambda row: (row["liquidity_drop_pct"], row["threat_risk_score"]), reverse=True)[:6]
+
+    return jsonify({
+        "stats": {
+            "quotes_24h": len(quote_rows),
+            "quote_success_rate": _rate(quote_rows),
+            "avg_quote_ms": _avg_latency(quote_rows),
+            "sends_24h": len(send_rows),
+            "send_success_rate": _rate(send_rows),
+            "avg_send_ms": _avg_latency(send_rows),
+            "avg_fill_slippage_bps": round(sum(fill_slips) / len(fill_slips), 1) if fill_slips else 0.0,
+            "transfer_hook_count": transfer_hook_count,
+            "no_exit_count": no_exit_count,
+        },
+        "top_whales": top_whales,
+        "threat_map": threat_map,
+        "liquidity_risks": liquidity_risks,
+        "route_mix": [{"route": route, "count": count} for route, count in sorted(route_mix.items(), key=lambda item: -item[1])[:6]],
+        "failure_reasons": [{"reason": reason, "count": count} for reason, count in sorted(fail_reasons.items(), key=lambda item: -item[1])[:6]],
     })
 
 @app.route("/api/pnl-history")
@@ -5391,7 +5769,7 @@ DASHBOARD_HTML = _CSS + """
 .ai-stat-value{font-size:20px;font-weight:800;color:var(--t1)}
 .ai-stat-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-top:4px}
 .sig-table-wrap{max-height:640px;overflow:auto}
-.sig-table{width:100%;border-collapse:collapse;font-size:11px;min-width:1380px}
+.sig-table{width:100%;border-collapse:collapse;font-size:11px;min-width:1520px}
 .sig-table th{position:sticky;top:0;background:#0c1522;color:var(--t3);font-size:10px;text-transform:uppercase;letter-spacing:.08em;padding:10px 8px;border-bottom:1px solid var(--b1);z-index:1}
 .sig-table td{padding:10px 8px;border-bottom:1px solid rgba(26,46,69,.5);vertical-align:top}
 .sig-table tbody tr{cursor:pointer;transition:.12s}
@@ -5579,6 +5957,9 @@ DASHBOARD_HTML = _CSS + """
         </div>
         <div class="glass" id="pattern-lab" style="margin-top:14px">
           <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Pattern lab loading…</div>
+        </div>
+        <div class="glass" id="ops-radar" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Ops radar loading…</div>
         </div>
       </div>
     </div>
@@ -5781,6 +6162,7 @@ let _charts = {};
 let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
+let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
 let _tabPollers = {};
 let _settingsDirty = false;
 let aiSuggestion = null;
@@ -6331,19 +6713,22 @@ function hideConfirmModal() {
 // ══════════════════════════ SIGNAL EXPLORER ══════════════════════════
 async function pollSignals() {
   try {
-    const [data, pattern] = await Promise.all([
+    const [data, pattern, ops] = await Promise.all([
       fetch('/api/signal-explorer').then(r => r.json()).catch(() => null),
       fetch('/api/pattern-lab').then(r => r.json()).catch(() => null),
+      fetch('/api/ops-metrics').then(r => r.json()).catch(() => null),
     ]);
     if (!data) return;
     _sigData = data.recent || [];
     _patternLab = pattern || { tokens: [], deployers: [], themes: [] };
+    _opsMetrics = ops || { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
     document.getElementById('sig-total').textContent = data.stats.total_evaluated;
     document.getElementById('sig-pass-rate').textContent = data.stats.pass_rate + '%';
     const topR = data.stats.top_reject_reasons;
     document.getElementById('sig-top-reject').textContent = topR.length ? topR[0].reason.slice(0,30) : '\u2014';
     renderSignals();
     renderPatternLab();
+    renderOpsRadar();
   } catch(e) {}
 }
 
@@ -6384,6 +6769,7 @@ function renderSignals() {
           <th>MC</th>
           <th>Deployer</th>
           <th>Narrative</th>
+          <th>Whale</th>
           <th>Threat</th>
           <th>Vol Spike</th>
           <th>Holder Growth</th>
@@ -6416,6 +6802,7 @@ function renderSignals() {
             <td>${fmtK(s.mc)}</td>
             <td><div style="font-family:monospace">${shortWallet(intel.deployer_wallet)}</div><div class="sig-mini-muted">rep ${intel.deployer_score||0}</div></td>
             <td><div>${intel.narrative_score||0}</div><div class="sig-mini-muted">${(intel.narrative_tags||[]).slice(0,2).join(' · ') || 'no tags'}</div></td>
+            <td><div>${intel.whale_score||0}</div><div class="sig-mini-muted">act ${intel.whale_action_score||0} · cc ${intel.cluster_confidence||0}</div></td>
             <td><div>${intel.threat_risk_score||0}</div><div class="sig-mini-muted">${(intel.threat_flags||[]).slice(0,2).join(' · ') || 'clean'}</div></td>
             <td>${Number(intel.volume_spike_ratio || 0).toFixed(1)}x</td>
             <td>${Math.round(Number(intel.holder_growth_1h || 0))}%</td>
@@ -6453,8 +6840,8 @@ function renderPatternLab() {
               <div style="font-size:10px;color:var(--t3)">${(t.narrative_tags||[]).join(' · ') || 'no tags yet'}</div>
             </div>
             <div style="text-align:right">
-              <div style="font-size:12px;font-weight:700;color:var(--gold2)">${(t.max_multiple||1).toFixed(2)}x</div>
-              <div style="font-size:10px;color:var(--t3)">${t.green_lights||0}/3 lights</div>
+              <div style="font-size:12px;font-weight:700;color:var(--gold2)">whale ${t.whale_score||0}</div>
+              <div style="font-size:10px;color:var(--t3)">act ${t.whale_action_score||0} · ${(t.max_multiple||1).toFixed(2)}x</div>
             </div>
           </div>
         </div>`).join('')}
@@ -6466,6 +6853,66 @@ function renderPatternLab() {
           <span style="color:var(--t2);font-family:monospace">${shortWallet(d.wallet)}</span>
           <span style="color:var(--t1)">rep ${d.reputation_score} · ${d.best_multiple.toFixed(2)}x best</span>
         </div>`).join('')}
+    </div>
+  `;
+}
+
+function renderOpsRadar() {
+  const box = document.getElementById('ops-radar');
+  if (!box) return;
+  const stats = _opsMetrics.stats || {};
+  const whales = _opsMetrics.top_whales || [];
+  const threats = _opsMetrics.threat_map || [];
+  const liquidity = _opsMetrics.liquidity_risks || [];
+  const routes = _opsMetrics.route_mix || [];
+  const failures = _opsMetrics.failure_reasons || [];
+  box.innerHTML = `
+    <div class="sec-label">Ops Radar</div>
+    <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px">
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">Quote Success</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.quote_success_rate||0}%</div>
+        <div style="font-size:10px;color:var(--t3)">${stats.avg_quote_ms||0} ms avg</div>
+      </div>
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">Send Success</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.send_success_rate||0}%</div>
+        <div style="font-size:10px;color:var(--t3)">${stats.avg_send_ms||0} ms avg</div>
+      </div>
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">Fill Slippage</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.avg_fill_slippage_bps||0} bps</div>
+        <div style="font-size:10px;color:var(--t3)">${stats.quotes_24h||0} quotes</div>
+      </div>
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">Exit Risks</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.no_exit_count||0}</div>
+        <div style="font-size:10px;color:var(--t3)">${stats.transfer_hook_count||0} hooks</div>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Whale Radar</div>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">
+      ${whales.slice(0,4).map(w => `
+        <div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11px">
+          <span style="color:var(--t1)">${w.name}</span>
+          <span style="color:var(--t2)">w ${w.whale_score} · a ${w.whale_action_score} · cc ${w.cluster_confidence}</span>
+        </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">No whale entities ranked yet</div>'}
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Threat Map</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      ${threats.slice(0,4).map(t => `<span class="badge bg-red">${t.name} · ${t.threat_risk_score}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No active threat flags</span>'}
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Liquidity Risk</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      ${liquidity.slice(0,4).map(t => `<span class="badge bg-gold">${t.name} · -${t.liquidity_drop_pct}%</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No liquidity drains detected</span>'}
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Execution Routes</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      ${routes.slice(0,4).map(r => `<span class="badge bg-blue">${r.route} · ${r.count}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No route data yet</span>'}
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Top Failures</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      ${failures.slice(0,4).map(f => `<span class="badge bg-muted">${f.reason} · ${f.count}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No recent execution failures</span>'}
     </div>
   `;
 }
@@ -6513,12 +6960,20 @@ function showSignalDetail(idx, fromRender=false) {
       <span class="badge bg-muted">${intel.first_buyer_count||0} first buyers</span>
       <span class="badge bg-muted">${intel.smart_wallet_first10||0} smart first 10</span>
     </div>
+    <div class="sec-label">Whale / Entity Score</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <span class="badge bg-blue">Whale ${intel.whale_score||0}/100</span>
+      <span class="badge bg-blue">Action ${intel.whale_action_score||0}/100</span>
+      <span class="badge bg-muted">Cluster ${intel.cluster_confidence||0}</span>
+      <span class="badge bg-muted">Infra penalty ${intel.infra_penalty||0}</span>
+    </div>
     <div class="sec-label">Threat / Exit Risk</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
       <span class="badge bg-red">Threat ${intel.threat_risk_score||0}/100</span>
       <span class="badge bg-muted">Program ${(intel.token_program||'').startsWith('Tokenz') ? 'Token-2022' : 'SPL Token'}</span>
       <span class="badge bg-muted">Exit ${intel.can_exit === false ? 'blocked' : intel.can_exit === true ? 'available' : 'unknown'}</span>
       <span class="badge bg-muted">Hook ${intel.transfer_hook_enabled ? 'enabled' : 'none'}</span>
+      <span class="badge bg-muted">Liq drain ${Math.round(Number(intel.liquidity_drop_pct||0))}%</span>
     </div>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
       ${(intel.threat_flags||[]).map(flag => `<span class="badge bg-red">${flag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No threat flags currently detected</span>'}
