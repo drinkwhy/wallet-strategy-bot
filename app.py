@@ -144,30 +144,39 @@ PRESETS = {
     "safe": {
         "label":"Safe — Low Risk / Consistent",
         "description":"Small positions, tight stops. Capital preservation first.",
-        "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":2.0,
-        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":720,"time_stop_min":20,
+        "max_buy_sol":0.02,"tp1_mult":2.0,"tp2_mult":3.0,
+        "trail_pct":0.15,"stop_loss":0.70,"max_age_min":360,"time_stop_min":20,
         "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":40,"cooldown_min":15,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":50,"min_narrative_score":22,
+        "min_green_lights":3,"min_volume_spike_mult":12,"late_entry_mult":5.0,
+        "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
         "description":"Moderate positions, balanced take-profits. Best for most markets.",
-        "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":2.5,
-        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
+        "max_buy_sol":0.04,"tp1_mult":2.0,"tp2_mult":4.0,
+        "trail_pct":0.20,"stop_loss":0.70,"max_age_min":240,"time_stop_min":30,
         "min_liq":8000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":30,"cooldown_min":10,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":50,"min_narrative_score":20,
+        "min_green_lights":3,"min_volume_spike_mult":10,"late_entry_mult":5.0,
+        "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
     "aggressive": {
         "label":"Aggressive — Higher Risk / Bigger Swings",
         "description":"Larger positions, wider stops. More exposure for trending markets.",
-        "max_buy_sol":0.07,"tp1_mult":1.8,"tp2_mult":4.0,
-        "trail_pct":0.25,"stop_loss":0.65,"max_age_min":2880,"time_stop_min":45,
+        "max_buy_sol":0.07,"tp1_mult":2.0,"tp2_mult":6.0,
+        "trail_pct":0.25,"stop_loss":0.70,"max_age_min":180,"time_stop_min":45,
         "min_liq":5000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":20,"cooldown_min":7,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":18,
+        "min_green_lights":3,"min_volume_spike_mult":8,"late_entry_mult":5.0,
+        "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
     },
@@ -175,9 +184,12 @@ PRESETS = {
         "label":"Degen — High Risk / Max Profit",
         "description":"Larger positions, wide stops. For hot markets only.",
         "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
-        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":4320,"time_stop_min":60,
+        "trail_pct":0.30,"stop_loss":0.70,"max_age_min":120,"time_stop_min":60,
         "min_liq":3000,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "min_vol":500,"min_score":15,"cooldown_min":5,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":15,
+        "min_green_lights":3,"min_volume_spike_mult":6,"late_entry_mult":5.0,
+        "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
     },
@@ -312,6 +324,53 @@ def init_db():
             score INTEGER DEFAULT 0,
             ts TIMESTAMP DEFAULT NOW()
         )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS deployer_stats (
+            deployer_wallet TEXT PRIMARY KEY,
+            launches_total INTEGER DEFAULT 0,
+            wins_2x INTEGER DEFAULT 0,
+            wins_5x INTEGER DEFAULT 0,
+            wins_10x INTEGER DEFAULT 0,
+            best_multiple REAL DEFAULT 1,
+            last_token_mint TEXT,
+            reputation_score INTEGER DEFAULT 0,
+            last_dormant_days REAL DEFAULT 0,
+            first_seen_at TIMESTAMP DEFAULT NOW(),
+            last_seen_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS token_intel (
+            mint TEXT PRIMARY KEY,
+            name TEXT,
+            symbol TEXT,
+            deployer_wallet TEXT,
+            first_seen_at TIMESTAMP DEFAULT NOW(),
+            last_seen_at TIMESTAMP DEFAULT NOW(),
+            first_price REAL,
+            max_price REAL,
+            first_mc REAL,
+            max_mc REAL,
+            first_vol REAL,
+            latest_vol REAL,
+            first_liq REAL,
+            latest_liq REAL,
+            holder_count INTEGER DEFAULT 0,
+            holder_growth_1h REAL DEFAULT 0,
+            volume_spike_ratio REAL DEFAULT 0,
+            first_buyer_count INTEGER DEFAULT 0,
+            smart_wallet_buys INTEGER DEFAULT 0,
+            smart_wallet_first10 INTEGER DEFAULT 0,
+            narrative_tags TEXT,
+            social_links TEXT,
+            social_keys TEXT,
+            narrative_score INTEGER DEFAULT 0,
+            deployer_score INTEGER DEFAULT 0,
+            max_multiple REAL DEFAULT 1,
+            green_lights INTEGER DEFAULT 0,
+            checklist_json TEXT,
+            milestones_json TEXT,
+            last_updated TIMESTAMP DEFAULT NOW()
+        )""")
         conn.commit()
         # indexes on columns added by migrate_db — safe to skip if column not yet present
         for _idx_sql in [
@@ -321,6 +380,8 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_trades_user_id_ts ON trades (user_id, timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_bot_settings_user_id ON bot_settings (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_open_positions_user_id ON open_positions (user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)",
         ]:
             try:
                 cur.execute(_idx_sql)
@@ -375,6 +436,54 @@ def migrate_db():
                 referrer_id INTEGER, referred_id INTEGER,
                 commission_sol REAL DEFAULT 0, paid INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT NOW())""")
+        except Exception:
+            conn.rollback()
+        try:
+            cur.execute("""CREATE TABLE IF NOT EXISTS deployer_stats (
+                deployer_wallet TEXT PRIMARY KEY,
+                launches_total INTEGER DEFAULT 0,
+                wins_2x INTEGER DEFAULT 0,
+                wins_5x INTEGER DEFAULT 0,
+                wins_10x INTEGER DEFAULT 0,
+                best_multiple REAL DEFAULT 1,
+                last_token_mint TEXT,
+                reputation_score INTEGER DEFAULT 0,
+                last_dormant_days REAL DEFAULT 0,
+                first_seen_at TIMESTAMP DEFAULT NOW(),
+                last_seen_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS token_intel (
+                mint TEXT PRIMARY KEY,
+                name TEXT,
+                symbol TEXT,
+                deployer_wallet TEXT,
+                first_seen_at TIMESTAMP DEFAULT NOW(),
+                last_seen_at TIMESTAMP DEFAULT NOW(),
+                first_price REAL,
+                max_price REAL,
+                first_mc REAL,
+                max_mc REAL,
+                first_vol REAL,
+                latest_vol REAL,
+                first_liq REAL,
+                latest_liq REAL,
+                holder_count INTEGER DEFAULT 0,
+                holder_growth_1h REAL DEFAULT 0,
+                volume_spike_ratio REAL DEFAULT 0,
+                first_buyer_count INTEGER DEFAULT 0,
+                smart_wallet_buys INTEGER DEFAULT 0,
+                smart_wallet_first10 INTEGER DEFAULT 0,
+                narrative_tags TEXT,
+                social_links TEXT,
+                social_keys TEXT,
+                narrative_score INTEGER DEFAULT 0,
+                deployer_score INTEGER DEFAULT 0,
+                max_multiple REAL DEFAULT 1,
+                green_lights INTEGER DEFAULT 0,
+                checklist_json TEXT,
+                milestones_json TEXT,
+                last_updated TIMESTAMP DEFAULT NOW())""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
         except Exception:
             conn.rollback()
         conn.commit()
@@ -1036,7 +1145,10 @@ class BotInstance:
 
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
         s = self.settings
-        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={s['max_buy_sol']+0.01:.4f}", flush=True)
+        risk_pct = float(s.get("risk_per_trade_pct", 0) or 0)
+        trade_sol = min(float(s["max_buy_sol"]), self.sol_balance * (risk_pct / 100.0)) if risk_pct > 0 else float(s["max_buy_sol"])
+        trade_sol = round(trade_sol, 4)
+        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
         if cb:
@@ -1066,8 +1178,13 @@ class BotInstance:
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
             return
-        if self.sol_balance < s["max_buy_sol"] + 0.01:
-            reason = f"Low balance ({self.sol_balance:.4f} SOL, need {s['max_buy_sol']+0.01:.4f})"
+        if trade_sol <= 0.001:
+            reason = f"Risk model size too small ({trade_sol:.4f} SOL)"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
+            return
+        if self.sol_balance < trade_sol + 0.01:
+            reason = f"Low balance ({self.sol_balance:.4f} SOL, need {trade_sol+0.01:.4f})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
             return
@@ -1092,8 +1209,8 @@ class BotInstance:
             return
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
-        self.log_msg(f"Quoting {name} | slippage={slippage}bps ...")
-        quote = self.jupiter_quote(SOL_MINT, mint, int(s["max_buy_sol"]*1e9), slippage)
+        self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
+        quote = self.jupiter_quote(SOL_MINT, mint, int(trade_sol*1e9), slippage)
         if not quote:
             self.log_filter(name, mint, False, "No Jupiter quote available")
             self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
@@ -1128,7 +1245,7 @@ class BotInstance:
 
             self.positions[mint] = {
                 "name":name,"entry_price":real_price,"peak_price":real_price,
-                "timestamp":time.time(),"tp1_hit":False,"entry_sol":s["max_buy_sol"],
+                "timestamp":time.time(),"tp1_hit":False,"entry_sol":trade_sol,
                 "dev_wallet": dev_wallet,
             }
             try:
@@ -1142,7 +1259,7 @@ class BotInstance:
                                   SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
                                       peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
                                       tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
-                               (self.user_id, mint, name, real_price, real_price, s["max_buy_sol"], 0, dev_wallet))
+                               (self.user_id, mint, name, real_price, real_price, trade_sol, 0, dev_wallet))
                     _conn.commit()
                 finally:
                     db_return(_conn)
@@ -1151,7 +1268,7 @@ class BotInstance:
             self.buys_this_hour     += 1
             self.consecutive_losses  = 0   # reset on successful buy
             self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
-            self.log_msg(f"BUY {name} @ ${real_price:.8f} | slip={slippage}bps | solscan.io/tx/{sig}")
+            self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
                 conn = db()
@@ -1163,7 +1280,7 @@ class BotInstance:
                     db_return(conn)
                 if u and u["telegram_chat_id"]:
                     send_telegram(u["telegram_chat_id"],
-                        f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {s['max_buy_sol']} SOL\n🔗 solscan.io/tx/{sig}")
+                        f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {trade_sol} SOL\n🔗 solscan.io/tx/{sig}")
             except Exception as _e:
                 print(f"[ERROR] {_e}", flush=True)
         else:
@@ -1358,6 +1475,12 @@ class BotInstance:
         max_age = s.get("max_age_min", 999)
         min_vol = s.get("min_vol", 0)
         min_score = s.get("min_score", 0)
+        min_green_lights = int(s.get("min_green_lights", 3))
+        min_holder_growth_pct = float(s.get("min_holder_growth_pct", 50))
+        min_narrative_score = int(s.get("min_narrative_score", 20))
+        min_volume_spike_mult = float(s.get("min_volume_spike_mult", 10))
+        late_entry_mult = float(s.get("late_entry_mult", 5.0))
+        nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
@@ -1414,12 +1537,69 @@ class BotInstance:
                 self.signal_explorer_log.appendleft(sig_entry)
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
+        intel = ensure_token_intel(mint, base_info={
+            "mint": mint,
+            "name": name,
+            "price": price,
+            "mc": mc,
+            "vol": vol,
+            "liq": liq,
+            "age_min": age_min,
+            "change": change,
+            "score": score_total,
+        })
+        checklist = build_three_signal_checklist(_sinfo, intel, settings=s)
+        intel["checklist"] = checklist["items"]
+        intel["green_lights"] = checklist["green_lights"]
+        sig_entry["intel"] = intel
+        sig_entry["filters"].extend([
+            {
+                "name": "Tracked Wallet Edge",
+                "passed": checklist["items"][0]["passed"],
+                "value": checklist["items"][0]["value"],
+                "threshold": checklist["items"][0]["threshold"],
+            },
+            {
+                "name": "Volume / Holder Acceleration",
+                "passed": checklist["items"][1]["passed"],
+                "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x | {float(intel.get('holder_growth_1h') or 0):+.0f}%",
+                "threshold": f">= {min_volume_spike_mult:.0f}x or >= {min_holder_growth_pct:.0f}%",
+            },
+            {
+                "name": "Narrative Timing",
+                "passed": checklist["items"][2]["passed"],
+                "value": f"{intel.get('narrative_score', 0)}",
+                "threshold": f">= {min_narrative_score}",
+            },
+            {
+                "name": "3 Green Lights",
+                "passed": checklist["green_lights"] >= min_green_lights,
+                "value": f"{checklist['green_lights']}/3",
+                "threshold": f">= {min_green_lights}",
+            },
+            {
+                "name": "Late Entry Guard",
+                "passed": float(intel.get("max_multiple") or 1) <= late_entry_mult or int(intel.get("narrative_score") or 0) >= nuclear_narrative_score,
+                "value": f"{float(intel.get('max_multiple') or 1):.2f}x seen",
+                "threshold": f"<= {late_entry_mult:.1f}x unless narrative >= {nuclear_narrative_score}",
+            },
+        ])
+        if checklist["green_lights"] < min_green_lights:
+            sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if float(intel.get("max_multiple") or 1) > late_entry_mult and int(intel.get("narrative_score") or 0) < nuclear_narrative_score:
+            sig_entry["reason"] = f"Late entry ({float(intel.get('max_multiple') or 1):.2f}x) without nuclear narrative"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
         sig_entry["passed"] = True
         sig_entry["reason"] = f"Passed all filters (score {score_total})"
         self.signal_explorer_log.appendleft(sig_entry)
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, f"Signal passed all filters (score {score_total})")
-        self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
+        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -1537,6 +1717,784 @@ WHALE_LABELS = {
 _whale_seen  = set()
 _whale_mints = {}   # mint -> last_seen timestamp (dedup per token)
 _whale_buys  = deque(maxlen=200)  # recent whale buys for dashboard
+
+SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+INTEL_TRACK_WINDOW_SEC = 3600
+INTEL_REFRESH_SEC = 75
+INTEL_MAX_TRACKED = 250
+_token_intel_cache = {}
+_deployer_stats_cache = {}
+_token_intel_lock = threading.Lock()
+_holder_history = {}
+NARRATIVE_KEYWORDS = {
+    "dog": ["dog", "inu", "shib", "woof", "bonk"],
+    "cat": ["cat", "kitty", "meow"],
+    "frog": ["pepe", "frog"],
+    "politics": ["trump", "maga", "biden", "election", "sec", "fed", "tariff"],
+    "freedom": ["free", "freedom", "unban", "justice", "banned", "lawsuit"],
+    "sports": ["nba", "nfl", "soccer", "ufc", "march", "madness", "cup"],
+    "holiday": ["xmas", "christmas", "santa", "easter", "halloween", "turkey"],
+    "ai": ["ai", "gpt", "agent", "bot", "terminal"],
+    "solana": ["sol", "solana", "jup", "jupiter", "raydium", "pump"],
+    "celebrity": ["elon", "drake", "ye", "kanye", "mrbeast"],
+}
+
+
+def _json_load(value, default):
+    if value in (None, "", b""):
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        loaded = json.loads(value)
+        return loaded if loaded is not None else default
+    except Exception:
+        return default
+
+
+def _dedupe_keep_order(items):
+    seen = set()
+    out = []
+    for item in items or []:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _now_utc():
+    return datetime.utcnow()
+
+
+def _to_iso(dt):
+    if not dt:
+        return ""
+    if isinstance(dt, str):
+        return dt
+    return dt.isoformat()
+
+
+def _from_iso(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def get_helius_api_key():
+    try:
+        from urllib.parse import parse_qs, urlparse
+        parsed = urlparse(HELIUS_RPC)
+        api_key = parse_qs(parsed.query).get("api-key", [""])[0]
+        if api_key:
+            return api_key
+    except Exception:
+        pass
+    tail = HELIUS_RPC.split("/")[-1]
+    return "" if "?" in tail else tail
+
+
+def rpc_call(method, params=None, timeout=10):
+    try:
+        resp = requests.post(HELIUS_RPC, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or [],
+        }, headers=HEADERS, timeout=timeout)
+        if resp.ok:
+            body = resp.json()
+            return body.get("result")
+    except Exception as e:
+        print(f"[RPC] {method} failed: {e}", flush=True)
+    return None
+
+
+def helius_address_transactions(address, limit=50, tx_type=None, timeout=10):
+    api_key = get_helius_api_key()
+    if not api_key:
+        return []
+    params = {"api-key": api_key, "limit": int(limit)}
+    if tx_type:
+        params["type"] = tx_type
+    try:
+        resp = requests.get(
+            f"https://api.helius.xyz/v0/addresses/{address}/transactions",
+            params=params,
+            headers=HEADERS,
+            timeout=timeout,
+        )
+        data = resp.json() if resp.ok else []
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[HELIUS] {address} tx fetch failed: {e}", flush=True)
+        return []
+
+
+def extract_social_links(pair):
+    info = (pair or {}).get("info") or {}
+    links = []
+    for website in info.get("websites") or []:
+        url = (website or {}).get("url")
+        if url:
+            links.append(url.strip())
+    for social in info.get("socials") or []:
+        url = (social or {}).get("url") or (social or {}).get("handle")
+        if url:
+            links.append(str(url).strip())
+    return _dedupe_keep_order(links)
+
+
+def social_keys(links):
+    keys = []
+    for raw in links or []:
+        item = str(raw or "").strip().lower()
+        if not item:
+            continue
+        for prefix in ("https://", "http://"):
+            if item.startswith(prefix):
+                item = item[len(prefix):]
+        if item.startswith("www."):
+            item = item[4:]
+        item = item.split("?", 1)[0].rstrip("/")
+        for marker in ("x.com/", "twitter.com/", "t.me/", "telegram.me/", "discord.gg/"):
+            if marker in item:
+                item = item.split(marker, 1)[1]
+        keys.append(item)
+    return _dedupe_keep_order(keys)
+
+
+def market_mood_snapshot():
+    now = _now_utc()
+    tags = []
+    if now.month in (11, 12):
+        tags.extend(["holiday", "christmas"])
+    if now.month in (3, 4):
+        tags.extend(["tax", "sports"])
+    if now.month == 10:
+        tags.extend(["holiday", "halloween"])
+    if now.weekday() >= 5:
+        tags.append("weekend")
+    return tags
+
+
+def infer_narrative_tags(name, symbol, socials=None):
+    haystack = " ".join([str(name or ""), str(symbol or "")] + list(socials or [])).lower()
+    tags = []
+    for tag, keywords in NARRATIVE_KEYWORDS.items():
+        if any(word in haystack for word in keywords):
+            tags.append(tag)
+    return _dedupe_keep_order(tags)
+
+
+def extract_wallet_flow_from_swaps(txns, mint):
+    buyers = []
+    sellers = []
+    unique_buyers = []
+    unique_sellers = []
+    ordered = sorted((tx for tx in txns if isinstance(tx, dict)), key=lambda tx: tx.get("timestamp") or 0)
+    for tx in ordered:
+        fee_payer = tx.get("feePayer", "")
+        swap = (tx.get("events") or {}).get("swap") or {}
+        if not fee_payer or not swap:
+            continue
+        token_outputs = swap.get("tokenOutputs") or []
+        token_inputs = swap.get("tokenInputs") or []
+        native_input = swap.get("nativeInput") or {}
+        native_output = swap.get("nativeOutput") or {}
+        if any(t.get("mint") == mint for t in token_outputs):
+            buyers.append({
+                "wallet": fee_payer,
+                "timestamp": tx.get("timestamp") or 0,
+                "sol": round(float(native_input.get("amount") or 0) / 1e9, 4),
+            })
+            if fee_payer not in unique_buyers:
+                unique_buyers.append(fee_payer)
+        elif any(t.get("mint") == mint for t in token_inputs):
+            sellers.append({
+                "wallet": fee_payer,
+                "timestamp": tx.get("timestamp") or 0,
+                "sol": round(float(native_output.get("amount") or 0) / 1e9, 4),
+            })
+            if fee_payer not in unique_sellers:
+                unique_sellers.append(fee_payer)
+    first_buyers = unique_buyers[:10]
+    smart_wallet_first10 = sum(1 for wallet in first_buyers if wallet in WHALE_WALLETS)
+    smart_wallet_buys = sum(1 for wallet in unique_buyers if wallet in WHALE_WALLETS)
+    deployer_candidate = None
+    for tx in ordered:
+        fee_payer = tx.get("feePayer", "")
+        if fee_payer and fee_payer not in (mint, SOL_MINT, SPL_TOKEN_PROGRAM, PUMP_PROGRAM):
+            deployer_candidate = fee_payer
+            break
+    return {
+        "buyers": buyers,
+        "sellers": sellers,
+        "first_buyers": first_buyers,
+        "smart_wallet_buys": smart_wallet_buys,
+        "smart_wallet_first10": smart_wallet_first10,
+        "deployer_candidate": deployer_candidate,
+    }
+
+
+def resolve_deployer_wallet(mint, txns=None):
+    txns = txns if txns is not None else helius_address_transactions(mint, limit=40, timeout=8)
+    flow = extract_wallet_flow_from_swaps(txns, mint)
+    if flow.get("deployer_candidate"):
+        return flow["deployer_candidate"]
+    for tx in sorted((tx for tx in txns if isinstance(tx, dict)), key=lambda tx: tx.get("timestamp") or 0):
+        fee_payer = tx.get("feePayer", "")
+        if fee_payer and fee_payer not in (mint, SOL_MINT, SPL_TOKEN_PROGRAM, PUMP_PROGRAM):
+            return fee_payer
+    return None
+
+
+def get_token_holder_count(mint, txns=None):
+    count = 0
+    try:
+        largest = rpc_call("getTokenLargestAccounts", [mint], timeout=8) or {}
+        rows = largest.get("value", []) if isinstance(largest, dict) else []
+        count = len([row for row in rows if float(row.get("uiAmount") or 0) > 0])
+    except Exception:
+        pass
+    txns = txns or []
+    wallets = set()
+    for tx in txns:
+        fee_payer = (tx or {}).get("feePayer")
+        if fee_payer:
+            wallets.add(fee_payer)
+    return max(count, len(wallets))
+
+
+def volume_spike_ratio(mint, current_vol):
+    now = time.time()
+    hist = _volume_history.get(mint, [])
+    hist = [(t, v) for t, v in hist if now - t < 300]
+    if current_vol:
+        hist.append((now, current_vol))
+    _volume_history[mint] = hist
+    previous = [v for _, v in hist[:-1] if v > 0]
+    if not previous:
+        return 1.0 if current_vol else 0.0
+    baseline = max(min(previous), 1)
+    return round(float(current_vol or 0) / baseline, 2)
+
+
+def social_reuse_score(keys):
+    keys = set(keys or [])
+    if not keys:
+        return 0
+    hits = 0
+    for cached in list(_token_intel_cache.values()):
+        if float(cached.get("max_multiple") or 1) < 2:
+            continue
+        if keys.intersection(set(cached.get("social_keys") or [])):
+            hits += 1
+    if hits < 2:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT social_keys, max_multiple
+                FROM token_intel
+                WHERE social_keys IS NOT NULL AND social_keys <> ''
+                ORDER BY last_updated DESC
+                LIMIT 200
+            """)
+            for row in cur.fetchall():
+                if float(row.get("max_multiple") or 1) < 2:
+                    continue
+                if keys.intersection(set(_json_load(row.get("social_keys"), []))):
+                    hits += 1
+        finally:
+            db_return(conn)
+    return min(20, hits * 5)
+
+
+def compute_deployer_reputation(stats):
+    if not stats or not stats.get("deployer_wallet"):
+        return 0
+    score = 0
+    score += int(stats.get("wins_2x") or 0) * 8
+    score += int(stats.get("wins_5x") or 0) * 10
+    score += int(stats.get("wins_10x") or 0) * 14
+    score += min(20, int(float(stats.get("best_multiple") or 1) * 2))
+    score += 8 if float(stats.get("last_dormant_days") or 0) >= 180 else 0
+    if int(stats.get("launches_total") or 0) > 5 and int(stats.get("wins_2x") or 0) == 0:
+        score = max(0, score - 8)
+    return min(100, score)
+
+
+def get_deployer_stats(deployer_wallet):
+    if not deployer_wallet:
+        return {}
+    cached = _deployer_stats_cache.get(deployer_wallet)
+    if cached:
+        return dict(cached)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM deployer_stats WHERE deployer_wallet=%s", (deployer_wallet,))
+        row = cur.fetchone()
+    finally:
+        db_return(conn)
+    stats = dict(row) if row else {
+        "deployer_wallet": deployer_wallet,
+        "launches_total": 0,
+        "wins_2x": 0,
+        "wins_5x": 0,
+        "wins_10x": 0,
+        "best_multiple": 1,
+        "last_token_mint": None,
+        "reputation_score": 0,
+        "last_dormant_days": 0,
+        "first_seen_at": _now_utc(),
+        "last_seen_at": _now_utc(),
+    }
+    stats["reputation_score"] = compute_deployer_reputation(stats)
+    _deployer_stats_cache[deployer_wallet] = dict(stats)
+    return stats
+
+
+def persist_deployer_stats(stats):
+    if not stats or not stats.get("deployer_wallet"):
+        return
+    stats = dict(stats)
+    stats["reputation_score"] = compute_deployer_reputation(stats)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO deployer_stats (
+                deployer_wallet, launches_total, wins_2x, wins_5x, wins_10x,
+                best_multiple, last_token_mint, reputation_score, last_dormant_days,
+                first_seen_at, last_seen_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (deployer_wallet) DO UPDATE SET
+                launches_total=EXCLUDED.launches_total,
+                wins_2x=EXCLUDED.wins_2x,
+                wins_5x=EXCLUDED.wins_5x,
+                wins_10x=EXCLUDED.wins_10x,
+                best_multiple=EXCLUDED.best_multiple,
+                last_token_mint=EXCLUDED.last_token_mint,
+                reputation_score=EXCLUDED.reputation_score,
+                last_dormant_days=EXCLUDED.last_dormant_days,
+                first_seen_at=LEAST(deployer_stats.first_seen_at, EXCLUDED.first_seen_at),
+                last_seen_at=GREATEST(deployer_stats.last_seen_at, EXCLUDED.last_seen_at)
+        """, (
+            stats["deployer_wallet"],
+            int(stats.get("launches_total") or 0),
+            int(stats.get("wins_2x") or 0),
+            int(stats.get("wins_5x") or 0),
+            int(stats.get("wins_10x") or 0),
+            float(stats.get("best_multiple") or 1),
+            stats.get("last_token_mint"),
+            int(stats.get("reputation_score") or 0),
+            float(stats.get("last_dormant_days") or 0),
+            _from_iso(stats.get("first_seen_at")) or _now_utc(),
+            _from_iso(stats.get("last_seen_at")) or _now_utc(),
+        ))
+        conn.commit()
+    finally:
+        db_return(conn)
+    _deployer_stats_cache[stats["deployer_wallet"]] = dict(stats)
+
+
+def register_deployer_launch(deployer_wallet, mint):
+    if not deployer_wallet:
+        return {}
+    stats = get_deployer_stats(deployer_wallet)
+    now = _now_utc()
+    last_seen = _from_iso(stats.get("last_seen_at"))
+    if stats.get("last_token_mint") != mint:
+        stats["launches_total"] = int(stats.get("launches_total") or 0) + 1
+    if last_seen:
+        stats["last_dormant_days"] = round(max(0.0, (now - last_seen).total_seconds() / 86400), 1)
+    stats["deployer_wallet"] = deployer_wallet
+    stats["last_token_mint"] = mint
+    stats["last_seen_at"] = now
+    stats["first_seen_at"] = _from_iso(stats.get("first_seen_at")) or now
+    persist_deployer_stats(stats)
+    return stats
+
+
+def update_holder_history(mint, holder_count):
+    now = time.time()
+    hist = _holder_history.get(mint, [])
+    hist = [(t, v) for t, v in hist if now - t < INTEL_TRACK_WINDOW_SEC]
+    hist.append((now, int(holder_count or 0)))
+    _holder_history[mint] = hist
+    baseline = next((v for _, v in hist if v > 0), 0)
+    if not baseline:
+        return 0.0
+    return round(((holder_count - baseline) / baseline) * 100, 1)
+
+
+def build_narrative_profile(name, symbol, pair=None, deployer_stats=None, social_keys_list=None):
+    socials = social_keys_list or social_keys(extract_social_links(pair))
+    tags = infer_narrative_tags(name, symbol, socials)
+    mood = set(market_mood_snapshot())
+    aligned = [tag for tag in tags if tag in mood or (tag == "holiday" and {"christmas", "halloween"} & mood)]
+    score = len(tags) * 6 + len(aligned) * 8 + min(12, len(socials) * 4)
+    if float((deployer_stats or {}).get("last_dormant_days") or 0) >= 180:
+        score += 8
+    score += social_reuse_score(socials)
+    return {
+        "tags": _dedupe_keep_order(tags),
+        "aligned_tags": _dedupe_keep_order(aligned),
+        "score": min(100, score),
+        "social_keys": socials,
+    }
+
+
+def build_three_signal_checklist(info, intel, settings=None):
+    settings = settings or PRESETS["balanced"]
+    deployer_pass = (
+        (intel.get("deployer_wallet") in WHALE_WALLETS) or
+        int(intel.get("deployer_score") or 0) >= 18 or
+        int(intel.get("smart_wallet_first10") or 0) > 0
+    )
+    volume_pass = (
+        float(intel.get("volume_spike_ratio") or 0) >= float(settings.get("min_volume_spike_mult", 10)) or
+        float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 50))
+    )
+    narrative_pass = int(intel.get("narrative_score") or 0) >= int(settings.get("min_narrative_score", 20))
+    items = [
+        {
+            "name": "Tracked deployer / first-buyer quality",
+            "passed": deployer_pass,
+            "value": f"{intel.get('deployer_score', 0)} rep | {intel.get('smart_wallet_first10', 0)} smart in first10",
+            "threshold": "tracked wallet, rep >= 18, or smart first10",
+        },
+        {
+            "name": "Volume / holder acceleration",
+            "passed": volume_pass,
+            "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x vol | {float(intel.get('holder_growth_1h') or 0):+.0f}% holders",
+            "threshold": f">= {settings.get('min_volume_spike_mult', 10)}x or >= {settings.get('min_holder_growth_pct', 50)}%",
+        },
+        {
+            "name": "Narrative timing fit",
+            "passed": narrative_pass,
+            "value": f"{intel.get('narrative_score', 0)} score",
+            "threshold": f">= {settings.get('min_narrative_score', 20)}",
+        },
+    ]
+    return {"items": items, "green_lights": sum(1 for item in items if item["passed"])}
+
+
+def token_intel_payload(row):
+    if not row:
+        return {}
+    payload = dict(row)
+    for key, default in [
+        ("narrative_tags", []),
+        ("social_links", []),
+        ("social_keys", []),
+        ("checklist_json", []),
+        ("milestones_json", {}),
+    ]:
+        payload[key] = _json_load(payload.get(key), default)
+    payload["checklist"] = payload.pop("checklist_json", [])
+    payload["milestones"] = payload.pop("milestones_json", {})
+    for dt_key in ("first_seen_at", "last_seen_at", "last_updated"):
+        payload[dt_key] = _to_iso(payload.get(dt_key))
+    return payload
+
+
+def persist_token_intel(intel):
+    if not intel or not intel.get("mint"):
+        return
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO token_intel (
+                mint, name, symbol, deployer_wallet, first_seen_at, last_seen_at,
+                first_price, max_price, first_mc, max_mc, first_vol, latest_vol,
+                first_liq, latest_liq, holder_count, holder_growth_1h, volume_spike_ratio,
+                first_buyer_count, smart_wallet_buys, smart_wallet_first10, narrative_tags,
+                social_links, social_keys, narrative_score, deployer_score, max_multiple,
+                green_lights, checklist_json, milestones_json, last_updated
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (mint) DO UPDATE SET
+                name=EXCLUDED.name,
+                symbol=EXCLUDED.symbol,
+                deployer_wallet=COALESCE(token_intel.deployer_wallet, EXCLUDED.deployer_wallet),
+                last_seen_at=GREATEST(token_intel.last_seen_at, EXCLUDED.last_seen_at),
+                max_price=GREATEST(COALESCE(token_intel.max_price, 0), COALESCE(EXCLUDED.max_price, 0)),
+                max_mc=GREATEST(COALESCE(token_intel.max_mc, 0), COALESCE(EXCLUDED.max_mc, 0)),
+                latest_vol=EXCLUDED.latest_vol,
+                latest_liq=EXCLUDED.latest_liq,
+                holder_count=EXCLUDED.holder_count,
+                holder_growth_1h=EXCLUDED.holder_growth_1h,
+                volume_spike_ratio=EXCLUDED.volume_spike_ratio,
+                first_buyer_count=EXCLUDED.first_buyer_count,
+                smart_wallet_buys=EXCLUDED.smart_wallet_buys,
+                smart_wallet_first10=EXCLUDED.smart_wallet_first10,
+                narrative_tags=EXCLUDED.narrative_tags,
+                social_links=EXCLUDED.social_links,
+                social_keys=EXCLUDED.social_keys,
+                narrative_score=EXCLUDED.narrative_score,
+                deployer_score=EXCLUDED.deployer_score,
+                max_multiple=GREATEST(COALESCE(token_intel.max_multiple, 1), COALESCE(EXCLUDED.max_multiple, 1)),
+                green_lights=EXCLUDED.green_lights,
+                checklist_json=EXCLUDED.checklist_json,
+                milestones_json=EXCLUDED.milestones_json,
+                last_updated=EXCLUDED.last_updated
+        """, (
+            intel["mint"],
+            intel.get("name"),
+            intel.get("symbol"),
+            intel.get("deployer_wallet"),
+            _from_iso(intel.get("first_seen_at")) or _now_utc(),
+            _from_iso(intel.get("last_seen_at")) or _now_utc(),
+            float(intel.get("first_price") or 0),
+            float(intel.get("max_price") or intel.get("first_price") or 0),
+            float(intel.get("first_mc") or 0),
+            float(intel.get("max_mc") or intel.get("first_mc") or 0),
+            float(intel.get("first_vol") or 0),
+            float(intel.get("latest_vol") or 0),
+            float(intel.get("first_liq") or 0),
+            float(intel.get("latest_liq") or 0),
+            int(intel.get("holder_count") or 0),
+            float(intel.get("holder_growth_1h") or 0),
+            float(intel.get("volume_spike_ratio") or 0),
+            int(intel.get("first_buyer_count") or 0),
+            int(intel.get("smart_wallet_buys") or 0),
+            int(intel.get("smart_wallet_first10") or 0),
+            json.dumps(_dedupe_keep_order(intel.get("narrative_tags") or [])),
+            json.dumps(_dedupe_keep_order(intel.get("social_links") or [])),
+            json.dumps(_dedupe_keep_order(intel.get("social_keys") or [])),
+            int(intel.get("narrative_score") or 0),
+            int(intel.get("deployer_score") or 0),
+            float(intel.get("max_multiple") or 1),
+            int(intel.get("green_lights") or 0),
+            json.dumps(intel.get("checklist") or []),
+            json.dumps(intel.get("milestones") or {}),
+            _from_iso(intel.get("last_updated")) or _now_utc(),
+        ))
+        conn.commit()
+    finally:
+        db_return(conn)
+
+
+def update_deployer_outcomes(mint, multiple, deployer_wallet=None):
+    if not mint or float(multiple or 0) <= 1:
+        return
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT deployer_wallet, milestones_json FROM token_intel WHERE mint=%s", (mint,))
+        row = cur.fetchone()
+    finally:
+        db_return(conn)
+    if not row:
+        return
+    deployer_wallet = deployer_wallet or row.get("deployer_wallet")
+    if not deployer_wallet:
+        return
+    milestones = _json_load(row.get("milestones_json"), {})
+    changed = False
+    stats = get_deployer_stats(deployer_wallet)
+    for level in (2, 5, 10):
+        key = f"{level}x"
+        if float(multiple) >= level and not milestones.get(key):
+            milestones[key] = True
+            stats[f"wins_{level}x"] = int(stats.get(f"wins_{level}x") or 0) + 1
+            changed = True
+    if float(multiple) > float(stats.get("best_multiple") or 1):
+        stats["best_multiple"] = float(multiple)
+        changed = True
+    if not changed:
+        return
+    persist_deployer_stats(stats)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE token_intel
+            SET milestones_json=%s, max_multiple=GREATEST(COALESCE(max_multiple, 1), %s), last_updated=NOW()
+            WHERE mint=%s
+        """, (json.dumps(milestones), float(multiple), mint))
+        conn.commit()
+    finally:
+        db_return(conn)
+
+
+def prime_token_intel(info, pair=None, source="scanner"):
+    mint = (info or {}).get("mint")
+    if not mint:
+        return {}
+    now = _now_utc()
+    links = extract_social_links(pair)
+    keys = social_keys(links)
+    with _token_intel_lock:
+        cached = token_intel_payload(_token_intel_cache.get(mint) or {})
+        first_price = float(cached.get("first_price") or info.get("price") or 0)
+        first_mc = float(cached.get("first_mc") or info.get("mc") or 0)
+        intel = {
+            "mint": mint,
+            "name": info.get("name") or cached.get("name"),
+            "symbol": info.get("symbol") or cached.get("symbol"),
+            "deployer_wallet": cached.get("deployer_wallet"),
+            "first_seen_at": cached.get("first_seen_at") or now,
+            "last_seen_at": now,
+            "first_price": first_price,
+            "max_price": max(float(cached.get("max_price") or 0), float(info.get("price") or 0), first_price),
+            "first_mc": first_mc,
+            "max_mc": max(float(cached.get("max_mc") or 0), float(info.get("mc") or 0), first_mc),
+            "first_vol": float(cached.get("first_vol") or info.get("vol") or 0),
+            "latest_vol": float(info.get("vol") or cached.get("latest_vol") or 0),
+            "first_liq": float(cached.get("first_liq") or info.get("liq") or 0),
+            "latest_liq": float(info.get("liq") or cached.get("latest_liq") or 0),
+            "holder_count": int(cached.get("holder_count") or 0),
+            "holder_growth_1h": float(cached.get("holder_growth_1h") or 0),
+            "volume_spike_ratio": float(volume_spike_ratio(mint, float(info.get("vol") or 0)) or 0),
+            "first_buyer_count": int(cached.get("first_buyer_count") or 0),
+            "smart_wallet_buys": int(cached.get("smart_wallet_buys") or 0),
+            "smart_wallet_first10": int(cached.get("smart_wallet_first10") or 0),
+            "narrative_tags": cached.get("narrative_tags") or [],
+            "social_links": _dedupe_keep_order((cached.get("social_links") or []) + links),
+            "social_keys": _dedupe_keep_order((cached.get("social_keys") or []) + keys),
+            "narrative_score": int(cached.get("narrative_score") or 0),
+            "deployer_score": int(cached.get("deployer_score") or 0),
+            "max_multiple": float(cached.get("max_multiple") or 1),
+            "green_lights": int(cached.get("green_lights") or 0),
+            "checklist": cached.get("checklist") or [],
+            "milestones": cached.get("milestones") or {},
+            "last_updated": cached.get("last_updated"),
+            "source": source,
+        }
+        if first_price and float(info.get("price") or 0):
+            intel["max_multiple"] = max(intel["max_multiple"], round(float(info.get("price")) / first_price, 2))
+        if first_mc and float(info.get("mc") or 0):
+            intel["max_multiple"] = max(intel["max_multiple"], round(float(info.get("mc")) / first_mc, 2))
+        if len(_token_intel_cache) >= INTEL_MAX_TRACKED and mint not in _token_intel_cache:
+            stale_key = min(_token_intel_cache, key=lambda k: _to_iso(_token_intel_cache[k].get("last_seen_at")) or "")
+            _token_intel_cache.pop(stale_key, None)
+        _token_intel_cache[mint] = dict(intel)
+    persist_token_intel(intel)
+    if intel.get("deployer_wallet"):
+        update_deployer_outcomes(mint, intel.get("max_multiple") or 1, intel.get("deployer_wallet"))
+    return token_intel_payload(intel)
+
+
+def refresh_token_intel(mint, base_info=None, pair=None, force=False):
+    if not mint:
+        return {}
+    cached = token_intel_payload(_token_intel_cache.get(mint) or {})
+    if cached and not force:
+        last_updated = _from_iso(cached.get("last_updated"))
+        if last_updated and (_now_utc() - last_updated).total_seconds() < INTEL_REFRESH_SEC:
+            return cached
+    base_info = dict(base_info or {})
+    base_info.setdefault("mint", mint)
+    if not base_info.get("name") or not base_info.get("price"):
+        try:
+            resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+            if resp.status_code == 200:
+                pairs = resp.json().get("pairs") or []
+                if pairs:
+                    pair = pair or pairs[0]
+                    derived = _process_dex_pair(pair)
+                    if derived:
+                        base_info.update(derived)
+        except Exception as e:
+            print(f"[INTEL] Dex refresh failed for {mint}: {e}", flush=True)
+    seeded = prime_token_intel(base_info, pair=pair, source="refresh")
+    txns = helius_address_transactions(mint, limit=60, timeout=8)
+    flow = extract_wallet_flow_from_swaps(txns, mint)
+    deployer_wallet = seeded.get("deployer_wallet") or resolve_deployer_wallet(mint, txns)
+    if deployer_wallet and deployer_wallet != seeded.get("deployer_wallet"):
+        deployer_stats = register_deployer_launch(deployer_wallet, mint)
+    else:
+        deployer_stats = get_deployer_stats(deployer_wallet)
+    holder_count = get_token_holder_count(mint, txns)
+    holder_growth = update_holder_history(mint, holder_count)
+    narrative = build_narrative_profile(
+        base_info.get("name") or seeded.get("name"),
+        base_info.get("symbol") or seeded.get("symbol"),
+        pair=pair,
+        deployer_stats=deployer_stats,
+        social_keys_list=seeded.get("social_keys") or [],
+    )
+    intel = dict(seeded)
+    intel.update({
+        "deployer_wallet": deployer_wallet,
+        "holder_count": holder_count,
+        "holder_growth_1h": holder_growth,
+        "first_buyer_count": len(flow.get("first_buyers") or []),
+        "smart_wallet_buys": int(flow.get("smart_wallet_buys") or 0),
+        "smart_wallet_first10": int(flow.get("smart_wallet_first10") or 0),
+        "narrative_tags": narrative["tags"],
+        "social_keys": _dedupe_keep_order((seeded.get("social_keys") or []) + narrative["social_keys"]),
+        "narrative_score": narrative["score"],
+        "deployer_score": compute_deployer_reputation(deployer_stats),
+        "last_seen_at": _now_utc(),
+        "last_updated": _now_utc(),
+    })
+    checklist = build_three_signal_checklist(base_info, intel)
+    intel["checklist"] = checklist["items"]
+    intel["green_lights"] = checklist["green_lights"]
+    first_price = float(intel.get("first_price") or 0)
+    first_mc = float(intel.get("first_mc") or 0)
+    if first_price and float(base_info.get("price") or 0):
+        intel["max_multiple"] = max(float(intel.get("max_multiple") or 1), round(float(base_info["price"]) / first_price, 2))
+    if first_mc and float(base_info.get("mc") or 0):
+        intel["max_multiple"] = max(float(intel.get("max_multiple") or 1), round(float(base_info["mc"]) / first_mc, 2))
+    persist_token_intel(intel)
+    with _token_intel_lock:
+        _token_intel_cache[mint] = dict(intel)
+    if deployer_wallet:
+        update_deployer_outcomes(mint, intel.get("max_multiple") or 1, deployer_wallet)
+    return token_intel_payload(intel)
+
+
+def ensure_token_intel(mint, base_info=None, pair=None, force=False):
+    if not mint:
+        return {}
+    cached = token_intel_payload(_token_intel_cache.get(mint) or {})
+    if cached and not force:
+        last_updated = _from_iso(cached.get("last_updated"))
+        if last_updated and (_now_utc() - last_updated).total_seconds() < INTEL_REFRESH_SEC:
+            return cached
+    try:
+        return refresh_token_intel(mint, base_info=base_info, pair=pair, force=force)
+    except Exception as e:
+        print(f"[INTEL] refresh failed for {mint}: {e}", flush=True)
+        return cached or token_intel_payload(prime_token_intel(base_info or {"mint": mint}, pair=pair))
+
+
+def token_pattern_monitor():
+    time.sleep(20)
+    while True:
+        try:
+            feed = list(market_feed)[:60]
+            ranked = sorted(
+                [item for item in feed if item.get("mint")],
+                key=lambda item: ((item.get("score") or 0), -(item.get("age_min") or 9999)),
+                reverse=True,
+            )[:8]
+            for item in ranked:
+                intel = ensure_token_intel(item["mint"], base_info=item, force=False)
+                if intel:
+                    item["intel"] = intel
+                    item["green_lights"] = intel.get("green_lights", 0)
+                    item["deployer_score"] = intel.get("deployer_score", 0)
+                    item["narrative_score"] = intel.get("narrative_score", 0)
+            with _token_intel_lock:
+                if len(_token_intel_cache) > INTEL_MAX_TRACKED:
+                    by_age = sorted(_token_intel_cache.items(), key=lambda kv: str(kv[1].get("last_seen_at") or ""))
+                    for stale_key, _ in by_age[:max(0, len(_token_intel_cache) - INTEL_MAX_TRACKED)]:
+                        _token_intel_cache.pop(stale_key, None)
+        except Exception as e:
+            print(f"[INTEL] monitor error: {e}", flush=True)
+        time.sleep(45)
 
 def check_whale_wallets():
     """Poll recent transactions of whale wallets and copy their buys."""
@@ -1664,6 +2622,12 @@ def _process_dex_pair(p):
             "ts":       int(time.time()),
         }
         info["score"] = min(100, ai_score(info) + check_social_signals(str(p)))
+        intel = prime_token_intel(info, pair=p, source="scanner")
+        if intel:
+            info["intel"] = intel
+            info["green_lights"] = intel.get("green_lights", 0)
+            info["deployer_score"] = intel.get("deployer_score", 0)
+            info["narrative_score"] = intel.get("narrative_score", 0)
         return info
     except Exception as _e:
         print(f"[ERROR] {_e}", flush=True)
@@ -1672,6 +2636,12 @@ def _process_dex_pair(p):
 def _broadcast_signal(info):
     """Push info to market_feed and evaluate against all running bots."""
     mint = info["mint"]
+    intel = ensure_token_intel(mint, base_info=info, pair=None, force=False)
+    if intel:
+        info["intel"] = intel
+        info["green_lights"] = intel.get("green_lights", 0)
+        info["deployer_score"] = intel.get("deployer_score", 0)
+        info["narrative_score"] = intel.get("narrative_score", 0)
     market_feed.appendleft(info)
     record_price(mint, info["price"])
     with user_bots_lock:
@@ -1927,7 +2897,8 @@ def auto_restart_bots():
             uid = row["user_id"]
             try:
                 kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
-                settings = dict(PRESETS.get(row["preset"], PRESETS["balanced"]))
+                preset_name = normalize_preset_name(row["preset"])
+                settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
                 if row.get("max_correlated") is not None:
                     settings["max_correlated"] = row["max_correlated"]
                 if row.get("drawdown_limit_sol") is not None:
@@ -2239,6 +3210,7 @@ def ensure_background_workers_started():
             check_whale_wallets,
             global_scanner,
             new_pairs_scanner,
+            token_pattern_monitor,
             auto_restart_bots,
             warm_sender_connections,
             listing_scanner,
@@ -2589,7 +3561,7 @@ def setup():
     error = ""
     if request.method == "POST":
         private_key = request.form.get("private_key","").strip()
-        preset      = request.form.get("preset","steady")
+        preset      = normalize_preset_name(request.form.get("preset","steady"))
         run_mode    = request.form.get("run_mode","indefinite")
         duration    = int(request.form.get("run_duration_min",0) or 0)
         profit      = float(request.form.get("profit_target_sol",0) or 0)
@@ -2733,7 +3705,7 @@ def api_start():
         kp = Keypair.from_bytes(base58.b58decode(decrypt_key(w["encrypted_key"])))
     except Exception:
         return jsonify({"ok":False,"msg":"Wallet key could not be decrypted — please re-enter your private key at /setup"})
-    preset   = bs["preset"] if bs else "balanced"
+    preset   = normalize_preset_name(bs["preset"] if bs else "balanced")
     settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
     # Apply user-specific overrides saved in DB on top of preset defaults
     if bs:
@@ -2832,7 +3804,10 @@ def api_settings():
         ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
         ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
         ("drawdown_limit_sol", float), ("cooldown_min", int),
-        ("min_vol", float), ("min_score", int),
+        ("min_vol", float), ("min_score", int), ("risk_per_trade_pct", float),
+        ("min_holder_growth_pct", float), ("min_narrative_score", int),
+        ("min_green_lights", int), ("min_volume_spike_mult", float),
+        ("late_entry_mult", float), ("nuclear_narrative_score", int),
     ]:
         if key in data:
             try: overrides[key] = cast(data[key])
@@ -2946,8 +3921,24 @@ def api_wallet_tree(mint):
 def api_market_feed():
     """Polling endpoint — returns latest market tokens as JSON."""
     since = int(request.args.get("since", 0))
-    tokens = [t for t in market_feed if t.get("ts", 0) > since]
-    return jsonify(tokens[:30])
+    latest = {}
+    for item in list(market_feed):
+        mint = item.get("mint")
+        ts = int(item.get("ts", 0) or 0)
+        if not mint or ts <= since:
+            continue
+        prev = latest.get(mint)
+        if not prev or ts > int(prev.get("ts", 0) or 0):
+            merged = dict(item)
+            intel = merged.get("intel") or token_intel_payload(_token_intel_cache.get(mint) or {})
+            if intel:
+                merged["intel"] = intel
+                merged["green_lights"] = intel.get("green_lights", 0)
+                merged["deployer_score"] = intel.get("deployer_score", 0)
+                merged["narrative_score"] = intel.get("narrative_score", 0)
+            latest[mint] = merged
+    tokens = sorted(latest.values(), key=lambda item: int(item.get("ts", 0) or 0), reverse=True)
+    return jsonify(tokens[:40])
 
 @app.route("/api/manual-buy", methods=["POST"])
 @login_required
@@ -3063,6 +4054,77 @@ def api_signal_explorer():
             "pass_rate": round(passed / total * 100, 1) if total > 0 else 0,
             "top_reject_reasons": [{"reason": r, "count": c} for r, c in top_reasons],
         }
+    })
+
+
+@app.route("/api/pattern-lab")
+@login_required
+def api_pattern_lab():
+    tokens = []
+    with _token_intel_lock:
+        tokens = [token_intel_payload(row) for row in _token_intel_cache.values()]
+    if len(tokens) < 10:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT *
+                FROM token_intel
+                ORDER BY max_multiple DESC, last_updated DESC
+                LIMIT 40
+            """)
+            tokens.extend(token_intel_payload(row) for row in cur.fetchall())
+        finally:
+            db_return(conn)
+    deduped = {}
+    for token in tokens:
+        mint = token.get("mint")
+        if mint and mint not in deduped:
+            deduped[mint] = token
+    ranked = sorted(
+        deduped.values(),
+        key=lambda token: (
+            float(token.get("max_multiple") or 1),
+            int(token.get("green_lights") or 0),
+            int(token.get("narrative_score") or 0),
+        ),
+        reverse=True,
+    )[:10]
+    tag_counts = {}
+    for token in ranked:
+        for tag in token.get("narrative_tags") or []:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    deployers = []
+    for token in ranked:
+        wallet = token.get("deployer_wallet")
+        if not wallet:
+            continue
+        stats = get_deployer_stats(wallet)
+        deployers.append({
+            "wallet": wallet,
+            "reputation_score": int(stats.get("reputation_score") or 0),
+            "launches_total": int(stats.get("launches_total") or 0),
+            "wins_2x": int(stats.get("wins_2x") or 0),
+            "wins_5x": int(stats.get("wins_5x") or 0),
+            "best_multiple": float(stats.get("best_multiple") or 1),
+        })
+    deployers = sorted(deployers, key=lambda row: (row["reputation_score"], row["best_multiple"]), reverse=True)
+    return jsonify({
+        "tokens": [{
+            "mint": token.get("mint"),
+            "name": token.get("name"),
+            "symbol": token.get("symbol"),
+            "max_multiple": round(float(token.get("max_multiple") or 1), 2),
+            "green_lights": int(token.get("green_lights") or 0),
+            "deployer_wallet": token.get("deployer_wallet"),
+            "deployer_score": int(token.get("deployer_score") or 0),
+            "narrative_score": int(token.get("narrative_score") or 0),
+            "narrative_tags": token.get("narrative_tags") or [],
+            "holder_growth_1h": float(token.get("holder_growth_1h") or 0),
+            "volume_spike_ratio": float(token.get("volume_spike_ratio") or 0),
+        } for token in ranked],
+        "deployers": deployers[:6],
+        "themes": [{"tag": tag, "count": count} for tag, count in sorted(tag_counts.items(), key=lambda item: -item[1])[:6]],
     })
 
 @app.route("/api/pnl-history")
@@ -4116,6 +5178,9 @@ DASHBOARD_HTML = _CSS + """
         <div class="glass" id="sig-detail">
           <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Click a signal to view details</div>
         </div>
+        <div class="glass" id="pattern-lab" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Pattern lab loading…</div>
+        </div>
       </div>
     </div>
   </div>
@@ -4212,9 +5277,9 @@ DASHBOARD_HTML = _CSS + """
         <div class="fgroup"><label class="flabel">Cooldown (min)</label><input class="finput" id="s-cooldown" type="number" value="10"></div>
       </div>
       <div class="glass">
-        <div class="fgroup"><label class="flabel">TP1 Multiplier</label><input class="finput" id="s-tp1" type="number" step="0.1" value="1.5"></div>
-        <div class="fgroup"><label class="flabel">TP2 Multiplier</label><input class="finput" id="s-tp2" type="number" step="0.1" value="2.0"></div>
-        <div class="fgroup"><label class="flabel">Stop Loss</label><input class="finput" id="s-sl" type="number" step="0.05" value="0.75"></div>
+        <div class="fgroup"><label class="flabel">TP1 Multiplier</label><input class="finput" id="s-tp1" type="number" step="0.1" value="2.0"></div>
+        <div class="fgroup"><label class="flabel">TP2 Multiplier</label><input class="finput" id="s-tp2" type="number" step="0.1" value="4.0"></div>
+        <div class="fgroup"><label class="flabel">Stop Loss</label><input class="finput" id="s-sl" type="number" step="0.05" value="0.70"></div>
       </div>
       <div class="glass">
         <div class="fgroup"><label class="flabel">Trailing Stop %</label><input class="finput" id="s-trail" type="number" step="0.05" value="0.20"></div>
@@ -4223,6 +5288,19 @@ DASHBOARD_HTML = _CSS + """
       <div class="glass">
         <div class="fgroup"><label class="flabel">Min Volume ($)</label><input class="finput" id="s-minvol" type="number" step="100" value="3000"></div>
         <div class="fgroup"><label class="flabel">Min AI Score (0-100)</label><input class="finput" id="s-minscore" type="number" min="0" max="100" value="30"></div>
+      </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Risk Per Trade %</label><input class="finput" id="s-risk" type="number" step="0.1" value="2.0"></div>
+        <div class="fgroup"><label class="flabel">Holder Growth % (1h)</label><input class="finput" id="s-holders" type="number" step="5" value="50"></div>
+      </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Volume Spike Multiple</label><input class="finput" id="s-volspike" type="number" step="0.5" value="10"></div>
+        <div class="fgroup"><label class="flabel">Min Narrative Score</label><input class="finput" id="s-narr" type="number" step="1" value="20"></div>
+      </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Green Lights Required</label><input class="finput" id="s-lights" type="number" min="1" max="3" value="3"></div>
+        <div class="fgroup"><label class="flabel">Late Entry Max Multiple</label><input class="finput" id="s-latemult" type="number" step="0.5" value="5.0"></div>
+        <div class="fgroup"><label class="flabel">Nuclear Narrative Score</label><input class="finput" id="s-nuclear" type="number" step="1" value="40"></div>
       </div>
     </div>
     <div style="margin-top:16px;display:flex;gap:10px">
@@ -4268,7 +5346,8 @@ let selectedMint = null, logBarExpanded = true;
 let treeCanvas = null, treeCtx = null;
 let _charts = {};
 let _activeTab = 'scanner';
-let _sigData = [], _sigSelected = null, sigFilter = 'all';
+let _sigData = [], _sigView = [], _sigSelected = null, sigFilter = 'all';
+let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _tabPollers = {};
 
 // ── Tab System ────────────────────────────────────────────────────────────────
@@ -4316,6 +5395,7 @@ function fmtAge(m) { return m < 60 ? m.toFixed(0) + 'm' : (m/60).toFixed(1) + 'h
 function chgClass(v) { return v > 0 ? 'chg-pos' : v < 0 ? 'chg-neg' : 'chg-0'; }
 function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
+function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
 function tokColor(name) {
   const h = [...(name||'?')].reduce((a,c) => a + c.charCodeAt(0), 0);
   return ['#14c784','#3b82f6','#f59e0b','#a855f7','#06b6d4','#f43f5e','#84cc16','#f97316'][h % 8];
@@ -4367,7 +5447,7 @@ function renderTokenRows() {
             <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
             <div>
               <div class="tok-name">${t.name||sym}${sc>=80?' &#x1f525;':''}</div>
-              <div class="tok-sym">${sym}${t.whale?' &#x1f40b;':''}</div>
+              <div class="tok-sym">${sym}${t.whale?' &#x1f40b;':''} · ${(t.green_lights||0)}/3 GL · N${t.narrative_score||0}</div>
             </div>
           </div>
         </td>
@@ -4508,9 +5588,12 @@ async function pollFeed() {
   try {
     const tokens = await fetch('/api/market-feed?since=' + feedSince).then(r => r.json());
     if (tokens && tokens.length) {
-      const mints = new Set(allTokens.map(t => t.mint));
-      tokens.forEach(t => { if (!mints.has(t.mint)) allTokens.unshift(t); });
-      if (allTokens.length > 100) allTokens = allTokens.slice(0, 100);
+      const byMint = new Map(allTokens.map(t => [t.mint, t]));
+      tokens.forEach(t => {
+        const prev = byMint.get(t.mint) || {};
+        byMint.set(t.mint, { ...prev, ...t, intel: { ...(prev.intel||{}), ...(t.intel||{}) } });
+      });
+      allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 100);
       feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
       renderTokenRows();
       updateTicker();
@@ -4564,10 +5647,10 @@ async function pollListings() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {
-  safe:       { max_buy_sol:0.02, tp1_mult:1.3, tp2_mult:2.0, stop_loss:0.85, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3, min_vol:5000, min_score:40 },
-  balanced:   { max_buy_sol:0.04, tp1_mult:1.5, tp2_mult:2.5, stop_loss:0.75, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5, min_vol:3000, min_score:30 },
-  aggressive: { max_buy_sol:0.07, tp1_mult:1.8, tp2_mult:4.0, stop_loss:0.65, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8, min_vol:1000, min_score:20 },
-  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.60, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0, min_vol:500,  min_score:15 }
+  safe:       { max_buy_sol:0.02, tp1_mult:2.0, tp2_mult:3.0, stop_loss:0.70, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3, min_vol:5000, min_score:40, risk_per_trade_pct:2.0, min_holder_growth_pct:50, min_narrative_score:22, min_green_lights:3, min_volume_spike_mult:12, late_entry_mult:5.0, nuclear_narrative_score:42 },
+  balanced:   { max_buy_sol:0.04, tp1_mult:2.0, tp2_mult:4.0, stop_loss:0.70, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5, min_vol:3000, min_score:30, risk_per_trade_pct:2.0, min_holder_growth_pct:50, min_narrative_score:20, min_green_lights:3, min_volume_spike_mult:10, late_entry_mult:5.0, nuclear_narrative_score:40 },
+  aggressive: { max_buy_sol:0.07, tp1_mult:2.0, tp2_mult:6.0, stop_loss:0.70, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8, min_vol:1000, min_score:20, risk_per_trade_pct:2.0, min_holder_growth_pct:40, min_narrative_score:18, min_green_lights:3, min_volume_spike_mult:8,  late_entry_mult:5.0, nuclear_narrative_score:38 },
+  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.70, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0, min_vol:500,  min_score:15, risk_per_trade_pct:2.0, min_holder_growth_pct:30, min_narrative_score:15, min_green_lights:3, min_volume_spike_mult:6,  late_entry_mult:5.0, nuclear_narrative_score:35 }
 };
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
@@ -4578,7 +5661,9 @@ function selectPreset(name) {
   if (!p) return;
   const m = { 's-buy':p.max_buy_sol, 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss,
               's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol,
-              's-minvol':p.min_vol, 's-minscore':p.min_score };
+              's-minvol':p.min_vol, 's-minscore':p.min_score, 's-risk':p.risk_per_trade_pct,
+              's-holders':p.min_holder_growth_pct, 's-narr':p.min_narrative_score, 's-lights':p.min_green_lights,
+              's-volspike':p.min_volume_spike_mult, 's-latemult':p.late_entry_mult, 's-nuclear':p.nuclear_narrative_score };
   for (const [id, val] of Object.entries(m)) {
     const inp = document.getElementById(id);
     if (inp) inp.value = val;
@@ -4591,14 +5676,21 @@ async function saveSettings() {
       preset:              document.getElementById('s-preset').value,
       max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
       cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
-      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 1.5),
-      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 2.0),
-      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.75),
+      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 2.0),
+      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 4.0),
+      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.70),
       trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
       max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
       drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
       min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
       min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
+      risk_per_trade_pct:  parseFloat(document.getElementById('s-risk')?.value || 2.0),
+      min_holder_growth_pct: parseFloat(document.getElementById('s-holders')?.value || 50),
+      min_narrative_score: parseInt(document.getElementById('s-narr')?.value || 20),
+      min_green_lights:    parseInt(document.getElementById('s-lights')?.value || 3),
+      min_volume_spike_mult: parseFloat(document.getElementById('s-volspike')?.value || 10),
+      late_entry_mult:     parseFloat(document.getElementById('s-latemult')?.value || 5.0),
+      nuclear_narrative_score: parseInt(document.getElementById('s-nuclear')?.value || 40),
     })
   }).then(r => r.json()).catch(() => null);
   showToast(res && res.ok !== false ? '\u2713 Settings saved' : '\u26a0 Save failed', res && res.ok !== false);
@@ -4667,14 +5759,21 @@ async function refresh() {
     const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
     setVal('s-maxpos',   s.max_correlated   ?? 5);
     setVal('s-cooldown', s.cooldown_min     ?? 10);
-    setVal('s-tp1',      s.tp1_mult         ?? 1.5);
-    setVal('s-tp2',      s.tp2_mult         ?? 2.5);
-    setVal('s-sl',       s.stop_loss        ?? 0.75);
+    setVal('s-tp1',      s.tp1_mult         ?? 2.0);
+    setVal('s-tp2',      s.tp2_mult         ?? 4.0);
+    setVal('s-sl',       s.stop_loss        ?? 0.70);
     setVal('s-trail',    s.trail_pct        ?? 0.20);
     setVal('s-buy',      s.max_buy_sol      ?? 0.04);
     setVal('s-dd',       s.drawdown_limit_sol ?? 0.5);
     setVal('s-minvol',   s.min_vol          ?? 3000);
     setVal('s-minscore', s.min_score        ?? 30);
+    setVal('s-risk',     s.risk_per_trade_pct ?? 2.0);
+    setVal('s-holders',  s.min_holder_growth_pct ?? 50);
+    setVal('s-narr',     s.min_narrative_score ?? 20);
+    setVal('s-lights',   s.min_green_lights ?? 3);
+    setVal('s-volspike', s.min_volume_spike_mult ?? 10);
+    setVal('s-latemult', s.late_entry_mult ?? 5.0);
+    setVal('s-nuclear',  s.nuclear_narrative_score ?? 40);
   }
 }
 
@@ -4704,13 +5803,19 @@ function showToast(msg, ok=true) {
 // ══════════════════════════ SIGNAL EXPLORER ══════════════════════════
 async function pollSignals() {
   try {
-    const data = await fetch('/api/signal-explorer').then(r => r.json());
+    const [data, pattern] = await Promise.all([
+      fetch('/api/signal-explorer').then(r => r.json()).catch(() => null),
+      fetch('/api/pattern-lab').then(r => r.json()).catch(() => null),
+    ]);
+    if (!data) return;
     _sigData = data.recent || [];
+    _patternLab = pattern || { tokens: [], deployers: [], themes: [] };
     document.getElementById('sig-total').textContent = data.stats.total_evaluated;
     document.getElementById('sig-pass-rate').textContent = data.stats.pass_rate + '%';
     const topR = data.stats.top_reject_reasons;
     document.getElementById('sig-top-reject').textContent = topR.length ? topR[0].reason.slice(0,30) : '\u2014';
     renderSignals();
+    renderPatternLab();
   } catch(e) {}
 }
 
@@ -4719,15 +5824,17 @@ function renderSignals() {
   if (sigFilter === 'pass') items = items.filter(s => s.passed);
   if (sigFilter === 'fail') items = items.filter(s => !s.passed);
   const container = document.getElementById('sig-list');
-  if (!items.length) { container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">No signals yet \u2014 start the bot</div>'; return; }
-  container.innerHTML = items.slice(0, 80).map((s, i) => {
+  _sigView = items.slice(0, 80);
+  if (!_sigView.length) { container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">No signals yet \u2014 start the bot</div>'; return; }
+  container.innerHTML = _sigView.map((s, i) => {
     const sc = s.score?.total || 0;
     const col = scoreColor(sc);
+    const greens = s.intel?.green_lights || 0;
     return `<div class="sig-row${_sigSelected===i?' active':''}" onclick="showSignalDetail(${i})">
       <div style="width:6px;height:6px;border-radius:50%;background:${s.passed?'var(--grn)':'var(--red2)'};flex-shrink:0"></div>
       <div style="flex:1;min-width:0">
         <div style="font-weight:600;color:var(--t1);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${s.name||'?'}</div>
-        <div style="font-size:10px;color:var(--t3)">${s.reason||''}</div>
+        <div style="font-size:10px;color:var(--t3)">${greens}/3 lights · ${s.reason||''}</div>
       </div>
       <div class="score-bar"><div class="score-bar-fill" style="width:${sc}%;background:${col}"></div></div>
       <span style="font-size:10px;font-weight:700;color:${col};font-family:monospace;width:22px;text-align:right">${sc}</span>
@@ -4737,14 +5844,59 @@ function renderSignals() {
   }).join('');
 }
 
+function renderPatternLab() {
+  const box = document.getElementById('pattern-lab');
+  if (!box) return;
+  const tokens = _patternLab.tokens || [];
+  const deployers = _patternLab.deployers || [];
+  const themes = _patternLab.themes || [];
+  if (!tokens.length) {
+    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Pattern lab will fill as the scanner tracks deployers and runners.</div>';
+    return;
+  }
+  box.innerHTML = `
+    <div class="sec-label">Pattern Lab</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      ${themes.map(t => `<span class="badge bg-blue">${t.tag} · ${t.count}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No repeating themes yet</span>'}
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Mapped runners</div>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
+      ${tokens.slice(0,5).map(t => `
+        <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px;background:rgba(255,255,255,.02)">
+          <div style="display:flex;justify-content:space-between;gap:8px">
+            <div>
+              <div style="font-size:12px;font-weight:700;color:var(--t1)">${t.name||t.symbol||'?'}</div>
+              <div style="font-size:10px;color:var(--t3)">${(t.narrative_tags||[]).join(' · ') || 'no tags yet'}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-size:12px;font-weight:700;color:var(--gold2)">${(t.max_multiple||1).toFixed(2)}x</div>
+              <div style="font-size:10px;color:var(--t3)">${t.green_lights||0}/3 lights</div>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>
+    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Top deployers</div>
+    <div style="display:flex;flex-direction:column;gap:6px">
+      ${deployers.slice(0,4).map(d => `
+        <div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11px">
+          <span style="color:var(--t2);font-family:monospace">${shortWallet(d.wallet)}</span>
+          <span style="color:var(--t1)">rep ${d.reputation_score} · ${d.best_multiple.toFixed(2)}x best</span>
+        </div>`).join('')}
+    </div>
+  `;
+}
+
 function showSignalDetail(idx) {
   _sigSelected = idx;
   renderSignals();
-  const s = _sigData[idx];
+  const s = _sigView[idx];
   if (!s) return;
   const sc = s.score || {};
+  const intel = s.intel || {};
+  const checklist = intel.checklist || [];
+  const links = intel.social_links || [];
+  const tags = intel.narrative_tags || [];
   const detail = document.getElementById('sig-detail');
-  // Radar chart + filter pipeline + score breakdown
   detail.innerHTML = `
     <div style="font-weight:700;font-size:14px;margin-bottom:4px">${s.name||'?'}</div>
     <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:12px">${s.mint||''}</div>
@@ -4755,6 +5907,28 @@ function showSignalDetail(idx) {
       <div style="font-size:11px"><span style="color:var(--t3)">Liq</span> <b>${fmtK(s.liq)}</b></div>
       <div style="font-size:11px"><span style="color:var(--t3)">Age</span> <b>${fmtAge(s.age_min||0)}</b></div>
       <div style="font-size:11px"><span style="color:var(--t3)">Chg</span> <b class="${chgClass(s.change)}">${chgStr(s.change||0)}</b></div>
+    </div>
+    <div class="sec-label">Three-Signal Checklist</div>
+    ${(checklist||[]).map(c => `<div class="filter-step">
+      <div class="filter-dot ${c.passed?'pass':'fail'}"></div>
+      <span style="flex:1">${c.name}</span>
+      <span style="color:var(--t1);font-weight:600;font-size:11px">${c.value||''}</span>
+    </div>`).join('') || '<div style="font-size:11px;color:var(--t3);margin-bottom:10px">Waiting for deployer and holder intel…</div>'}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 14px">
+      <span class="badge bg-blue">${intel.green_lights||0}/3 green lights</span>
+      <span class="badge bg-gold">Narrative ${intel.narrative_score||0}</span>
+      <span class="badge bg-grn">Deployer ${intel.deployer_score||0}</span>
+      <span class="badge bg-muted">${(intel.volume_spike_ratio||0).toFixed ? intel.volume_spike_ratio.toFixed(1) : intel.volume_spike_ratio || 0}x vol</span>
+      <span class="badge bg-muted">${intel.holder_growth_1h||0}% holders</span>
+    </div>
+    <div class="sec-label">Deployer / Social Intent</div>
+    <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Deployer: <span style="font-family:monospace;color:var(--t1)">${shortWallet(intel.deployer_wallet)}</span></div>
+    <div style="font-size:11px;color:var(--t2);margin-bottom:6px">First buyers: <b style="color:var(--t1)">${intel.first_buyer_count||0}</b> &nbsp; Smart in first 10: <b style="color:var(--t1)">${intel.smart_wallet_first10||0}</b></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      ${tags.map(tag => `<span class="badge bg-blue">${tag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No narrative tags yet</span>'}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
+      ${links.slice(0,4).map(link => `<a class="badge bg-muted" href="${link}" target="_blank" rel="noreferrer">${link.replace(/^https?:\\/\\//,'').slice(0,28)}</a>`).join('') || '<span style="font-size:11px;color:var(--t3)">No socials found</span>'}
     </div>
     <div class="sec-label">AI Score Breakdown (${sc.total||0}/100)</div>
     <canvas id="sig-radar" height="200" style="margin-bottom:14px"></canvas>
