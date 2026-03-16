@@ -1,0 +1,32 @@
+{
+  "packageId": "com.soltrader.app",
+  "host": "soltrader.app",
+  "name": "SolTrader",
+  "launcherName": "SolTrader",
+  "display": "standalone",
+  "themeColor": "#07101E",
+  "navigationColor": "#07101E",
+  "navigationColorDark": "#07101E",
+  "navigationDividerColor": "#1A2E45",
+  "navigationDividerColorDark": "#1A2E45",
+  "backgroundColor": "#07101E",
+  "enableNotifications": false,
+  "startUrl": "/",
+  "iconUrl": "https://soltrader.app/icon-512.png",
+  "maskableIconUrl": "https://soltrader.app/icon-512.png",
+  "monochromeIconUrl": "https://soltrader.app/icon-512.png",
+  "shortcuts": [
+    {"name": "Dashboard", "shortName": "Dashboard", "url": "/dashboard", "description": "Open trading dashboard"},
+    {"name": "Sign In",   "shortName": "Sign In",   "url": "/login",     "description": "Sign into your account"}
+  ],
+  "signingKey": {
+    "path": "./soltrader-keystore.jks",
+    "alias": "soltrader"
+  },
+  "appVersionCode": 1,
+  "appVersionName": "1.0.0",
+  "orientation": "portrait",
+  "fullScopeUrl": "https://soltrader.app/",
+  "minSdkVersion": 21,
+  "targetSdkVersion": 34
+}
