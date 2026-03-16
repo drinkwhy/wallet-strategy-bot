@@ -186,6 +186,15 @@ PRESETS = {
 PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
 
+def normalize_preset_name(preset):
+    preset = str(preset or "balanced").strip().lower()
+    aliases = {
+        "steady": "balanced",
+        "max": "degen",
+    }
+    preset = aliases.get(preset, preset)
+    return preset if preset in PRESETS else "balanced"
+
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -1211,7 +1220,7 @@ class BotInstance:
                     cooldown_min = self.settings.get("cooldown_min", 10)
                     cooldown_sec = cooldown_min * 60
                     self.cooldown_until = time.time() + cooldown_sec
-                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {name}")
+                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {pos['name']}")
                 # Telegram alert
                 try:
                     conn = db()
@@ -1614,7 +1623,8 @@ def check_whale_wallets():
                                         if bot.running and mint not in bot.positions:
                                             bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
                                             try:
-                                                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, 0)
+                                                change = (p.get("priceChange") or {}).get("h1", 0) or 0
+                                                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, change)
                                             except Exception as _e:
                                                 print(f"[ERROR] {_e}", flush=True)
                                 except Exception as _e:
@@ -2646,7 +2656,7 @@ def dashboard():
             .replace("{{UPGRADE_BTN}}", upgrade_btn)
             .replace("{{PLAN}}", plan_info.get("label", ""))
             .replace("{{WALLET}}", wallet.get("public_key", ""))
-            .replace("{{PRESET}}", (bsettings or {}).get("preset", "balanced")),
+            .replace("{{PRESET}}", normalize_preset_name((bsettings or {}).get("preset", "balanced"))),
             mimetype="text/html"
         )
     except Exception as e:
@@ -2811,8 +2821,8 @@ def api_manual_sell():
 @login_required
 def api_settings():
     uid  = session["user_id"]
-    data = request.json
-    preset   = data.get("preset","balanced")
+    data = request.json or {}
+    preset   = normalize_preset_name(data.get("preset","balanced"))
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
@@ -3087,7 +3097,8 @@ def api_pnl_history():
     worst_t = 0
     for t in trades:
         pnl = t["pnl_sol"] or 0
-        if t["action"] == "sell":
+        action = str(t.get("action") or "").upper()
+        if action.startswith("SELL"):
             running_pnl += pnl
             if pnl > 0: wins += 1
             else: losses += 1
