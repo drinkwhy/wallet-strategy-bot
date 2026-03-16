@@ -252,6 +252,36 @@ def dashboard_preset_settings():
         for preset_name in ("safe", "balanced", "aggressive", "degen")
     }
 
+
+def replay_recent_market_feed(bot, limit=40):
+    """Re-evaluate the latest unique scanner candidates with current bot settings."""
+    if not bot:
+        return 0
+    seen = set()
+    replayed = 0
+    for item in list(market_feed):
+        mint = item.get("mint")
+        if not mint or mint in seen:
+            continue
+        seen.add(mint)
+        try:
+            bot.evaluate_signal(
+                mint,
+                item.get("name", "Unknown"),
+                float(item.get("price") or 0),
+                float(item.get("mc") or 0),
+                float(item.get("vol") or 0),
+                float(item.get("liq") or 0),
+                float(item.get("age_min") or 0),
+                float(item.get("change") or 0),
+            )
+            replayed += 1
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
+        if replayed >= limit:
+            break
+    return replayed
+
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
@@ -3977,17 +4007,21 @@ def api_settings():
     finally:
         db_return(conn)
     bot = user_bots.get(uid)
+    replayed = 0
     if bot:
         bot.settings.update(PRESETS.get(preset, bot.settings))
         bot.settings.update(overrides)
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
         bot.profit_target    = profit
+        replayed = replay_recent_market_feed(bot)
+        bot.log_msg(f"Settings updated — mode {preset}. Re-evaluated {replayed} recent scanner candidates.")
     return jsonify({
         "ok": True,
         "preset": preset,
         "overrides_count": len(overrides),
         "saved_fields": sorted(overrides.keys()),
+        "replayed_candidates": replayed,
     })
 
 @app.route("/api/chart/<mint>")
@@ -5955,6 +5989,7 @@ async function saveSettings() {
       [
         `Mode: ${presetName}`,
         `${res.overrides_count ?? 0} overrides saved`,
+        `${res.replayed_candidates ?? 0} recent coins rechecked`,
         'Server confirmed',
       ]
     );
