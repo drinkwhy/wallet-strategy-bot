@@ -1701,15 +1701,15 @@ class BotInstance:
         trade_sol = round(trade_sol, 4)
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
         
-        # ── Enhanced pre-trade risk check ─────────────────────────────────────
+        # ── Enhanced pre-trade risk check (warn only, don't block) ────────────
         if self.enhanced_enabled:
             try:
                 can_trade, cb_reason = self.risk_engine.circuit_breaker.is_trading_allowed(self.user_id)
                 if not can_trade:
-                    self.log_msg(f"⛔ ENHANCED CIRCUIT BREAKER — {cb_reason}")
-                    return
+                    self.log_msg(f"⚠️ Enhanced circuit breaker warning: {cb_reason}")
+                    # Don't return - let original circuit breaker handle blocking
                 
-                # Full pre-trade risk assessment
+                # Full pre-trade risk assessment (informational only)
                 risk_ok, risk_reasons, assessment = self.risk_engine.pre_trade_check(
                     user_id=self.user_id,
                     mint=mint,
@@ -1723,13 +1723,11 @@ class BotInstance:
                     token_age_sec=age_min * 60,
                 )
                 
+                # Log warnings but don't block (let original filters handle it)
                 if not risk_ok:
-                    for reason in risk_reasons[:3]:
-                        self.log_msg(f"⚠️ Risk: {reason}")
-                    self.log_filter(name, mint, False, f"Enhanced risk check failed: {risk_reasons[0] if risk_reasons else 'unknown'}")
-                    return
+                    for reason in risk_reasons[:2]:
+                        self.log_msg(f"⚠️ Risk note: {reason}")
                 
-                # Log any warnings
                 if assessment.warnings:
                     for warn in assessment.warnings[:2]:
                         self.log_msg(f"📋 {warn}")
