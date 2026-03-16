@@ -148,8 +148,8 @@ PRESETS = {
         "trail_pct":0.15,"stop_loss":0.70,"max_age_min":360,"time_stop_min":20,
         "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":40,"cooldown_min":15,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":50,"min_narrative_score":22,
-        "min_green_lights":3,"min_volume_spike_mult":12,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":18,
+        "min_green_lights":2,"min_volume_spike_mult":8,"late_entry_mult":5.0,
         "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
@@ -161,8 +161,8 @@ PRESETS = {
         "trail_pct":0.20,"stop_loss":0.70,"max_age_min":240,"time_stop_min":30,
         "min_liq":8000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":30,"cooldown_min":10,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":50,"min_narrative_score":20,
-        "min_green_lights":3,"min_volume_spike_mult":10,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
+        "min_green_lights":2,"min_volume_spike_mult":6,"late_entry_mult":5.0,
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
@@ -174,8 +174,8 @@ PRESETS = {
         "trail_pct":0.25,"stop_loss":0.70,"max_age_min":180,"time_stop_min":45,
         "min_liq":5000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":20,"cooldown_min":7,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":18,
-        "min_green_lights":3,"min_volume_spike_mult":8,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":25,"min_narrative_score":14,
+        "min_green_lights":2,"min_volume_spike_mult":5,"late_entry_mult":5.0,
         "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
@@ -187,8 +187,8 @@ PRESETS = {
         "trail_pct":0.30,"stop_loss":0.70,"max_age_min":120,"time_stop_min":60,
         "min_liq":3000,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "min_vol":500,"min_score":15,"cooldown_min":5,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":15,
-        "min_green_lights":3,"min_volume_spike_mult":6,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":12,
+        "min_green_lights":1,"min_volume_spike_mult":4,"late_entry_mult":5.0,
         "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
@@ -1894,8 +1894,8 @@ class BotInstance:
             return
         utc_hour = time.gmtime().tm_hour
         if not (10 <= utc_hour < 23):
-            if change < 30:
-                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < 30%"
+            if change < 20 and score_total < (min_score + 10):
+                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < 20% and score {score_total} not strong enough"
                 self.log_signal_entry(sig_entry)
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
@@ -1914,9 +1914,18 @@ class BotInstance:
         threat_flags = intel.get("threat_flags") or []
         can_exit = intel.get("can_exit")
         transfer_hook_enabled = bool(intel.get("transfer_hook_enabled"))
+        whale_score = int(intel.get("whale_score") or 0)
+        whale_action_score = int(intel.get("whale_action_score") or 0)
         checklist = build_three_signal_checklist(_sinfo, intel, settings=s)
         intel["checklist"] = checklist["items"]
         intel["green_lights"] = checklist["green_lights"]
+        adaptive_green_override = (
+            checklist["green_lights"] + 1 >= min_green_lights and
+            whale_score >= 55 and
+            whale_action_score >= 40 and
+            threat_score < 25 and
+            score_total >= (min_score + 5)
+        )
         sig_entry["intel"] = intel
         sig_entry["filters"].extend([
             {
@@ -1939,15 +1948,15 @@ class BotInstance:
             },
             {
                 "name": "Whale / Entity Score",
-                "passed": int(intel.get("whale_score") or 0) >= 35,
+                "passed": whale_score >= 28,
                 "value": f"w {intel.get('whale_score', 0)} · a {intel.get('whale_action_score', 0)} · cc {intel.get('cluster_confidence', 0)}",
-                "threshold": "whale >= 35",
+                "threshold": "whale >= 28",
             },
             {
                 "name": "3 Green Lights",
-                "passed": checklist["green_lights"] >= min_green_lights,
-                "value": f"{checklist['green_lights']}/3",
-                "threshold": f">= {min_green_lights}",
+                "passed": checklist["green_lights"] >= min_green_lights or adaptive_green_override,
+                "value": f"{checklist['green_lights']}/3" + (" + adaptive whale override" if adaptive_green_override else ""),
+                "threshold": f">= {min_green_lights} or strong whale + low threat",
             },
             {
                 "name": "Late Entry Guard",
@@ -1977,7 +1986,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if checklist["green_lights"] < min_green_lights:
+        if checklist["green_lights"] < min_green_lights and not adaptive_green_override:
             sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
@@ -2653,34 +2662,46 @@ def build_narrative_profile(name, symbol, pair=None, deployer_stats=None, social
 
 def build_three_signal_checklist(info, intel, settings=None):
     settings = settings or PRESETS["balanced"]
+    deployer_threshold = max(10, int(settings.get("min_narrative_score", 20)) - 4)
+    whale_override = int(intel.get("whale_score") or 0) >= 45 or int(intel.get("whale_action_score") or 0) >= 35
     deployer_pass = (
         (intel.get("deployer_wallet") in WHALE_WALLETS) or
-        int(intel.get("deployer_score") or 0) >= 18 or
-        int(intel.get("smart_wallet_first10") or 0) > 0
+        int(intel.get("deployer_score") or 0) >= deployer_threshold or
+        int(intel.get("smart_wallet_first10") or 0) > 0 or
+        whale_override
     )
     volume_pass = (
         float(intel.get("volume_spike_ratio") or 0) >= float(settings.get("min_volume_spike_mult", 10)) or
-        float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 50))
+        float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 50)) or
+        (
+            float(info.get("change") or 0) >= 20 and
+            float(info.get("momentum") or 0) >= 2
+        )
     )
-    narrative_pass = int(intel.get("narrative_score") or 0) >= int(settings.get("min_narrative_score", 20))
+    narrative_floor = max(8, int(settings.get("min_narrative_score", 20)) - 3)
+    aligned_tags = [tag for tag in (intel.get("narrative_tags") or []) if tag in set(market_mood_snapshot())]
+    narrative_pass = (
+        int(intel.get("narrative_score") or 0) >= narrative_floor or
+        bool(aligned_tags)
+    )
     items = [
         {
             "name": "Tracked deployer / first-buyer quality",
             "passed": deployer_pass,
             "value": f"{intel.get('deployer_score', 0)} rep | {intel.get('smart_wallet_first10', 0)} smart in first10",
-            "threshold": "tracked wallet, rep >= 18, or smart first10",
+            "threshold": f"tracked wallet, rep >= {deployer_threshold}, strong whale score, or smart first10",
         },
         {
             "name": "Volume / holder acceleration",
             "passed": volume_pass,
             "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x vol | {float(intel.get('holder_growth_1h') or 0):+.0f}% holders",
-            "threshold": f">= {settings.get('min_volume_spike_mult', 10)}x or >= {settings.get('min_holder_growth_pct', 50)}%",
+            "threshold": f">= {settings.get('min_volume_spike_mult', 10)}x, >= {settings.get('min_holder_growth_pct', 50)}%, or strong price+momentum",
         },
         {
             "name": "Narrative timing fit",
             "passed": narrative_pass,
             "value": f"{intel.get('narrative_score', 0)} score",
-            "threshold": f">= {settings.get('min_narrative_score', 20)}",
+            "threshold": f">= {narrative_floor} or aligned with market mood",
         },
     ]
     return {"items": items, "green_lights": sum(1 for item in items if item["passed"])}
