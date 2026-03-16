@@ -150,6 +150,7 @@ PRESETS = {
         "min_vol":5000,"min_score":40,"cooldown_min":15,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":18,
         "min_green_lights":2,"min_volume_spike_mult":8,"late_entry_mult":5.0,
+        "offpeak_min_change":20,
         "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
@@ -163,6 +164,7 @@ PRESETS = {
         "min_vol":3000,"min_score":30,"cooldown_min":10,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
         "min_green_lights":2,"min_volume_spike_mult":6,"late_entry_mult":5.0,
+        "offpeak_min_change":18,
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
@@ -176,6 +178,7 @@ PRESETS = {
         "min_vol":1000,"min_score":20,"cooldown_min":7,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":25,"min_narrative_score":14,
         "min_green_lights":2,"min_volume_spike_mult":5,"late_entry_mult":5.0,
+        "offpeak_min_change":15,
         "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
@@ -189,6 +192,7 @@ PRESETS = {
         "min_vol":500,"min_score":15,"cooldown_min":5,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":12,
         "min_green_lights":1,"min_volume_spike_mult":4,"late_entry_mult":5.0,
+        "offpeak_min_change":12,
         "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
@@ -197,6 +201,21 @@ PRESETS = {
 # keep backward compat
 PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
+
+BOT_OVERRIDE_FIELDS = [
+    ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
+    ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
+    ("drawdown_limit_sol", float), ("cooldown_min", int),
+    ("max_age_min", int), ("time_stop_min", int), ("min_liq", float),
+    ("min_mc", float), ("max_mc", float), ("priority_fee", int),
+    ("min_vol", float), ("min_score", int), ("risk_per_trade_pct", float),
+    ("min_holder_growth_pct", float), ("min_narrative_score", int),
+    ("min_green_lights", int), ("min_volume_spike_mult", float),
+    ("late_entry_mult", float), ("nuclear_narrative_score", int),
+    ("offpeak_min_change", float),
+    ("adaptive_relax_level", int), ("adaptive_zero_buy_hours", int),
+    ("adaptive_last_relax_at", str),
+]
 
 def normalize_preset_name(preset):
     preset = str(preset or "balanced").strip().lower()
@@ -251,6 +270,46 @@ def dashboard_preset_settings():
         preset_name: dict(PRESETS[preset_name])
         for preset_name in ("safe", "balanced", "aggressive", "degen")
     }
+
+
+def build_bot_overrides(source):
+    source = source or {}
+    overrides = {}
+    for key, cast in BOT_OVERRIDE_FIELDS:
+        if key not in source or source.get(key) is None:
+            continue
+        try:
+            value = source.get(key)
+            overrides[key] = str(value) if cast is str else cast(value)
+        except Exception:
+            pass
+    return overrides
+
+
+def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
+    preset = normalize_preset_name(preset)
+    overrides = build_bot_overrides(settings)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
+            max_correlated=%s,drawdown_limit_sol=%s,custom_settings=%s
+            WHERE user_id=%s
+        """, (
+            preset,
+            run_mode,
+            int(duration or 0),
+            float(profit or 0),
+            int(overrides.get("max_correlated", settings.get("max_correlated", PRESETS[preset]["max_correlated"]))),
+            float(overrides.get("drawdown_limit_sol", settings.get("drawdown_limit_sol", PRESETS[preset]["drawdown_limit_sol"]))),
+            json.dumps(overrides) if overrides else None,
+            user_id,
+        ))
+        conn.commit()
+    finally:
+        db_return(conn)
+    return overrides
 
 
 def replay_recent_market_feed(bot, limit=40):
@@ -963,11 +1022,12 @@ def send_sol(keypair, to_address, amount_sol):
         return None
 
 class BotInstance:
-    def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol):
+    def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol, preset_name="balanced"):
         self.user_id          = user_id
         self.keypair          = keypair
         self.wallet           = str(keypair.pubkey())
         self.settings         = dict(settings)
+        self.preset_name      = normalize_preset_name(preset_name)
         self.positions        = {}
         self.log              = []
         self.running          = True
@@ -988,10 +1048,76 @@ class BotInstance:
         # ── Risk controls ───────────────────────────────────────────────────
         self.peak_balance       = 0.0   # for max-drawdown circuit breaker
         self.buys_this_hour     = 0
+        self.evals_this_hour    = 0
         self.hour_start         = time.time()
         self.consecutive_losses = 0
         self.cooldown_until     = 0.0   # epoch — no buys before this time
         self.loss_mints         = {}    # mint -> epoch when loss occurred (1h cooldown)
+        self.auto_relax_level   = int(self.settings.get("adaptive_relax_level") or 0)
+
+    def relax_entry_guards(self):
+        steps = [
+            ("min_green_lights", lambda v: max(1, int(v) - 1), "minimum green lights"),
+            ("min_volume_spike_mult", lambda v: max(2.0, round(float(v) - 1.5, 1)), "volume spike threshold"),
+            ("min_holder_growth_pct", lambda v: max(10.0, round(float(v) - 10.0, 1)), "holder growth threshold"),
+            ("min_narrative_score", lambda v: max(8, int(v) - 2), "narrative score threshold"),
+            ("min_score", lambda v: max(10, int(v) - 3), "AI score floor"),
+            ("offpeak_min_change", lambda v: max(8.0, round(float(v) - 3.0, 1)), "off-peak change guard"),
+            ("max_age_min", lambda v: min(480, int(v) + 60), "max token age"),
+            ("max_mc", lambda v: min(1500000.0, round(float(v) * 1.35, -3)), "max market cap"),
+        ]
+        changed = None
+        while self.auto_relax_level < len(steps):
+            key, adjust, label = steps[self.auto_relax_level]
+            self.auto_relax_level += 1
+            old_value = self.settings.get(key, PRESETS[self.preset_name].get(key))
+            try:
+                new_value = adjust(old_value)
+            except Exception:
+                continue
+            if new_value == old_value:
+                continue
+            self.settings[key] = new_value
+            changed = (key, old_value, new_value, label)
+            break
+        self.settings["adaptive_relax_level"] = self.auto_relax_level
+        self.settings["adaptive_zero_buy_hours"] = int(self.settings.get("adaptive_zero_buy_hours") or 0) + 1
+        self.settings["adaptive_last_relax_at"] = _now_utc().isoformat()
+        persist_bot_settings(
+            self.user_id,
+            self.preset_name,
+            self.run_mode,
+            self.run_duration_min,
+            self.profit_target,
+            self.settings,
+        )
+        return changed
+
+    def maybe_relax_guards(self):
+        now = time.time()
+        if now - self.hour_start < 3600:
+            return
+        buys = int(self.buys_this_hour or 0)
+        evals = int(self.evals_this_hour or 0)
+        self.hour_start = now
+        self.buys_this_hour = 0
+        self.evals_this_hour = 0
+        if buys > 0:
+            self.settings["adaptive_zero_buy_hours"] = 0
+            self.log_msg(f"Hourly check — {buys} buys across {evals} evaluated coins. Guards unchanged.")
+            return
+        if evals <= 0:
+            self.log_msg("Hourly check — no coins evaluated in the last hour. Guards unchanged.")
+            return
+        changed = self.relax_entry_guards()
+        if not changed:
+            self.log_msg(f"Hourly check — 0 buys across {evals} evaluated coins. Guard relaxation already at max level {self.auto_relax_level}.")
+            return
+        key, old_value, new_value, label = changed
+        replayed = replay_recent_market_feed(self, limit=60)
+        self.log_msg(
+            f"Hourly check — 0 buys across {evals} evaluated coins. Relaxed {label}: {old_value} → {new_value}. Replayed {replayed} recent candidates."
+        )
 
     def log_msg(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -1603,6 +1729,7 @@ class BotInstance:
             except Exception as _e:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
+            self.settings["adaptive_zero_buy_hours"] = 0
             self.consecutive_losses  = 0   # reset on successful buy
             self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
             self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
@@ -1841,12 +1968,14 @@ class BotInstance:
         min_holder_growth_pct = float(s.get("min_holder_growth_pct", 50))
         min_narrative_score = int(s.get("min_narrative_score", 20))
         min_volume_spike_mult = float(s.get("min_volume_spike_mult", 10))
+        offpeak_min_change = float(s.get("offpeak_min_change", 20))
         late_entry_mult = float(s.get("late_entry_mult", 5.0))
         nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
         score_total = _sd["total"]
+        self.evals_this_hour += 1
         sig_entry = {
             "mint": mint, "name": name, "price": price,
             "mc": mc, "vol": vol, "liq": liq, "age_min": age_min, "change": change,
@@ -1894,8 +2023,8 @@ class BotInstance:
             return
         utc_hour = time.gmtime().tm_hour
         if not (10 <= utc_hour < 23):
-            if change < 20 and score_total < (min_score + 10):
-                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < 20% and score {score_total} not strong enough"
+            if change < offpeak_min_change and score_total < (min_score + 10):
+                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < {offpeak_min_change:.0f}% and score {score_total} not strong enough"
                 self.log_signal_entry(sig_entry)
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
@@ -2015,6 +2144,7 @@ class BotInstance:
         self.log_msg(f"Bot started | Wallet: {self.wallet} | Balance: {self.sol_balance:.4f} SOL")
         while self.running:
             try:
+                self.maybe_relax_guards()
                 if self.should_stop():
                     self.cashout_all()
                     self.running = False
@@ -3548,7 +3678,8 @@ def auto_restart_bots():
                 bot = BotInstance(uid, kp, settings,
                     run_mode=row["run_mode"],
                     run_duration_min=row["run_duration_min"],
-                    profit_target_sol=row["profit_target_sol"])
+                    profit_target_sol=row["profit_target_sol"],
+                    preset_name=preset_name)
                 with user_bots_lock:
                     user_bots[uid] = bot
                 # Reload open positions from DB so they survive Railway restarts
@@ -4363,6 +4494,7 @@ def api_start():
         run_mode          = bs["run_mode"] if bs else "indefinite",
         run_duration_min  = bs["run_duration_min"] if bs else 0,
         profit_target_sol = bs["profit_target_sol"] if bs else 0,
+        preset_name       = preset,
     )
     with user_bots_lock:
         user_bots[uid] = bot
@@ -4432,44 +4564,16 @@ def api_settings():
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
-    # Extra live settings
-    overrides = {}
-    for key, cast in [
-        ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
-        ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
-        ("drawdown_limit_sol", float), ("cooldown_min", int),
-        ("max_age_min", int), ("time_stop_min", int), ("min_liq", float),
-        ("min_mc", float), ("max_mc", float), ("priority_fee", int),
-        ("min_vol", float), ("min_score", int), ("risk_per_trade_pct", float),
-        ("min_holder_growth_pct", float), ("min_narrative_score", int),
-        ("min_green_lights", int), ("min_volume_spike_mult", float),
-        ("late_entry_mult", float), ("nuclear_narrative_score", int),
-    ]:
-        if key in data:
-            try: overrides[key] = cast(data[key])
-            except Exception as _e:
-                print(f"[ERROR] {_e}", flush=True)
-    import json as _json
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
-            max_correlated=%s,drawdown_limit_sol=%s,custom_settings=%s
-            WHERE user_id=%s
-        """, (preset, run_mode, duration, profit,
-              overrides.get("max_correlated", 5),
-              overrides.get("drawdown_limit_sol", 0.5),
-              _json.dumps(overrides) if overrides else None,
-              uid))
-        conn.commit()
-    finally:
-        db_return(conn)
+    overrides = build_bot_overrides(data)
+    base_settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
+    base_settings.update(overrides)
+    persist_bot_settings(uid, preset, run_mode, duration, profit, base_settings)
     bot = user_bots.get(uid)
     replayed = 0
     if bot:
         bot.settings.update(PRESETS.get(preset, bot.settings))
         bot.settings.update(overrides)
+        bot.preset_name       = preset
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
         bot.profit_target    = profit
