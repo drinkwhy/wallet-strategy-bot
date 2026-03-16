@@ -132,33 +132,85 @@ PRESETS = {
         "label":"Safe — Low Risk / Consistent",
         "description":"Small positions, tight stops. Capital preservation first.",
         "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":2.0,
-        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":720,"time_stop_min":20,
+        "trail_pct":0.15,"stop_loss":0.85,"max_age_min":240,"time_stop_min":20,
         "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
-        "listing_sniper":True,
+        "listing_sniper":True,"min_ai_score":40,"min_change_1h":5,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
         "description":"Moderate positions, balanced take-profits. Best for most markets.",
         "max_buy_sol":0.04,"tp1_mult":1.2,"tp2_mult":1.5,
-        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
+        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":360,"time_stop_min":30,
         "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
-        "listing_sniper":True,
+        "listing_sniper":True,"min_ai_score":35,"min_change_1h":8,
     },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
         "description":"Larger positions, wide stops. For hot markets only.",
         "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
-        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":4320,"time_stop_min":60,
+        "trail_pct":0.30,"stop_loss":0.60,"max_age_min":720,"time_stop_min":60,
         "min_liq":0,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
-        "listing_sniper":True,
+        "listing_sniper":True,"min_ai_score":30,"min_change_1h":12,
     },
 }
 # keep backward compat
 PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
+
+LIVE_SETTING_CASTS = {
+    "max_correlated": int,
+    "tp1_mult": float,
+    "tp2_mult": float,
+    "stop_loss": float,
+    "trail_pct": float,
+    "max_buy_sol": float,
+    "drawdown_limit_sol": float,
+    "cooldown_min": int,
+    "min_ai_score": int,
+    "min_change_1h": float,
+}
+
+def normalize_preset_name(preset):
+    preset = str(preset or "balanced").strip().lower()
+    aliases = {
+        "steady": "balanced",
+        "max": "degen",
+        "aggressive": "degen",
+    }
+    preset = aliases.get(preset, preset)
+    return preset if preset in PRESETS else "balanced"
+
+def sanitize_live_overrides(raw):
+    if not isinstance(raw, dict):
+        return {}
+    overrides = {}
+    for key, cast in LIVE_SETTING_CASTS.items():
+        if key not in raw:
+            continue
+        try:
+            overrides[key] = cast(raw[key])
+        except Exception:
+            continue
+    return overrides
+
+def load_custom_settings(raw):
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    return sanitize_live_overrides(data)
+
+def build_effective_settings(preset, custom_settings=None, plan_max_buy_sol=None):
+    settings = dict(PRESETS.get(normalize_preset_name(preset), PRESETS["balanced"]))
+    settings.update(load_custom_settings(custom_settings))
+    if plan_max_buy_sol is not None:
+        settings["max_buy_sol"] = min(settings.get("max_buy_sol", plan_max_buy_sol), plan_max_buy_sol)
+    return settings
 
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -1182,7 +1234,7 @@ class BotInstance:
                     cooldown_min = self.settings.get("cooldown_min", 10)
                     cooldown_sec = cooldown_min * 60
                     self.cooldown_until = time.time() + cooldown_sec
-                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {name}")
+                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {pos['name']}")
                 # Telegram alert
                 try:
                     conn = db()
@@ -1318,6 +1370,10 @@ class BotInstance:
         max_mc  = s.get("max_mc", 999999)
         min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
+        min_score = s.get("min_ai_score", 0)
+        utc_hour = time.gmtime().tm_hour
+        min_change = s.get("min_change_1h", -20)
+        effective_min_change = max(min_change, 30) if not (10 <= utc_hour < 23) else min_change
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
@@ -1329,7 +1385,8 @@ class BotInstance:
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
                 {"name": "Liquidity", "passed": liq == 0 or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": change >= -20, "value": f"{change:+.0f}%", "threshold": "> -20%"},
+                {"name": "Price Change", "passed": change >= effective_min_change, "value": f"{change:+.0f}%", "threshold": f"\u2265 {effective_min_change:+.0f}%"},
+                {"name": "AI Score", "passed": _sd["total"] >= min_score, "value": f"{_sd['total']}/100", "threshold": f"\u2265 {min_score}"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
@@ -1349,18 +1406,16 @@ class BotInstance:
             self.signal_explorer_log.appendleft(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change < -20:
-            sig_entry["reason"] = f"1h change {change:.0f}% too negative"
+        if change < effective_min_change:
+            sig_entry["reason"] = f"1h change {change:.0f}% < min {effective_min_change:.0f}%"
             self.signal_explorer_log.appendleft(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        utc_hour = time.gmtime().tm_hour
-        if not (10 <= utc_hour < 23):
-            if change < 30:
-                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < 30%"
-                self.signal_explorer_log.appendleft(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
+        if _sd["total"] < min_score:
+            sig_entry["reason"] = f"AI score {_sd['total']} < min {min_score}"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
         sig_entry["passed"] = True
         sig_entry["reason"] = "Passed all filters"
         self.signal_explorer_log.appendleft(sig_entry)
@@ -1567,7 +1622,8 @@ def check_whale_wallets():
                                         if bot.running and mint not in bot.positions:
                                             bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
                                             try:
-                                                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, 0)
+                                                change = (p.get("priceChange") or {}).get("h1", 0) or 0
+                                                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, change)
                                             except Exception as _e:
                                                 print(f"[ERROR] {_e}", flush=True)
                                 except Exception as _e:
@@ -1830,7 +1886,7 @@ def auto_restart_bots():
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
+                SELECT bs.user_id, bs.preset, bs.custom_settings, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
                        w.encrypted_key, u.plan, u.email
                 FROM bot_settings bs
                 JOIN wallets w ON w.user_id = bs.user_id
@@ -1844,7 +1900,7 @@ def auto_restart_bots():
             uid = row["user_id"]
             try:
                 kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
-                settings = dict(PRESETS.get(row["preset"], PRESETS["balanced"]))
+                settings = build_effective_settings(row["preset"], row.get("custom_settings"))
                 max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email","")), PLAN_LIMITS["basic"])["max_buy_sol"]
                 settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
                 bot = BotInstance(uid, kp, settings,
@@ -2544,13 +2600,14 @@ def dashboard():
         upgrade_btn = '<a href="/subscribe/basic" class="nbtn">Subscribe — $49/mo (drop to 15% fee)</a>'
     else:
         upgrade_btn = '<a href="/subscribe/free" class="nbtn" style="background:var(--bg3);border:1px solid var(--grn);color:var(--grn)">Profit Only — Free</a>'
+    selected_preset = normalize_preset_name(bsettings["preset"] if bsettings else "balanced")
     return Response(DASHBOARD_HTML
         .replace("{{EMAIL}}", user["email"])
         .replace("{{PLAN_LABEL}}", plan_info["label"])
         .replace("{{UPGRADE_BTN}}", upgrade_btn)
         .replace("{{PLAN}}", plan_info["label"])
         .replace("{{WALLET}}", wallet["public_key"])
-        .replace("{{PRESET}}", bsettings["preset"] if bsettings else "balanced"),
+        .replace("{{PRESET}}", selected_preset),
         mimetype="text/html"
     )
 
@@ -2579,6 +2636,21 @@ def api_state():
     total_trades = stats["wins"] + stats["losses"]
     stats["win_rate"] = round(stats["wins"] / total_trades * 100, 1) if total_trades else 0
     stats["streak"] = -(bot.consecutive_losses) if bot and bot.consecutive_losses > 0 else stats["wins"]
+    settings = bot.settings if bot else {}
+    if not bot:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT plan, email FROM users WHERE id=%s", (uid,))
+            user = cur.fetchone()
+            cur.execute("SELECT preset, custom_settings FROM bot_settings WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
+        finally:
+            db_return(conn)
+        if user and row:
+            plan = effective_plan(user["plan"], user["email"])
+            max_sol = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
+            settings = build_effective_settings(row["preset"], row.get("custom_settings"), max_sol)
     return jsonify({
         "running":    bot.running if bot else False,
         "balance":    round(bot.sol_balance, 4) if bot else 0,
@@ -2586,7 +2658,7 @@ def api_state():
         "log":        bot.log[:120] if bot else [],
         "stats":      stats,
         "filter_log": list(bot.filter_log)[:10] if bot else [],
-        "settings":   bot.settings if bot else {},
+        "settings":   settings,
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -2618,10 +2690,9 @@ def api_start():
         kp = Keypair.from_bytes(base58.b58decode(decrypt_key(w["encrypted_key"])))
     except Exception:
         return jsonify({"ok":False,"msg":"Wallet key could not be decrypted — please re-enter your private key at /setup"})
-    preset   = bs["preset"] if bs else "balanced"
-    settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
     max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
-    settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
+    preset   = normalize_preset_name(bs["preset"] if bs else "balanced")
+    settings = build_effective_settings(preset, bs.get("custom_settings") if bs else None, max_sol)
     bot = BotInstance(
         uid, kp, settings,
         run_mode          = bs["run_mode"] if bs else "indefinite",
@@ -2691,38 +2762,35 @@ def api_manual_sell():
 @login_required
 def api_settings():
     uid  = session["user_id"]
-    data = request.json
-    preset   = data.get("preset","balanced")
+    data = request.json or {}
+    preset   = normalize_preset_name(data.get("preset","balanced"))
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
-    # Extra live settings
-    overrides = {}
-    for key, cast in [
-        ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
-        ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
-        ("drawdown_limit_sol", float), ("cooldown_min", int),
-    ]:
-        if key in data:
-            try: overrides[key] = cast(data[key])
-            except Exception as _e:
-                print(f"[ERROR] {_e}", flush=True)
+    overrides = sanitize_live_overrides(data)
     conn = db()
     try:
         cur = conn.cursor()
+        cur.execute("SELECT plan, email FROM users WHERE id=%s", (uid,))
+        user = cur.fetchone()
+        plan = effective_plan(user["plan"], user["email"]) if user else "basic"
+        max_plan_buy = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
+        if "max_buy_sol" in overrides:
+            overrides["max_buy_sol"] = min(overrides["max_buy_sol"], max_plan_buy)
         cur.execute("""
             UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
-            max_correlated=%s,drawdown_limit_sol=%s
+            max_correlated=%s,drawdown_limit_sol=%s,custom_settings=%s
             WHERE user_id=%s
         """, (preset, run_mode, duration, profit,
               overrides.get("max_correlated", 5),
-              overrides.get("drawdown_limit_sol", 0.5), uid))
+              overrides.get("drawdown_limit_sol", 0.5),
+              json.dumps(overrides), uid))
         conn.commit()
     finally:
         db_return(conn)
     bot = user_bots.get(uid)
     if bot:
-        bot.settings.update(PRESETS.get(preset, bot.settings))
+        bot.settings.update(PRESETS.get(preset, PRESETS["balanced"]))
         bot.settings.update(overrides)
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
@@ -2963,7 +3031,8 @@ def api_pnl_history():
     worst_t = 0
     for t in trades:
         pnl = t["pnl_sol"] or 0
-        if t["action"] == "sell":
+        action = str(t.get("action") or "").upper()
+        if action.startswith("SELL"):
             running_pnl += pnl
             if pnl > 0: wins += 1
             else: losses += 1
@@ -3751,8 +3820,9 @@ SETUP_HTML = _CSS + """
       <div class="fgroup">
         <label class="flabel">Trading Strategy</label>
         <select class="finput" name="preset">
-          <option value="steady">Steady Profit — Conservative (1.5x TP1, 3x TP2, −25% stop)</option>
-          <option value="max">Max Profit — Aggressive (2x TP1, 10x TP2, trailing stop)</option>
+          <option value="safe">Safe — Low Risk / Consistent</option>
+          <option value="balanced" selected>Balanced — Medium Risk / Steady Profit</option>
+          <option value="degen">Degen — High Risk / Max Profit</option>
         </select>
       </div>
       <div class="fgroup">
@@ -4050,10 +4120,6 @@ DASHBOARD_HTML = _CSS + """
       <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
         <div class="preset-name">⚖️ Balanced</div>
         <div class="preset-desc">Mix of safety and opportunity</div>
-      </div>
-      <div class="preset-card" id="pc-aggressive" onclick="selectPreset('aggressive')">
-        <div class="preset-name">🔥 Aggressive</div>
-        <div class="preset-desc">Higher risk, bigger swings</div>
       </div>
       <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
         <div class="preset-name">💀 Degen</div>
@@ -5011,9 +5077,9 @@ ADMIN_HTML = _CSS + """
 
 <script>
 const PRESET_DEFAULTS = {
-  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:20,tstop:20,liq:25000,minmc:10000,maxmc:80000,prio:10000,dd:0.3,maxpos:2},
-  balanced: {buy:0.04,tp1:1.5,tp2:3.0,sl:0.75,trail:0.20,age:30,tstop:30,liq:10000,minmc:5000,maxmc:150000,prio:30000,dd:0.5,maxpos:3},
-  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:10,tstop:60,liq:5000,minmc:2000,maxmc:250000,prio:100000,dd:1.0,maxpos:5},
+  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:240,tstop:20,liq:10000,minmc:10000,maxmc:150000,prio:10000,dd:0.3,maxpos:2},
+  balanced: {buy:0.04,tp1:1.2,tp2:1.5,sl:0.75,trail:0.20,age:360,tstop:30,liq:5000,minmc:5000,maxmc:250000,prio:30000,dd:0.5,maxpos:5},
+  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:720,tstop:60,liq:0,minmc:2000,maxmc:500000,prio:100000,dd:1.0,maxpos:5},
 };
 let aiSuggestion = null;
 
