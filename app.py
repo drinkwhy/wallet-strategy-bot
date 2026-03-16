@@ -457,6 +457,12 @@ def init_db():
             social_keys TEXT,
             narrative_score INTEGER DEFAULT 0,
             deployer_score INTEGER DEFAULT 0,
+            token_program TEXT,
+            transfer_hook_enabled INTEGER DEFAULT 0,
+            can_exit INTEGER,
+            threat_risk_score INTEGER DEFAULT 0,
+            threat_flags TEXT,
+            infra_labels TEXT,
             max_multiple REAL DEFAULT 1,
             green_lights INTEGER DEFAULT 0,
             checklist_json TEXT,
@@ -518,6 +524,12 @@ def migrate_db():
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS reason TEXT",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS payload_json TEXT",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS ts TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS token_program TEXT",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS transfer_hook_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS can_exit INTEGER",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS threat_risk_score INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS threat_flags TEXT",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS infra_labels TEXT",
         ]
         for m in migrations:
             try:
@@ -578,6 +590,12 @@ def migrate_db():
                 social_keys TEXT,
                 narrative_score INTEGER DEFAULT 0,
                 deployer_score INTEGER DEFAULT 0,
+                token_program TEXT,
+                transfer_hook_enabled INTEGER DEFAULT 0,
+                can_exit INTEGER,
+                threat_risk_score INTEGER DEFAULT 0,
+                threat_flags TEXT,
+                infra_labels TEXT,
                 max_multiple REAL DEFAULT 1,
                 green_lights INTEGER DEFAULT 0,
                 checklist_json TEXT,
@@ -1721,6 +1739,10 @@ class BotInstance:
             "change": change,
             "score": score_total,
         })
+        threat_score = int(intel.get("threat_risk_score") or 0)
+        threat_flags = intel.get("threat_flags") or []
+        can_exit = intel.get("can_exit")
+        transfer_hook_enabled = bool(intel.get("transfer_hook_enabled"))
         checklist = build_three_signal_checklist(_sinfo, intel, settings=s)
         intel["checklist"] = checklist["items"]
         intel["green_lights"] = checklist["green_lights"]
@@ -1756,7 +1778,28 @@ class BotInstance:
                 "value": f"{float(intel.get('max_multiple') or 1):.2f}x seen",
                 "threshold": f"<= {late_entry_mult:.1f}x unless narrative >= {nuclear_narrative_score}",
             },
+            {
+                "name": "Threat / Exit Risk",
+                "passed": threat_score < 60 and can_exit is not False and not transfer_hook_enabled,
+                "value": f"{threat_score}/100 {' · '.join(threat_flags[:2]) if threat_flags else 'clean'}",
+                "threshold": "score < 60, exit route available, no transfer hook",
+            },
         ])
+        if transfer_hook_enabled:
+            sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if can_exit is False:
+            sig_entry["reason"] = "No exit route available"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if threat_score >= 60:
+            sig_entry["reason"] = f"Threat risk {threat_score}/100 ({', '.join(threat_flags[:3]) or 'risk'})"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
         if checklist["green_lights"] < min_green_lights:
             sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
             self.log_signal_entry(sig_entry)
@@ -1892,6 +1935,17 @@ _whale_mints = {}   # mint -> last_seen timestamp (dedup per token)
 _whale_buys  = deque(maxlen=200)  # recent whale buys for dashboard
 
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+JUPITER_ROUTER_PROGRAM = "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"
+WORMHOLE_CORE_BRIDGE = "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth"
+KNOWN_INFRA_LABELS = {
+    SPL_TOKEN_PROGRAM: "spl-token",
+    TOKEN_2022_PROGRAM: "token-2022",
+    PUMP_PROGRAM: "pump-fun",
+    RAYDIUM_AMM: "raydium-amm",
+    JUPITER_ROUTER_PROGRAM: "jupiter-router",
+    WORMHOLE_CORE_BRIDGE: "wormhole-bridge",
+}
 INTEL_TRACK_WINDOW_SEC = 3600
 INTEL_REFRESH_SEC = 75
 INTEL_MAX_TRACKED = 250
@@ -1934,6 +1988,34 @@ def _dedupe_keep_order(items):
         seen.add(item)
         out.append(item)
     return out
+
+
+def infer_infrastructure_labels(wallets):
+    labels = []
+    for wallet in wallets or []:
+        if not wallet:
+            continue
+        label = KNOWN_INFRA_LABELS.get(wallet)
+        if label:
+            labels.append(label)
+        if wallet in WHALE_WALLETS:
+            labels.append("tracked-whale")
+    return _dedupe_keep_order(labels)
+
+
+def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
+    urls = [
+        f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+        f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+    ]
+    for url in urls:
+        try:
+            data = requests.get(url, timeout=6).json()
+            if "error" not in data:
+                return data
+        except Exception:
+            pass
+    return None
 
 
 def _now_utc():
@@ -2102,7 +2184,7 @@ def extract_wallet_flow_from_swaps(txns, mint):
     deployer_candidate = None
     for tx in ordered:
         fee_payer = tx.get("feePayer", "")
-        if fee_payer and fee_payer not in (mint, SOL_MINT, SPL_TOKEN_PROGRAM, PUMP_PROGRAM):
+        if fee_payer and fee_payer not in (mint, SOL_MINT, SPL_TOKEN_PROGRAM, PUMP_PROGRAM) and fee_payer not in KNOWN_INFRA_LABELS:
             deployer_candidate = fee_payer
             break
     return {
@@ -2122,7 +2204,7 @@ def resolve_deployer_wallet(mint, txns=None):
         return flow["deployer_candidate"]
     for tx in sorted((tx for tx in txns if isinstance(tx, dict)), key=lambda tx: tx.get("timestamp") or 0):
         fee_payer = tx.get("feePayer", "")
-        if fee_payer and fee_payer not in (mint, SOL_MINT, SPL_TOKEN_PROGRAM, PUMP_PROGRAM):
+        if fee_payer and fee_payer not in (mint, SOL_MINT, SPL_TOKEN_PROGRAM, PUMP_PROGRAM) and fee_payer not in KNOWN_INFRA_LABELS:
             return fee_payer
     return None
 
@@ -2360,6 +2442,61 @@ def build_three_signal_checklist(info, intel, settings=None):
     return {"items": items, "green_lights": sum(1 for item in items if item["passed"])}
 
 
+def inspect_token_risk(mint, age_min=0, first_liq=0, latest_liq=0):
+    owner = ""
+    info = {}
+    transfer_hook_enabled = False
+    freeze_authority = None
+    mint_authority = None
+    can_exit = None
+    try:
+        result = rpc_call("getAccountInfo", [mint, {"encoding": "jsonParsed"}], timeout=8) or {}
+        value = result.get("value") if isinstance(result, dict) else {}
+        owner = (value or {}).get("owner") or ""
+        info = (((value or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        extensions = info.get("extensions") or []
+        ext_blob = json.dumps(extensions).lower() if extensions else ""
+        transfer_hook_enabled = ("transferhook" in ext_blob) or ("transfer_hook" in ext_blob)
+        freeze_authority = info.get("freezeAuthority")
+        mint_authority = info.get("mintAuthority")
+    except Exception as e:
+        print(f"[RISK] token account inspect failed for {mint}: {e}", flush=True)
+    if age_min >= 20:
+        can_exit = bool(jupiter_quote_direct(mint, SOL_MINT, 10_000_000, 5000))
+    liq_drop_pct = 0.0
+    if float(first_liq or 0) > 0 and float(latest_liq or 0) >= 0:
+        latest_ratio = float(latest_liq or 0) / max(float(first_liq or 0), 1.0)
+        liq_drop_pct = round(max(0.0, (1.0 - latest_ratio) * 100.0), 1)
+    flags = []
+    score = 0
+    if owner == TOKEN_2022_PROGRAM:
+        flags.append("token-2022")
+        score += 10
+    if transfer_hook_enabled:
+        flags.append("transfer-hook")
+        score += 35
+    if freeze_authority not in (None, ""):
+        flags.append("freeze-authority")
+        score += 30
+    if mint_authority not in (None, "", PUMP_PROGRAM):
+        flags.append("mint-authority")
+        score += 20
+    if can_exit is False:
+        flags.append("no-exit-route")
+        score += 40
+    if liq_drop_pct >= 55:
+        flags.append("liquidity-drain")
+        score += 25
+    return {
+        "token_program": owner or SPL_TOKEN_PROGRAM,
+        "transfer_hook_enabled": bool(transfer_hook_enabled),
+        "can_exit": can_exit,
+        "threat_risk_score": min(100, score),
+        "threat_flags": _dedupe_keep_order(flags),
+        "liquidity_drop_pct": liq_drop_pct,
+    }
+
+
 def token_intel_payload(row):
     if not row:
         return {}
@@ -2368,12 +2505,17 @@ def token_intel_payload(row):
         ("narrative_tags", []),
         ("social_links", []),
         ("social_keys", []),
+        ("threat_flags", []),
+        ("infra_labels", []),
         ("checklist_json", []),
         ("milestones_json", {}),
     ]:
         payload[key] = _json_load(payload.get(key), default)
     payload["checklist"] = payload.pop("checklist_json", [])
     payload["milestones"] = payload.pop("milestones_json", {})
+    payload["transfer_hook_enabled"] = bool(payload.get("transfer_hook_enabled"))
+    if payload.get("can_exit") is not None:
+        payload["can_exit"] = bool(payload.get("can_exit"))
     for dt_key in ("first_seen_at", "last_seen_at", "last_updated"):
         payload[dt_key] = _to_iso(payload.get(dt_key))
     return payload
@@ -2391,9 +2533,10 @@ def persist_token_intel(intel):
                 first_price, max_price, first_mc, max_mc, first_vol, latest_vol,
                 first_liq, latest_liq, holder_count, holder_growth_1h, volume_spike_ratio,
                 first_buyer_count, smart_wallet_buys, smart_wallet_first10, narrative_tags,
-                social_links, social_keys, narrative_score, deployer_score, max_multiple,
-                green_lights, checklist_json, milestones_json, last_updated
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                social_links, social_keys, narrative_score, deployer_score, token_program,
+                transfer_hook_enabled, can_exit, threat_risk_score, threat_flags, infra_labels,
+                max_multiple, green_lights, checklist_json, milestones_json, last_updated
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (mint) DO UPDATE SET
                 name=EXCLUDED.name,
                 symbol=EXCLUDED.symbol,
@@ -2414,6 +2557,12 @@ def persist_token_intel(intel):
                 social_keys=EXCLUDED.social_keys,
                 narrative_score=EXCLUDED.narrative_score,
                 deployer_score=EXCLUDED.deployer_score,
+                token_program=EXCLUDED.token_program,
+                transfer_hook_enabled=EXCLUDED.transfer_hook_enabled,
+                can_exit=EXCLUDED.can_exit,
+                threat_risk_score=EXCLUDED.threat_risk_score,
+                threat_flags=EXCLUDED.threat_flags,
+                infra_labels=EXCLUDED.infra_labels,
                 max_multiple=GREATEST(COALESCE(token_intel.max_multiple, 1), COALESCE(EXCLUDED.max_multiple, 1)),
                 green_lights=EXCLUDED.green_lights,
                 checklist_json=EXCLUDED.checklist_json,
@@ -2445,6 +2594,12 @@ def persist_token_intel(intel):
             json.dumps(_dedupe_keep_order(intel.get("social_keys") or [])),
             int(intel.get("narrative_score") or 0),
             int(intel.get("deployer_score") or 0),
+            intel.get("token_program"),
+            int(bool(intel.get("transfer_hook_enabled"))),
+            None if intel.get("can_exit") is None else int(bool(intel.get("can_exit"))),
+            int(intel.get("threat_risk_score") or 0),
+            json.dumps(_dedupe_keep_order(intel.get("threat_flags") or [])),
+            json.dumps(_dedupe_keep_order(intel.get("infra_labels") or [])),
             float(intel.get("max_multiple") or 1),
             int(intel.get("green_lights") or 0),
             json.dumps(intel.get("checklist") or []),
@@ -2536,6 +2691,12 @@ def prime_token_intel(info, pair=None, source="scanner"):
             "social_keys": _dedupe_keep_order((cached.get("social_keys") or []) + keys),
             "narrative_score": int(cached.get("narrative_score") or 0),
             "deployer_score": int(cached.get("deployer_score") or 0),
+            "token_program": cached.get("token_program"),
+            "transfer_hook_enabled": bool(cached.get("transfer_hook_enabled")),
+            "can_exit": cached.get("can_exit"),
+            "threat_risk_score": int(cached.get("threat_risk_score") or 0),
+            "threat_flags": cached.get("threat_flags") or [],
+            "infra_labels": cached.get("infra_labels") or [],
             "max_multiple": float(cached.get("max_multiple") or 1),
             "green_lights": int(cached.get("green_lights") or 0),
             "checklist": cached.get("checklist") or [],
@@ -2596,6 +2757,15 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
         deployer_stats=deployer_stats,
         social_keys_list=seeded.get("social_keys") or [],
     )
+    infra_labels = infer_infrastructure_labels(
+        [deployer_wallet] + list(flow.get("first_buyers") or [])
+    )
+    risk = inspect_token_risk(
+        mint,
+        age_min=float(base_info.get("age_min") or seeded.get("age_min") or 0),
+        first_liq=float(seeded.get("first_liq") or base_info.get("liq") or 0),
+        latest_liq=float(base_info.get("liq") or seeded.get("latest_liq") or 0),
+    )
     intel = dict(seeded)
     intel.update({
         "deployer_wallet": deployer_wallet,
@@ -2608,6 +2778,12 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
         "social_keys": _dedupe_keep_order((seeded.get("social_keys") or []) + narrative["social_keys"]),
         "narrative_score": narrative["score"],
         "deployer_score": compute_deployer_reputation(deployer_stats),
+        "token_program": risk.get("token_program"),
+        "transfer_hook_enabled": risk.get("transfer_hook_enabled"),
+        "can_exit": risk.get("can_exit"),
+        "threat_risk_score": risk.get("threat_risk_score"),
+        "threat_flags": risk.get("threat_flags") or [],
+        "infra_labels": infra_labels,
         "last_seen_at": _now_utc(),
         "last_updated": _now_utc(),
     })
@@ -6208,6 +6384,7 @@ function renderSignals() {
           <th>MC</th>
           <th>Deployer</th>
           <th>Narrative</th>
+          <th>Threat</th>
           <th>Vol Spike</th>
           <th>Holder Growth</th>
           <th>Smart First 10</th>
@@ -6239,6 +6416,7 @@ function renderSignals() {
             <td>${fmtK(s.mc)}</td>
             <td><div style="font-family:monospace">${shortWallet(intel.deployer_wallet)}</div><div class="sig-mini-muted">rep ${intel.deployer_score||0}</div></td>
             <td><div>${intel.narrative_score||0}</div><div class="sig-mini-muted">${(intel.narrative_tags||[]).slice(0,2).join(' · ') || 'no tags'}</div></td>
+            <td><div>${intel.threat_risk_score||0}</div><div class="sig-mini-muted">${(intel.threat_flags||[]).slice(0,2).join(' · ') || 'clean'}</div></td>
             <td>${Number(intel.volume_spike_ratio || 0).toFixed(1)}x</td>
             <td>${Math.round(Number(intel.holder_growth_1h || 0))}%</td>
             <td>${intel.smart_wallet_first10||0}</td>
@@ -6335,9 +6513,20 @@ function showSignalDetail(idx, fromRender=false) {
       <span class="badge bg-muted">${intel.first_buyer_count||0} first buyers</span>
       <span class="badge bg-muted">${intel.smart_wallet_first10||0} smart first 10</span>
     </div>
+    <div class="sec-label">Threat / Exit Risk</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <span class="badge bg-red">Threat ${intel.threat_risk_score||0}/100</span>
+      <span class="badge bg-muted">Program ${(intel.token_program||'').startsWith('Tokenz') ? 'Token-2022' : 'SPL Token'}</span>
+      <span class="badge bg-muted">Exit ${intel.can_exit === false ? 'blocked' : intel.can_exit === true ? 'available' : 'unknown'}</span>
+      <span class="badge bg-muted">Hook ${intel.transfer_hook_enabled ? 'enabled' : 'none'}</span>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
+      ${(intel.threat_flags||[]).map(flag => `<span class="badge bg-red">${flag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No threat flags currently detected</span>'}
+    </div>
     <div class="sec-label">Deployer / Social Intent</div>
     <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Deployer: <span style="font-family:monospace;color:var(--t1)">${shortWallet(intel.deployer_wallet)}</span></div>
     <div style="font-size:11px;color:var(--t2);margin-bottom:6px">First buyers: <b style="color:var(--t1)">${intel.first_buyer_count||0}</b> &nbsp; Smart in first 10: <b style="color:var(--t1)">${intel.smart_wallet_first10||0}</b></div>
+    <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Infrastructure labels: <b style="color:var(--t1)">${(intel.infra_labels||[]).join(', ') || 'none'}</b></div>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
       ${tags.map(tag => `<span class="badge bg-blue">${tag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No narrative tags yet</span>'}
     </div>
