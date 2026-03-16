@@ -651,7 +651,7 @@ td{padding:5px 8px;border-bottom:1px solid #1c1c1c}
 .green{color:#14F195}.red{color:#FF4444}.yellow{color:#FFD700}.purple{color:#9945FF}.gray{color:#555}
 .log-box{background:#1a1a1a;border:1px solid #252525;border-radius:8px;padding:14px;height:260px;overflow-y:auto}
 .log-line{font-size:11px;color:#666;line-height:1.9;border-bottom:1px solid #181818}
-.log-line.buy{color:#14F195}.log-line.sell{color:#FF6B6B}.log-line.signal{color:#FFD700}
+.log-line.buy{color:#ffffff}.log-line.sell-win{color:#14F195}.log-line.sell-loss{color:#FF4444}.log-line.signal{color:#FFD700}
 .log-line.hold{color:#3a3a3a}.log-line.rug{color:#FF4444}
 .btn{border:none;border-radius:6px;padding:7px 14px;font-family:monospace;font-size:12px;cursor:pointer;font-weight:bold;transition:opacity .15s}
 .btn:hover{opacity:.8}
@@ -803,9 +803,14 @@ async function refresh(){
 
   // Log
   document.getElementById('log').innerHTML=d.log.map(l=>{
-    const c=l.includes('BUY')?'buy':(l.includes('SELL')||l.includes('CASHOUT'))?'sell'
-           :l.includes('SIGNAL')?'signal':l.includes('HOLD')?'hold'
-           :(l.includes('RUG')||l.includes('rug'))?'rug':'';
+    let c='';
+    if(l.includes('BUY')){c='buy';}
+    else if(l.includes('SELL')||l.includes('CASHOUT')){
+      c=l.includes('PnL: -')?'sell-loss':'sell-win';
+    }
+    else if(l.includes('SIGNAL')){c='signal';}
+    else if(l.includes('HOLD')){c='hold';}
+    else if(l.includes('RUG')||l.includes('rug')){c='rug';}
     return `<div class="log-line ${c}">${l}</div>`;
   }).join('');
 }
