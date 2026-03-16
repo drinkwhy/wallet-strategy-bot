@@ -61,86 +61,48 @@ PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 # ── Preset configurations ──────────────────────────────────────────────────────
 PRESETS = {
-    "scalp": {
-        "label":         "Scalp",
+    "steady": {
+        "label":         "Steady Profit",
         "max_buy_sol":   0.03,
-        "tp1_mult":      1.16,
-        "tp2_mult":      1.34,
-        "trail_pct":     0.08,
-        "stop_loss":     0.92,
-        "max_age_min":   45,
-        "time_stop_min": 8,
-        "min_vol_mc":    0.60,
-        "min_liq":       18000,
-        "min_mc":        9000,
-        "max_mc":        160000,
-        "min_vol":       15000,
-        "min_score":     68,
-        "priority_fee":  70000,
-        "anti_rug":      True,
-        "pump_scan":     True,
-    },
-    "runner": {
-        "label":         "Runner",
-        "max_buy_sol":   0.06,
-        "tp1_mult":      1.45,
-        "tp2_mult":      2.75,
-        "trail_pct":     0.16,
-        "stop_loss":     0.82,
-        "max_age_min":   180,
-        "time_stop_min": 22,
-        "min_vol_mc":    0.35,
-        "min_liq":       12000,
-        "min_mc":        6000,
-        "max_mc":        320000,
-        "min_vol":       8000,
-        "min_score":     56,
-        "priority_fee":  95000,
-        "anti_rug":      True,
-        "pump_scan":     True,
-    },
-    "all_in": {
-        "label":         "All-In",
-        "max_buy_sol":   0.15,
-        "tp1_mult":      1.85,
-        "tp2_mult":      4.5,
-        "trail_pct":     0.23,
-        "stop_loss":     0.74,
-        "max_age_min":   240,
+        "tp1_mult":      1.5,
+        "tp2_mult":      3.0,
+        "trail_pct":     0.20,
+        "stop_loss":     0.75,   # -25%
+        "max_age_min":   30,
         "time_stop_min": 30,
-        "min_vol_mc":    0.22,
+        "min_vol_mc":    0.5,
         "min_liq":       10000,
-        "min_mc":        4000,
-        "max_mc":        500000,
-        "min_vol":       6000,
-        "min_score":     52,
-        "priority_fee":  140000,
+        "min_mc":        5000,
+        "max_mc":        100000,
+        "min_vol":       3000,
+        "min_score":     30,
+        "priority_fee":  10000,  # lamports
+        "anti_rug":      True,
+        "pump_scan":     True,
+    },
+    "max": {
+        "label":         "Max Profit",
+        "max_buy_sol":   0.10,
+        "tp1_mult":      2.0,
+        "tp2_mult":      10.0,
+        "trail_pct":     0.30,
+        "stop_loss":     0.60,   # -40%  (wider to survive volatility)
+        "max_age_min":   15,     # ultra-early only
+        "time_stop_min": 60,
+        "min_vol_mc":    0.3,
+        "min_liq":       5000,
+        "min_mc":        2000,
+        "max_mc":        200000,
+        "min_vol":       500,
+        "min_score":     15,
+        "priority_fee":  100000, # pay more to land first
         "anti_rug":      True,
         "pump_scan":     True,
     },
 }
 
-PRESET_ALIASES = {
-    "steady": "scalp",
-    "safe": "scalp",
-    "balanced": "runner",
-    "aggressive": "runner",
-    "max": "all_in",
-    "degen": "all_in",
-}
-
-
-def normalize_preset(name):
-    key = str(name or "runner").strip().lower().replace("-", "_").replace(" ", "_")
-    key = PRESET_ALIASES.get(key, key)
-    return key if key in PRESETS else "runner"
-
-
-active_preset = "runner"
-
-# ── Live settings (start with runner) ─────────────────────────────────────────
-settings = dict(PRESETS[active_preset])
-settings["preset"] = active_preset
+# ── Live settings (start with steady) ─────────────────────────────────────────
+settings = dict(PRESETS["steady"])
 
 # ── Shared state ───────────────────────────────────────────────────────────────
 seen_tokens = set()
@@ -402,7 +364,6 @@ def buy_token(mint, name, price):
             "timestamp":   time.time(),
             "tp1_hit":     False,
             "entry_sol":   s["max_buy_sol"],
-            "remaining_pct": 1.0,
         }
         log(f"BUY  {name} @ ${price:.8f} | {s['max_buy_sol']} SOL | solscan.io/tx/{sig}")
         refresh_balance()
@@ -435,9 +396,7 @@ def sell_partial(mint, pct, reason):
         if sig:
             cur = get_token_price(mint)
             pnl_pct = (cur / pos["entry_price"] - 1) * 100 if cur and pos["entry_price"] else 0
-            remaining_pct = float(pos.get("remaining_pct", 1.0) or 1.0)
-            sold_fraction = min(remaining_pct, max(0.0, remaining_pct * pct))
-            pnl_sol = pos["entry_sol"] * sold_fraction * (pnl_pct / 100)
+            pnl_sol = pos["entry_sol"] * pct * (pnl_pct / 100)
             log(f"SELL {pos['name']} {int(pct*100)}% — {reason} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL) | solscan.io/tx/{sig}")
 
             if pct >= 1.0:
@@ -449,7 +408,6 @@ def sell_partial(mint, pct, reason):
                 del positions[mint]
             else:
                 positions[mint]["tp1_hit"] = True
-                positions[mint]["remaining_pct"] = max(0.0, remaining_pct - sold_fraction)
                 stats["wins"] += 1
                 stats["total_pnl_sol"] += pnl_sol
 
@@ -655,17 +613,22 @@ def cashout():
 
 @app.route("/preset/<name>", methods=["POST"])
 def load_preset(name):
-    global active_preset, settings
-    preset = normalize_preset(name)
-    active_preset = preset
-    settings = dict(PRESETS[preset])
-    settings["preset"] = preset
-    log(f"Loaded preset: {PRESETS[preset]['label']}")
+    if name not in PRESETS:
+        return jsonify({"ok": False, "error": "Unknown preset"})
+    settings.update(PRESETS[name])
+    log(f"Loaded preset: {PRESETS[name]['label']}")
     return jsonify({"ok": True, "settings": settings})
 
 @app.route("/settings", methods=["POST"])
 def update_settings():
-    return jsonify({"ok": False, "error": "Manual customization is disabled. Use a preset."}), 400
+    data = request.json
+    for key in ["max_buy_sol","tp1_mult","tp2_mult","trail_pct","stop_loss",
+                 "max_age_min","time_stop_min","min_vol_mc","min_liq",
+                 "min_mc","max_mc","priority_fee","anti_rug","pump_scan"]:
+        if key in data:
+            settings[key] = data[key]
+    log(f"Custom settings applied")
+    return jsonify({"ok": True, "settings": settings})
 
 # ── Dashboard HTML ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -745,16 +708,28 @@ a{color:#9945FF;text-decoration:none}
 
 <!-- Row 2: presets + settings -->
 <div class="card" style="margin-bottom:14px">
-  <h2>Fixed Trading Profiles</h2>
+  <h2>Strategy Presets</h2>
   <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-    <button class="btn btn-green"  id="preset-scalp"  onclick="loadPreset('scalp')">⚡ Scalp</button>
-    <button class="btn btn-blue"   id="preset-runner" onclick="loadPreset('runner')">📈 Runner</button>
-    <button class="btn btn-purple" id="preset-all_in" onclick="loadPreset('all_in')">💥 All-In</button>
+    <button class="btn btn-green"  id="preset-steady" onclick="loadPreset('steady')">📈 Steady Profit</button>
+    <button class="btn btn-purple" id="preset-max"    onclick="loadPreset('max')">🚀 Max Profit</button>
+    <span style="color:#555;font-size:11px;align-self:center">— or customize below then Apply</span>
   </div>
   <hr class="divider">
-  <div id="preset-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;font-size:12px;color:#aaa"></div>
-  <div style="font-size:11px;color:#666;margin-top:12px">
-    Manual parameter editing is disabled. The bot now runs only from these three built-in profiles.
+  <div style="margin-top:10px">
+    <div class="field"><label>Buy (SOL)</label><input type="number" id="s-buy"   step="0.01" min="0.01"></div>
+    <div class="field"><label>TP1 (x)</label><input type="number"   id="s-tp1"   step="0.1"  min="1.1"></div>
+    <div class="field"><label>TP2 (x)</label><input type="number"   id="s-tp2"   step="0.5"  min="1.5"></div>
+    <div class="field"><label>Trail Stop (%)</label><input type="number" id="s-trail" step="1" min="5" max="60"></div>
+    <div class="field"><label>Hard SL (%)</label><input type="number"    id="s-sl"    step="1" min="5" max="80"></div>
+    <div class="field"><label>Max Age (min)</label><input type="number"  id="s-age"   step="5" min="1"></div>
+    <div class="field"><label>Time Stop (min)</label><input type="number" id="s-ts"   step="5" min="5"></div>
+    <div class="field"><label>Min Liq ($)</label><input type="number"    id="s-liq"   step="500" min="500"></div>
+    <div class="field"><label>Min MC ($)</label><input type="number"     id="s-minmc" step="500" min="500"></div>
+    <div class="field"><label>Max MC ($)</label><input type="number"     id="s-maxmc" step="5000" min="1000"></div>
+    <div class="field"><label>Priority Fee (lamports)</label><input type="number" id="s-fee" step="10000" min="0"></div>
+    <div class="field"><label>Anti-Rug</label><input type="checkbox" id="s-rug"></div>
+    <div class="field"><label>Pump.fun Scan</label><input type="checkbox" id="s-pump"></div>
+    <button class="btn btn-gray" onclick="saveSettings()">Apply Custom</button>
   </div>
 </div>
 
@@ -773,28 +748,6 @@ a{color:#9945FF;text-decoration:none}
 <script>
 let running=true, st={};
 
-function renderPresetSummary() {
-  if (!st || !Object.keys(st).length) return;
-  const rows = [
-    ['Preset', st.preset || 'runner'],
-    ['Buy cap', (st.max_buy_sol ?? 0).toFixed(2) + ' SOL'],
-    ['TP1 / TP2', `${(st.tp1_mult ?? 0).toFixed(2)}x / ${(st.tp2_mult ?? 0).toFixed(2)}x`],
-    ['Hard stop', '-' + Math.round((1 - (st.stop_loss ?? 1)) * 100) + '%'],
-    ['Trail stop', Math.round((st.trail_pct ?? 0) * 100) + '%'],
-    ['Max age', (st.max_age_min ?? 0) + ' min'],
-    ['Time stop', (st.time_stop_min ?? 0) + ' min'],
-    ['Min liquidity', '$' + (st.min_liq ?? 0).toLocaleString()],
-    ['MC range', '$' + (st.min_mc ?? 0).toLocaleString() + ' - $' + (st.max_mc ?? 0).toLocaleString()],
-    ['Priority fee', (st.priority_fee ?? 0).toLocaleString() + ' lamports'],
-  ];
-  document.getElementById('preset-summary').innerHTML = rows.map(([label, value]) =>
-    `<div style="background:#111;border:1px solid #242424;border-radius:6px;padding:10px">
-      <div style="font-size:10px;color:#666;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px">${label}</div>
-      <div style="color:#e0e0e0;font-weight:bold">${value}</div>
-    </div>`
-  ).join('');
-}
-
 async function refresh(){
   const d=await fetch('/state').then(r=>r.json()).catch(()=>null);
   if(!d)return;
@@ -812,9 +765,20 @@ async function refresh(){
   if(running){dot.className='dot';txt.textContent='Running';btn.textContent='⏸ Pause';btn.className='btn btn-yellow';}
   else{dot.className='dot red';txt.textContent='Paused';btn.textContent='▶ Resume';btn.className='btn btn-green';}
 
-  renderPresetSummary();
-  document.querySelectorAll('[id^=preset-]').forEach(b=>b.classList.remove('preset-active'));
-  document.getElementById('preset-'+(st.preset || 'runner'))?.classList.add('preset-active');
+  // Sync settings fields
+  document.getElementById('s-buy').value   =st.max_buy_sol;
+  document.getElementById('s-tp1').value   =st.tp1_mult;
+  document.getElementById('s-tp2').value   =st.tp2_mult;
+  document.getElementById('s-trail').value =Math.round(st.trail_pct*100);
+  document.getElementById('s-sl').value    =Math.round((1-st.stop_loss)*100);
+  document.getElementById('s-age').value   =st.max_age_min;
+  document.getElementById('s-ts').value    =st.time_stop_min;
+  document.getElementById('s-liq').value   =st.min_liq;
+  document.getElementById('s-minmc').value =st.min_mc;
+  document.getElementById('s-maxmc').value =st.max_mc;
+  document.getElementById('s-fee').value   =st.priority_fee;
+  document.getElementById('s-rug').checked =!!st.anti_rug;
+  document.getElementById('s-pump').checked=!!st.pump_scan;
 
   // Positions
   if(d.positions.length){
@@ -868,6 +832,32 @@ async function loadPreset(name){
   document.querySelectorAll('[id^=preset-]').forEach(b=>b.classList.remove('preset-active'));
   document.getElementById('preset-'+name)?.classList.add('preset-active');
   setTimeout(refresh,400);
+}
+
+async function saveSettings(){
+  const sl=parseFloat(document.getElementById('s-sl').value);
+  const trail=parseFloat(document.getElementById('s-trail').value);
+  // Clear preset highlight since user customized
+  document.querySelectorAll('[id^=preset-]').forEach(b=>b.classList.remove('preset-active'));
+  await fetch('/settings',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      max_buy_sol:  parseFloat(document.getElementById('s-buy').value),
+      tp1_mult:     parseFloat(document.getElementById('s-tp1').value),
+      tp2_mult:     parseFloat(document.getElementById('s-tp2').value),
+      trail_pct:    trail/100,
+      stop_loss:    (100-sl)/100,
+      max_age_min:  parseFloat(document.getElementById('s-age').value),
+      time_stop_min:parseFloat(document.getElementById('s-ts').value),
+      min_liq:      parseFloat(document.getElementById('s-liq').value),
+      min_mc:       parseFloat(document.getElementById('s-minmc').value),
+      max_mc:       parseFloat(document.getElementById('s-maxmc').value),
+      priority_fee: parseFloat(document.getElementById('s-fee').value),
+      anti_rug:     document.getElementById('s-rug').checked,
+      pump_scan:    document.getElementById('s-pump').checked,
+    })
+  });
+  setTimeout(refresh,300);
 }
 
 refresh();
