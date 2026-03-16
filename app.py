@@ -147,15 +147,17 @@ PRESETS = {
         "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":2.0,
         "trail_pct":0.15,"stop_loss":0.85,"max_age_min":720,"time_stop_min":20,
         "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
+        "min_vol":5000,"min_score":40,"cooldown_min":15,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
         "description":"Moderate positions, balanced take-profits. Best for most markets.",
-        "max_buy_sol":0.04,"tp1_mult":1.2,"tp2_mult":1.5,
+        "max_buy_sol":0.04,"tp1_mult":1.5,"tp2_mult":2.5,
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":1440,"time_stop_min":30,
-        "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
+        "min_liq":8000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
+        "min_vol":3000,"min_score":30,"cooldown_min":10,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
@@ -164,7 +166,8 @@ PRESETS = {
         "description":"Larger positions, wider stops. More exposure for trending markets.",
         "max_buy_sol":0.07,"tp1_mult":1.8,"tp2_mult":4.0,
         "trail_pct":0.25,"stop_loss":0.65,"max_age_min":2880,"time_stop_min":45,
-        "min_liq":2000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
+        "min_liq":5000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
+        "min_vol":1000,"min_score":20,"cooldown_min":7,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
     },
@@ -173,7 +176,8 @@ PRESETS = {
         "description":"Larger positions, wide stops. For hot markets only.",
         "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
         "trail_pct":0.30,"stop_loss":0.60,"max_age_min":4320,"time_stop_min":60,
-        "min_liq":0,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
+        "min_liq":3000,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
+        "min_vol":500,"min_score":15,"cooldown_min":5,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
     },
@@ -1343,9 +1347,12 @@ class BotInstance:
         max_mc  = s.get("max_mc", 999999)
         min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
+        min_vol = s.get("min_vol", 0)
+        min_score = s.get("min_score", 0)
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
+        score_total = _sd["total"]
         sig_entry = {
             "mint": mint, "name": name, "price": price,
             "mc": mc, "vol": vol, "liq": liq, "age_min": age_min, "change": change,
@@ -1354,11 +1361,13 @@ class BotInstance:
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
                 {"name": "Liquidity", "passed": liq == 0 or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": change >= -20, "value": f"{change:+.0f}%", "threshold": "> -20%"},
+                {"name": "Price Change", "passed": change >= -10, "value": f"{change:+.0f}%", "threshold": "> -10%"},
+                {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
+                {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
-        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}%", flush=True)
+        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
             self.signal_explorer_log.appendleft(sig_entry)
@@ -1374,8 +1383,18 @@ class BotInstance:
             self.signal_explorer_log.appendleft(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change < -20:
+        if change < -10:
             sig_entry["reason"] = f"1h change {change:.0f}% too negative"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if vol < min_vol:
+            sig_entry["reason"] = f"Volume ${vol:,.0f} < min ${min_vol:,}"
+            self.signal_explorer_log.appendleft(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if score_total < min_score:
+            sig_entry["reason"] = f"AI Score {score_total} < min {min_score}"
             self.signal_explorer_log.appendleft(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
@@ -1387,10 +1406,10 @@ class BotInstance:
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
         sig_entry["passed"] = True
-        sig_entry["reason"] = "Passed all filters"
+        sig_entry["reason"] = f"Passed all filters (score {score_total})"
         self.signal_explorer_log.appendleft(sig_entry)
-        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}%")
-        self.log_filter(name, mint, True, f"Signal passed all filters")
+        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
+        self.log_filter(name, mint, True, f"Signal passed all filters (score {score_total})")
         self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
 
     def cashout_all(self):
@@ -2803,6 +2822,7 @@ def api_settings():
         ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
         ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
         ("drawdown_limit_sol", float), ("cooldown_min", int),
+        ("min_vol", float), ("min_score", int),
     ]:
         if key in data:
             try: overrides[key] = cast(data[key])
@@ -4189,6 +4209,10 @@ DASHBOARD_HTML = _CSS + """
         <div class="fgroup"><label class="flabel">Trailing Stop %</label><input class="finput" id="s-trail" type="number" step="0.05" value="0.20"></div>
         <div class="fgroup"><label class="flabel">Session Drawdown Limit (SOL)</label><input class="finput" id="s-dd" type="number" step="0.1" value="0.5"></div>
       </div>
+      <div class="glass">
+        <div class="fgroup"><label class="flabel">Min Volume ($)</label><input class="finput" id="s-minvol" type="number" step="100" value="3000"></div>
+        <div class="fgroup"><label class="flabel">Min AI Score (0-100)</label><input class="finput" id="s-minscore" type="number" min="0" max="100" value="30"></div>
+      </div>
     </div>
     <div style="margin-top:16px;display:flex;gap:10px">
       <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
@@ -4529,10 +4553,10 @@ async function pollListings() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {
-  safe:       { max_buy_sol:0.02, tp1_mult:1.3, tp2_mult:2.0, stop_loss:0.85, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3 },
-  balanced:   { max_buy_sol:0.04, tp1_mult:1.2, tp2_mult:1.5, stop_loss:0.75, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5 },
-  aggressive: { max_buy_sol:0.07, tp1_mult:1.8, tp2_mult:4.0, stop_loss:0.65, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8 },
-  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.60, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0 }
+  safe:       { max_buy_sol:0.02, tp1_mult:1.3, tp2_mult:2.0, stop_loss:0.85, trail_pct:0.15, max_correlated:2, cooldown_min:15, drawdown_limit_sol:0.3, min_vol:5000, min_score:40 },
+  balanced:   { max_buy_sol:0.04, tp1_mult:1.5, tp2_mult:2.5, stop_loss:0.75, trail_pct:0.20, max_correlated:5, cooldown_min:10, drawdown_limit_sol:0.5, min_vol:3000, min_score:30 },
+  aggressive: { max_buy_sol:0.07, tp1_mult:1.8, tp2_mult:4.0, stop_loss:0.65, trail_pct:0.25, max_correlated:5, cooldown_min:7,  drawdown_limit_sol:0.8, min_vol:1000, min_score:20 },
+  degen:      { max_buy_sol:0.10, tp1_mult:2.0, tp2_mult:10.0,stop_loss:0.60, trail_pct:0.30, max_correlated:5, cooldown_min:5,  drawdown_limit_sol:1.0, min_vol:500,  min_score:15 }
 };
 function selectPreset(name) {
   document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
@@ -4542,7 +4566,8 @@ function selectPreset(name) {
   const p = PRESET_SETTINGS[name];
   if (!p) return;
   const m = { 's-buy':p.max_buy_sol, 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss,
-              's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol };
+              's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol,
+              's-minvol':p.min_vol, 's-minscore':p.min_score };
   for (const [id, val] of Object.entries(m)) {
     const inp = document.getElementById(id);
     if (inp) inp.value = val;
@@ -4561,6 +4586,8 @@ async function saveSettings() {
       trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
       max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
       drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
+      min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
+      min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
     })
   }).then(r => r.json()).catch(() => null);
   showToast(res && res.ok !== false ? '\u2713 Settings saved' : '\u26a0 Save failed', res && res.ok !== false);
@@ -4629,12 +4656,14 @@ async function refresh() {
     const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
     setVal('s-maxpos',   s.max_correlated   ?? 5);
     setVal('s-cooldown', s.cooldown_min     ?? 10);
-    setVal('s-tp1',      s.tp1_mult         ?? 1.2);
-    setVal('s-tp2',      s.tp2_mult         ?? 1.5);
+    setVal('s-tp1',      s.tp1_mult         ?? 1.5);
+    setVal('s-tp2',      s.tp2_mult         ?? 2.5);
     setVal('s-sl',       s.stop_loss        ?? 0.75);
     setVal('s-trail',    s.trail_pct        ?? 0.20);
     setVal('s-buy',      s.max_buy_sol      ?? 0.04);
     setVal('s-dd',       s.drawdown_limit_sol ?? 0.5);
+    setVal('s-minvol',   s.min_vol          ?? 3000);
+    setVal('s-minscore', s.min_score        ?? 30);
   }
 }
 
@@ -5103,6 +5132,16 @@ ADMIN_HTML = _CSS + """
           <input class="setting-input" id="s-maxpos" type="number" step="1" value="3">
           <div class="setting-unit">#</div>
         </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Min Volume</div><div class="setting-desc">Skip tokens below this 24h volume</div></div>
+          <input class="setting-input" id="s-minvol" type="number" step="100" value="3000">
+          <div class="setting-unit">USD</div>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Min AI Score</div><div class="setting-desc">Skip tokens scoring below this (0-100)</div></div>
+          <input class="setting-input" id="s-minscore" type="number" min="0" max="100" step="5" value="30">
+          <div class="setting-unit">/100</div>
+        </div>
       </div>
       <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="savePreset()">💾 Save Preset Override</button>
     </div>
@@ -5139,28 +5178,30 @@ ADMIN_HTML = _CSS + """
 
 <script>
 const PRESET_DEFAULTS = {
-  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:20,tstop:20,liq:25000,minmc:10000,maxmc:80000,prio:10000,dd:0.3,maxpos:2},
-  balanced: {buy:0.04,tp1:1.5,tp2:3.0,sl:0.75,trail:0.20,age:30,tstop:30,liq:10000,minmc:5000,maxmc:150000,prio:30000,dd:0.5,maxpos:3},
-  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:10,tstop:60,liq:5000,minmc:2000,maxmc:250000,prio:100000,dd:1.0,maxpos:5},
+  safe:     {buy:0.02,tp1:1.3,tp2:2.0,sl:0.85,trail:0.15,age:20,tstop:20,liq:10000,minmc:10000,maxmc:150000,prio:10000,dd:0.3,maxpos:2,minvol:5000,minscore:40},
+  balanced: {buy:0.04,tp1:1.5,tp2:2.5,sl:0.75,trail:0.20,age:30,tstop:30,liq:8000,minmc:5000,maxmc:250000,prio:30000,dd:0.5,maxpos:5,minvol:3000,minscore:30},
+  degen:    {buy:0.10,tp1:2.0,tp2:10.0,sl:0.60,trail:0.30,age:10,tstop:60,liq:3000,minmc:2000,maxmc:500000,prio:100000,dd:1.0,maxpos:5,minvol:500,minscore:15},
 };
 let aiSuggestion = null;
 
 function loadPreset(name) {
   const p = PRESET_DEFAULTS[name];
   if (!p) return;
-  document.getElementById('s-max-buy').value = p.buy;
-  document.getElementById('s-tp1').value     = p.tp1;
-  document.getElementById('s-tp2').value     = p.tp2;
-  document.getElementById('s-sl').value      = p.sl;
-  document.getElementById('s-trail').value   = p.trail;
-  document.getElementById('s-age').value     = p.age;
-  document.getElementById('s-tstop').value   = p.tstop;
-  document.getElementById('s-liq').value     = p.liq;
-  document.getElementById('s-minmc').value   = p.minmc;
-  document.getElementById('s-maxmc').value   = p.maxmc;
-  document.getElementById('s-prio').value    = p.prio;
-  document.getElementById('s-dd').value      = p.dd;
-  document.getElementById('s-maxpos').value  = p.maxpos;
+  document.getElementById('s-max-buy').value  = p.buy;
+  document.getElementById('s-tp1').value      = p.tp1;
+  document.getElementById('s-tp2').value      = p.tp2;
+  document.getElementById('s-sl').value       = p.sl;
+  document.getElementById('s-trail').value    = p.trail;
+  document.getElementById('s-age').value      = p.age;
+  document.getElementById('s-tstop').value    = p.tstop;
+  document.getElementById('s-liq').value      = p.liq;
+  document.getElementById('s-minmc').value    = p.minmc;
+  document.getElementById('s-maxmc').value    = p.maxmc;
+  document.getElementById('s-prio').value     = p.prio;
+  document.getElementById('s-dd').value       = p.dd;
+  document.getElementById('s-maxpos').value   = p.maxpos;
+  document.getElementById('s-minvol').value   = p.minvol;
+  document.getElementById('s-minscore').value = p.minscore;
 }
 
 async function savePreset() {
@@ -5180,6 +5221,8 @@ async function savePreset() {
     priority_fee:     parseInt(document.getElementById('s-prio').value),
     drawdown_limit_sol: parseFloat(document.getElementById('s-dd').value),
     max_correlated:   parseInt(document.getElementById('s-maxpos').value),
+    min_vol:          parseFloat(document.getElementById('s-minvol').value),
+    min_score:        parseInt(document.getElementById('s-minscore').value),
   };
   const r = await fetch('/api/admin/override-preset', {
     method:'POST', headers:{'Content-Type':'application/json'},

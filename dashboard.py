@@ -74,6 +74,8 @@ PRESETS = {
         "min_liq":       10000,
         "min_mc":        5000,
         "max_mc":        100000,
+        "min_vol":       3000,
+        "min_score":     30,
         "priority_fee":  10000,  # lamports
         "anti_rug":      True,
         "pump_scan":     True,
@@ -91,6 +93,8 @@ PRESETS = {
         "min_liq":       5000,
         "min_mc":        2000,
         "max_mc":        200000,
+        "min_vol":       500,
+        "min_score":     15,
         "priority_fee":  100000, # pay more to land first
         "anti_rug":      True,
         "pump_scan":     True,
