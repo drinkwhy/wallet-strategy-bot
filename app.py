@@ -1378,7 +1378,7 @@ class BotInstance:
 
     def refresh_balance(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
-        for rpc_url in [HELIUS_RPC, "https://api.mainnet-beta.solana.com"]:
+        for rpc_url in [HELIUS_RPC, "https://rpc.ankr.com/solana", "https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]:
             try:
                 r = requests.post(rpc_url, json=payload, timeout=5)
                 data = r.json()
