@@ -1647,11 +1647,6 @@ class BotInstance:
 
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
-        now = time.time()
-        # Cooldown after losses
-        if now < self.cooldown_until:
-            mins = int((self.cooldown_until - now) / 60) + 1
-            return f"Loss cooldown active ({mins}m remaining)"
         return None
 
     def check_honeypot(self, mint, age_min=0):
@@ -1976,10 +1971,7 @@ class BotInstance:
                     self.stats["losses"] += 1
                     self.consecutive_losses += 1
                     self.loss_mints[mint] = time.time()  # block this mint for 1h
-                    cooldown_min = self.settings.get("cooldown_min", 10)
-                    cooldown_sec = cooldown_min * 60
-                    self.cooldown_until = time.time() + cooldown_sec
-                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {pos['name']}")
+                    self.cooldown_until = 0.0
                 # Telegram alert
                 try:
                     conn = db()
@@ -5381,7 +5373,7 @@ def api_position_analytics():
         "session_drawdown": round(bot.session_drawdown, 4),
         "drawdown_limit": bot.settings.get("drawdown_limit_sol", 0.5),
         "consecutive_losses": bot.consecutive_losses,
-        "cooldown_remaining": max(0, round(bot.cooldown_until - time.time())),
+        "cooldown_remaining": 0,
         "peak_balance": round(bot.peak_balance, 4),
         "current_balance": round(bot.sol_balance, 4),
         "positions_count": len(bot.positions),
