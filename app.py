@@ -997,8 +997,8 @@ def ai_score(info):
     """Score a token 0-100 based on multiple signals."""
     return ai_score_detailed(info)["total"]
 
-def check_holder_concentration(mint):
-    """Returns True if top holders don't own >50% of supply."""
+def check_holder_concentration(mint, max_top5_pct=0.65):
+    """Returns True if the top 5 holders stay under the configured share of supply."""
     try:
         r = requests.post(HELIUS_RPC, json={
             "jsonrpc":"2.0","id":1,
@@ -1010,7 +1010,7 @@ def check_holder_concentration(mint):
         total = sum(float(a.get("uiAmount") or 0) for a in accounts)
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
         if total <= 0: return True
-        return (top5 / total) < 0.50
+        return (top5 / total) < max_top5_pct
     except Exception as _e:
         print(f"[ERROR] Holder check failed: {_e}", flush=True)
         return True
@@ -1772,8 +1772,8 @@ class BotInstance:
             self.log_msg(f"SKIP {name} — {reason}")
             return
         # Holder concentration (skip for very new tokens — pump.fun always starts concentrated)
-        if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint):
-            self.log_filter(name, mint, False, "Top 5 holders own >50% of supply")
+        if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint, 0.65):
+            self.log_filter(name, mint, False, "Top 5 holders own >65% of supply")
             self.log_msg(f"SKIP {name} — holder concentration too high")
             return
         # Dynamic slippage
