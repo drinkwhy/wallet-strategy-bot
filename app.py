@@ -364,14 +364,25 @@ def build_bot_overrides(source):
 def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
     preset = normalize_preset_name(preset)
     overrides = build_bot_overrides(settings)
+    print(f"[SETTINGS] Saving for user {user_id}: preset={preset}, overrides={overrides}", flush=True)
     conn = db()
     try:
         cur = conn.cursor()
+        # Use INSERT ... ON CONFLICT to ensure row exists
         cur.execute("""
-            UPDATE bot_settings SET preset=%s,run_mode=%s,run_duration_min=%s,profit_target_sol=%s,
-            max_correlated=%s,drawdown_limit_sol=%s,custom_settings=%s
-            WHERE user_id=%s
+            INSERT INTO bot_settings (user_id, preset, run_mode, run_duration_min, profit_target_sol,
+                max_correlated, drawdown_limit_sol, custom_settings)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                preset = EXCLUDED.preset,
+                run_mode = EXCLUDED.run_mode,
+                run_duration_min = EXCLUDED.run_duration_min,
+                profit_target_sol = EXCLUDED.profit_target_sol,
+                max_correlated = EXCLUDED.max_correlated,
+                drawdown_limit_sol = EXCLUDED.drawdown_limit_sol,
+                custom_settings = EXCLUDED.custom_settings
         """, (
+            user_id,
             preset,
             run_mode,
             int(duration or 0),
@@ -379,9 +390,11 @@ def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
             int(overrides.get("max_correlated", settings.get("max_correlated", PRESETS[preset]["max_correlated"]))),
             float(overrides.get("drawdown_limit_sol", settings.get("drawdown_limit_sol", PRESETS[preset]["drawdown_limit_sol"]))),
             json.dumps(overrides) if overrides else None,
-            user_id,
         ))
         conn.commit()
+        print(f"[SETTINGS] Saved successfully", flush=True)
+    except Exception as e:
+        print(f"[SETTINGS] Save error: {e}", flush=True)
     finally:
         db_return(conn)
     return overrides
