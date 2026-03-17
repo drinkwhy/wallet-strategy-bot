@@ -236,12 +236,12 @@ PRESETS = {
         "max_buy_sol":0.04,"tp1_mult":2.0,"tp2_mult":4.0,
         "trail_pct":0.20,"stop_loss":0.70,"max_age_min":240,"time_stop_min":30,
         "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
-        "min_vol":3000,"min_score":20,"cooldown_min":6,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":15,"min_narrative_score":12,
-        "min_green_lights":1,"min_volume_spike_mult":3,"late_entry_mult":10.0,
-        "offpeak_min_change":15,
-        "nuclear_narrative_score":20,
-        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
+        "min_vol":3000,"min_score":30,"cooldown_min":10,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
+        "min_green_lights":2,"min_volume_spike_mult":6,"late_entry_mult":5.0,
+        "offpeak_min_change":18,
+        "nuclear_narrative_score":40,
+        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
     "aggressive": {
@@ -288,9 +288,13 @@ BOT_OVERRIDE_FIELDS = [
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
     ("offpeak_min_change", float),
-    ("adaptive_relax_level", int), ("adaptive_zero_buy_hours", int),
-    ("adaptive_last_relax_at", str),
 ]
+
+AUTO_RELAX_STATE_FIELDS = (
+    "adaptive_relax_level",
+    "adaptive_zero_buy_hours",
+    "adaptive_last_relax_at",
+)
 
 def normalize_preset_name(preset):
     preset = str(preset or "balanced").strip().lower()
@@ -300,6 +304,15 @@ def normalize_preset_name(preset):
     }
     preset = aliases.get(preset, preset)
     return preset if preset in PRESETS else "balanced"
+
+
+def strip_auto_relax_state(settings):
+    if not isinstance(settings, dict):
+        return {}
+    cleaned = dict(settings)
+    for key in AUTO_RELAX_STATE_FIELDS:
+        cleaned.pop(key, None)
+    return cleaned
 
 
 ADMIN_PRESET_FIELDS = {
@@ -363,6 +376,7 @@ def build_bot_overrides(source):
 
 def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
     preset = normalize_preset_name(preset)
+    settings = strip_auto_relax_state(settings)
     overrides = build_bot_overrides(settings)
     print(f"[SETTINGS] Saving for user {user_id}: preset={preset}, overrides={overrides}", flush=True)
     conn = db()
@@ -1122,7 +1136,7 @@ class BotInstance:
         self.user_id          = user_id
         self.keypair          = keypair
         self.wallet           = str(keypair.pubkey())
-        self.settings         = dict(settings)
+        self.settings         = strip_auto_relax_state(dict(settings))
         self.preset_name      = normalize_preset_name(preset_name)
         self.positions        = {}
         self.log              = []
@@ -1149,7 +1163,7 @@ class BotInstance:
         self.consecutive_losses = 0
         self.cooldown_until     = 0.0   # epoch — no buys before this time
         self.loss_mints         = {}    # mint -> epoch when loss occurred (1h cooldown)
-        self.auto_relax_level   = int(self.settings.get("adaptive_relax_level") or 0)
+        self.auto_relax_level   = 0
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
         self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
@@ -1174,42 +1188,7 @@ class BotInstance:
                 print(f"[WARN] Enhanced systems init failed: {_enh_err}")
 
     def relax_entry_guards(self):
-        steps = [
-            ("min_green_lights", lambda v: max(1, int(v) - 1), "minimum green lights"),
-            ("min_volume_spike_mult", lambda v: max(2.0, round(float(v) - 1.5, 1)), "volume spike threshold"),
-            ("min_holder_growth_pct", lambda v: max(10.0, round(float(v) - 10.0, 1)), "holder growth threshold"),
-            ("min_narrative_score", lambda v: max(8, int(v) - 2), "narrative score threshold"),
-            ("min_score", lambda v: max(10, int(v) - 3), "AI score floor"),
-            ("offpeak_min_change", lambda v: max(8.0, round(float(v) - 3.0, 1)), "off-peak change guard"),
-            ("max_age_min", lambda v: min(480, int(v) + 60), "max token age"),
-            ("max_mc", lambda v: min(1500000.0, round(float(v) * 1.35, -3)), "max market cap"),
-        ]
-        changed = None
-        while self.auto_relax_level < len(steps):
-            key, adjust, label = steps[self.auto_relax_level]
-            self.auto_relax_level += 1
-            old_value = self.settings.get(key, PRESETS[self.preset_name].get(key))
-            try:
-                new_value = adjust(old_value)
-            except Exception:
-                continue
-            if new_value == old_value:
-                continue
-            self.settings[key] = new_value
-            changed = (key, old_value, new_value, label)
-            break
-        self.settings["adaptive_relax_level"] = self.auto_relax_level
-        self.settings["adaptive_zero_buy_hours"] = int(self.settings.get("adaptive_zero_buy_hours") or 0) + 1
-        self.settings["adaptive_last_relax_at"] = _now_utc().isoformat()
-        persist_bot_settings(
-            self.user_id,
-            self.preset_name,
-            self.run_mode,
-            self.run_duration_min,
-            self.profit_target,
-            self.settings,
-        )
-        return changed
+        return None
 
     def persist_runtime_settings(self):
         persist_bot_settings(
@@ -1225,28 +1204,10 @@ class BotInstance:
         now = time.time()
         if now - self.hour_start < 3600:
             return
-        buys = int(self.buys_this_hour or 0)
-        evals = int(self.evals_this_hour or 0)
         self.hour_start = now
         self.buys_this_hour = 0
         self.evals_this_hour = 0
-        if buys > 0:
-            self.settings["adaptive_zero_buy_hours"] = 0
-            self.persist_runtime_settings()
-            self.log_msg(f"Hourly check — {buys} buys across {evals} evaluated coins. Guards unchanged.")
-            return
-        if evals <= 0:
-            self.log_msg("Hourly check — no coins evaluated in the last hour. Guards unchanged.")
-            return
-        changed = self.relax_entry_guards()
-        if not changed:
-            self.log_msg(f"Hourly check — 0 buys across {evals} evaluated coins. Guard relaxation already at max level {self.auto_relax_level}.")
-            return
-        key, old_value, new_value, label = changed
-        replayed = replay_recent_market_feed(self, limit=60)
-        self.log_msg(
-            f"Hourly check — 0 buys across {evals} evaluated coins. Relaxed {label}: {old_value} → {new_value}. Replayed {replayed} recent candidates."
-        )
+        return
 
     def execution_health_alert(self):
         now = time.time()
@@ -1729,15 +1690,17 @@ class BotInstance:
         trade_sol = round(trade_sol, 4)
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
         
-        # ── Enhanced pre-trade risk check (warn only, don't block) ────────────
+        # ── Enhanced pre-trade risk check ─────────────────────────────────────
         if self.enhanced_enabled:
             try:
                 can_trade, cb_reason = self.risk_engine.circuit_breaker.is_trading_allowed(self.user_id)
                 if not can_trade:
-                    self.log_msg(f"⚠️ Enhanced circuit breaker warning: {cb_reason}")
-                    # Don't return - let original circuit breaker handle blocking
+                    reason = f"Enhanced circuit breaker: {cb_reason}"
+                    self.log_filter(name, mint, False, reason)
+                    self.log_msg(f"⛔ {reason}")
+                    return
                 
-                # Full pre-trade risk assessment (informational only)
+                # Block only hard failures; warnings remain advisory.
                 risk_ok, risk_reasons, assessment = self.risk_engine.pre_trade_check(
                     user_id=self.user_id,
                     mint=mint,
@@ -1751,10 +1714,16 @@ class BotInstance:
                     token_age_sec=age_min * 60,
                 )
                 
-                # Log warnings but don't block (let original filters handle it)
                 if not risk_ok:
-                    for reason in risk_reasons[:2]:
-                        self.log_msg(f"⚠️ Risk note: {reason}")
+                    for reason in risk_reasons[:3]:
+                        self.log_msg(f"⛔ Enhanced risk block: {reason}")
+                    self.log_filter(
+                        name,
+                        mint,
+                        False,
+                        f"Enhanced risk block: {risk_reasons[0] if risk_reasons else 'unknown'}",
+                    )
+                    return
                 
                 if assessment.warnings:
                     for warn in assessment.warnings[:2]:
@@ -1921,8 +1890,6 @@ class BotInstance:
             except Exception as _e:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
-            self.settings["adaptive_zero_buy_hours"] = 0
-            self.persist_runtime_settings()
             self.consecutive_losses  = 0   # reset on successful buy
             self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
             self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
@@ -3077,6 +3044,14 @@ def build_three_signal_checklist(info, intel, settings=None):
     settings = settings or PRESETS["balanced"]
     deployer_threshold = max(10, int(settings.get("min_narrative_score", 20)) - 4)
     whale_override = int(intel.get("whale_score") or 0) >= 45 or int(intel.get("whale_action_score") or 0) >= 35
+    price_momentum_override = (
+        10 <= float(info.get("change") or 0) <= 25 and
+        float(info.get("momentum") or 0) >= 12 and
+        (
+            whale_override or
+            int(intel.get("narrative_score") or 0) >= int(settings.get("nuclear_narrative_score", 40))
+        )
+    )
     deployer_pass = (
         (intel.get("deployer_wallet") in WHALE_WALLETS) or
         int(intel.get("deployer_score") or 0) >= deployer_threshold or
@@ -3086,10 +3061,7 @@ def build_three_signal_checklist(info, intel, settings=None):
     volume_pass = (
         float(intel.get("volume_spike_ratio") or 0) >= float(settings.get("min_volume_spike_mult", 10)) or
         float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 50)) or
-        (
-            float(info.get("change") or 0) >= 20 and
-            float(info.get("momentum") or 0) >= 2
-        )
+        price_momentum_override
     )
     narrative_floor = max(8, int(settings.get("min_narrative_score", 20)) - 3)
     aligned_tags = [tag for tag in (intel.get("narrative_tags") or []) if tag in set(market_mood_snapshot())]
@@ -3108,7 +3080,11 @@ def build_three_signal_checklist(info, intel, settings=None):
             "name": "Volume / holder acceleration",
             "passed": volume_pass,
             "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x vol | {float(intel.get('holder_growth_1h') or 0):+.0f}% holders",
-            "threshold": f">= {settings.get('min_volume_spike_mult', 10)}x, >= {settings.get('min_holder_growth_pct', 50)}%, or strong price+momentum",
+            "threshold": (
+                f">= {settings.get('min_volume_spike_mult', 10)}x, "
+                f">= {settings.get('min_holder_growth_pct', 50)}%, "
+                "or 10-25% price change + strong momentum + whale/narrative confirmation"
+            ),
         },
         {
             "name": "Narrative timing fit",
@@ -4737,10 +4713,11 @@ def api_state():
                             db_settings.update(custom)
                     except Exception:
                         pass
+                db_settings = strip_auto_relax_state(db_settings)
         finally:
             db_return(conn)
     except Exception:
-        db_settings = bot.settings if bot else {}
+        db_settings = strip_auto_relax_state(bot.settings) if bot else {}
     
     return jsonify({
         "running":    bot.running if bot else False,
@@ -4751,8 +4728,8 @@ def api_state():
         "filter_log": list(bot.filter_log)[:10] if bot else [],
         "settings":   db_settings,
         "adaptive": {
-            "relax_level": int(db_settings.get("adaptive_relax_level") or 0),
-            "zero_buy_hours": int(db_settings.get("adaptive_zero_buy_hours") or 0),
+            "relax_level": 0,
+            "zero_buy_hours": 0,
             "offpeak_min_change": float(db_settings.get("offpeak_min_change") or 0),
         },
     })
@@ -5464,10 +5441,10 @@ def api_ops_metrics():
         },
         "rpc_health": rpc_health_snapshot(window_sec=900),
         "adaptive": {
-            "relax_level": int((bot.settings if bot else {}).get("adaptive_relax_level") or 0),
-            "zero_buy_hours": int((bot.settings if bot else {}).get("adaptive_zero_buy_hours") or 0),
+            "relax_level": 0,
+            "zero_buy_hours": 0,
             "offpeak_min_change": float((bot.settings if bot else {}).get("offpeak_min_change") or 0),
-            "last_relax_at": (bot.settings if bot else {}).get("adaptive_last_relax_at"),
+            "last_relax_at": None,
         },
         "top_whales": top_whales,
         "threat_map": threat_map,
