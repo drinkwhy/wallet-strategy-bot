@@ -6667,7 +6667,7 @@ DASHBOARD_HTML = _CSS + """
         <div class="fgroup"><label class="flabel">Min Narrative Score</label><input class="finput" id="s-narr" type="number" step="1" value="20"></div>
       </div>
       <div class="glass">
-        <div class="fgroup"><label class="flabel">Green Lights Required</label><input class="finput" id="s-lights" type="number" min="1" max="3" value="3"></div>
+        <div class="fgroup"><label class="flabel">Green Lights Required</label><input class="finput" id="s-lights" type="number" min="0" max="3" value="3"></div>
         <div class="fgroup"><label class="flabel">Late Entry Max Multiple</label><input class="finput" id="s-latemult" type="number" step="0.5" value="5.0"></div>
         <div class="fgroup"><label class="flabel">Nuclear Narrative Score</label><input class="finput" id="s-nuclear" type="number" step="1" value="40"></div>
       </div>
@@ -7090,33 +7090,45 @@ function selectPreset(name) {
   }
 }
 async function saveSettings() {
+  const intVal = (id, fallback) => {
+    const raw = document.getElementById(id)?.value;
+    if (raw === undefined || raw === null || raw === '') return fallback;
+    const parsed = parseInt(raw, 10);
+    return Number.isNaN(parsed) ? fallback : parsed;
+  };
+  const floatVal = (id, fallback) => {
+    const raw = document.getElementById(id)?.value;
+    if (raw === undefined || raw === null || raw === '') return fallback;
+    const parsed = parseFloat(raw);
+    return Number.isNaN(parsed) ? fallback : parsed;
+  };
   const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       preset:              document.getElementById('s-preset').value,
-      max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
-      cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
-      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 2.0),
-      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 4.0),
-      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.70),
-      trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
-      max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
-      drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
-      min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
-      min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
-      max_age_min:         parseInt(document.getElementById('s-age')?.value || 240),
-      time_stop_min:       parseInt(document.getElementById('s-tstop')?.value || 30),
-      min_liq:             parseFloat(document.getElementById('s-liq')?.value || 8000),
-      min_mc:              parseFloat(document.getElementById('s-minmc')?.value || 5000),
-      max_mc:              parseFloat(document.getElementById('s-maxmc')?.value || 250000),
-      priority_fee:        parseInt(document.getElementById('s-prio')?.value || 30000),
-      risk_per_trade_pct:  parseFloat(document.getElementById('s-risk')?.value || 2.0),
-      min_holder_growth_pct: parseFloat(document.getElementById('s-holders')?.value || 50),
-      min_narrative_score: parseInt(document.getElementById('s-narr')?.value || 20),
-      min_green_lights:    parseInt(document.getElementById('s-lights')?.value || 3),
-      min_volume_spike_mult: parseFloat(document.getElementById('s-volspike')?.value || 10),
-      late_entry_mult:     parseFloat(document.getElementById('s-latemult')?.value || 5.0),
-      nuclear_narrative_score: parseInt(document.getElementById('s-nuclear')?.value || 40),
+      max_correlated:      intVal('s-maxpos', 5),
+      cooldown_min:        intVal('s-cooldown', 10),
+      tp1_mult:            floatVal('s-tp1', 2.0),
+      tp2_mult:            floatVal('s-tp2', 4.0),
+      stop_loss:           floatVal('s-sl', 0.70),
+      trail_pct:           floatVal('s-trail', 0.20),
+      max_buy_sol:         floatVal('s-buy', 0.04),
+      drawdown_limit_sol:  floatVal('s-dd', 0.5),
+      min_vol:             floatVal('s-minvol', 3000),
+      min_score:           intVal('s-minscore', 30),
+      max_age_min:         intVal('s-age', 240),
+      time_stop_min:       intVal('s-tstop', 30),
+      min_liq:             floatVal('s-liq', 8000),
+      min_mc:              floatVal('s-minmc', 5000),
+      max_mc:              floatVal('s-maxmc', 250000),
+      priority_fee:        intVal('s-prio', 30000),
+      risk_per_trade_pct:  floatVal('s-risk', 2.0),
+      min_holder_growth_pct: floatVal('s-holders', 50),
+      min_narrative_score: intVal('s-narr', 20),
+      min_green_lights:    intVal('s-lights', 3),
+      min_volume_spike_mult: floatVal('s-volspike', 10),
+      late_entry_mult:     floatVal('s-latemult', 5.0),
+      nuclear_narrative_score: intVal('s-nuclear', 40),
     })
   }).then(r => r.json()).catch(() => null);
   if (res && res.ok !== false) {
