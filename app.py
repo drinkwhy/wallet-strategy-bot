@@ -6777,6 +6777,25 @@ function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
 function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
 function markSettingsDirty() { _settingsDirty = true; }
+const SETTINGS_INPUT_IDS = [
+  's-buy', 's-tp1', 's-tp2', 's-sl', 's-trail', 's-maxpos', 's-cooldown',
+  's-dd', 's-minvol', 's-minscore', 's-age', 's-tstop', 's-liq', 's-minmc',
+  's-maxmc', 's-prio', 's-risk', 's-holders', 's-narr', 's-lights',
+  's-volspike', 's-latemult', 's-nuclear'
+];
+function initSettingsEditor() {
+  const inputs = SETTINGS_INPUT_IDS.map(id => document.getElementById(id)).filter(Boolean);
+  const syncFocusState = () => {
+    document._settingsFocused = inputs.includes(document.activeElement);
+  };
+  document._settingsFocused = false;
+  inputs.forEach(inp => {
+    inp.addEventListener('focus', () => { document._settingsFocused = true; });
+    inp.addEventListener('blur', () => { setTimeout(syncFocusState, 0); });
+    inp.addEventListener('input', markSettingsDirty);
+    inp.addEventListener('change', markSettingsDirty);
+  });
+}
 function signalKey(s) { return `${s.mint || ''}|${s.logged_at || s.ts || ''}|${s.passed ? 1 : 0}|${s.reason || ''}`; }
 function fmtDateTime(ts) {
   if (!ts) return '—';
@@ -7814,6 +7833,7 @@ async function loadPnl(range) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function() { selectPreset('{{PRESET}}' || 'balanced'); })();
+initSettingsEditor();
 window.addEventListener('resize', () => {
   if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
     treeCanvas.width = treeCanvas.parentElement.clientWidth;
