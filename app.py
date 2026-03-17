@@ -4681,6 +4681,34 @@ def api_state():
     total_trades = stats["wins"] + stats["losses"]
     stats["win_rate"] = round(stats["wins"] / total_trades * 100, 1) if total_trades else 0
     stats["streak"] = -(bot.consecutive_losses) if bot and bot.consecutive_losses > 0 else stats["wins"]
+    
+    # Load settings from database, not bot memory
+    db_settings = {}
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT preset, custom_settings, max_correlated, drawdown_limit_sol FROM bot_settings WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
+            if row:
+                preset_name = normalize_preset_name(row.get("preset", "balanced"))
+                db_settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
+                if row.get("max_correlated") is not None:
+                    db_settings["max_correlated"] = row["max_correlated"]
+                if row.get("drawdown_limit_sol") is not None:
+                    db_settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
+                if row.get("custom_settings"):
+                    try:
+                        custom = json.loads(row["custom_settings"])
+                        if isinstance(custom, dict):
+                            db_settings.update(custom)
+                    except Exception:
+                        pass
+        finally:
+            db_return(conn)
+    except Exception:
+        db_settings = bot.settings if bot else {}
+    
     return jsonify({
         "running":    bot.running if bot else False,
         "balance":    round(bot.sol_balance, 4) if bot else 0,
@@ -4688,12 +4716,12 @@ def api_state():
         "log":        bot.log[:120] if bot else [],
         "stats":      stats,
         "filter_log": list(bot.filter_log)[:10] if bot else [],
-        "settings":   bot.settings if bot else {},
+        "settings":   db_settings,
         "adaptive": {
-            "relax_level": int((bot.settings if bot else {}).get("adaptive_relax_level") or 0),
-            "zero_buy_hours": int((bot.settings if bot else {}).get("adaptive_zero_buy_hours") or 0),
-            "offpeak_min_change": float((bot.settings if bot else {}).get("offpeak_min_change") or 0),
-        } if bot else {},
+            "relax_level": int(db_settings.get("adaptive_relax_level") or 0),
+            "zero_buy_hours": int(db_settings.get("adaptive_zero_buy_hours") or 0),
+            "offpeak_min_change": float(db_settings.get("offpeak_min_change") or 0),
+        },
     })
 
 @app.route("/api/start", methods=["POST"])
