@@ -7084,7 +7084,7 @@ async function saveSettings() {
   } else {
     showToast('\u26a0 Save failed', false);
   }
-  setTimeout(refresh, 300);
+  setTimeout(refresh, 800);
   return res;
 }
 
