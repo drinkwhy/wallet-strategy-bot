@@ -236,7 +236,7 @@ PRESETS = {
         "max_buy_sol":0.04,"tp1_mult":2.0,"tp2_mult":4.0,
         "trail_pct":0.20,"stop_loss":0.70,"max_age_min":240,"time_stop_min":30,
         "min_liq":10000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
-        "min_vol":3000,"min_score":20,"cooldown_min":10,
+        "min_vol":3000,"min_score":20,"cooldown_min":6,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":15,"min_narrative_score":12,
         "min_green_lights":1,"min_volume_spike_mult":3,"late_entry_mult":10.0,
         "offpeak_min_change":15,
