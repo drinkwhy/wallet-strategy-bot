@@ -2404,7 +2404,13 @@ class BotInstance:
             self.sell(mint, 1.0, "CASHOUT")
 
     def run(self):
-        self.refresh_balance()
+        # Retry balance fetch on startup — RPC may be degraded
+        for attempt in range(5):
+            self.refresh_balance()
+            if self.sol_balance > 0:
+                break
+            self.log_msg(f"[WARN] Balance read 0.0 SOL, retrying ({attempt+1}/5)...")
+            time.sleep(2)
         self.start_balance = self.sol_balance
         self.peak_balance  = self.sol_balance
         self.log_msg(f"Bot started | Wallet: {self.wallet} | Balance: {self.sol_balance:.4f} SOL")
