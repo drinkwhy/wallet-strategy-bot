@@ -981,15 +981,8 @@ def ai_score_detailed(info):
     vol_s = 25 if vol > 100000 else 18 if vol > 50000 else 10 if vol > 10000 else 5 if vol > 1000 else 0
     liq_s = 20 if liq > 50000 else 14 if liq > 20000 else 8 if liq > 5000 else 3 if liq > 1000 else 0
     age_s = 20 if age < 5 else 14 if age < 15 else 8 if age < 30 else 3 if age < 60 else 0
-    # Moderate early pumps are higher quality than already-exhausted vertical moves.
-    chg_s = (20 if 10 <= chg <= 30 else
-             15 if 5 <= chg < 10 else
-             10 if 30 < chg <= 50 else
-             0 if chg > 100 else
-             5 if 50 < chg <= 100 else
-             5 if 0 <= chg < 5 else
-             -10 if chg < -10 else 0)
-    mom_s = max(-10, min(15, int(mom * 0.15)))
+    chg_s = 20 if chg > 100 else 15 if chg > 50 else 10 if chg > 20 else 5 if chg > 5 else -10 if chg < -20 else 0
+    mom_s = min(15, int(mom * 0.15))
     total = max(0, min(100, vol_s + liq_s + age_s + chg_s + mom_s))
     return {"total": total, "volume": vol_s, "liquidity": liq_s, "age": age_s, "price_change": chg_s, "momentum": mom_s}
 
@@ -997,8 +990,8 @@ def ai_score(info):
     """Score a token 0-100 based on multiple signals."""
     return ai_score_detailed(info)["total"]
 
-def check_holder_concentration(mint, max_top5_pct=0.65):
-    """Returns True if the top 5 holders stay under the configured share of supply."""
+def check_holder_concentration(mint):
+    """Returns True if top holders don't own >50% of supply."""
     try:
         r = requests.post(HELIUS_RPC, json={
             "jsonrpc":"2.0","id":1,
@@ -1010,7 +1003,7 @@ def check_holder_concentration(mint, max_top5_pct=0.65):
         total = sum(float(a.get("uiAmount") or 0) for a in accounts)
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
         if total <= 0: return True
-        return (top5 / total) < max_top5_pct
+        return (top5 / total) < 0.50
     except Exception as _e:
         print(f"[ERROR] Holder check failed: {_e}", flush=True)
         return True
@@ -1654,6 +1647,11 @@ class BotInstance:
 
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
+        now = time.time()
+        # Cooldown after losses
+        if now < self.cooldown_until:
+            mins = int((self.cooldown_until - now) / 60) + 1
+            return f"Loss cooldown active ({mins}m remaining)"
         return None
 
     def check_honeypot(self, mint, age_min=0):
@@ -1681,47 +1679,6 @@ class BotInstance:
         s = self.settings
         trade_sol = round(float(s["max_buy_sol"]), 4)
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
-
-        # ── Enhanced pre-trade risk check ─────────────────────────────────────
-        if self.enhanced_enabled:
-            try:
-                can_trade, cb_reason = self.risk_engine.circuit_breaker.is_trading_allowed(self.user_id)
-                if not can_trade:
-                    reason = f"Enhanced circuit breaker: {cb_reason}"
-                    self.log_filter(name, mint, False, reason)
-                    self.log_msg(f"⛔ {reason}")
-                    return
-
-                risk_ok, risk_reasons, assessment = self.risk_engine.pre_trade_check(
-                    user_id=self.user_id,
-                    mint=mint,
-                    sol_amount=trade_sol,
-                    slippage_bps=int(s.get("slippage_bps", 500)),
-                    priority_fee_sol=float(s.get("priority_fee", 100000)) / 1e9,
-                    position_count=len(self.positions),
-                    max_positions=int(s.get("max_correlated", 3)),
-                    liquidity_usd=liq,
-                    deployer_wallet=dev_wallet,
-                    token_age_sec=age_min * 60,
-                )
-
-                if not risk_ok:
-                    for reason in risk_reasons[:3]:
-                        self.log_msg(f"⛔ Enhanced risk block: {reason}")
-                    self.log_filter(
-                        name,
-                        mint,
-                        False,
-                        f"Enhanced risk block: {risk_reasons[0] if risk_reasons else 'unknown'}",
-                    )
-                    return
-
-                if assessment.warnings:
-                    for warn in assessment.warnings[:2]:
-                        self.log_msg(f"📋 {warn}")
-
-            except Exception as _enh_risk_err:
-                print(f"[WARN] Enhanced risk check error: {_enh_risk_err}")
 
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
@@ -1772,8 +1729,8 @@ class BotInstance:
             self.log_msg(f"SKIP {name} — {reason}")
             return
         # Holder concentration (skip for very new tokens — pump.fun always starts concentrated)
-        if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint, 0.65):
-            self.log_filter(name, mint, False, "Top 5 holders own >65% of supply")
+        if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint):
+            self.log_filter(name, mint, False, "Top 5 holders own >50% of supply")
             self.log_msg(f"SKIP {name} — holder concentration too high")
             return
         # Dynamic slippage
@@ -2019,7 +1976,10 @@ class BotInstance:
                     self.stats["losses"] += 1
                     self.consecutive_losses += 1
                     self.loss_mints[mint] = time.time()  # block this mint for 1h
-                    self.cooldown_until = 0.0
+                    cooldown_min = self.settings.get("cooldown_min", 10)
+                    cooldown_sec = cooldown_min * 60
+                    self.cooldown_until = time.time() + cooldown_sec
+                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {pos['name']}")
                 # Telegram alert
                 try:
                     conn = db()
@@ -2186,20 +2146,10 @@ class BotInstance:
         max_mc  = s.get("max_mc", 999999)
         min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
-        min_vol = s.get("min_vol", 0)
-        min_score = s.get("min_score", 0)
-        min_green_lights = int(s.get("min_green_lights", 2))
-        min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
-        min_narrative_score = int(s.get("min_narrative_score", 16))
-        min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
-        offpeak_min_change = float(s.get("offpeak_min_change", 25))
-        late_entry_mult = float(s.get("late_entry_mult", 4.0))
-        nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
-        max_hot_change = 200.0
+        offpeak_min_change = float(s.get("offpeak_min_change", 30))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
-        score_total = _sd["total"]
         self.evals_this_hour += 1
         sig_entry = {
             "mint": mint, "name": name, "price": price,
@@ -2207,26 +2157,19 @@ class BotInstance:
             "score": _sd, "passed": False, "reason": "",
             "filters": [
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
-                {"name": "Liquidity", "passed": liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
+                {"name": "Liquidity", "passed": liq == 0 or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
-                {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
-                {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
+                {"name": "Price Change", "passed": change >= -20, "value": f"{change:+.0f}%", "threshold": "> -20%"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
-        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
+        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}%", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if liq <= 0:
-            sig_entry["reason"] = "No liquidity data available"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if liq < min_liq:
+        if liq > 0 and liq < min_liq:
             sig_entry["reason"] = f"Liq ${liq:,.0f} < min ${min_liq:,}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
@@ -2236,23 +2179,8 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change <= 0:
-            sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if change > max_hot_change:
-            sig_entry["reason"] = f"1h change {change:.0f}% too extended"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if vol < min_vol:
-            sig_entry["reason"] = f"Volume ${vol:,.0f} < min ${min_vol:,}"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if score_total < min_score:
-            sig_entry["reason"] = f"AI Score {score_total} < min {min_score}"
+        if change < -20:
+            sig_entry["reason"] = f"1h change {change:.0f}% too negative"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
@@ -2263,109 +2191,12 @@ class BotInstance:
                 self.log_signal_entry(sig_entry)
                 self.log_filter(name, mint, False, sig_entry["reason"])
                 return
-        intel = ensure_token_intel(mint, base_info={
-            "mint": mint,
-            "name": name,
-            "price": price,
-            "mc": mc,
-            "vol": vol,
-            "liq": liq,
-            "age_min": age_min,
-            "change": change,
-            "score": score_total,
-        })
-        threat_score = int(intel.get("threat_risk_score") or 0)
-        threat_flags = intel.get("threat_flags") or []
-        can_exit = intel.get("can_exit")
-        transfer_hook_enabled = bool(intel.get("transfer_hook_enabled"))
-        whale_score = int(intel.get("whale_score") or 0)
-        whale_action_score = int(intel.get("whale_action_score") or 0)
-        checklist = build_three_signal_checklist(_sinfo, intel, settings=s)
-        intel["checklist"] = checklist["items"]
-        intel["green_lights"] = checklist["green_lights"]
-        adaptive_green_override = (
-            checklist["green_lights"] + 1 >= min_green_lights and
-            whale_score >= 55 and
-            whale_action_score >= 40 and
-            threat_score < 25 and
-            score_total >= (min_score + 5)
-        )
-        sig_entry["intel"] = intel
-        sig_entry["filters"].extend([
-            {
-                "name": "Tracked Wallet Edge",
-                "passed": checklist["items"][0]["passed"],
-                "value": checklist["items"][0]["value"],
-                "threshold": checklist["items"][0]["threshold"],
-            },
-            {
-                "name": "Volume / Holder Acceleration",
-                "passed": checklist["items"][1]["passed"],
-                "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x | {float(intel.get('holder_growth_1h') or 0):+.0f}%",
-                "threshold": f">= {min_volume_spike_mult:.0f}x or >= {min_holder_growth_pct:.0f}%",
-            },
-            {
-                "name": "Narrative Timing",
-                "passed": checklist["items"][2]["passed"],
-                "value": f"{intel.get('narrative_score', 0)}",
-                "threshold": f">= {min_narrative_score}",
-            },
-            {
-                "name": "Whale / Entity Score",
-                "passed": whale_score >= 28,
-                "value": f"w {intel.get('whale_score', 0)} · a {intel.get('whale_action_score', 0)} · cc {intel.get('cluster_confidence', 0)}",
-                "threshold": "whale >= 28",
-            },
-            {
-                "name": "3 Green Lights",
-                "passed": checklist["green_lights"] >= min_green_lights or adaptive_green_override,
-                "value": f"{checklist['green_lights']}/3" + (" + adaptive whale override" if adaptive_green_override else ""),
-                "threshold": f">= {min_green_lights} or strong whale + low threat",
-            },
-            {
-                "name": "Late Entry Guard",
-                "passed": float(intel.get("max_multiple") or 1) <= late_entry_mult or int(intel.get("narrative_score") or 0) >= nuclear_narrative_score,
-                "value": f"{float(intel.get('max_multiple') or 1):.2f}x seen",
-                "threshold": f"<= {late_entry_mult:.1f}x unless narrative >= {nuclear_narrative_score}",
-            },
-            {
-                "name": "Threat / Exit Risk",
-                "passed": threat_score < 60 and can_exit is not False and not transfer_hook_enabled,
-                "value": f"{threat_score}/100 {' · '.join(threat_flags[:2]) if threat_flags else 'clean'}",
-                "threshold": "score < 60, exit route available, no transfer hook",
-            },
-        ])
-        if transfer_hook_enabled:
-            sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if can_exit is False:
-            sig_entry["reason"] = "No exit route available"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if threat_score >= 60:
-            sig_entry["reason"] = f"Threat risk {threat_score}/100 ({', '.join(threat_flags[:3]) or 'risk'})"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if checklist["green_lights"] < min_green_lights and not adaptive_green_override:
-            sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if float(intel.get("max_multiple") or 1) > late_entry_mult and int(intel.get("narrative_score") or 0) < nuclear_narrative_score:
-            sig_entry["reason"] = f"Late entry ({float(intel.get('max_multiple') or 1):.2f}x) without nuclear narrative"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
         sig_entry["passed"] = True
         sig_entry["reason"] = "Passed all filters"
         self.log_signal_entry(sig_entry)
-        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
+        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}%")
         self.log_filter(name, mint, True, "Signal passed all filters")
-        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
+        self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -5550,7 +5381,7 @@ def api_position_analytics():
         "session_drawdown": round(bot.session_drawdown, 4),
         "drawdown_limit": bot.settings.get("drawdown_limit_sol", 0.5),
         "consecutive_losses": bot.consecutive_losses,
-        "cooldown_remaining": 0,
+        "cooldown_remaining": max(0, round(bot.cooldown_until - time.time())),
         "peak_balance": round(bot.peak_balance, 4),
         "current_balance": round(bot.sol_balance, 4),
         "positions_count": len(bot.positions),
@@ -6667,7 +6498,7 @@ DASHBOARD_HTML = _CSS + """
         <div class="fgroup"><label class="flabel">Min Narrative Score</label><input class="finput" id="s-narr" type="number" step="1" value="20"></div>
       </div>
       <div class="glass">
-        <div class="fgroup"><label class="flabel">Green Lights Required</label><input class="finput" id="s-lights" type="number" min="0" max="3" value="3"></div>
+        <div class="fgroup"><label class="flabel">Green Lights Required</label><input class="finput" id="s-lights" type="number" min="1" max="3" value="3"></div>
         <div class="fgroup"><label class="flabel">Late Entry Max Multiple</label><input class="finput" id="s-latemult" type="number" step="0.5" value="5.0"></div>
         <div class="fgroup"><label class="flabel">Nuclear Narrative Score</label><input class="finput" id="s-nuclear" type="number" step="1" value="40"></div>
       </div>
@@ -6777,25 +6608,6 @@ function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
 function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
 function markSettingsDirty() { _settingsDirty = true; }
-const SETTINGS_INPUT_IDS = [
-  's-buy', 's-tp1', 's-tp2', 's-sl', 's-trail', 's-maxpos', 's-cooldown',
-  's-dd', 's-minvol', 's-minscore', 's-age', 's-tstop', 's-liq', 's-minmc',
-  's-maxmc', 's-prio', 's-risk', 's-holders', 's-narr', 's-lights',
-  's-volspike', 's-latemult', 's-nuclear'
-];
-function initSettingsEditor() {
-  const inputs = SETTINGS_INPUT_IDS.map(id => document.getElementById(id)).filter(Boolean);
-  const syncFocusState = () => {
-    document._settingsFocused = inputs.includes(document.activeElement);
-  };
-  document._settingsFocused = false;
-  inputs.forEach(inp => {
-    inp.addEventListener('focus', () => { document._settingsFocused = true; });
-    inp.addEventListener('blur', () => { setTimeout(syncFocusState, 0); });
-    inp.addEventListener('input', markSettingsDirty);
-    inp.addEventListener('change', markSettingsDirty);
-  });
-}
 function signalKey(s) { return `${s.mint || ''}|${s.logged_at || s.ts || ''}|${s.passed ? 1 : 0}|${s.reason || ''}`; }
 function fmtDateTime(ts) {
   if (!ts) return '—';
@@ -7090,45 +6902,33 @@ function selectPreset(name) {
   }
 }
 async function saveSettings() {
-  const intVal = (id, fallback) => {
-    const raw = document.getElementById(id)?.value;
-    if (raw === undefined || raw === null || raw === '') return fallback;
-    const parsed = parseInt(raw, 10);
-    return Number.isNaN(parsed) ? fallback : parsed;
-  };
-  const floatVal = (id, fallback) => {
-    const raw = document.getElementById(id)?.value;
-    if (raw === undefined || raw === null || raw === '') return fallback;
-    const parsed = parseFloat(raw);
-    return Number.isNaN(parsed) ? fallback : parsed;
-  };
   const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       preset:              document.getElementById('s-preset').value,
-      max_correlated:      intVal('s-maxpos', 5),
-      cooldown_min:        intVal('s-cooldown', 10),
-      tp1_mult:            floatVal('s-tp1', 2.0),
-      tp2_mult:            floatVal('s-tp2', 4.0),
-      stop_loss:           floatVal('s-sl', 0.70),
-      trail_pct:           floatVal('s-trail', 0.20),
-      max_buy_sol:         floatVal('s-buy', 0.04),
-      drawdown_limit_sol:  floatVal('s-dd', 0.5),
-      min_vol:             floatVal('s-minvol', 3000),
-      min_score:           intVal('s-minscore', 30),
-      max_age_min:         intVal('s-age', 240),
-      time_stop_min:       intVal('s-tstop', 30),
-      min_liq:             floatVal('s-liq', 8000),
-      min_mc:              floatVal('s-minmc', 5000),
-      max_mc:              floatVal('s-maxmc', 250000),
-      priority_fee:        intVal('s-prio', 30000),
-      risk_per_trade_pct:  floatVal('s-risk', 2.0),
-      min_holder_growth_pct: floatVal('s-holders', 50),
-      min_narrative_score: intVal('s-narr', 20),
-      min_green_lights:    intVal('s-lights', 3),
-      min_volume_spike_mult: floatVal('s-volspike', 10),
-      late_entry_mult:     floatVal('s-latemult', 5.0),
-      nuclear_narrative_score: intVal('s-nuclear', 40),
+      max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
+      cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
+      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 2.0),
+      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 4.0),
+      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.70),
+      trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
+      max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
+      drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
+      min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
+      min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
+      max_age_min:         parseInt(document.getElementById('s-age')?.value || 240),
+      time_stop_min:       parseInt(document.getElementById('s-tstop')?.value || 30),
+      min_liq:             parseFloat(document.getElementById('s-liq')?.value || 8000),
+      min_mc:              parseFloat(document.getElementById('s-minmc')?.value || 5000),
+      max_mc:              parseFloat(document.getElementById('s-maxmc')?.value || 250000),
+      priority_fee:        parseInt(document.getElementById('s-prio')?.value || 30000),
+      risk_per_trade_pct:  parseFloat(document.getElementById('s-risk')?.value || 2.0),
+      min_holder_growth_pct: parseFloat(document.getElementById('s-holders')?.value || 50),
+      min_narrative_score: parseInt(document.getElementById('s-narr')?.value || 20),
+      min_green_lights:    parseInt(document.getElementById('s-lights')?.value || 3),
+      min_volume_spike_mult: parseFloat(document.getElementById('s-volspike')?.value || 10),
+      late_entry_mult:     parseFloat(document.getElementById('s-latemult')?.value || 5.0),
+      nuclear_narrative_score: parseInt(document.getElementById('s-nuclear')?.value || 40),
     })
   }).then(r => r.json()).catch(() => null);
   if (res && res.ok !== false) {
@@ -7845,7 +7645,6 @@ async function loadPnl(range) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function() { selectPreset('{{PRESET}}' || 'balanced'); })();
-initSettingsEditor();
 window.addEventListener('resize', () => {
   if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
     treeCanvas.width = treeCanvas.parentElement.clientWidth;
