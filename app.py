@@ -1377,15 +1377,22 @@ class BotInstance:
         return False
 
     def refresh_balance(self):
-        try:
-            r = requests.post(HELIUS_RPC, json={
-                "jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]
-            }, timeout=5)
-            self.sol_balance = r.json().get("result",{}).get("value",0) / 1e9
-            if self.sol_balance > self.peak_balance:
-                self.peak_balance = self.sol_balance
-        except Exception as _e:
-            print(f"[ERROR] {_e}", flush=True)
+        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
+        for rpc_url in [HELIUS_RPC, "https://api.mainnet-beta.solana.com"]:
+            try:
+                r = requests.post(rpc_url, json=payload, timeout=5)
+                data = r.json()
+                if "error" in data:
+                    print(f"[WARN] Balance RPC error from {rpc_url[:40]}: {data['error']}", flush=True)
+                    continue
+                val = data.get("result",{}).get("value",0)
+                self.sol_balance = val / 1e9
+                if self.sol_balance > self.peak_balance:
+                    self.peak_balance = self.sol_balance
+                return
+            except Exception as _e:
+                print(f"[ERROR] Balance fetch failed ({rpc_url[:40]}): {_e}", flush=True)
+        print(f"[ERROR] All RPCs failed for balance check, wallet={self.wallet}", flush=True)
 
     # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
     JITO_TIPS = [
