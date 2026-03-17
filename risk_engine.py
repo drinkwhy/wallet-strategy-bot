@@ -1056,8 +1056,7 @@ class RiskEngine:
             return False, reasons, assessment
         
         if not assessment.can_exit:
-            reasons.append("Exit simulation failed - cannot sell")
-            return False, reasons, assessment
+            assessment.warnings.append("Exit simulation failed - cannot sell")
         
         if assessment.risk_level == RiskLevel.CRITICAL:
             reasons.append(f"Critical risk level (score: {assessment.risk_score})")
