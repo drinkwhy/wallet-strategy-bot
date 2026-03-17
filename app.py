@@ -967,8 +967,16 @@ def ai_score_detailed(info):
     vol_s = 25 if vol > 100000 else 18 if vol > 50000 else 10 if vol > 10000 else 5 if vol > 1000 else 0
     liq_s = 20 if liq > 50000 else 14 if liq > 20000 else 8 if liq > 5000 else 3 if liq > 1000 else 0
     age_s = 20 if age < 5 else 14 if age < 15 else 8 if age < 30 else 3 if age < 60 else 0
-    chg_s = 20 if chg > 100 else 15 if chg > 50 else 10 if chg > 20 else 5 if chg > 5 else -10 if chg < -20 else 0
-    mom_s = min(15, int(mom * 0.15))
+    # Moderate early pumps (10-30%) are the sweet spot; extreme pumps likely topping
+    chg_s = (20 if 10 <= chg <= 30 else
+             15 if 5 <= chg < 10 else
+             10 if 30 < chg <= 50 else
+             0 if chg > 100 else
+             5 if 50 < chg <= 100 else
+             5 if 0 <= chg < 5 else
+             -10 if chg < -10 else 0)
+    # Reward accelerating volume, penalize decelerating (smart money exiting)
+    mom_s = max(-10, min(15, int(mom * 0.15)))
     total = max(0, min(100, vol_s + liq_s + age_s + chg_s + mom_s))
     return {"total": total, "volume": vol_s, "liquidity": liq_s, "age": age_s, "price_change": chg_s, "momentum": mom_s}
 
@@ -2282,11 +2290,10 @@ class BotInstance:
             return
         utc_hour = time.gmtime().tm_hour
         if not (10 <= utc_hour < 23):
-            if change < offpeak_min_change and score_total < (min_score + 10):
-                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) \u2014 change {change:.0f}% < {offpeak_min_change:.0f}% and score {score_total} not strong enough"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
+            sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) — no new buys"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
         intel = ensure_token_intel(mint, base_info={
             "mint": mint,
             "name": name,
