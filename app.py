@@ -4010,36 +4010,38 @@ def _extract_symbols(exchange, data):
     """Parse the raw API response for each exchange into a set of uppercase base symbols."""
     syms = set()
     try:
+        data_dict = data if isinstance(data, dict) else {}
+        data_list = data if isinstance(data, list) else []
         if exchange == "binance":
-            for s in data.get("symbols", []):
+            for s in data_dict.get("symbols", []):
                 if s.get("status") == "TRADING" and s.get("quoteAsset") in ("USDT","BUSD","FDUSD"):
                     syms.add(s["baseAsset"].upper())
         elif exchange == "coinbase":
-            for p in data:
+            for p in data_list:
                 if p.get("status") == "online" and p.get("quote_currency") in ("USD","USDT"):
                     syms.add(p["base_currency"].upper())
         elif exchange == "okx":
-            for p in (data.get("data") or []):
+            for p in (data_dict.get("data") or []):
                 if p.get("state") == "live" and p.get("instId","").endswith("-USDT"):
                     syms.add(p["instId"].split("-")[0].upper())
         elif exchange == "kraken":
-            for k, v in (data.get("result") or {}).items():
+            for k, v in (data_dict.get("result") or {}).items():
                 if isinstance(v, dict) and v.get("status") == "online":
                     base = v.get("base","")
                     if base.startswith("X"): base = base[1:]
                     if base.startswith("Z"): base = base[1:]
                     syms.add(base.upper())
         elif exchange == "bybit":
-            lst = (data.get("result") or {}).get("list") or []
+            lst = (data_dict.get("result") or {}).get("list") or []
             for p in lst:
                 if p.get("status") == "Trading" and p.get("symbol","").endswith("USDT"):
                     syms.add(p["symbol"][:-4].upper())
         elif exchange == "kucoin":
-            for p in (data.get("data") or []):
+            for p in (data_dict.get("data") or []):
                 if p.get("enableTrading") and p.get("quoteCurrency") in ("USDT","USDC"):
                     syms.add(p["baseCurrency"].upper())
         elif exchange == "gate":
-            for p in data:
+            for p in data_list:
                 if p.get("trade_status") == "tradable" and p.get("id","").endswith("_USDT"):
                     syms.add(p["id"].split("_")[0].upper())
     except Exception as _e:
