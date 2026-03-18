@@ -4105,112 +4105,115 @@ def new_pairs_scanner():
             time.sleep(20)
 
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
+def _sniper_emit_token(mint, source_label="helius-ws"):
+    if not mint or mint == SOL_MINT:
+        return False
+    with seen_tokens_lock:
+        if mint in seen_tokens:
+            return False
+    try:
+        resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+        if resp.status_code != 200:
+            return False
+        pairs = safe_json_response(resp, {}).get("pairs") or []
+        if not pairs:
+            return False
+        info = _process_dex_pair(pairs[0])
+        if not info:
+            return False
+        with seen_tokens_lock:
+            if mint in seen_tokens:
+                return False
+            seen_tokens.add(mint)
+        info["sniped"] = True
+        info["source"] = source_label
+        print(f"[Sniper] {source_label}: {info['name']} | MC:${info['mc']:,.0f} Age:{info['age_min']:.0f}m", flush=True)
+        _broadcast_signal(info)
+        return True
+    except Exception as e:
+        print(f"[Sniper] emit error for {mint}: {e}", flush=True)
+        return False
+
+
 def helius_pool_sniper():
-    """Listen for new Raydium/Pump.fun pool creation via Helius logs subscription."""
+    """Listen for fresh Pump.fun and Raydium transactions and feed them into the main signal path."""
     import json as _json
     ws_url = HELIUS_RPC.replace("https://", "wss://").replace("http://", "ws://")
-    # Extract API key from RPC URL if present
     api_key = ""
     if "api-key=" in HELIUS_RPC:
         api_key = HELIUS_RPC.split("api-key=")[-1]
     elif "?" in HELIUS_RPC:
-        api_key = HELIUS_RPC.split("?")[-1].replace("api-key=","")
+        api_key = HELIUS_RPC.split("?")[-1].replace("api-key=", "")
+    tracked_programs = [
+        (PUMP_FUN, "pumpfun"),
+        (RAYDIUM_AMM, "raydium"),
+    ]
 
     while True:
         try:
             import websocket as ws_lib
             wss = f"wss://atlas-mainnet.helius-rpc.com/?api-key={api_key}" if api_key else ws_url
+            seen_signatures = set()
 
             def on_open(ws):
-                # Subscribe to logs mentioning Raydium AMM (new pool creation)
-                sub = _json.dumps({
-                    "jsonrpc":"2.0","id":1,"method":"logsSubscribe",
-                    "params":[
-                        {"mentions": [RAYDIUM_AMM]},
-                        {"commitment": "confirmed"}
-                    ]
-                })
-                ws.send(sub)
-                print("[Sniper] Subscribed to Raydium pool creation logs")
+                for idx, (program_id, label) in enumerate(tracked_programs, start=1):
+                    ws.send(_json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": idx,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [program_id]},
+                            {"commitment": "confirmed"},
+                        ],
+                    }))
+                    print(f"[Sniper] Subscribed to {label} logs", flush=True)
 
             def on_message(ws, message):
                 try:
                     data = _json.loads(message)
-                    result = data.get("params",{}).get("result",{})
-                    value  = result.get("value",{})
-                    logs   = value.get("logs",[])
-                    sig    = value.get("signature","")
-                    # Check if this is a new pool init
-                    if any("initialize" in l.lower() or "initializemint" in l.lower() for l in logs):
-                        # Extract mint from account keys (simplified)
-                        tx_r = requests.post(HELIUS_RPC, json={
-                            "jsonrpc":"2.0","id":1,"method":"getTransaction",
-                            "params":[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]
-                        }, timeout=8)
-                        tx = tx_r.json().get("result")
-                        if not tx: return
-                        # Get new token mints from post balances
-                        post_bals = (tx.get("meta") or {}).get("postTokenBalances",[])
-                        for pb in post_bals:
-                            mint = pb.get("mint","")
-                            if not mint or mint == SOL_MINT or mint in seen_tokens:
-                                continue
-                            seen_tokens.add(mint)
-                            # Fetch info and add to market feed immediately
-                            try:
-                                _pr = dex_get(
-                                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                    timeout=5
-                                )
-                                if _pr.status_code != 200: continue
-                                pairs = _pr.json().get("pairs")
-                                if not pairs: continue
-                                p = pairs[0]
-                                created_at = p.get("pairCreatedAt")
-                                age_min = (time.time()*1000 - created_at)/60000 if created_at else 0
-                                vol    = (p.get("volume") or {}).get("h24",0) or 0
-                                change = (p.get("priceChange") or {}).get("h1",0) or 0
-                                liq    = (p.get("liquidity") or {}).get("usd",0) or 0
-                                info = {
-                                    "name":   p.get("baseToken",{}).get("name","Unknown"),
-                                    "symbol": p.get("baseToken",{}).get("symbol","?"),
-                                    "price":  float(p.get("priceUsd") or 0),
-                                    "mc":     p.get("marketCap",0) or 0,
-                                    "vol":    vol,"liq":liq,"age_min":age_min,
-                                    "change": change,"momentum":0,"mint":mint,
-                                    "sniped": True,  # flag as websocket-sniped
-                                }
-                                info["score"] = ai_score(info)
-                                info["ts"]    = int(time.time())
-                                market_feed.appendleft(info)
-                                for bot in list(user_bots.values()):
-                                    if bot.running:
-                                        bot.log_msg(f"⚡ SNIPE CANDIDATE: {info['name']} (on-chain detect)")
-                                        try:
-                                            bot.evaluate_signal(mint,info["name"],info["price"],
-                                                info["mc"],info["vol"],liq,age_min,change)
-                                        except Exception as _e:
-                                            print(f"[ERROR] {_e}", flush=True)
-                            except Exception as _e:
-                                print(f"[ERROR] {_e}", flush=True)
-                except Exception as _e:
-                    print(f"[ERROR] {_e}", flush=True)
+                    value = (((data or {}).get("params") or {}).get("result") or {}).get("value") or {}
+                    logs = value.get("logs") or []
+                    sig = value.get("signature") or ""
+                    if not sig or sig in seen_signatures:
+                        return
+                    if not any(token in (line or "").lower() for line in logs for token in ("initialize", "create", "buy", "swap")):
+                        return
+                    seen_signatures.add(sig)
+                    tx_result = rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}], timeout=8) or {}
+                    meta = (tx_result.get("meta") if isinstance(tx_result, dict) else {}) or {}
+                    post_bals = meta.get("postTokenBalances") or []
+                    source_label = "helius-ws"
+                    joined_logs = " ".join(str(line or "").lower() for line in logs)
+                    if PUMP_FUN.lower() in joined_logs:
+                        source_label = "helius-ws:pumpfun"
+                    elif RAYDIUM_AMM.lower() in joined_logs:
+                        source_label = "helius-ws:raydium"
+                    for pb in post_bals:
+                        mint = pb.get("mint") or ""
+                        _sniper_emit_token(mint, source_label=source_label)
+                except Exception as e:
+                    print(f"[Sniper] message error: {e}", flush=True)
 
-            def on_error(ws, err): print(f"[Sniper] WS error: {err}")
-            def on_close(ws, *a): print("[Sniper] WS closed — reconnecting...")
+            def on_error(ws, err):
+                print(f"[Sniper] WS error: {err}", flush=True)
 
-            ws_app = ws_lib.WebSocketApp(wss, on_open=on_open, on_message=on_message,
-                                          on_error=on_error, on_close=on_close)
+            def on_close(ws, *a):
+                print("[Sniper] WS closed — reconnecting...", flush=True)
+
+            ws_app = ws_lib.WebSocketApp(
+                wss,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
             ws_app.run_forever(ping_interval=30, ping_timeout=10)
         except ImportError:
-            print("[Sniper] websocket-client not installed — skipping WS sniper")
+            print("[Sniper] websocket-client not installed — skipping WS sniper", flush=True)
             break
         except Exception as e:
-            print(f"[Sniper] reconnecting in 10s: {e}")
+            print(f"[Sniper] reconnecting in 10s: {e}", flush=True)
             time.sleep(10)
-
-# helius_pool_sniper requires Helius Business plan ($99/mo) — disabled until upgraded
-# threading.Thread(target=helius_pool_sniper, daemon=True).start()
 
 def auto_restart_bots():
     """Restart bots that were running before a server restart."""
@@ -4554,6 +4557,7 @@ def ensure_background_workers_started():
             check_whale_wallets,
             global_scanner,
             new_pairs_scanner,
+            helius_pool_sniper,
             token_pattern_monitor,
             auto_restart_bots,
             warm_sender_connections,
