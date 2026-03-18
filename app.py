@@ -2496,18 +2496,21 @@ class BotInstance:
         s = self.settings
         min_liq = float(s.get("min_liq", 0) or 0)
         pumpfun_liq_bypass = "pumpfun" in str(source or "").lower()
+        if min_liq > 0 and not pumpfun_liq_bypass:
+            min_liq = min(min_liq, 10.0)
         liq_filter_on = min_liq > 0 and not pumpfun_liq_bypass
         min_mc  = s.get("min_mc", 0)
-        max_mc  = s.get("max_mc", 999999)
-        max_age = s.get("max_age_min", 999)
-        min_vol = s.get("min_vol", 0)
-        min_score = s.get("min_score", 0)
-        min_green_lights = max(1, int(s.get("min_green_lights", 1)))
+        max_mc  = max(float(s.get("max_mc", 999999) or 999999), 5_000_000.0)
+        max_age = max(float(s.get("max_age_min", 999) or 999), 1440.0)
+        min_vol = min(float(s.get("min_vol", 0) or 0), 500.0) if float(s.get("min_vol", 0) or 0) > 0 else 0.0
+        min_score = min(int(s.get("min_score", 0) or 0), 15)
+        min_green_lights = max(0, int(s.get("min_green_lights", 1) or 0))
         min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
         min_narrative_score = int(s.get("min_narrative_score", 16))
         min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
         late_entry_mult = float(s.get("late_entry_mult", 5.0))
         nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
+        min_change = min(float(s.get("min_change_pct", 0) or 0), -15.0)
         max_hot_change = float(s.get("max_hot_change", 400.0))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
@@ -2522,7 +2525,7 @@ class BotInstance:
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
                 {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "pumpfun bypass" if pumpfun_liq_bypass else ("off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}")},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
+                {"name": "Price Change", "passed": min_change < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> {min_change:+.0f}% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
                 {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
             ],
@@ -2545,8 +2548,8 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change <= 0:
-            sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
+        if change <= min_change:
+            sig_entry["reason"] = f"1h change {change:.0f}% below floor {min_change:+.0f}%"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
@@ -4089,6 +4092,11 @@ def _process_dex_pair(p):
         price = float(p.get("priceUsd") or 0)
         if not price:
             return None
+        dex_id = str(p.get("dexId") or "").strip()
+        labels = [str(label or "").strip().lower() for label in (p.get("labels") or []) if str(label or "").strip()]
+        source = f"dex:{dex_id}" if dex_id else "scanner"
+        if "pumpfun" in dex_id.lower() or "pumpfun" in labels:
+            source = "dex:pumpfun"
         created_at = p.get("pairCreatedAt")
         age_min    = (time.time()*1000 - created_at) / 60000 if created_at else 9999
         vol        = (p.get("volume") or {}).get("h24", 0) or 0
@@ -4105,6 +4113,7 @@ def _process_dex_pair(p):
             "age_min":  age_min,
             "change":   change,
             "momentum": momentum,
+            "source":   source,
             "ts":       int(time.time()),
         }
         info["score"] = min(100, ai_score(info) + check_social_signals(str(p)))
