@@ -1175,7 +1175,7 @@ class BotInstance:
         self.hour_start         = time.time()
         self.consecutive_losses = 0
         self.cooldown_until     = 0.0   # retained for API compatibility; cooldown is disabled
-        self.loss_mints         = {}    # retained for compatibility; per-mint cooldown is disabled
+        self.loss_mints         = {}    # mint -> epoch when the bot last realized a loss on that mint
         self.auto_relax_level   = 0
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
@@ -1668,6 +1668,8 @@ class BotInstance:
 
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
+        if mint in self.loss_mints:
+            return "this mint already produced a loss"
         return None
 
     def check_honeypot(self, mint, age_min=0):
@@ -1993,6 +1995,7 @@ class BotInstance:
                 else:
                     self.stats["losses"] += 1
                     self.consecutive_losses += 1
+                    self.loss_mints[mint] = time.time()
                 # Telegram alert
                 try:
                     conn = db()
