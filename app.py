@@ -2033,17 +2033,6 @@ class BotInstance:
 
     def check_circuit_breakers(self):
         """Returns a reason string if trading should halt, else None."""
-        if self.start_balance > 0:
-            daily_loss_pct = (self.start_balance - self.sol_balance) / self.start_balance
-            if daily_loss_pct >= 0.05:
-                return f"Daily loss limit −5% hit ({daily_loss_pct*100:.1f}%)"
-        if self.peak_balance > 0:
-            drawdown_pct = (self.peak_balance - self.sol_balance) / self.peak_balance
-            if drawdown_pct >= 0.12:
-                return f"Max drawdown −12% hit ({drawdown_pct*100:.1f}%)"
-        health_alert = self.execution_health_alert()
-        if health_alert:
-            return health_alert
         return None
 
     def check_rate_limit(self, name, mint):
@@ -2720,7 +2709,11 @@ class BotInstance:
         momentum_auto_buy_enabled = bool(s.get("momentum_auto_buy_enabled", True))
         momentum_auto_buy_threshold = max(0, min(100, int(s.get("momentum_auto_buy_threshold", 85) or 85)))
         negative_screening_mode = bool(s.get("negative_screening_mode", True))
-        hard_threat_limit = 85
+        hard_threat_limit = 75
+        negative_hard_mc_floor = 1_000.0
+        negative_hard_min_vol = 250.0
+        negative_hard_change_floor = -85.0
+        negative_hard_hot_change = max(450.0, float(max_hot_change or 0))
         launch_lane_enabled = bool(s.get("launch_lane_enabled", True))
         launch_lane_max_age_min = max(1.0, float(s.get("launch_lane_max_age_min", 12) or 12))
         launch_lane_min_momentum = max(0, min(100, int(s.get("launch_lane_min_momentum", 55) or 55)))
@@ -2893,6 +2886,26 @@ class BotInstance:
         ])
         if negative_screening_mode:
             soft_failures = [f["name"] for f in sig_entry["filters"] if not f.get("passed") and f["name"] != "Negative Screening"]
+            if mc < negative_hard_mc_floor:
+                sig_entry["reason"] = f"MC ${mc:,.0f} below hard floor ${negative_hard_mc_floor:,.0f}"
+                self.log_signal_entry(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
+                return
+            if vol < negative_hard_min_vol:
+                sig_entry["reason"] = f"Volume ${vol:,.0f} below hard floor ${negative_hard_min_vol:,.0f}"
+                self.log_signal_entry(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
+                return
+            if change <= negative_hard_change_floor:
+                sig_entry["reason"] = f"1h change {change:.0f}% below hard floor {negative_hard_change_floor:+.0f}%"
+                self.log_signal_entry(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
+                return
+            if change > negative_hard_hot_change:
+                sig_entry["reason"] = f"1h change {change:.0f}% beyond hard cap {negative_hard_hot_change:.0f}%"
+                self.log_signal_entry(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
+                return
             if transfer_hook_enabled:
                 sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
                 self.log_signal_entry(sig_entry)
