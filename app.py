@@ -250,7 +250,7 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
+        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.3,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
     },
     "balanced": {
@@ -266,7 +266,7 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.5,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
     },
     "aggressive": {
@@ -282,7 +282,7 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
+        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.8,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
     },
     "degen": {
@@ -298,7 +298,7 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":35,
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
+        "anti_rug":True,"check_holders":False,"max_correlated":8,"drawdown_limit_sol":1.0,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
     },
     "custom": {
@@ -314,7 +314,7 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.5,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
     },
 }
@@ -2032,6 +2032,7 @@ class BotInstance:
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
         s = self.settings
         trade_sol = round(float(s["max_buy_sol"]), 4)
+        max_correlated = max(int(s.get("max_correlated", 5) or 5), 8)
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
 
         # ── Circuit breakers ─────────────────────────────────────────────────
@@ -2060,7 +2061,7 @@ class BotInstance:
             self.log_msg(f"SKIP {name} — {reason}")
             return
         # Correlated position limit
-        if len(self.positions) >= s.get("max_correlated", 5):
+        if len(self.positions) >= max_correlated:
             reason = f"Max correlated positions ({len(self.positions)})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
@@ -8002,7 +8003,7 @@ const SETTINGS_DEFAULTS = {
   max_mc: 250000,
   priority_fee: 30000,
   drawdown_limit_sol: 0.5,
-  max_correlated: 3,
+  max_correlated: 8,
   min_vol: 3000,
   min_score: 30,
   risk_per_trade_pct: 2.0,
