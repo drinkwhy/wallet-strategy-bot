@@ -1655,12 +1655,12 @@ class BotInstance:
         """Returns a reason string if trading should halt, else None."""
         if self.start_balance > 0:
             daily_loss_pct = (self.start_balance - self.sol_balance) / self.start_balance
-            if daily_loss_pct >= 0.20:
-                return f"Daily loss limit −20% hit ({daily_loss_pct*100:.1f}%)"
+            if daily_loss_pct >= 0.05:
+                return f"Daily loss limit −5% hit ({daily_loss_pct*100:.1f}%)"
         if self.peak_balance > 0:
             drawdown_pct = (self.peak_balance - self.sol_balance) / self.peak_balance
-            if drawdown_pct >= 0.50:
-                return f"Max drawdown −50% hit ({drawdown_pct*100:.1f}%)"
+            if drawdown_pct >= 0.12:
+                return f"Max drawdown −12% hit ({drawdown_pct*100:.1f}%)"
         health_alert = self.execution_health_alert()
         if health_alert:
             return health_alert
@@ -1668,11 +1668,6 @@ class BotInstance:
 
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
-        now = time.time()
-        # Cooldown after losses
-        if now < self.cooldown_until:
-            mins = int((self.cooldown_until - now) / 60) + 1
-            return f"Loss cooldown active ({mins}m remaining)"
         return None
 
     def check_honeypot(self, mint, age_min=0):
@@ -1998,11 +1993,6 @@ class BotInstance:
                 else:
                     self.stats["losses"] += 1
                     self.consecutive_losses += 1
-                    self.loss_mints[mint] = time.time()  # block this mint for 1h
-                    cooldown_min = self.settings.get("cooldown_min", 10)
-                    cooldown_sec = cooldown_min * 60
-                    self.cooldown_until = time.time() + cooldown_sec
-                    self.log_msg(f"⏸ Cooldown {cooldown_min}m after loss on {pos['name']}")
                 # Telegram alert
                 try:
                     conn = db()
@@ -2171,10 +2161,6 @@ class BotInstance:
 
     def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change):
         if mint in self.positions:
-            return
-        # Block mints we lost on within the last hour
-        lost_at = self.loss_mints.get(mint)
-        if lost_at and time.time() - lost_at < 3600:
             return
         s = self.settings
         min_mc  = s.get("min_mc", 0)
