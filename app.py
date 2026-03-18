@@ -1307,6 +1307,8 @@ class BotInstance:
             "ts": time.strftime("%H:%M:%S")
         }
         self.filter_log.appendleft(entry)
+        outcome = "PASS" if passed else "FAIL"
+        print(f"[FILTER U{self.user_id}] {outcome} {name} | {reason}", flush=True)
         # also save to DB
         try:
             conn = db()
@@ -4323,6 +4325,8 @@ def helius_pool_sniper():
         (RAYDIUM_AMM, "raydium"),
     ]
     seen_signatures = set()
+    timeout_state = {"streak": 0}
+    max_timeout_streak = 3
 
     while True:
         try:
@@ -4345,6 +4349,7 @@ def helius_pool_sniper():
 
             def on_message(ws, message):
                 try:
+                    timeout_state["streak"] = 0
                     data = _json.loads(message)
                     value = (((data or {}).get("params") or {}).get("result") or {}).get("value") or {}
                     logs = value.get("logs") or []
@@ -4363,9 +4368,10 @@ def helius_pool_sniper():
 
             def on_error(ws, err):
                 err_text = str(err or "")
+                err_lower = err_text.lower()
                 if (
                     "403 Forbidden" in err_text and (
-                        "only available for business plans" in err_text.lower() or
+                        "only available for business plans" in err_lower or
                         "code': -32403" in err_text or
                         '"code":-32403' in err_text.replace(" ", "")
                     )
@@ -4379,6 +4385,26 @@ def helius_pool_sniper():
                     except Exception:
                         pass
                     return
+                if "ping/pong timed out" in err_lower:
+                    timeout_state["streak"] += 1
+                    print(
+                        f"[Sniper] WS keepalive timeout ({timeout_state['streak']}/{max_timeout_streak})",
+                        flush=True,
+                    )
+                    if timeout_state["streak"] >= max_timeout_streak:
+                        error_state["fallback"] = True
+                        error_state["reason"] = "repeated websocket keepalive timeouts"
+                        print(
+                            f"[Sniper] Falling back to RPC polling after {timeout_state['streak']} timeout(s)",
+                            flush=True,
+                        )
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+                        return
+                else:
+                    timeout_state["streak"] = 0
                 print(f"[Sniper] WS error: {err}", flush=True)
 
             def on_close(ws, *a):
@@ -4393,10 +4419,14 @@ def helius_pool_sniper():
                 on_error=on_error,
                 on_close=on_close,
             )
-            ws_app.run_forever(ping_interval=30, ping_timeout=10)
+            ws_app.run_forever(ping_interval=45, ping_timeout=20)
             if error_state["fallback"]:
                 _run_rpc_poll_sniper(tracked_programs, seen_signatures)
                 return
+            if timeout_state["streak"] > 0:
+                backoff = min(15, 2 * timeout_state["streak"])
+                print(f"[Sniper] WS reconnect backoff {backoff}s", flush=True)
+                time.sleep(backoff)
         except ImportError:
             print("[Sniper] websocket-client not installed — using RPC polling fallback", flush=True)
             _run_rpc_poll_sniper(tracked_programs, seen_signatures)
