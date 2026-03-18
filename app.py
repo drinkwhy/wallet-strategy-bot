@@ -1668,8 +1668,11 @@ class BotInstance:
 
     def check_rate_limit(self, name, mint):
         """Returns a block reason string if rate-limited, else None."""
-        if mint in self.loss_mints:
-            return "this mint already produced a loss"
+        last_loss = self.loss_mints.get(mint)
+        if last_loss is not None:
+            if time.time() - last_loss < 30 * 60:
+                return "this mint lost within the past 30 minutes"
+            self.loss_mints.pop(mint, None)
         return None
 
     def check_honeypot(self, mint, age_min=0):
