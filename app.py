@@ -1174,8 +1174,8 @@ class BotInstance:
         self.evals_this_hour    = 0
         self.hour_start         = time.time()
         self.consecutive_losses = 0
-        self.cooldown_until     = 0.0   # epoch — no buys before this time
-        self.loss_mints         = {}    # mint -> epoch when loss occurred (1h cooldown)
+        self.cooldown_until     = 0.0   # retained for API compatibility; cooldown is disabled
+        self.loss_mints         = {}    # retained for compatibility; per-mint cooldown is disabled
         self.auto_relax_level   = 0
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
@@ -5534,7 +5534,7 @@ def api_position_analytics():
         "session_drawdown": round(bot.session_drawdown, 4),
         "drawdown_limit": bot.settings.get("drawdown_limit_sol", 0.5),
         "consecutive_losses": bot.consecutive_losses,
-        "cooldown_remaining": max(0, round(bot.cooldown_until - time.time())),
+        "cooldown_remaining": 0,
         "peak_balance": round(bot.peak_balance, 4),
         "current_balance": round(bot.sol_balance, 4),
         "positions_count": len(bot.positions),
@@ -7674,7 +7674,7 @@ async function pollPositions() {
     document.getElementById('risk-pos-val').textContent = `${risk.positions_count} / ${risk.max_positions}`;
     document.getElementById('risk-pos-bar').style.width = posPct + '%';
     document.getElementById('risk-losses').textContent = risk.consecutive_losses;
-    document.getElementById('risk-cooldown').textContent = risk.cooldown_remaining > 0 ? Math.ceil(risk.cooldown_remaining) + 's' : 'None';
+    document.getElementById('risk-cooldown').textContent = risk.cooldown_remaining > 0 ? Math.ceil(risk.cooldown_remaining) + 's' : 'Off';
     document.getElementById('risk-peak').textContent = risk.peak_balance;
     document.getElementById('risk-now').textContent = risk.current_balance;
   } catch(e) {}
