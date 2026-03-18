@@ -643,6 +643,19 @@ def init_db():
             timestamp TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS buy_history (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            mint TEXT,
+            name TEXT,
+            entry_price REAL,
+            entry_sol REAL,
+            slippage_bps INTEGER,
+            route_source TEXT,
+            tx_sig TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS perf_fees (
             id SERIAL PRIMARY KEY,
             session_id TEXT UNIQUE,
@@ -768,6 +781,7 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
             "CREATE INDEX IF NOT EXISTS idx_trades_user_id_ts ON trades (user_id, timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_buy_history_user_id_created_at ON buy_history (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_bot_settings_user_id ON bot_settings (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_open_positions_user_id ON open_positions (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)",
@@ -839,6 +853,7 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_buy_history_user_id_created_at ON buy_history (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
         try:
@@ -928,6 +943,17 @@ def migrate_db():
                 route_source TEXT,
                 failure_reason TEXT,
                 created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS buy_history (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER,
+                mint TEXT,
+                name TEXT,
+                entry_price REAL,
+                entry_sol REAL,
+                slippage_bps INTEGER,
+                route_source TEXT,
+                tx_sig TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS preset_overrides (
                 preset TEXT PRIMARY KEY,
                 overrides_json TEXT,
@@ -935,6 +961,7 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_buy_history_user_id_created_at ON buy_history (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
         conn.commit()
@@ -1254,6 +1281,7 @@ class BotInstance:
         self.filter_log        = deque(maxlen=50)
         self.signal_explorer_log = deque(maxlen=200)
         self.execution_events  = deque(maxlen=200)
+        self.buy_history       = deque(maxlen=50)
         # ── Risk controls ───────────────────────────────────────────────────
         self.peak_balance       = 0.0   # for max-drawdown circuit breaker
         self.buys_this_hour     = 0
@@ -1419,6 +1447,45 @@ class BotInstance:
                         None if expected_out is None else float(expected_out),
                         None if actual_out is None else float(actual_out),
                         route_source, failure_reason,
+                    )
+                )
+                conn.commit()
+            finally:
+                db_return(conn)
+        except Exception as _e:
+            print(f"[ERROR] {_e}", flush=True)
+
+    def log_buy_history(self, mint, name, entry_price, entry_sol, slippage_bps, route_source, tx_sig):
+        payload = {
+            "mint": mint,
+            "name": name,
+            "entry_price": float(entry_price or 0),
+            "entry_sol": float(entry_sol or 0),
+            "slippage_bps": None if slippage_bps is None else int(slippage_bps),
+            "route_source": route_source or "",
+            "tx_sig": tx_sig or "",
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        self.buy_history.appendleft(payload)
+        try:
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO buy_history (
+                        user_id,mint,name,entry_price,entry_sol,slippage_bps,route_source,tx_sig
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        self.user_id,
+                        payload["mint"],
+                        payload["name"],
+                        payload["entry_price"],
+                        payload["entry_sol"],
+                        payload["slippage_bps"],
+                        payload["route_source"],
+                        payload["tx_sig"],
                     )
                 )
                 conn.commit()
@@ -2033,7 +2100,7 @@ class BotInstance:
         s = self.settings
         trade_sol = round(float(s["max_buy_sol"]), 4)
         max_correlated = max(int(s.get("max_correlated", 5) or 5), 8)
-        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
+        print(f"[BUY-TRY U{self.user_id}] {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
 
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
@@ -2199,7 +2266,9 @@ class BotInstance:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
             self.consecutive_losses  = 0   # reset on successful buy
+            self.log_buy_history(mint, name, real_price, trade_sol, slippage, route_source, sig)
             self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
+            print(f"[BUY-OK U{self.user_id}] {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | tx={sig}", flush=True)
             self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
@@ -2216,6 +2285,7 @@ class BotInstance:
             except Exception as _e:
                 print(f"[ERROR] {_e}", flush=True)
         else:
+            print(f"[BUY-FAIL U{self.user_id}] {name} | send failed", flush=True)
             self.log_filter(name, mint, False, "Transaction failed to send")
 
     def sell(self, mint, pct, reason):
@@ -5331,6 +5401,7 @@ def api_state():
     uid = session["user_id"]
     bot = user_bots.get(uid)
     pos_list = []
+    recent_buys = []
     preset_name = normalize_preset_name(bot.preset_name if bot else "balanced")
     if bot:
         pos_snapshot = dict(bot.positions)  # thread-safe snapshot
@@ -5382,6 +5453,31 @@ def api_state():
             db_return(conn)
     except Exception:
         db_settings = strip_auto_relax_state(bot.settings) if bot else {}
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT mint, name, entry_price, entry_sol, slippage_bps, route_source, tx_sig, created_at
+                FROM buy_history
+                WHERE user_id=%s
+                ORDER BY created_at DESC
+                LIMIT 20
+            """, (uid,))
+            recent_buys = [{
+                "mint": row.get("mint"),
+                "name": row.get("name"),
+                "entry_price": float(row.get("entry_price") or 0),
+                "entry_sol": float(row.get("entry_sol") or 0),
+                "slippage_bps": row.get("slippage_bps"),
+                "route_source": row.get("route_source") or "",
+                "tx_sig": row.get("tx_sig") or "",
+                "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
+            } for row in cur.fetchall()]
+        finally:
+            db_return(conn)
+    except Exception:
+        recent_buys = list(bot.buy_history)[:20] if bot else []
     
     return jsonify({
         "running":    bot.running if bot else False,
@@ -5389,6 +5485,7 @@ def api_state():
         "balance":    round(bot.sol_balance, 4) if bot else 0,
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
+        "recent_buys": recent_buys,
         "stats":      stats,
         "filter_log": list(bot.filter_log)[:10] if bot else [],
         "settings":   db_settings,
@@ -7180,6 +7277,13 @@ DASHBOARD_HTML = _CSS + """
           <div id="listing-feed" style="max-height:120px;overflow-y:auto;font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
           <div style="margin-top:6px;font-size:10px;color:var(--t3)">Catches: <span id="listing-stat" style="color:var(--gold2);font-weight:700">0</span></div>
         </div>
+        <div class="glass">
+          <div class="sec-label" style="display:flex;justify-content:space-between;align-items:center">
+            <span>Recent Buys</span>
+            <span id="buy-count-badge" style="font-size:9px;color:var(--grn);text-transform:none;letter-spacing:0">0 fills</span>
+          </div>
+          <div id="buy-feed" style="max-height:180px;overflow-y:auto;font-size:11px;color:var(--t3)">Waiting for confirmed buys…</div>
+        </div>
       </div>
       <div class="scanner-main">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -8457,6 +8561,26 @@ async function refresh() {
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
+  }
+  if (Array.isArray(d.recent_buys)) {
+    const buyFeed = document.getElementById('buy-feed');
+    const buyBadge = document.getElementById('buy-count-badge');
+    if (buyFeed) {
+      buyFeed.innerHTML = d.recent_buys.length ? d.recent_buys.map(b => `
+        <div style="padding:7px 0;border-bottom:1px solid var(--b1)">
+          <div style="display:flex;justify-content:space-between;gap:10px">
+            <span style="font-weight:700;color:var(--t1)">${b.name || '?'}</span>
+            <span style="font-size:10px;color:var(--t3)">${(b.created_at || '').replace('T',' ').slice(5,16)}</span>
+          </div>
+          <div style="font-size:10px;color:var(--t3);margin-top:3px">
+            @ $${Number(b.entry_price || 0).toFixed(8)} · ${Number(b.entry_sol || 0).toFixed(4)} SOL · ${b.slippage_bps ?? '—'}bps
+          </div>
+          <div style="font-size:10px;color:var(--blue2);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+            ${b.tx_sig ? `solscan.io/tx/${b.tx_sig}` : (b.route_source || 'fill logged')}
+          </div>
+        </div>`).join('') : '<div style="font-size:11px;color:var(--t3)">Waiting for confirmed buys\u2026</div>';
+    }
+    if (buyBadge) buyBadge.textContent = `${d.recent_buys.length} fills`;
   }
   if (d.settings && Object.keys(d.settings).length) {
     const savedSettings = { ...d.settings, preset: d.preset || 'balanced' };
