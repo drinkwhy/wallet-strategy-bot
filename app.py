@@ -6691,6 +6691,28 @@ DASHBOARD_HTML = _CSS + """
 .checkpoint-step{display:flex;align-items:flex-start;gap:10px}
 .checkpoint-index{width:22px;height:22px;border-radius:999px;background:rgba(59,130,246,.14);border:1px solid rgba(59,130,246,.28);color:var(--blue2);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0}
 .checkpoint-meta{font-size:10px;color:var(--t3);margin-top:4px;line-height:1.45}
+.operator-map{display:flex;flex-direction:column;gap:14px}
+.operator-lane{border:1px solid rgba(255,255,255,.06);background:linear-gradient(180deg,rgba(8,16,26,.92),rgba(11,21,34,.82));border-radius:14px;padding:14px}
+.operator-lane-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.operator-lane-title{font-size:12px;font-weight:800;color:var(--t1);text-transform:uppercase;letter-spacing:.08em}
+.operator-lane-note{font-size:11px;color:var(--t3);line-height:1.45;max-width:520px}
+.operator-chip-row{display:flex;flex-wrap:wrap;gap:8px}
+.operator-chip{padding:7px 10px;border-radius:999px;border:1px solid rgba(59,130,246,.24);background:rgba(59,130,246,.08);font-size:11px;color:var(--t2);font-weight:700}
+.operator-chip.feed{border-color:rgba(20,199,132,.22);background:rgba(20,199,132,.08);color:var(--grn)}
+.operator-chip.guard{border-color:rgba(245,158,11,.24);background:rgba(245,158,11,.08);color:var(--gold2)}
+.operator-chip.exit{border-color:rgba(220,38,38,.24);background:rgba(220,38,38,.08);color:#ff8b8b}
+.operator-stage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+.operator-stage{border:1px solid rgba(59,130,246,.12);background:rgba(14,23,36,.82);border-radius:12px;padding:12px}
+.operator-stage-num{font-size:10px;font-weight:800;color:var(--blue2);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
+.operator-stage-title{font-size:13px;font-weight:700;color:var(--t1);margin-bottom:5px}
+.operator-stage-value{font-size:11px;color:var(--t2);line-height:1.5}
+.operator-stage-meta{font-size:10px;color:var(--t3);line-height:1.45;margin-top:6px}
+.operator-arrow-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 10px}
+.operator-arrow{font-size:12px;color:var(--blue2);font-weight:800}
+.operator-rule-list{display:flex;flex-direction:column;gap:7px}
+.operator-rule{display:flex;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:rgba(7,13,23,.4);font-size:11px}
+.operator-rule-label{font-weight:700;color:var(--t2)}
+.operator-rule-value{color:var(--t3);text-align:right}
 .settings-save-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .save-pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(20,199,132,.24);background:rgba(20,199,132,.08);font-size:11px;color:var(--grn);font-weight:700}
 .save-pill.pending{border-color:rgba(245,158,11,.24);background:rgba(245,158,11,.08);color:var(--gold2)}
@@ -7058,6 +7080,13 @@ DASHBOARD_HTML = _CSS + """
       </div>
 
       <div class="settings-stack">
+        <div class="settings-card">
+          <div class="settings-section-title">Operator Map</div>
+          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">One shared engine handles every coin. Whales, snipes, scanners, and listings only change how a token enters the path, not how it gets approved.</div>
+          <div id="settings-operator-map" class="operator-map">
+            <div style="font-size:12px;color:var(--t3)">Building operator map…</div>
+          </div>
+        </div>
         <div class="settings-card">
           <div class="settings-section-title">Checkpoint Map</div>
           <div style="font-size:12px;color:var(--t2);margin-bottom:12px">This is the live pass order. A coin has to survive these checkpoints before it reaches quote and buy.</div>
@@ -7731,10 +7760,143 @@ function renderLaunchSummary(settings) {
     `<span class="badge bg-muted">Holders ${settings.check_holders ? 'on' : 'off'}</span>`,
   ].join('');
 }
+function renderOperatorMap(settings) {
+  const el = document.getElementById('settings-operator-map');
+  if (!el) return;
+  const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
+  const liqText = Number(s.min_liq || 0) > 0 ? `$${Number(s.min_liq).toLocaleString()}+` : 'off';
+  const sourceFeeds = [
+    ['Dex token-profiles', 'feed'],
+    ['Dex new-pairs', 'feed'],
+    ['Helius sniper', 'feed'],
+    ['Whale tracker', 'feed'],
+    ['Listing scanner', 'feed'],
+  ];
+  const entryStages = [
+    {
+      num: 'Stage 1',
+      title: 'Normalize Signal',
+      value: 'Every feed becomes one token candidate and enters the same evaluator.',
+      meta: 'Whales and snipes do not bypass any later filter. They only surface the coin earlier.',
+    },
+    {
+      num: 'Stage 2',
+      title: 'Basic Filters',
+      value: `MC $${Number(s.min_mc).toLocaleString()}-$${Number(s.max_mc).toLocaleString()} | Liq ${liqText} | Age <= ${Number(s.max_age_min).toLocaleString()}m`,
+      meta: `Change must stay above 0% and under ${Number(s.max_hot_change).toLocaleString()}%. Vol must be >= $${Number(s.min_vol).toLocaleString()} and score >= ${Number(s.min_score).toLocaleString()}.`,
+    },
+    {
+      num: 'Stage 3',
+      title: 'Checklist Gates',
+      value: `${Number(s.min_green_lights).toLocaleString()} green light(s) | holders >= ${Number(s.min_holder_growth_pct).toLocaleString()}% | narrative >= ${Number(s.min_narrative_score).toLocaleString()}`,
+      meta: `Volume spike must be >= ${Number(s.min_volume_spike_mult).toLocaleString()}x. Late entry dies above ${Number(s.late_entry_mult).toLocaleString()}x unless narrative reaches ${Number(s.nuclear_narrative_score).toLocaleString()}.`,
+    },
+    {
+      num: 'Stage 4',
+      title: 'Safety Gates',
+      value: `Authority ${s.anti_rug ? 'on' : 'off'} | holders ${s.check_holders ? 'on' : 'off'} | losing mint block 30m`,
+      meta: 'The buy path can still die here on route failure, dev blacklist, drawdown, balance, or correlated-position limits.',
+    },
+    {
+      num: 'Stage 5',
+      title: 'Execution',
+      value: `Quote -> simulate -> sign -> Helius Sender -> Jito tip -> confirm`,
+      meta: `Priority fee ${Number(s.priority_fee).toLocaleString()} lamports. Max buy ${Number(s.max_buy_sol || 0).toFixed(2)} SOL with risk cap ${Number(s.risk_per_trade_pct || 0).toFixed(1)}%.`,
+    },
+  ];
+  const exitRules = [
+    ['TP1 partial', `${Number(s.tp1_mult || 0).toFixed(2)}x`],
+    ['TP2 full', `${Number(s.tp2_mult || 0).toFixed(2)}x`],
+    ['Stop loss', `${Number(s.stop_loss || 0).toFixed(2)} ratio`],
+    ['Trailing stop', `${Math.round(Number(s.trail_pct || 0) * 100)}% retrace`],
+    ['Time stop', `${Number(s.time_stop_min || 0).toLocaleString()} min`],
+    ['Surge hold', '2.0x inside 10s -> hold until 14% drop from peak'],
+    ['Listing exits', 'listing TP / SL / timeout if source was listing scanner'],
+  ];
+  const guardRules = [
+    ['Session drawdown', `${Number(s.drawdown_limit_sol || 0).toFixed(2)} SOL`],
+    ['Max correlated positions', `${Number(s.max_correlated || 0)} open names`],
+    ['Recent losing mint', 'same mint blocked for 30 minutes after a red close'],
+    ['Holder concentration', s.check_holders ? 'blocking' : 'disabled'],
+  ];
+  el.innerHTML = `
+    <div class="operator-lane">
+      <div class="operator-lane-head">
+        <div>
+          <div class="operator-lane-title">Signal Sources</div>
+          <div class="operator-lane-note">These feeds are watched in parallel and all route into the same buy engine.</div>
+        </div>
+      </div>
+      <div class="operator-chip-row">
+        ${sourceFeeds.map(([label, cls]) => `<span class="operator-chip ${cls}">${label}</span>`).join('')}
+      </div>
+      <div class="operator-arrow-row">
+        <span class="operator-arrow">all feeds -> broadcast signal -> evaluate_signal()</span>
+      </div>
+    </div>
+    <div class="operator-lane">
+      <div class="operator-lane-head">
+        <div>
+          <div class="operator-lane-title">Buy Path</div>
+          <div class="operator-lane-note">A coin only reaches quote and buy after it survives every stage below in order.</div>
+        </div>
+        <div class="operator-chip-row">
+          <span class="operator-chip guard">runtime gates stay live after filters</span>
+        </div>
+      </div>
+      <div class="operator-stage-grid">
+        ${entryStages.map(stage => `
+          <div class="operator-stage">
+            <div class="operator-stage-num">${stage.num}</div>
+            <div class="operator-stage-title">${stage.title}</div>
+            <div class="operator-stage-value">${stage.value}</div>
+            <div class="operator-stage-meta">${stage.meta}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="operator-lane">
+      <div class="operator-lane-head">
+        <div>
+          <div class="operator-lane-title">Live Guards</div>
+          <div class="operator-lane-note">These rules are monitored even after a token passes the numeric checkpoint map.</div>
+        </div>
+      </div>
+      <div class="operator-rule-list">
+        ${guardRules.map(([label, value]) => `
+          <div class="operator-rule">
+            <span class="operator-rule-label">${label}</span>
+            <span class="operator-rule-value">${value}</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="operator-lane">
+      <div class="operator-lane-head">
+        <div>
+          <div class="operator-lane-title">Sell + Monitor Path</div>
+          <div class="operator-lane-note">Once bought, every open position is monitored on the same loop until one exit path fires.</div>
+        </div>
+        <div class="operator-chip-row">
+          <span class="operator-chip exit">positions -> check_positions() -> sell()</span>
+        </div>
+      </div>
+      <div class="operator-rule-list">
+        ${exitRules.map(([label, value]) => `
+          <div class="operator-rule">
+            <span class="operator-rule-label">${label}</span>
+            <span class="operator-rule-value">${value}</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
 function renderSettingsVisuals(settings) {
   const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
   renderLaunchSummary(s);
   renderSettingsSnapshot(s);
+  renderOperatorMap(s);
   const el = document.getElementById('settings-checkpoint-path');
   if (!el) return;
   const liqRule = Number(s.min_liq || 0) > 0 ? `Liquidity must be >= $${Number(s.min_liq).toLocaleString()}` : 'Liquidity checkpoint disabled';
