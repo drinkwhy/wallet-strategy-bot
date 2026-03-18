@@ -1553,23 +1553,70 @@ class BotInstance:
             f"http://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
         ]
 
-    def sign_and_send(self, swap_tx_b64):
-        raw = base64.b64decode(swap_tx_b64)
-        tx  = VersionedTransaction.from_bytes(raw)
+    def _encode_signed_transaction(self, signed_tx):
+        return base64.b64encode(bytes(signed_tx)).decode()
 
-        # ── inject tip into the transaction ────────────────────────────────
-        try:
-            signed_tx = self._inject_tip(tx)
-            enc = base64.b64encode(bytes(signed_tx)).decode()
-            self.log_msg(f"💰 Jito tip injected ({self.TIP_LAMPORTS/1e9:.4f} SOL)")
-        except Exception as e:
-            self.log_msg(f"Tip injection failed ({e}), sending without tip")
-            signed_tx = VersionedTransaction(tx.message, [self.keypair])
-            enc = base64.b64encode(bytes(signed_tx)).decode()
+    def _latest_blockhash(self):
+        result = rpc_call("getLatestBlockhash", [{"commitment": "processed"}], timeout=6) or {}
+        value = result.get("value") if isinstance(result, dict) else {}
+        return (value or {}).get("blockhash")
 
-        # ── send via Helius Sender (all regions in parallel, first wins) ───
+    def _resign_with_blockhash(self, tx, recent_blockhash):
+        from solders.hash import Hash as SolHash
+        from solders.message import MessageV0
+
+        if not recent_blockhash:
+            return tx
+        msg = tx.message
+        fresh_hash = recent_blockhash if not isinstance(recent_blockhash, str) else SolHash.from_string(recent_blockhash)
+        new_msg = MessageV0(
+            header=msg.header,
+            account_keys=list(msg.account_keys),
+            recent_blockhash=fresh_hash,
+            instructions=list(msg.instructions),
+            address_table_lookups=list(msg.address_table_lookups),
+        )
+        return VersionedTransaction(new_msg, [self.keypair])
+
+    def _simulate_signed_transaction(self, signed_tx):
+        started = time.perf_counter()
+        result = rpc_call("simulateTransaction", [
+            self._encode_signed_transaction(signed_tx),
+            {
+                "encoding": "base64",
+                "replaceRecentBlockhash": True,
+                "sigVerify": False,
+                "commitment": "processed",
+            },
+        ], timeout=10) or {}
+        value = result.get("value") if isinstance(result, dict) else {}
+        replacement = None
+        replacement_blockhash = (value or {}).get("replacementBlockhash")
+        if isinstance(replacement_blockhash, dict):
+            replacement = replacement_blockhash.get("blockhash")
+        return {
+            "ok": bool(value) and not value.get("err"),
+            "latency_ms": round((time.perf_counter() - started) * 1000),
+            "units_consumed": value.get("unitsConsumed"),
+            "err": value.get("err"),
+            "logs": value.get("logs") or [],
+            "replacement_blockhash": replacement,
+        }
+
+    def _is_blockhash_error(self, message):
+        text = str(message or "").lower()
+        return any(token in text for token in (
+            "blockhash not found",
+            "blockhash expired",
+            "transaction expired",
+            "signature has expired",
+        ))
+
+    def _send_encoded_transaction(self, enc):
         send_params = {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}
         req_id = str(int(time.time()*1000))
+        region_errors = []
+
         def _send_region(url):
             r = requests.post(url, json={
                 "jsonrpc":"2.0","id":req_id,
@@ -1582,18 +1629,24 @@ class BotInstance:
                 raise ValueError(res["error"].get("message","?"))
             return None
 
-        with ThreadPoolExecutor(max_workers=7) as pool:
-            futures = {pool.submit(_send_region, u): u for u in self._sender_endpoints()}
-            for fut in as_completed(futures, timeout=6):
-                try:
-                    result = fut.result()
-                    if result:
-                        url, sig = result
-                        region = url.split("//")[1].split("-sender")[0]
-                        self.log_msg(f"⚡ Sent via Helius Sender ({region})")
-                        return sig
-                except Exception as e:
-                    pass  # other regions may still succeed
+        try:
+            with ThreadPoolExecutor(max_workers=7) as pool:
+                futures = {pool.submit(_send_region, u): u for u in self._sender_endpoints()}
+                for fut in as_completed(futures, timeout=6):
+                    try:
+                        result = fut.result()
+                        if result:
+                            url, sig = result
+                            region = url.split("//")[1].split("-sender")[0]
+                            return {
+                                "sig": sig,
+                                "source": f"helius-sender:{region}",
+                                "error": None,
+                            }
+                    except Exception as e:
+                        region_errors.append(str(e))
+        except Exception as e:
+            region_errors.append(str(e))
 
         # ── fallback: regular Helius RPC ────────────────────────────────────
         try:
@@ -1603,11 +1656,101 @@ class BotInstance:
             }, timeout=15)
             res = r.json()
             if res.get("result"):
-                self.log_msg("📡 Sent via Helius RPC (fallback)")
-            return res.get("result") if "result" in res else None
+                return {
+                    "sig": res["result"],
+                    "source": "helius-rpc-fallback",
+                    "error": None,
+                }
+            error_text = ""
+            if res.get("error"):
+                error_text = res["error"].get("message", "")
+            return {
+                "sig": None,
+                "source": "helius-rpc-fallback",
+                "error": error_text or "; ".join(region_errors[:3]) or "transaction-send-failed",
+            }
         except Exception as e:
-            self.log_msg(f"sendTransaction error: {e}")
-            return None
+            return {
+                "sig": None,
+                "source": "helius-rpc-fallback",
+                "error": str(e) or "; ".join(region_errors[:3]) or "transaction-send-failed",
+            }
+
+    def sign_and_send(self, swap_tx_b64):
+        raw = base64.b64decode(swap_tx_b64)
+        tx  = VersionedTransaction.from_bytes(raw)
+        meta = {
+            "sig": None,
+            "source": "",
+            "tip_injected": False,
+            "simulation_ok": None,
+            "simulation_units": None,
+            "simulation_error": "",
+            "simulation_latency_ms": 0,
+            "send_latency_ms": 0,
+            "resend_count": 0,
+            "failure_reason": "",
+        }
+
+        try:
+            signed_tx = self._inject_tip(tx)
+            meta["tip_injected"] = True
+            self.log_msg(f"💰 Jito tip injected ({self.TIP_LAMPORTS/1e9:.4f} SOL)")
+        except Exception as e:
+            self.log_msg(f"Tip injection failed ({e}), sending without tip")
+            signed_tx = VersionedTransaction(tx.message, [self.keypair])
+            meta["failure_reason"] = f"tip-injection:{e}"
+
+        fresh_blockhash = self._latest_blockhash()
+        if fresh_blockhash:
+            try:
+                signed_tx = self._resign_with_blockhash(signed_tx, fresh_blockhash)
+            except Exception as e:
+                meta["failure_reason"] = f"blockhash-refresh:{e}"
+
+        simulation = self._simulate_signed_transaction(signed_tx)
+        meta["simulation_ok"] = bool(simulation.get("ok"))
+        meta["simulation_units"] = simulation.get("units_consumed")
+        meta["simulation_latency_ms"] = int(simulation.get("latency_ms") or 0)
+        meta["simulation_error"] = _format_rpc_error(simulation.get("err"))
+        if meta["simulation_units"]:
+            self.log_msg(f"📋 Simulated swap | {int(meta['simulation_units'])} CU")
+        if meta["simulation_error"]:
+            self.log_msg(f"📋 Simulation warning: {meta['simulation_error']}")
+        if simulation.get("replacement_blockhash"):
+            try:
+                signed_tx = self._resign_with_blockhash(signed_tx, simulation["replacement_blockhash"])
+            except Exception:
+                pass
+
+        send_started = time.perf_counter()
+        last_error = meta["simulation_error"] or meta["failure_reason"]
+        for attempt in range(2):
+            if attempt:
+                meta["resend_count"] = attempt
+                refreshed = self._latest_blockhash()
+                if refreshed:
+                    try:
+                        signed_tx = self._resign_with_blockhash(signed_tx, refreshed)
+                        self.log_msg("🔁 Refreshed blockhash and retried send")
+                    except Exception as e:
+                        last_error = f"blockhash-resign-failed:{e}"
+                        break
+            send_result = self._send_encoded_transaction(self._encode_signed_transaction(signed_tx))
+            if send_result.get("sig"):
+                meta["sig"] = send_result["sig"]
+                meta["source"] = send_result.get("source") or ""
+                if meta["source"].startswith("helius-sender:"):
+                    self.log_msg(f"⚡ Sent via Helius Sender ({meta['source'].split(':', 1)[1]})")
+                else:
+                    self.log_msg("📡 Sent via Helius RPC (fallback)")
+                break
+            last_error = send_result.get("error") or last_error or "transaction-send-failed"
+            if not self._is_blockhash_error(last_error):
+                break
+        meta["send_latency_ms"] = round((time.perf_counter() - send_started) * 1000)
+        meta["failure_reason"] = "" if meta["sig"] else (last_error or "transaction-send-failed")
+        return meta
 
     def _jupiter_quote_single(self, url):
         """Try a single Jupiter quote URL with retries. Returns quote dict or None."""
@@ -1839,15 +1982,37 @@ class BotInstance:
             self.log_filter(name, mint, False, "Jupiter swap build failed")
             self.log_msg(f"SKIP {name} — Jupiter swap build failed")
             return
-        send_started = time.perf_counter()
-        sig = self.sign_and_send(swap_tx)
+        send_result = self.sign_and_send(swap_tx)
+        simulate_note = None
+        if send_result.get("simulation_units") is not None:
+            simulate_note = f"units={int(send_result['simulation_units'])}"
+        if send_result.get("simulation_error"):
+            simulate_note = send_result["simulation_error"]
         self.log_execution_event(
-            mint, name, "buy", "send", bool(sig),
-            latency_ms=round((time.perf_counter() - send_started) * 1000),
+            mint, name, "buy", "simulate", bool(send_result.get("simulation_ok")),
+            latency_ms=send_result.get("simulation_latency_ms"),
             slippage_bps=slippage,
             expected_out=quote.get("outAmount"),
             route_source=route_source,
-            failure_reason=None if sig else "transaction-send-failed",
+            failure_reason=simulate_note,
+        )
+        if send_result.get("resend_count"):
+            self.log_execution_event(
+                mint, name, "buy", "resend", bool(send_result.get("sig")),
+                latency_ms=0,
+                slippage_bps=slippage,
+                expected_out=quote.get("outAmount"),
+                route_source=route_source,
+                failure_reason=f"attempts={int(send_result['resend_count'])}",
+            )
+        sig = send_result.get("sig")
+        self.log_execution_event(
+            mint, name, "buy", "send", bool(sig),
+            latency_ms=send_result.get("send_latency_ms"),
+            slippage_bps=slippage,
+            expected_out=quote.get("outAmount"),
+            route_source=route_source,
+            failure_reason=None if sig else (send_result.get("failure_reason") or "transaction-send-failed"),
         )
         if sig:
             # Compute real entry price from execution instead of DexScreener quote
@@ -1993,14 +2158,34 @@ class BotInstance:
                     except Exception:
                         pass
                 return
-            send_started = time.perf_counter()
-            sig = self.sign_and_send(swap_tx)
+            send_result = self.sign_and_send(swap_tx)
+            simulate_note = None
+            if send_result.get("simulation_units") is not None:
+                simulate_note = f"units={int(send_result['simulation_units'])}"
+            if send_result.get("simulation_error"):
+                simulate_note = send_result["simulation_error"]
             self.log_execution_event(
-                mint, pos["name"], "sell", "send", bool(sig),
-                latency_ms=round((time.perf_counter() - send_started) * 1000),
+                mint, pos["name"], "sell", "simulate", bool(send_result.get("simulation_ok")),
+                latency_ms=send_result.get("simulation_latency_ms"),
                 expected_out=quote.get("outAmount"),
                 route_source=route_source,
-                failure_reason=None if sig else "transaction-send-failed",
+                failure_reason=simulate_note,
+            )
+            if send_result.get("resend_count"):
+                self.log_execution_event(
+                    mint, pos["name"], "sell", "resend", bool(send_result.get("sig")),
+                    latency_ms=0,
+                    expected_out=quote.get("outAmount"),
+                    route_source=route_source,
+                    failure_reason=f"attempts={int(send_result['resend_count'])}",
+                )
+            sig = send_result.get("sig")
+            self.log_execution_event(
+                mint, pos["name"], "sell", "send", bool(sig),
+                latency_ms=send_result.get("send_latency_ms"),
+                expected_out=quote.get("outAmount"),
+                route_source=route_source,
+                failure_reason=None if sig else (send_result.get("failure_reason") or "transaction-send-failed"),
             )
             if sig:
                 cur     = self.get_token_price(mint) or pos["entry_price"]
@@ -2624,6 +2809,81 @@ def extract_route_label(quote):
     return "jupiter"
 
 
+def _nested_lookup(value, keys):
+    wanted = {str(k).lower() for k in (keys or [])}
+    if isinstance(value, dict):
+        for raw_key, raw_val in value.items():
+            if str(raw_key).lower() in wanted and raw_val not in (None, ""):
+                return raw_val
+            found = _nested_lookup(raw_val, wanted)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _nested_lookup(item, wanted)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _coerce_int(value, default=0):
+    try:
+        if value in (None, ""):
+            return int(default)
+        if isinstance(value, bool):
+            return int(value)
+        return int(float(value))
+    except Exception:
+        return int(default)
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value in (None, "", 0, "0", "false", "False", "FALSE", "none", "None"):
+        return False
+    return True
+
+
+def _format_rpc_error(value):
+    if value in (None, "", {}):
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, separators=(",", ":"), default=str)
+    except Exception:
+        return str(value)
+
+
+def _extract_token2022_risk(info):
+    extensions = info.get("extensions") or []
+    ext_blob = json.dumps(extensions, separators=(",", ":"), default=str).lower() if extensions else ""
+    transfer_hook_enabled = ("transferhook" in ext_blob) or ("transfer_hook" in ext_blob)
+    permanent_delegate_enabled = ("permanentdelegate" in ext_blob) or ("permanent_delegate" in ext_blob)
+    mint_close_authority_enabled = ("mintcloseauthority" in ext_blob) or ("mint_close_authority" in ext_blob)
+    transfer_fee_bps = 0
+    raw_fee = _nested_lookup(
+        extensions,
+        {
+            "transferFeeBasisPoints",
+            "transfer_fee_basis_points",
+            "basisPoints",
+            "basis_points",
+            "feeBasisPoints",
+            "fee_basis_points",
+        },
+    )
+    if raw_fee not in (None, "") and "transferfee" in ext_blob:
+        transfer_fee_bps = max(0, _coerce_int(raw_fee, 0))
+    return {
+        "transfer_hook_enabled": bool(transfer_hook_enabled),
+        "permanent_delegate_enabled": bool(permanent_delegate_enabled),
+        "mint_close_authority_enabled": bool(mint_close_authority_enabled),
+        "transfer_fee_bps": transfer_fee_bps,
+    }
+
+
 def _now_utc():
     return datetime.utcnow()
 
@@ -3131,6 +3391,9 @@ def inspect_token_risk(mint, age_min=0, first_liq=0, latest_liq=0):
     owner = ""
     info = {}
     transfer_hook_enabled = False
+    permanent_delegate_enabled = False
+    mint_close_authority_enabled = False
+    transfer_fee_bps = 0
     freeze_authority = None
     mint_authority = None
     can_exit = None
@@ -3139,9 +3402,11 @@ def inspect_token_risk(mint, age_min=0, first_liq=0, latest_liq=0):
         value = result.get("value") if isinstance(result, dict) else {}
         owner = (value or {}).get("owner") or ""
         info = (((value or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
-        extensions = info.get("extensions") or []
-        ext_blob = json.dumps(extensions).lower() if extensions else ""
-        transfer_hook_enabled = ("transferhook" in ext_blob) or ("transfer_hook" in ext_blob)
+        token_2022_risk = _extract_token2022_risk(info)
+        transfer_hook_enabled = bool(token_2022_risk.get("transfer_hook_enabled"))
+        permanent_delegate_enabled = bool(token_2022_risk.get("permanent_delegate_enabled"))
+        mint_close_authority_enabled = bool(token_2022_risk.get("mint_close_authority_enabled"))
+        transfer_fee_bps = max(0, _coerce_int(token_2022_risk.get("transfer_fee_bps"), 0))
         freeze_authority = info.get("freezeAuthority")
         mint_authority = info.get("mintAuthority")
     except Exception as e:
@@ -3160,6 +3425,15 @@ def inspect_token_risk(mint, age_min=0, first_liq=0, latest_liq=0):
     if transfer_hook_enabled:
         flags.append("transfer-hook")
         score += 35
+    if permanent_delegate_enabled:
+        flags.append("permanent-delegate")
+        score += 30
+    if mint_close_authority_enabled:
+        flags.append("mint-close-authority")
+        score += 20
+    if transfer_fee_bps > 0:
+        flags.append(f"transfer-fee-{transfer_fee_bps}bps")
+        score += min(20, max(8, math.ceil(transfer_fee_bps / 20)))
     if freeze_authority not in (None, ""):
         flags.append("freeze-authority")
         score += 30
@@ -3175,6 +3449,9 @@ def inspect_token_risk(mint, age_min=0, first_liq=0, latest_liq=0):
     return {
         "token_program": owner or SPL_TOKEN_PROGRAM,
         "transfer_hook_enabled": bool(transfer_hook_enabled),
+        "permanent_delegate_enabled": bool(permanent_delegate_enabled),
+        "mint_close_authority_enabled": bool(mint_close_authority_enabled),
+        "transfer_fee_bps": transfer_fee_bps,
         "can_exit": can_exit,
         "threat_risk_score": min(100, score),
         "threat_flags": _dedupe_keep_order(flags),
@@ -3199,6 +3476,12 @@ def token_intel_payload(row):
     payload["checklist"] = payload.pop("checklist_json", [])
     payload["milestones"] = payload.pop("milestones_json", {})
     payload["transfer_hook_enabled"] = bool(payload.get("transfer_hook_enabled"))
+    if "permanent_delegate_enabled" in payload:
+        payload["permanent_delegate_enabled"] = _coerce_bool(payload.get("permanent_delegate_enabled"))
+    if "mint_close_authority_enabled" in payload:
+        payload["mint_close_authority_enabled"] = _coerce_bool(payload.get("mint_close_authority_enabled"))
+    if "transfer_fee_bps" in payload:
+        payload["transfer_fee_bps"] = _coerce_int(payload.get("transfer_fee_bps"), 0)
     if payload.get("can_exit") is not None:
         payload["can_exit"] = bool(payload.get("can_exit"))
     for dt_key in ("first_seen_at", "last_seen_at", "last_updated"):
@@ -3481,6 +3764,9 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
         "deployer_score": compute_deployer_reputation(deployer_stats),
         "token_program": risk.get("token_program"),
         "transfer_hook_enabled": risk.get("transfer_hook_enabled"),
+        "permanent_delegate_enabled": risk.get("permanent_delegate_enabled"),
+        "mint_close_authority_enabled": risk.get("mint_close_authority_enabled"),
+        "transfer_fee_bps": risk.get("transfer_fee_bps"),
         "can_exit": risk.get("can_exit"),
         "threat_risk_score": risk.get("threat_risk_score"),
         "threat_flags": risk.get("threat_flags") or [],
