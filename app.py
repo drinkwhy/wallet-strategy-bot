@@ -205,6 +205,24 @@ def dex_get(url, **kwargs):
         _dex_backoff_until = time.time() + 30  # back off 30s on any 429
     return resp
 
+
+def safe_json_response(resp, default=None):
+    """Parse JSON safely from HTTP responses that may return empty/non-JSON bodies."""
+    if default is None:
+        default = {}
+    if resp is None:
+        return default
+    try:
+        if not (resp.text or "").strip():
+            return default
+    except Exception:
+        return default
+    try:
+        data = resp.json()
+        return default if data is None else data
+    except Exception:
+        return default
+
 PLAN_LIMITS = {
     "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
     "basic": {"max_buy_sol": 0.1,  "label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
@@ -2171,7 +2189,6 @@ class BotInstance:
         s = self.settings
         min_mc  = s.get("min_mc", 0)
         max_mc  = s.get("max_mc", 999999)
-        min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
         min_vol = s.get("min_vol", 0)
         min_score = s.get("min_score", 0)
@@ -2193,7 +2210,7 @@ class BotInstance:
             "score": _sd, "passed": False, "reason": "",
             "filters": [
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
-                {"name": "Liquidity", "passed": liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
+                {"name": "Liquidity", "passed": True, "value": f"${liq:,.0f}", "threshold": "off"},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
                 {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
@@ -2201,19 +2218,9 @@ class BotInstance:
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
-        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
+        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(filter off) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if liq <= 0:
-            sig_entry["reason"] = "No liquidity data available"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
-        if liq < min_liq:
-            sig_entry["reason"] = f"Liq ${liq:,.0f} < min ${min_liq:,}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
@@ -4048,12 +4055,11 @@ def _find_solana_token(symbol):
         )
         if _sr.status_code != 200:
             return None
-        r = _sr.json()
+        r = safe_json_response(_sr, {"pairs": []})
         pairs = r.get("pairs") or []
         sol_pairs = [p for p in pairs
                      if p.get("chainId") == "solana"
                      and p.get("baseToken",{}).get("symbol","").upper() == symbol
-                     and (p.get("liquidity") or {}).get("usd", 0) > 5_000
                      and (p.get("liquidity") or {}).get("usd", 0) < 50_000_000]
         if not sol_pairs:
             return None
@@ -4079,7 +4085,8 @@ def listing_scanner():
     # Seed known pairs so we don't fire on startup
     for exchange, (url, _, _, _) in LISTING_EXCHANGES.items():
         try:
-            data = requests.get(url, headers=HEADERS, timeout=10).json()
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            data = safe_json_response(resp, [])
             _listing_known[exchange] = _extract_symbols(exchange, data)
         except Exception as _e:
             print(f"[ERROR] {_e}", flush=True)
@@ -4090,7 +4097,8 @@ def listing_scanner():
         try:
             for exchange, (url, _, _, _) in LISTING_EXCHANGES.items():
                 try:
-                    data = requests.get(url, headers=HEADERS, timeout=10).json()
+                    resp = requests.get(url, headers=HEADERS, timeout=10)
+                    data = safe_json_response(resp, [])
                     current = _extract_symbols(exchange, data)
                     prev    = _listing_known.get(exchange, set())
                     new_syms = current - prev
