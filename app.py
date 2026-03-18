@@ -252,6 +252,10 @@ PRESETS = {
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.3,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
+        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
+        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
+        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
+        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
@@ -268,6 +272,10 @@ PRESETS = {
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.5,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
+        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
+        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
+        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
+        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
     },
     "aggressive": {
         "label":"Aggressive — Higher Risk / Bigger Swings",
@@ -284,6 +292,10 @@ PRESETS = {
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.8,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
+        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
+        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
+        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
+        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
     },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
@@ -300,6 +312,10 @@ PRESETS = {
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":False,"max_correlated":8,"drawdown_limit_sol":1.0,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
+        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
+        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
+        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
+        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
     },
     "custom": {
         "label":"Custom — Manual Exit Tuning",
@@ -316,6 +332,10 @@ PRESETS = {
         "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.5,
         "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
+        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
+        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
+        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
+        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
     },
 }
 # keep backward compat
@@ -631,6 +651,7 @@ def init_db():
             entry_sol REAL,
             tp1_hit INTEGER DEFAULT 0,
             dev_wallet TEXT,
+            strategy TEXT DEFAULT 'core',
             opened_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(user_id, mint)
         )""")
@@ -820,6 +841,7 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS is_running INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
+            "ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'core'",
             "ALTER TABLE perf_fees ADD COLUMN IF NOT EXISTS session_id TEXT",
             "ALTER TABLE filter_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
@@ -1291,6 +1313,7 @@ class BotInstance:
         self.cooldown_until     = 0.0   # retained for API compatibility; cooldown is disabled
         self.loss_mints         = {}    # mint -> epoch when the bot last realized a loss on that mint
         self.auto_relax_level   = 0
+        self.last_steady_buy_at = 0.0
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
         self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
@@ -1335,6 +1358,65 @@ class BotInstance:
         self.buys_this_hour = 0
         self.evals_this_hour = 0
         return
+
+    def strategy_position_count(self, strategy_tag):
+        strategy_tag = str(strategy_tag or "core").strip().lower()
+        return sum(1 for pos in self.positions.values() if str(pos.get("strategy") or "core").strip().lower() == strategy_tag)
+
+    def maybe_run_steady_lane(self):
+        s = self.settings
+        if not bool(s.get("steady_lane_enabled", True)):
+            return
+        interval_min = max(15, int(s.get("steady_lane_interval_min", 60) or 60))
+        if time.time() - self.last_steady_buy_at < interval_min * 60:
+            return
+        max_positions = max(1, int(s.get("steady_lane_max_positions", 2) or 2))
+        if self.strategy_position_count("steady") >= max_positions:
+            return
+        seen = set()
+        candidates = []
+        for item in list(market_feed)[:80]:
+            mint = item.get("mint")
+            if not mint or mint in seen or mint in self.positions:
+                continue
+            seen.add(mint)
+            price = float(item.get("price") or 0)
+            mc = float(item.get("mc") or 0)
+            vol = float(item.get("vol") or 0)
+            liq = float(item.get("liq") or 0)
+            age_min = float(item.get("age_min") or 0)
+            change = float(item.get("change") or 0)
+            score = float(item.get("score") or 0)
+            if not price or age_min < 3 or age_min > float(s.get("steady_lane_max_age_min", 240) or 240):
+                continue
+            if liq < float(s.get("steady_lane_min_liq", 3000) or 3000):
+                continue
+            if vol < float(s.get("steady_lane_min_vol", 3000) or 3000):
+                continue
+            if score < float(s.get("steady_lane_min_score", 20) or 20):
+                continue
+            if mc <= 0 or mc > 1_000_000 or change < -20 or change > 120:
+                continue
+            intel = item.get("intel") or ensure_token_intel(mint, base_info=item, pair=None, force=False) or {}
+            if bool(intel.get("transfer_hook_enabled")) or intel.get("can_exit") is False or int(intel.get("threat_risk_score") or 0) >= 60:
+                continue
+            candidate_score = score + min(liq / 10000.0, 20.0) + min(vol / 10000.0, 20.0) + min(float(intel.get("green_lights") or 0) * 4.0, 12.0) - abs(change) * 0.08
+            candidates.append((candidate_score, item, intel))
+        if not candidates:
+            return
+        candidates.sort(key=lambda row: row[0], reverse=True)
+        _, item, intel = candidates[0]
+        self.last_steady_buy_at = time.time()
+        self.log_msg(f"🕐 STEADY lane selecting {item.get('name','Unknown')} | score={float(item.get('score') or 0):.0f} liq=${float(item.get('liq') or 0):,.0f}")
+        self.buy(
+            item["mint"],
+            f"[STEADY] {item.get('name','Unknown')}",
+            float(item.get("price") or 0),
+            liq=float(item.get("liq") or 0),
+            dev_wallet=intel.get("deployer_wallet"),
+            age_min=float(item.get("age_min") or 0),
+            strategy_tag="steady",
+        )
 
     def execution_health_alert(self):
         now = time.time()
@@ -2096,7 +2178,7 @@ class BotInstance:
             "checks": checks,
         }
 
-    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
+    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, strategy_tag="core"):
         s = self.settings
         trade_sol = round(float(s["max_buy_sol"]), 4)
         max_correlated = max(int(s.get("max_correlated", 5) or 5), 8)
@@ -2107,40 +2189,40 @@ class BotInstance:
         if cb:
             self.log_msg(f"⛔ CIRCUIT BREAKER — {cb} — halting bot")
             self.running = False
-            return
+            return False
         # ── Rate limiting ────────────────────────────────────────────────────
         rl = self.check_rate_limit(name, mint)
         if rl:
             self.log_filter(name, mint, False, rl)
             self.log_msg(f"SKIP {name} — {rl}")
-            return
+            return False
         # ── Consolidated token safety path ───────────────────────────────────
         safety = self.pre_buy_safety_check(mint, name=name, dev_wallet=dev_wallet, age_min=age_min, liq=liq)
         if not safety.get("safe"):
             reason = safety.get("reason") or "Pre-buy safety check failed"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return
+            return False
         # Drawdown limit
         if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
             reason = f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return
+            return False
         # Correlated position limit
         if len(self.positions) >= max_correlated:
             reason = f"Max correlated positions ({len(self.positions)})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return
+            return False
         if self.sol_balance < trade_sol + 0.01:
             reason = f"Low balance ({self.sol_balance:.4f} SOL, need {trade_sol+0.01:.4f})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return
+            return False
         if mint in self.positions:
             self.log_msg(f"SKIP {name} — already in position")
-            return
+            return False
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
@@ -2158,7 +2240,7 @@ class BotInstance:
         if not quote:
             self.log_filter(name, mint, False, "No Jupiter quote available")
             self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
-            return
+            return False
         swap_started = time.perf_counter()
         swap_tx = self.jupiter_swap(quote)
         self.log_execution_event(
@@ -2172,7 +2254,7 @@ class BotInstance:
         if not swap_tx:
             self.log_filter(name, mint, False, "Jupiter swap build failed")
             self.log_msg(f"SKIP {name} — Jupiter swap build failed")
-            return
+            return False
         send_result = self.sign_and_send(swap_tx)
         simulate_note = None
         if send_result.get("simulation_units") is not None:
@@ -2244,6 +2326,7 @@ class BotInstance:
                 "name":name,"entry_price":real_price,"peak_price":real_price,
                 "timestamp":time.time(),"tp1_hit":False,"entry_sol":trade_sol,
                 "dev_wallet": dev_wallet,
+                "strategy": str(strategy_tag or "core"),
                 "surge_hold_active": False,
                 "surge_peak_price": real_price,
             }
@@ -2252,13 +2335,14 @@ class BotInstance:
                 try:
                     _c = _conn.cursor()
                     _c.execute("""INSERT INTO open_positions
-                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet)
-                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet,strategy)
+                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                                   ON CONFLICT (user_id,mint) DO UPDATE
                                   SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
                                       peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
-                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
-                               (self.user_id, mint, name, real_price, real_price, trade_sol, 0, dev_wallet))
+                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet,
+                                      strategy=EXCLUDED.strategy""",
+                               (self.user_id, mint, name, real_price, real_price, trade_sol, 0, dev_wallet, str(strategy_tag or "core")))
                     _conn.commit()
                 finally:
                     db_return(_conn)
@@ -2284,9 +2368,11 @@ class BotInstance:
                         f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {trade_sol} SOL\n🔗 solscan.io/tx/{sig}")
             except Exception as _e:
                 print(f"[ERROR] {_e}", flush=True)
+            return True
         else:
             print(f"[BUY-FAIL U{self.user_id}] {name} | send failed", flush=True)
             self.log_filter(name, mint, False, "Transaction failed to send")
+            return False
 
     def sell(self, mint, pct, reason):
         pos = self.positions.get(mint)
@@ -2535,6 +2621,7 @@ class BotInstance:
             age_sec    = time.time() - pos["timestamp"]
             age_min    = (time.time() - pos["timestamp"]) / 60
             trail_line = pos["peak_price"] * (1 - s["trail_pct"])
+            strategy_tag = str(pos.get("strategy") or "core").strip().lower()
 
             # ── Enhanced position monitoring (whale + rug detection) ─────────
             if self.enhanced_enabled:
@@ -2574,6 +2661,17 @@ class BotInstance:
                     self.sell(mint, 1.0, f"LISTING TIME 4h (exit at loss)")
                     continue
                 continue   # skip regular TP/SL logic for listing positions
+            if strategy_tag == "launch":
+                launch_peak_floor = max(1.05, float(s.get("launch_plateau_profit_mult", 1.35) or 1.35))
+                launch_plateau_trail_pct = min(0.35, max(0.03, float(s.get("launch_plateau_trail_pct", 0.10) or 0.10)))
+                launch_time_stop_min = max(3, float(s.get("launch_time_stop_min", 20) or 20))
+                launch_trail_line = pos["peak_price"] * (1 - launch_plateau_trail_pct)
+                if peak_ratio >= launch_peak_floor and cur <= launch_trail_line:
+                    self.sell(mint, 1.0, f"LAUNCH PLATEAU {ratio:.2f}x")
+                    continue
+                if age_min >= launch_time_stop_min:
+                    self.sell(mint, 1.0, f"LAUNCH TIME {ratio:.2f}x")
+                    continue
 
             if age_sec <= 10 and ratio >= 2.0 and not pos.get("surge_hold_active"):
                 pos["surge_hold_active"] = True
@@ -2623,8 +2721,15 @@ class BotInstance:
         momentum_auto_buy_threshold = max(0, min(100, int(s.get("momentum_auto_buy_threshold", 85) or 85)))
         negative_screening_mode = bool(s.get("negative_screening_mode", True))
         hard_threat_limit = 85
+        launch_lane_enabled = bool(s.get("launch_lane_enabled", True))
+        launch_lane_max_age_min = max(1.0, float(s.get("launch_lane_max_age_min", 12) or 12))
+        launch_lane_min_momentum = max(0, min(100, int(s.get("launch_lane_min_momentum", 55) or 55)))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
+        is_launch_lane = launch_lane_enabled and age_min <= launch_lane_max_age_min and (
+            _sinfo["momentum"] >= launch_lane_min_momentum or "pumpfun" in str(source or "").lower()
+        )
+        strategy_tag = "launch" if is_launch_lane else "core"
         _sd = ai_score_detailed(_sinfo)
         score_total = _sd["total"]
         self.evals_this_hour += 1
@@ -2664,7 +2769,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_msg(f"\u26a1 MOMENTUM AUTO-BUY {name} | vel={_sinfo['momentum']} >= {momentum_auto_buy_threshold}")
             self.log_filter(name, mint, True, sig_entry["reason"])
-            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
+            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min, strategy_tag=strategy_tag)
             return
         if not negative_screening_mode and not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
@@ -2815,7 +2920,7 @@ class BotInstance:
                 + (f" | advisory: {', '.join(soft_failures[:4])}" if soft_failures else "")
             )
             self.log_filter(name, mint, True, sig_entry["reason"])
-            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
+            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min, strategy_tag=strategy_tag)
             return
         if transfer_hook_enabled:
             sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
@@ -2847,7 +2952,7 @@ class BotInstance:
         self.log_signal_entry(sig_entry)
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, "Signal passed all filters")
-        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
+        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min, strategy_tag=strategy_tag)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -2873,6 +2978,7 @@ class BotInstance:
                     self.running = False
                     self.record_perf_fee()
                     break
+                self.maybe_run_steady_lane()
                 if self.positions:
                     self.check_positions()
                 time.sleep(3)
@@ -4682,6 +4788,7 @@ def auto_restart_bots():
                             "tp1_hit":     bool(p["tp1_hit"]),
                             "entry_sol":   p["entry_sol"],
                             "dev_wallet":  p["dev_wallet"],
+                            "strategy":    p.get("strategy") or "core",
                             "surge_hold_active": False,
                             "surge_peak_price": p["peak_price"] or p["entry_price"],
                         }
@@ -5418,6 +5525,7 @@ def api_state():
                     "pnl":           f"{(ratio-1)*100:+.1f}%" if ratio else "?",
                     "age_min":       round((time.time()-p["timestamp"])/60,1),
                     "tp1_hit":       p["tp1_hit"],
+                    "strategy":      p.get("strategy", "core"),
                 })
             except Exception:
                 pass  # position was sold mid-iteration
@@ -8536,7 +8644,7 @@ async function refresh() {
     ? d.positions.map(p => {
         const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
         return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
-          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
+          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.strategy && p.strategy !== 'core' ? `<span class="badge bg-blue" style="margin-left:4px;font-size:9px">${p.strategy}</span>` : ''}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
           <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
         </div>`;
       }).join('')
