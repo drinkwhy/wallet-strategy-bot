@@ -6755,7 +6755,26 @@ function chgClass(v) { return v > 0 ? 'chg-pos' : v < 0 ? 'chg-neg' : 'chg-0'; }
 function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
 function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
 function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
-function markSettingsDirty() { _settingsDirty = true; }
+function markSettingsDirty() {
+  _settingsDirty = true;
+  document._settingsFocused = true;
+}
+function bindSettingsInputs() {
+  ['s-preset', 's-tp1', 's-tp2', 's-sl', 's-trail'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el || el._settingsBound) return;
+    el._settingsBound = true;
+    el.addEventListener('focus', () => { document._settingsFocused = true; });
+    el.addEventListener('blur', () => {
+      setTimeout(() => {
+        const active = document.activeElement;
+        const ids = ['s-preset', 's-tp1', 's-tp2', 's-sl', 's-trail'];
+        document._settingsFocused = !!(active && ids.includes(active.id));
+      }, 0);
+    });
+    el.addEventListener('change', markSettingsDirty);
+  });
+}
 function signalKey(s) { return `${s.mint || ''}|${s.logged_at || s.ts || ''}|${s.passed ? 1 : 0}|${s.reason || ''}`; }
 function fmtDateTime(ts) {
   if (!ts) return '—';
@@ -7063,6 +7082,7 @@ async function saveSettings() {
   }).then(r => r.json()).catch(() => null);
   if (res && res.ok !== false) {
     _settingsDirty = false;
+    document._settingsFocused = false;
     showToast('\u2713 Settings saved', true);
     showConfirmModal(
       'Mode Saved',
@@ -7165,7 +7185,7 @@ async function refresh() {
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
   }
-  if (d.settings && Object.keys(d.settings).length && !document._settingsFocused) {
+  if (d.settings && Object.keys(d.settings).length && !document._settingsFocused && !_settingsDirty) {
     const s = d.settings;
     const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
     setVal('s-tp1',      s.tp1_mult         ?? 2.0);
@@ -7757,6 +7777,8 @@ async function loadPnl(range) {
 (function() {
   selectPreset('{{PRESET}}' || 'balanced', false);
   _settingsDirty = false;
+  document._settingsFocused = false;
+  bindSettingsInputs();
 })();
 window.addEventListener('resize', () => {
   if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
