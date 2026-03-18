@@ -230,7 +230,6 @@ PLAN_LIMITS = {
     "elite": {"max_buy_sol": 5.0,  "label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
     "trial": {"max_buy_sol": 0.05, "label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
 }
-DEFAULT_LISTING_EXCHANGES = ("binance", "coinbase", "okx", "kraken", "bybit", "kucoin", "gate")
 PRICE_TO_PLAN = {}
 for _plan_name, _price_id in (("basic", STRIPE_PRICE_BASIC), ("pro", STRIPE_PRICE_PRO), ("elite", STRIPE_PRICE_ELITE)):
     if _price_id:
@@ -249,13 +248,8 @@ PRESETS = {
         "offpeak_min_change":20,
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
-        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.3,
-        "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
-        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
-        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
-        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
-        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
+        "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
+        "listing_sniper":True,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
@@ -269,13 +263,8 @@ PRESETS = {
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
-        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.5,
-        "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
-        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
-        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
-        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
-        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
+        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "listing_sniper":True,
     },
     "aggressive": {
         "label":"Aggressive — Higher Risk / Bigger Swings",
@@ -289,13 +278,8 @@ PRESETS = {
         "offpeak_min_change":15,
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
-        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.8,
-        "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
-        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
-        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
-        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
-        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
+        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
+        "listing_sniper":True,
     },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
@@ -309,13 +293,8 @@ PRESETS = {
         "offpeak_min_change":12,
         "max_hot_change":400.0,
         "nuclear_narrative_score":35,
-        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":False,"max_correlated":8,"drawdown_limit_sol":1.0,
-        "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
-        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
-        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
-        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
-        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
+        "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
+        "listing_sniper":True,
     },
     "custom": {
         "label":"Custom — Manual Exit Tuning",
@@ -329,39 +308,13 @@ PRESETS = {
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
-        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
-        "anti_rug":True,"check_holders":True,"max_correlated":8,"drawdown_limit_sol":0.5,
-        "listing_sniper":True,"listing_exchanges":list(DEFAULT_LISTING_EXCHANGES),
-        "steady_lane_enabled":True,"steady_lane_interval_min":60,"steady_lane_max_positions":2,
-        "steady_lane_max_age_min":240,"steady_lane_min_liq":3000,"steady_lane_min_vol":3000,"steady_lane_min_score":20,
-        "launch_lane_enabled":True,"launch_lane_max_age_min":12,"launch_lane_min_momentum":55,
-        "launch_time_stop_min":20,"launch_plateau_profit_mult":1.35,"launch_plateau_trail_pct":0.10,
+        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "listing_sniper":True,
     },
 }
 # keep backward compat
 PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
-
-
-def normalize_listing_exchange_selection(value):
-    if value is None:
-        return list(DEFAULT_LISTING_EXCHANGES)
-    if isinstance(value, str):
-        raw_items = re.split(r"[\s,]+", value)
-    elif isinstance(value, (list, tuple, set)):
-        raw_items = list(value)
-    else:
-        return list(DEFAULT_LISTING_EXCHANGES)
-    valid = set(DEFAULT_LISTING_EXCHANGES)
-    selected = []
-    seen = set()
-    for item in raw_items:
-        key = str(item or "").strip().lower()
-        if key in valid and key not in seen:
-            seen.add(key)
-            selected.append(key)
-    return selected
-
 
 BOT_OVERRIDE_FIELDS = [
     ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
@@ -374,9 +327,6 @@ BOT_OVERRIDE_FIELDS = [
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
     ("offpeak_min_change", float), ("max_hot_change", float),
-    ("momentum_auto_buy_threshold", int),
-    ("momentum_auto_buy_enabled", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
-    ("listing_exchanges", normalize_listing_exchange_selection),
     ("anti_rug", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
     ("check_holders", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
 ]
@@ -434,8 +384,6 @@ ADMIN_PRESET_FIELDS = {
     "min_volume_spike_mult": "volspike",
     "late_entry_mult": "latemult",
     "nuclear_narrative_score": "nuclear",
-    "momentum_auto_buy_threshold": "momthr",
-    "momentum_auto_buy_enabled": "momauto",
 }
 
 
@@ -651,7 +599,6 @@ def init_db():
             entry_sol REAL,
             tp1_hit INTEGER DEFAULT 0,
             dev_wallet TEXT,
-            strategy TEXT DEFAULT 'core',
             opened_at TIMESTAMP DEFAULT NOW(),
             UNIQUE(user_id, mint)
         )""")
@@ -662,19 +609,6 @@ def init_db():
             mint TEXT, name TEXT, action TEXT,
             price REAL, pnl_sol REAL,
             timestamp TIMESTAMP DEFAULT NOW()
-        )""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS buy_history (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER,
-            mint TEXT,
-            name TEXT,
-            entry_price REAL,
-            entry_sol REAL,
-            slippage_bps INTEGER,
-            route_source TEXT,
-            tx_sig TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS perf_fees (
@@ -802,7 +736,6 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
             "CREATE INDEX IF NOT EXISTS idx_trades_user_id_ts ON trades (user_id, timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_buy_history_user_id_created_at ON buy_history (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_bot_settings_user_id ON bot_settings (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_open_positions_user_id ON open_positions (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)",
@@ -841,7 +774,6 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS is_running INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
-            "ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'core'",
             "ALTER TABLE perf_fees ADD COLUMN IF NOT EXISTS session_id TEXT",
             "ALTER TABLE filter_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
@@ -875,7 +807,6 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_buy_history_user_id_created_at ON buy_history (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
         try:
@@ -965,17 +896,6 @@ def migrate_db():
                 route_source TEXT,
                 failure_reason TEXT,
                 created_at TIMESTAMP DEFAULT NOW())""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS buy_history (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER,
-                mint TEXT,
-                name TEXT,
-                entry_price REAL,
-                entry_sol REAL,
-                slippage_bps INTEGER,
-                route_source TEXT,
-                tx_sig TEXT,
-                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS preset_overrides (
                 preset TEXT PRIMARY KEY,
                 overrides_json TEXT,
@@ -983,7 +903,6 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_buy_history_user_id_created_at ON buy_history (user_id, created_at DESC)")
         except Exception:
             conn.rollback()
         conn.commit()
@@ -1303,7 +1222,6 @@ class BotInstance:
         self.filter_log        = deque(maxlen=50)
         self.signal_explorer_log = deque(maxlen=200)
         self.execution_events  = deque(maxlen=200)
-        self.buy_history       = deque(maxlen=50)
         # ── Risk controls ───────────────────────────────────────────────────
         self.peak_balance       = 0.0   # for max-drawdown circuit breaker
         self.buys_this_hour     = 0
@@ -1313,7 +1231,6 @@ class BotInstance:
         self.cooldown_until     = 0.0   # retained for API compatibility; cooldown is disabled
         self.loss_mints         = {}    # mint -> epoch when the bot last realized a loss on that mint
         self.auto_relax_level   = 0
-        self.last_steady_buy_at = 0.0
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
         self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
@@ -1358,65 +1275,6 @@ class BotInstance:
         self.buys_this_hour = 0
         self.evals_this_hour = 0
         return
-
-    def strategy_position_count(self, strategy_tag):
-        strategy_tag = str(strategy_tag or "core").strip().lower()
-        return sum(1 for pos in self.positions.values() if str(pos.get("strategy") or "core").strip().lower() == strategy_tag)
-
-    def maybe_run_steady_lane(self):
-        s = self.settings
-        if not bool(s.get("steady_lane_enabled", True)):
-            return
-        interval_min = max(15, int(s.get("steady_lane_interval_min", 60) or 60))
-        if time.time() - self.last_steady_buy_at < interval_min * 60:
-            return
-        max_positions = max(1, int(s.get("steady_lane_max_positions", 2) or 2))
-        if self.strategy_position_count("steady") >= max_positions:
-            return
-        seen = set()
-        candidates = []
-        for item in list(market_feed)[:80]:
-            mint = item.get("mint")
-            if not mint or mint in seen or mint in self.positions:
-                continue
-            seen.add(mint)
-            price = float(item.get("price") or 0)
-            mc = float(item.get("mc") or 0)
-            vol = float(item.get("vol") or 0)
-            liq = float(item.get("liq") or 0)
-            age_min = float(item.get("age_min") or 0)
-            change = float(item.get("change") or 0)
-            score = float(item.get("score") or 0)
-            if not price or age_min < 3 or age_min > float(s.get("steady_lane_max_age_min", 240) or 240):
-                continue
-            if liq < float(s.get("steady_lane_min_liq", 3000) or 3000):
-                continue
-            if vol < float(s.get("steady_lane_min_vol", 3000) or 3000):
-                continue
-            if score < float(s.get("steady_lane_min_score", 20) or 20):
-                continue
-            if mc <= 0 or mc > 1_000_000 or change < -20 or change > 120:
-                continue
-            intel = item.get("intel") or ensure_token_intel(mint, base_info=item, pair=None, force=False) or {}
-            if bool(intel.get("transfer_hook_enabled")) or intel.get("can_exit") is False or int(intel.get("threat_risk_score") or 0) >= 60:
-                continue
-            candidate_score = score + min(liq / 10000.0, 20.0) + min(vol / 10000.0, 20.0) + min(float(intel.get("green_lights") or 0) * 4.0, 12.0) - abs(change) * 0.08
-            candidates.append((candidate_score, item, intel))
-        if not candidates:
-            return
-        candidates.sort(key=lambda row: row[0], reverse=True)
-        _, item, intel = candidates[0]
-        self.last_steady_buy_at = time.time()
-        self.log_msg(f"🕐 STEADY lane selecting {item.get('name','Unknown')} | score={float(item.get('score') or 0):.0f} liq=${float(item.get('liq') or 0):,.0f}")
-        self.buy(
-            item["mint"],
-            f"[STEADY] {item.get('name','Unknown')}",
-            float(item.get("price") or 0),
-            liq=float(item.get("liq") or 0),
-            dev_wallet=intel.get("deployer_wallet"),
-            age_min=float(item.get("age_min") or 0),
-            strategy_tag="steady",
-        )
 
     def execution_health_alert(self):
         now = time.time()
@@ -1529,45 +1387,6 @@ class BotInstance:
                         None if expected_out is None else float(expected_out),
                         None if actual_out is None else float(actual_out),
                         route_source, failure_reason,
-                    )
-                )
-                conn.commit()
-            finally:
-                db_return(conn)
-        except Exception as _e:
-            print(f"[ERROR] {_e}", flush=True)
-
-    def log_buy_history(self, mint, name, entry_price, entry_sol, slippage_bps, route_source, tx_sig):
-        payload = {
-            "mint": mint,
-            "name": name,
-            "entry_price": float(entry_price or 0),
-            "entry_sol": float(entry_sol or 0),
-            "slippage_bps": None if slippage_bps is None else int(slippage_bps),
-            "route_source": route_source or "",
-            "tx_sig": tx_sig or "",
-            "created_at": datetime.utcnow().isoformat(),
-        }
-        self.buy_history.appendleft(payload)
-        try:
-            conn = db()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO buy_history (
-                        user_id,mint,name,entry_price,entry_sol,slippage_bps,route_source,tx_sig
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        self.user_id,
-                        payload["mint"],
-                        payload["name"],
-                        payload["entry_price"],
-                        payload["entry_sol"],
-                        payload["slippage_bps"],
-                        payload["route_source"],
-                        payload["tx_sig"],
                     )
                 )
                 conn.commit()
@@ -2033,6 +1852,17 @@ class BotInstance:
 
     def check_circuit_breakers(self):
         """Returns a reason string if trading should halt, else None."""
+        if self.start_balance > 0:
+            daily_loss_pct = (self.start_balance - self.sol_balance) / self.start_balance
+            if daily_loss_pct >= 0.05:
+                return f"Daily loss limit −5% hit ({daily_loss_pct*100:.1f}%)"
+        if self.peak_balance > 0:
+            drawdown_pct = (self.peak_balance - self.sol_balance) / self.peak_balance
+            if drawdown_pct >= 0.12:
+                return f"Max drawdown −12% hit ({drawdown_pct*100:.1f}%)"
+        health_alert = self.execution_health_alert()
+        if health_alert:
+            return health_alert
         return None
 
     def check_rate_limit(self, name, mint):
@@ -2068,7 +1898,6 @@ class BotInstance:
     def pre_buy_safety_check(self, mint, name="", dev_wallet=None, age_min=0, liq=0):
         """Run token-specific blocking checks in one place and return a structured result."""
         s = self.settings
-        negative_screening_mode = bool(s.get("negative_screening_mode", True))
         checks = {}
         timings_ms = {}
         warnings = []
@@ -2083,10 +1912,7 @@ class BotInstance:
             elif s.get("anti_rug"):
                 checks["authority"] = None
                 warnings.append("authority check skipped for token under 30m")
-            if negative_screening_mode and s.get("check_holders"):
-                checks["holders"] = None
-                warnings.append("holder concentration downgraded to advisory in negative screening mode")
-            elif s.get("check_holders") and age_min >= 30:
+            if s.get("check_holders") and age_min >= 30:
                 future_map["holders"] = pool.submit(check_holder_concentration, mint)
             elif s.get("check_holders"):
                 checks["holders"] = None
@@ -2167,51 +1993,50 @@ class BotInstance:
             "checks": checks,
         }
 
-    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, strategy_tag="core"):
+    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
         s = self.settings
         trade_sol = round(float(s["max_buy_sol"]), 4)
-        max_correlated = max(int(s.get("max_correlated", 5) or 5), 8)
-        print(f"[BUY-TRY U{self.user_id}] {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
+        print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
 
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
         if cb:
             self.log_msg(f"⛔ CIRCUIT BREAKER — {cb} — halting bot")
             self.running = False
-            return False
+            return
         # ── Rate limiting ────────────────────────────────────────────────────
         rl = self.check_rate_limit(name, mint)
         if rl:
             self.log_filter(name, mint, False, rl)
             self.log_msg(f"SKIP {name} — {rl}")
-            return False
+            return
         # ── Consolidated token safety path ───────────────────────────────────
         safety = self.pre_buy_safety_check(mint, name=name, dev_wallet=dev_wallet, age_min=age_min, liq=liq)
         if not safety.get("safe"):
             reason = safety.get("reason") or "Pre-buy safety check failed"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return False
+            return
         # Drawdown limit
         if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
             reason = f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return False
+            return
         # Correlated position limit
-        if len(self.positions) >= max_correlated:
+        if len(self.positions) >= s.get("max_correlated", 5):
             reason = f"Max correlated positions ({len(self.positions)})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return False
+            return
         if self.sol_balance < trade_sol + 0.01:
             reason = f"Low balance ({self.sol_balance:.4f} SOL, need {trade_sol+0.01:.4f})"
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
-            return False
+            return
         if mint in self.positions:
             self.log_msg(f"SKIP {name} — already in position")
-            return False
+            return
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
@@ -2229,7 +2054,7 @@ class BotInstance:
         if not quote:
             self.log_filter(name, mint, False, "No Jupiter quote available")
             self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
-            return False
+            return
         swap_started = time.perf_counter()
         swap_tx = self.jupiter_swap(quote)
         self.log_execution_event(
@@ -2243,7 +2068,7 @@ class BotInstance:
         if not swap_tx:
             self.log_filter(name, mint, False, "Jupiter swap build failed")
             self.log_msg(f"SKIP {name} — Jupiter swap build failed")
-            return False
+            return
         send_result = self.sign_and_send(swap_tx)
         simulate_note = None
         if send_result.get("simulation_units") is not None:
@@ -2315,7 +2140,6 @@ class BotInstance:
                 "name":name,"entry_price":real_price,"peak_price":real_price,
                 "timestamp":time.time(),"tp1_hit":False,"entry_sol":trade_sol,
                 "dev_wallet": dev_wallet,
-                "strategy": str(strategy_tag or "core"),
                 "surge_hold_active": False,
                 "surge_peak_price": real_price,
             }
@@ -2324,14 +2148,13 @@ class BotInstance:
                 try:
                     _c = _conn.cursor()
                     _c.execute("""INSERT INTO open_positions
-                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet,strategy)
-                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                  (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet)
+                                  VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                                   ON CONFLICT (user_id,mint) DO UPDATE
                                   SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
                                       peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
-                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet,
-                                      strategy=EXCLUDED.strategy""",
-                               (self.user_id, mint, name, real_price, real_price, trade_sol, 0, dev_wallet, str(strategy_tag or "core")))
+                                      tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
+                               (self.user_id, mint, name, real_price, real_price, trade_sol, 0, dev_wallet))
                     _conn.commit()
                 finally:
                     db_return(_conn)
@@ -2339,9 +2162,7 @@ class BotInstance:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
             self.consecutive_losses  = 0   # reset on successful buy
-            self.log_buy_history(mint, name, real_price, trade_sol, slippage, route_source, sig)
             self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
-            print(f"[BUY-OK U{self.user_id}] {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | tx={sig}", flush=True)
             self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
@@ -2357,11 +2178,8 @@ class BotInstance:
                         f"🟢 <b>BUY</b> {name}\n💰 ${price:.8f}\n📊 {trade_sol} SOL\n🔗 solscan.io/tx/{sig}")
             except Exception as _e:
                 print(f"[ERROR] {_e}", flush=True)
-            return True
         else:
-            print(f"[BUY-FAIL U{self.user_id}] {name} | send failed", flush=True)
             self.log_filter(name, mint, False, "Transaction failed to send")
-            return False
 
     def sell(self, mint, pct, reason):
         pos = self.positions.get(mint)
@@ -2610,7 +2428,6 @@ class BotInstance:
             age_sec    = time.time() - pos["timestamp"]
             age_min    = (time.time() - pos["timestamp"]) / 60
             trail_line = pos["peak_price"] * (1 - s["trail_pct"])
-            strategy_tag = str(pos.get("strategy") or "core").strip().lower()
 
             # ── Enhanced position monitoring (whale + rug detection) ─────────
             if self.enhanced_enabled:
@@ -2650,17 +2467,6 @@ class BotInstance:
                     self.sell(mint, 1.0, f"LISTING TIME 4h (exit at loss)")
                     continue
                 continue   # skip regular TP/SL logic for listing positions
-            if strategy_tag == "launch":
-                launch_peak_floor = max(1.05, float(s.get("launch_plateau_profit_mult", 1.35) or 1.35))
-                launch_plateau_trail_pct = min(0.35, max(0.03, float(s.get("launch_plateau_trail_pct", 0.10) or 0.10)))
-                launch_time_stop_min = max(3, float(s.get("launch_time_stop_min", 20) or 20))
-                launch_trail_line = pos["peak_price"] * (1 - launch_plateau_trail_pct)
-                if peak_ratio >= launch_peak_floor and cur <= launch_trail_line:
-                    self.sell(mint, 1.0, f"LAUNCH PLATEAU {ratio:.2f}x")
-                    continue
-                if age_min >= launch_time_stop_min:
-                    self.sell(mint, 1.0, f"LAUNCH TIME {ratio:.2f}x")
-                    continue
 
             if age_sec <= 10 and ratio >= 2.0 and not pos.get("surge_hold_active"):
                 pos["surge_hold_active"] = True
@@ -2690,39 +2496,21 @@ class BotInstance:
         s = self.settings
         min_liq = float(s.get("min_liq", 0) or 0)
         pumpfun_liq_bypass = "pumpfun" in str(source or "").lower()
-        if min_liq > 0 and not pumpfun_liq_bypass:
-            min_liq = min(min_liq, 10.0)
         liq_filter_on = min_liq > 0 and not pumpfun_liq_bypass
         min_mc  = s.get("min_mc", 0)
-        max_mc  = max(float(s.get("max_mc", 999999) or 999999), 5_000_000.0)
-        max_age = max(float(s.get("max_age_min", 999) or 999), 1440.0)
-        min_vol = min(float(s.get("min_vol", 0) or 0), 500.0) if float(s.get("min_vol", 0) or 0) > 0 else 0.0
-        min_score = min(int(s.get("min_score", 0) or 0), 15)
-        min_green_lights = max(0, int(s.get("min_green_lights", 1) or 0))
+        max_mc  = s.get("max_mc", 999999)
+        max_age = s.get("max_age_min", 999)
+        min_vol = s.get("min_vol", 0)
+        min_score = s.get("min_score", 0)
+        min_green_lights = max(1, int(s.get("min_green_lights", 1)))
         min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
         min_narrative_score = int(s.get("min_narrative_score", 16))
         min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
         late_entry_mult = float(s.get("late_entry_mult", 5.0))
         nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
-        min_change = min(float(s.get("min_change_pct", 0) or 0), -15.0)
         max_hot_change = float(s.get("max_hot_change", 400.0))
-        momentum_auto_buy_enabled = bool(s.get("momentum_auto_buy_enabled", True))
-        momentum_auto_buy_threshold = max(0, min(100, int(s.get("momentum_auto_buy_threshold", 85) or 85)))
-        negative_screening_mode = bool(s.get("negative_screening_mode", True))
-        hard_threat_limit = 75
-        negative_hard_mc_floor = 1_000.0
-        negative_hard_min_vol = 250.0
-        negative_hard_change_floor = -85.0
-        negative_hard_hot_change = max(450.0, float(max_hot_change or 0))
-        launch_lane_enabled = bool(s.get("launch_lane_enabled", True))
-        launch_lane_max_age_min = max(1.0, float(s.get("launch_lane_max_age_min", 12) or 12))
-        launch_lane_min_momentum = max(0, min(100, int(s.get("launch_lane_min_momentum", 55) or 55)))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
-        is_launch_lane = launch_lane_enabled and age_min <= launch_lane_max_age_min and (
-            _sinfo["momentum"] >= launch_lane_min_momentum or "pumpfun" in str(source or "").lower()
-        )
-        strategy_tag = "launch" if is_launch_lane else "core"
         _sd = ai_score_detailed(_sinfo)
         score_total = _sd["total"]
         self.evals_this_hour += 1
@@ -2734,67 +2522,45 @@ class BotInstance:
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
                 {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "pumpfun bypass" if pumpfun_liq_bypass else ("off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}")},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": min_change < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> {min_change:+.0f}% and \u2264 {max_hot_change:.0f}%"},
+                {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
                 {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
-                {"name": "Momentum Auto-Buy", "passed": (not momentum_auto_buy_enabled) or _sinfo["momentum"] >= momentum_auto_buy_threshold, "value": f"{_sinfo['momentum']}/100", "threshold": "off" if not momentum_auto_buy_enabled else f"\u2265 {momentum_auto_buy_threshold} bypasses entry filters"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
         liq_text = "pumpfun bypass" if pumpfun_liq_bypass else (f"min {min_liq:,.0f}" if liq_filter_on else "filter off")
         print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}({liq_text}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
-        if momentum_auto_buy_enabled and _sinfo["momentum"] >= momentum_auto_buy_threshold:
-            intel = ensure_token_intel(mint, base_info={
-                "mint": mint,
-                "name": name,
-                "price": price,
-                "mc": mc,
-                "vol": vol,
-                "liq": liq,
-                "age_min": age_min,
-                "change": change,
-                "score": score_total,
-                "momentum": _sinfo["momentum"],
-            }) or {}
-            sig_entry["intel"] = intel
-            sig_entry["passed"] = True
-            sig_entry["reason"] = f"Momentum auto-buy ({_sinfo['momentum']}/100 >= {momentum_auto_buy_threshold})"
-            self.log_signal_entry(sig_entry)
-            self.log_msg(f"\u26a1 MOMENTUM AUTO-BUY {name} | vel={_sinfo['momentum']} >= {momentum_auto_buy_threshold}")
-            self.log_filter(name, mint, True, sig_entry["reason"])
-            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min, strategy_tag=strategy_tag)
-            return
-        if not negative_screening_mode and not (min_mc <= mc <= max_mc):
+        if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if not negative_screening_mode and liq_filter_on and liq < min_liq:
+        if liq_filter_on and liq < min_liq:
             sig_entry["reason"] = f"Liquidity ${liq:,.0f} < min ${min_liq:,.0f}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if not negative_screening_mode and age_min > max_age:
+        if age_min > max_age:
             sig_entry["reason"] = f"Age {age_min:.0f}m > max {max_age}m"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if not negative_screening_mode and change <= min_change:
-            sig_entry["reason"] = f"1h change {change:.0f}% below floor {min_change:+.0f}%"
+        if change <= 0:
+            sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if not negative_screening_mode and change > max_hot_change:
+        if change > max_hot_change:
             sig_entry["reason"] = f"1h change {change:.0f}% too extended"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if not negative_screening_mode and vol < min_vol:
+        if vol < min_vol:
             sig_entry["reason"] = f"Volume ${vol:,.0f} < min ${min_vol:,}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if not negative_screening_mode and score_total < min_score:
+        if score_total < min_score:
             sig_entry["reason"] = f"AI Score {score_total} < min {min_score}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
@@ -2877,64 +2643,7 @@ class BotInstance:
                 "value": f"{threat_score}/100 {' · '.join(threat_flags[:2]) if threat_flags else 'clean'}",
                 "threshold": "score < 60, exit route available, no transfer hook",
             },
-            {
-                "name": "Negative Screening",
-                "passed": negative_screening_mode,
-                "value": "on" if negative_screening_mode else "off",
-                "threshold": "reject only hard negatives before buy()",
-            },
         ])
-        if negative_screening_mode:
-            soft_failures = [f["name"] for f in sig_entry["filters"] if not f.get("passed") and f["name"] != "Negative Screening"]
-            if mc < negative_hard_mc_floor:
-                sig_entry["reason"] = f"MC ${mc:,.0f} below hard floor ${negative_hard_mc_floor:,.0f}"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            if vol < negative_hard_min_vol:
-                sig_entry["reason"] = f"Volume ${vol:,.0f} below hard floor ${negative_hard_min_vol:,.0f}"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            if change <= negative_hard_change_floor:
-                sig_entry["reason"] = f"1h change {change:.0f}% below hard floor {negative_hard_change_floor:+.0f}%"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            if change > negative_hard_hot_change:
-                sig_entry["reason"] = f"1h change {change:.0f}% beyond hard cap {negative_hard_hot_change:.0f}%"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            if transfer_hook_enabled:
-                sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            if can_exit is False and age_min >= 20:
-                sig_entry["reason"] = "No exit route available"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            if threat_score >= hard_threat_limit:
-                sig_entry["reason"] = f"Threat risk {threat_score}/100 ({', '.join(threat_flags[:3]) or 'risk'})"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
-            sig_entry["passed"] = True
-            sig_entry["reason"] = (
-                f"Negative screening pass ({len(soft_failures)} advisory flags)"
-                if soft_failures else
-                "Negative screening pass"
-            )
-            self.log_signal_entry(sig_entry)
-            self.log_msg(
-                f"SIGNAL {name} | NEGATIVE SCREEN PASS"
-                + (f" | advisory: {', '.join(soft_failures[:4])}" if soft_failures else "")
-            )
-            self.log_filter(name, mint, True, sig_entry["reason"])
-            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min, strategy_tag=strategy_tag)
-            return
         if transfer_hook_enabled:
             sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
             self.log_signal_entry(sig_entry)
@@ -2965,7 +2674,7 @@ class BotInstance:
         self.log_signal_entry(sig_entry)
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, "Signal passed all filters")
-        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min, strategy_tag=strategy_tag)
+        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -2991,7 +2700,6 @@ class BotInstance:
                     self.running = False
                     self.record_perf_fee()
                     break
-                self.maybe_run_steady_lane()
                 if self.positions:
                     self.check_positions()
                 time.sleep(3)
@@ -4381,11 +4089,6 @@ def _process_dex_pair(p):
         price = float(p.get("priceUsd") or 0)
         if not price:
             return None
-        dex_id = str(p.get("dexId") or "").strip()
-        labels = [str(label or "").strip().lower() for label in (p.get("labels") or []) if str(label or "").strip()]
-        source = f"dex:{dex_id}" if dex_id else "scanner"
-        if "pumpfun" in dex_id.lower() or "pumpfun" in labels:
-            source = "dex:pumpfun"
         created_at = p.get("pairCreatedAt")
         age_min    = (time.time()*1000 - created_at) / 60000 if created_at else 9999
         vol        = (p.get("volume") or {}).get("h24", 0) or 0
@@ -4402,7 +4105,6 @@ def _process_dex_pair(p):
             "age_min":  age_min,
             "change":   change,
             "momentum": momentum,
-            "source":   source,
             "ts":       int(time.time()),
         }
         info["score"] = min(100, ai_score(info) + check_social_signals(str(p)))
@@ -4801,7 +4503,6 @@ def auto_restart_bots():
                             "tp1_hit":     bool(p["tp1_hit"]),
                             "entry_sol":   p["entry_sol"],
                             "dev_wallet":  p["dev_wallet"],
-                            "strategy":    p.get("strategy") or "core",
                             "surge_hold_active": False,
                             "surge_peak_price": p["peak_price"] or p["entry_price"],
                         }
@@ -4994,8 +4695,7 @@ def process_listing_alerts():
         except _queue.Empty:
             continue
         try:
-            exchange_key = str(alert["exchange"] or "").strip().lower()
-            exchange = exchange_key.upper()
+            exchange = alert["exchange"].upper()
             mint     = alert["mint"]
             name     = alert["name"]
             price    = alert["price"]
@@ -5007,10 +4707,6 @@ def process_listing_alerts():
                     continue
                 # Skip if listing sniper is disabled for this bot
                 if not bot.settings.get("listing_sniper", True):
-                    continue
-                allowed_exchanges = set(normalize_listing_exchange_selection(bot.settings.get("listing_exchanges")))
-                if exchange_key not in allowed_exchanges:
-                    bot.log_msg(f"LISTING SKIP {name} on {exchange} — exchange not enabled")
                     continue
                 bot.log_msg(f"🔔 CEX LISTING: {name} on {exchange} — buying now")
                 try:
@@ -5521,7 +5217,6 @@ def api_state():
     uid = session["user_id"]
     bot = user_bots.get(uid)
     pos_list = []
-    recent_buys = []
     preset_name = normalize_preset_name(bot.preset_name if bot else "balanced")
     if bot:
         pos_snapshot = dict(bot.positions)  # thread-safe snapshot
@@ -5538,7 +5233,6 @@ def api_state():
                     "pnl":           f"{(ratio-1)*100:+.1f}%" if ratio else "?",
                     "age_min":       round((time.time()-p["timestamp"])/60,1),
                     "tp1_hit":       p["tp1_hit"],
-                    "strategy":      p.get("strategy", "core"),
                 })
             except Exception:
                 pass  # position was sold mid-iteration
@@ -5574,31 +5268,6 @@ def api_state():
             db_return(conn)
     except Exception:
         db_settings = strip_auto_relax_state(bot.settings) if bot else {}
-    try:
-        conn = db()
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT mint, name, entry_price, entry_sol, slippage_bps, route_source, tx_sig, created_at
-                FROM buy_history
-                WHERE user_id=%s
-                ORDER BY created_at DESC
-                LIMIT 20
-            """, (uid,))
-            recent_buys = [{
-                "mint": row.get("mint"),
-                "name": row.get("name"),
-                "entry_price": float(row.get("entry_price") or 0),
-                "entry_sol": float(row.get("entry_sol") or 0),
-                "slippage_bps": row.get("slippage_bps"),
-                "route_source": row.get("route_source") or "",
-                "tx_sig": row.get("tx_sig") or "",
-                "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at", "")),
-            } for row in cur.fetchall()]
-        finally:
-            db_return(conn)
-    except Exception:
-        recent_buys = list(bot.buy_history)[:20] if bot else []
     
     return jsonify({
         "running":    bot.running if bot else False,
@@ -5606,7 +5275,6 @@ def api_state():
         "balance":    round(bot.sol_balance, 4) if bot else 0,
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
-        "recent_buys": recent_buys,
         "stats":      stats,
         "filter_log": list(bot.filter_log)[:10] if bot else [],
         "settings":   db_settings,
@@ -7398,13 +7066,6 @@ DASHBOARD_HTML = _CSS + """
           <div id="listing-feed" style="max-height:120px;overflow-y:auto;font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
           <div style="margin-top:6px;font-size:10px;color:var(--t3)">Catches: <span id="listing-stat" style="color:var(--gold2);font-weight:700">0</span></div>
         </div>
-        <div class="glass">
-          <div class="sec-label" style="display:flex;justify-content:space-between;align-items:center">
-            <span>Recent Buys</span>
-            <span id="buy-count-badge" style="font-size:9px;color:var(--grn);text-transform:none;letter-spacing:0">0 fills</span>
-          </div>
-          <div id="buy-feed" style="max-height:180px;overflow-y:auto;font-size:11px;color:var(--t3)">Waiting for confirmed buys…</div>
-        </div>
       </div>
       <div class="scanner-main">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -7620,38 +7281,6 @@ DASHBOARD_HTML = _CSS + """
               <div class="setting-desc">Blocks concentrated ownership once the token is old enough for holder analysis.</div>
             </div>
             <label class="toggle-wrap"><input id="s-checkholders" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Momentum Auto-Buy</div>
-              <div class="setting-desc">Immediately buys when the volume-velocity score clears the threshold below.</div>
-            </div>
-            <label class="toggle-wrap"><input id="s-momauto" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Momentum Threshold</div>
-              <div class="setting-desc">0-100 velocity score required to bypass the normal entry filters.</div>
-            </div>
-            <div style="display:flex;align-items:center;gap:10px">
-              <input class="setting-input" id="s-momthr" type="number" min="0" max="100" step="1" style="width:120px">
-              <span class="setting-unit">/100</span>
-            </div>
-          </div>
-          <div class="setting-toggle-row" style="align-items:flex-start">
-            <div>
-              <div class="setting-label">Listing Auto-Buy Exchanges</div>
-              <div class="setting-desc">Only selected exchanges can trigger the instant CEX listing buy path.</div>
-            </div>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;max-width:430px">
-              <label class="toggle-wrap"><input id="s-listing-binance" type="checkbox"> <span style="color:var(--t2);font-size:12px">Binance</span></label>
-              <label class="toggle-wrap"><input id="s-listing-coinbase" type="checkbox"> <span style="color:var(--t2);font-size:12px">Coinbase</span></label>
-              <label class="toggle-wrap"><input id="s-listing-okx" type="checkbox"> <span style="color:var(--t2);font-size:12px">OKX</span></label>
-              <label class="toggle-wrap"><input id="s-listing-kraken" type="checkbox"> <span style="color:var(--t2);font-size:12px">Kraken</span></label>
-              <label class="toggle-wrap"><input id="s-listing-bybit" type="checkbox"> <span style="color:var(--t2);font-size:12px">Bybit</span></label>
-              <label class="toggle-wrap"><input id="s-listing-kucoin" type="checkbox"> <span style="color:var(--t2);font-size:12px">KuCoin</span></label>
-              <label class="toggle-wrap"><input id="s-listing-gate" type="checkbox"> <span style="color:var(--t2);font-size:12px">Gate</span></label>
-            </div>
           </div>
           <div class="setting-toggle-row">
             <div>
@@ -8198,22 +7827,12 @@ async function pollListings() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {{PRESET_SETTINGS}};
-const LISTING_EXCHANGE_OPTIONS = [
-  ['binance', 'Binance'],
-  ['coinbase', 'Coinbase'],
-  ['okx', 'OKX'],
-  ['kraken', 'Kraken'],
-  ['bybit', 'Bybit'],
-  ['kucoin', 'KuCoin'],
-  ['gate', 'Gate'],
-];
 const SETTINGS_FIELD_IDS = [
   's-preset', 's-max-buy', 's-tp1', 's-tp2', 's-sl', 's-trail',
   's-age', 's-tstop', 's-liq', 's-minmc', 's-maxmc', 's-prio',
   's-dd', 's-maxpos', 's-minvol', 's-minscore', 's-risk', 's-holders',
   's-narr', 's-lights', 's-volspike', 's-latemult', 's-nuclear',
-  's-offpeak', 's-hotchg', 's-antirug', 's-checkholders', 's-momauto', 's-momthr',
-  ...LISTING_EXCHANGE_OPTIONS.map(([key]) => `s-listing-${key}`),
+  's-offpeak', 's-hotchg', 's-antirug', 's-checkholders',
 ];
 const SETTINGS_DEFAULTS = {
   max_buy_sol: 0.04,
@@ -8228,7 +7847,7 @@ const SETTINGS_DEFAULTS = {
   max_mc: 250000,
   priority_fee: 30000,
   drawdown_limit_sol: 0.5,
-  max_correlated: 8,
+  max_correlated: 3,
   min_vol: 3000,
   min_score: 30,
   risk_per_trade_pct: 2.0,
@@ -8240,9 +7859,6 @@ const SETTINGS_DEFAULTS = {
   nuclear_narrative_score: 40,
   offpeak_min_change: 18,
   max_hot_change: 400,
-  momentum_auto_buy_enabled: true,
-  momentum_auto_buy_threshold: 85,
-  listing_exchanges: LISTING_EXCHANGE_OPTIONS.map(([key]) => key),
   anti_rug: true,
   check_holders: true,
 };
@@ -8257,11 +7873,6 @@ const SETTINGS_META = [
   ['Score', s => '>=' + Number(s.min_score || 0)],
   ['Liquidity', s => Number(s.min_liq || 0) > 0 ? '>=$' + Number(s.min_liq || 0).toLocaleString() : 'off'],
   ['Green Lights', s => Number(s.min_green_lights || 0)],
-  ['Momentum Buy', s => s.momentum_auto_buy_enabled ? '>=' + Number(s.momentum_auto_buy_threshold || 0) : 'off'],
-  ['Listing Exchanges', s => {
-    const selected = Array.isArray(s.listing_exchanges) ? s.listing_exchanges.length : SETTINGS_DEFAULTS.listing_exchanges.length;
-    return `${selected}/${LISTING_EXCHANGE_OPTIONS.length}`;
-  }],
   ['Holder Check', s => s.check_holders ? 'on' : 'off'],
 ];
 function setSettingsSaveState(text, pending=false) {
@@ -8275,19 +7886,12 @@ function readNum(id, fallback=0) {
   const v = el ? Number(el.value) : NaN;
   return Number.isFinite(v) ? v : fallback;
 }
-function normalizeListingExchanges(value) {
-  const fallback = SETTINGS_DEFAULTS.listing_exchanges;
-  if (!Array.isArray(value)) return [...fallback];
-  const allowed = new Set(LISTING_EXCHANGE_OPTIONS.map(([key]) => key));
-  return value.map(v => String(v || '').toLowerCase()).filter((key, idx, arr) => allowed.has(key) && arr.indexOf(key) === idx);
-}
 function setPresetChoice(name) {
   const presetInput = document.getElementById('s-preset');
   if (presetInput) presetInput.value = name;
 }
 function applySettingsToForm(settings, presetName) {
   const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
-  const selectedListingExchanges = new Set(normalizeListingExchanges(s.listing_exchanges));
   const setVal = (id, value) => {
     const el = document.getElementById(id);
     if (el) el.value = value;
@@ -8321,11 +7925,8 @@ function applySettingsToForm(settings, presetName) {
   setVal('s-nuclear', s.nuclear_narrative_score ?? SETTINGS_DEFAULTS.nuclear_narrative_score);
   setVal('s-offpeak', s.offpeak_min_change ?? SETTINGS_DEFAULTS.offpeak_min_change);
   setVal('s-hotchg', s.max_hot_change ?? SETTINGS_DEFAULTS.max_hot_change);
-  setVal('s-momthr', s.momentum_auto_buy_threshold ?? SETTINGS_DEFAULTS.momentum_auto_buy_threshold);
   setChecked('s-antirug', s.anti_rug ?? SETTINGS_DEFAULTS.anti_rug);
   setChecked('s-checkholders', s.check_holders ?? SETTINGS_DEFAULTS.check_holders);
-  setChecked('s-momauto', s.momentum_auto_buy_enabled ?? SETTINGS_DEFAULTS.momentum_auto_buy_enabled);
-  LISTING_EXCHANGE_OPTIONS.forEach(([key]) => setChecked(`s-listing-${key}`, selectedListingExchanges.has(key)));
   renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
 }
 function getSettingsFromForm() {
@@ -8355,11 +7956,8 @@ function getSettingsFromForm() {
     nuclear_narrative_score: readNum('s-nuclear', SETTINGS_DEFAULTS.nuclear_narrative_score),
     offpeak_min_change: readNum('s-offpeak', SETTINGS_DEFAULTS.offpeak_min_change),
     max_hot_change: readNum('s-hotchg', SETTINGS_DEFAULTS.max_hot_change),
-    momentum_auto_buy_threshold: readNum('s-momthr', SETTINGS_DEFAULTS.momentum_auto_buy_threshold),
-    listing_exchanges: LISTING_EXCHANGE_OPTIONS.filter(([key]) => !!document.getElementById(`s-listing-${key}`)?.checked).map(([key]) => key),
     anti_rug: !!document.getElementById('s-antirug')?.checked,
     check_holders: !!document.getElementById('s-checkholders')?.checked,
-    momentum_auto_buy_enabled: !!document.getElementById('s-momauto')?.checked,
   };
 }
 function renderSettingsSnapshot(settings) {
@@ -8382,8 +7980,6 @@ function renderLaunchSummary(settings) {
     `<span class="badge bg-muted">Score >= ${Number(settings.min_score || 0)}</span>`,
     `<span class="badge bg-muted">GL ${Number(settings.min_green_lights || 0)}</span>`,
     `<span class="badge bg-muted">Liq ${Number(settings.min_liq || 0) > 0 ? '$' + Number(settings.min_liq || 0).toLocaleString() : 'off'}</span>`,
-    `<span class="badge bg-muted">Momentum ${settings.momentum_auto_buy_enabled ? '>=' + Number(settings.momentum_auto_buy_threshold || 0) : 'off'}</span>`,
-    `<span class="badge bg-muted">Listings ${(Array.isArray(settings.listing_exchanges) ? settings.listing_exchanges.length : SETTINGS_DEFAULTS.listing_exchanges.length)}/${LISTING_EXCHANGE_OPTIONS.length}</span>`,
     `<span class="badge bg-muted">Holders ${settings.check_holders ? 'on' : 'off'}</span>`,
   ].join('');
 }
@@ -8657,7 +8253,7 @@ async function refresh() {
     ? d.positions.map(p => {
         const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
         return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
-          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.strategy && p.strategy !== 'core' ? `<span class="badge bg-blue" style="margin-left:4px;font-size:9px">${p.strategy}</span>` : ''}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
+          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
           <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
         </div>`;
       }).join('')
@@ -8682,26 +8278,6 @@ async function refresh() {
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
-  }
-  if (Array.isArray(d.recent_buys)) {
-    const buyFeed = document.getElementById('buy-feed');
-    const buyBadge = document.getElementById('buy-count-badge');
-    if (buyFeed) {
-      buyFeed.innerHTML = d.recent_buys.length ? d.recent_buys.map(b => `
-        <div style="padding:7px 0;border-bottom:1px solid var(--b1)">
-          <div style="display:flex;justify-content:space-between;gap:10px">
-            <span style="font-weight:700;color:var(--t1)">${b.name || '?'}</span>
-            <span style="font-size:10px;color:var(--t3)">${(b.created_at || '').replace('T',' ').slice(5,16)}</span>
-          </div>
-          <div style="font-size:10px;color:var(--t3);margin-top:3px">
-            @ $${Number(b.entry_price || 0).toFixed(8)} · ${Number(b.entry_sol || 0).toFixed(4)} SOL · ${b.slippage_bps ?? '—'}bps
-          </div>
-          <div style="font-size:10px;color:var(--blue2);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-            ${b.tx_sig ? `solscan.io/tx/${b.tx_sig}` : (b.route_source || 'fill logged')}
-          </div>
-        </div>`).join('') : '<div style="font-size:11px;color:var(--t3)">Waiting for confirmed buys\u2026</div>';
-    }
-    if (buyBadge) buyBadge.textContent = `${d.recent_buys.length} fills`;
   }
   if (d.settings && Object.keys(d.settings).length) {
     const savedSettings = { ...d.settings, preset: d.preset || 'balanced' };
