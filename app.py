@@ -248,6 +248,7 @@ PRESETS = {
         "offpeak_min_change":20,
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
+        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
     },
@@ -263,6 +264,7 @@ PRESETS = {
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
+        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
@@ -278,6 +280,7 @@ PRESETS = {
         "offpeak_min_change":15,
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
+        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
     },
@@ -293,6 +296,7 @@ PRESETS = {
         "offpeak_min_change":12,
         "max_hot_change":400.0,
         "nuclear_narrative_score":35,
+        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
     },
@@ -308,6 +312,7 @@ PRESETS = {
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
+        "momentum_auto_buy_enabled":True,"momentum_auto_buy_threshold":85,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
@@ -327,6 +332,8 @@ BOT_OVERRIDE_FIELDS = [
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
     ("offpeak_min_change", float), ("max_hot_change", float),
+    ("momentum_auto_buy_threshold", int),
+    ("momentum_auto_buy_enabled", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
     ("anti_rug", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
     ("check_holders", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
 ]
@@ -384,6 +391,8 @@ ADMIN_PRESET_FIELDS = {
     "min_volume_spike_mult": "volspike",
     "late_entry_mult": "latemult",
     "nuclear_narrative_score": "nuclear",
+    "momentum_auto_buy_threshold": "momthr",
+    "momentum_auto_buy_enabled": "momauto",
 }
 
 
@@ -7317,6 +7326,23 @@ DASHBOARD_HTML = _CSS + """
           </div>
           <div class="setting-toggle-row">
             <div>
+              <div class="setting-label">Momentum Auto-Buy</div>
+              <div class="setting-desc">Immediately buys when the volume-velocity score clears the threshold below.</div>
+            </div>
+            <label class="toggle-wrap"><input id="s-momauto" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
+          </div>
+          <div class="setting-toggle-row">
+            <div>
+              <div class="setting-label">Momentum Threshold</div>
+              <div class="setting-desc">0-100 velocity score required to bypass the normal entry filters.</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <input class="setting-input" id="s-momthr" type="number" min="0" max="100" step="1" style="width:120px">
+              <span class="setting-unit">/100</span>
+            </div>
+          </div>
+          <div class="setting-toggle-row">
+            <div>
               <div class="setting-label">Risk Per Trade</div>
               <div class="setting-desc">Wallet percentage cap the buy logic can use as a secondary position-size guard.</div>
             </div>
@@ -7865,7 +7891,7 @@ const SETTINGS_FIELD_IDS = [
   's-age', 's-tstop', 's-liq', 's-minmc', 's-maxmc', 's-prio',
   's-dd', 's-maxpos', 's-minvol', 's-minscore', 's-risk', 's-holders',
   's-narr', 's-lights', 's-volspike', 's-latemult', 's-nuclear',
-  's-offpeak', 's-hotchg', 's-antirug', 's-checkholders',
+  's-offpeak', 's-hotchg', 's-antirug', 's-checkholders', 's-momauto', 's-momthr',
 ];
 const SETTINGS_DEFAULTS = {
   max_buy_sol: 0.04,
@@ -7892,6 +7918,8 @@ const SETTINGS_DEFAULTS = {
   nuclear_narrative_score: 40,
   offpeak_min_change: 18,
   max_hot_change: 400,
+  momentum_auto_buy_enabled: true,
+  momentum_auto_buy_threshold: 85,
   anti_rug: true,
   check_holders: true,
 };
@@ -7906,6 +7934,7 @@ const SETTINGS_META = [
   ['Score', s => '>=' + Number(s.min_score || 0)],
   ['Liquidity', s => Number(s.min_liq || 0) > 0 ? '>=$' + Number(s.min_liq || 0).toLocaleString() : 'off'],
   ['Green Lights', s => Number(s.min_green_lights || 0)],
+  ['Momentum Buy', s => s.momentum_auto_buy_enabled ? '>=' + Number(s.momentum_auto_buy_threshold || 0) : 'off'],
   ['Holder Check', s => s.check_holders ? 'on' : 'off'],
 ];
 function setSettingsSaveState(text, pending=false) {
@@ -7958,8 +7987,10 @@ function applySettingsToForm(settings, presetName) {
   setVal('s-nuclear', s.nuclear_narrative_score ?? SETTINGS_DEFAULTS.nuclear_narrative_score);
   setVal('s-offpeak', s.offpeak_min_change ?? SETTINGS_DEFAULTS.offpeak_min_change);
   setVal('s-hotchg', s.max_hot_change ?? SETTINGS_DEFAULTS.max_hot_change);
+  setVal('s-momthr', s.momentum_auto_buy_threshold ?? SETTINGS_DEFAULTS.momentum_auto_buy_threshold);
   setChecked('s-antirug', s.anti_rug ?? SETTINGS_DEFAULTS.anti_rug);
   setChecked('s-checkholders', s.check_holders ?? SETTINGS_DEFAULTS.check_holders);
+  setChecked('s-momauto', s.momentum_auto_buy_enabled ?? SETTINGS_DEFAULTS.momentum_auto_buy_enabled);
   renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
 }
 function getSettingsFromForm() {
@@ -7989,8 +8020,10 @@ function getSettingsFromForm() {
     nuclear_narrative_score: readNum('s-nuclear', SETTINGS_DEFAULTS.nuclear_narrative_score),
     offpeak_min_change: readNum('s-offpeak', SETTINGS_DEFAULTS.offpeak_min_change),
     max_hot_change: readNum('s-hotchg', SETTINGS_DEFAULTS.max_hot_change),
+    momentum_auto_buy_threshold: readNum('s-momthr', SETTINGS_DEFAULTS.momentum_auto_buy_threshold),
     anti_rug: !!document.getElementById('s-antirug')?.checked,
     check_holders: !!document.getElementById('s-checkholders')?.checked,
+    momentum_auto_buy_enabled: !!document.getElementById('s-momauto')?.checked,
   };
 }
 function renderSettingsSnapshot(settings) {
@@ -8013,6 +8046,7 @@ function renderLaunchSummary(settings) {
     `<span class="badge bg-muted">Score >= ${Number(settings.min_score || 0)}</span>`,
     `<span class="badge bg-muted">GL ${Number(settings.min_green_lights || 0)}</span>`,
     `<span class="badge bg-muted">Liq ${Number(settings.min_liq || 0) > 0 ? '$' + Number(settings.min_liq || 0).toLocaleString() : 'off'}</span>`,
+    `<span class="badge bg-muted">Momentum ${settings.momentum_auto_buy_enabled ? '>=' + Number(settings.momentum_auto_buy_threshold || 0) : 'off'}</span>`,
     `<span class="badge bg-muted">Holders ${settings.check_holders ? 'on' : 'off'}</span>`,
   ].join('');
 }
