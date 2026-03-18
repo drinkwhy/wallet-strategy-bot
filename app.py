@@ -6315,19 +6315,13 @@ DASHBOARD_HTML = _CSS + """
 .preset-card:hover{border-color:var(--blue)}.preset-card.active{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
 .preset-name{font-size:12px;font-weight:700;margin-bottom:2px}.preset-desc{font-size:10px;color:var(--t3)}
 .launch-config{display:flex;flex-direction:column;gap:12px}
-.preset-slider{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
-.preset-chip{border:1px solid var(--b1);background:var(--surf);border-radius:12px;padding:10px 8px;color:var(--t2);cursor:pointer;text-align:center;transition:.15s}
-.preset-chip:hover{border-color:var(--blue);color:var(--t1)}
-.preset-chip.active{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue);background:rgba(37,99,235,.12);color:#fff}
-.preset-chip strong{display:block;font-size:11px;font-weight:800;letter-spacing:.02em}
-.preset-chip span{display:block;font-size:9px;color:var(--t3);margin-top:4px}
-.preset-chip.active span{color:#bfdbfe}
+.launch-select{margin-top:-2px}
 .custom-panel{display:none;border-top:1px solid rgba(255,255,255,.06);padding-top:12px}
 .custom-panel.show{display:block}
 .launch-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .launch-grid .fgroup{margin:0}
 .launch-note{font-size:10px;line-height:1.5;color:var(--t3)}
-@media(max-width:860px){.preset-slider{grid-template-columns:repeat(2,minmax(0,1fr))}.launch-grid{grid-template-columns:1fr}}
+@media(max-width:860px){.launch-grid{grid-template-columns:1fr}}
 .ai-panel{background:linear-gradient(135deg,rgba(20,199,132,.14),rgba(59,130,246,.08));border:1px solid rgba(20,199,132,.24);border-radius:14px;padding:18px;margin-bottom:18px}
 .ai-panel h3{margin:0 0 6px;font-size:16px;color:var(--t1)}
 .ai-panel p{margin:0;color:var(--t2);font-size:12px;line-height:1.5}
@@ -6425,30 +6419,17 @@ DASHBOARD_HTML = _CSS + """
             <button id="toggle-btn" class="btn btn-success btn-full" onclick="toggleBot()">▶ Start Bot</button>
             <button class="btn btn-ghost" onclick="cashout()" style="padding:9px 12px" title="Sell all">💰</button>
           </div>
-          <input type="hidden" id="s-preset" value="balanced">
           <div class="launch-config">
             <div class="sec-label">Launch Bot</div>
-            <div class="preset-slider">
-              <button class="preset-chip" type="button" id="pc-safe" onclick="selectPreset('safe')">
-                <strong>Safe</strong>
-                <span>low risk</span>
-              </button>
-              <button class="preset-chip" type="button" id="pc-balanced" onclick="selectPreset('balanced')">
-                <strong>Balanced</strong>
-                <span>default</span>
-              </button>
-              <button class="preset-chip" type="button" id="pc-aggressive" onclick="selectPreset('aggressive')">
-                <strong>Aggressive</strong>
-                <span>higher heat</span>
-              </button>
-              <button class="preset-chip" type="button" id="pc-degen" onclick="selectPreset('degen')">
-                <strong>Degen</strong>
-                <span>full send</span>
-              </button>
-              <button class="preset-chip" type="button" id="pc-custom" onclick="selectPreset('custom')">
-                <strong>Custom</strong>
-                <span>manual exits</span>
-              </button>
+            <div class="fgroup launch-select">
+              <label class="flabel" for="s-preset">Mode</label>
+              <select class="finput" id="s-preset" onchange="selectPreset(this.value)">
+                <option value="safe">Safe</option>
+                <option value="balanced" selected>Balanced (Default)</option>
+                <option value="aggressive">Aggressive</option>
+                <option value="degen">Degen</option>
+                <option value="custom">Custom</option>
+              </select>
             </div>
             <div id="custom-panel" class="custom-panel">
               <div class="launch-grid">
@@ -6495,7 +6476,7 @@ DASHBOARD_HTML = _CSS + """
             <div class="launch-note">
               Entries require at least 1 green light, run until midnight Central, and pause between 12:00 AM and 6:00 AM Central.
             </div>
-            <button class="btn btn-ghost btn-full" type="button" onclick="saveSettings()">Save Mode</button>
+            <button class="btn btn-ghost btn-full" type="button" onclick="saveSettings()">Save Settings</button>
           </div>
         </div>
         <div class="glass">
@@ -7040,10 +7021,8 @@ async function pollListings() {
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {{PRESET_SETTINGS}};
 function setPresetChoice(name) {
-  document.querySelectorAll('.preset-chip').forEach(c => c.classList.remove('active'));
-  const el = document.getElementById('pc-' + name);
-  if (el) el.classList.add('active');
-  document.getElementById('s-preset').value = name;
+  const presetInput = document.getElementById('s-preset');
+  if (presetInput) presetInput.value = name;
   const customPanel = document.getElementById('custom-panel');
   if (customPanel) customPanel.classList.toggle('show', name === 'custom');
 }
