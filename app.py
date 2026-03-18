@@ -3930,6 +3930,71 @@ def check_whale_wallets():
                 continue
             for wallet in WHALE_WALLETS:
                 try:
+                    enhanced_txs = helius_address_transactions(wallet, limit=8, timeout=8)
+                    used_enhanced = False
+                    for tx in enhanced_txs:
+                        sig = tx.get("signature")
+                        if not sig or sig in _whale_seen:
+                            continue
+                        _whale_seen.add(sig)
+                        transfers = tx.get("tokenTransfers") or []
+                        if not isinstance(transfers, list):
+                            continue
+                        used_enhanced = True
+                        for transfer in transfers:
+                            mint = transfer.get("mint") or ""
+                            to_user = transfer.get("toUserAccount") or ""
+                            amount = float(transfer.get("tokenAmount") or 0)
+                            if not mint or mint == SOL_MINT or to_user != wallet or amount <= 0:
+                                continue
+                            try:
+                                _wr = dex_get(
+                                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                                    timeout=5
+                                )
+                                if _wr.status_code != 200:
+                                    continue
+                                pairs = safe_json_response(_wr, {}).get("pairs") or []
+                                if not pairs:
+                                    continue
+                                p = pairs[0]
+                                price  = float(p.get("priceUsd") or 0)
+                                mc     = p.get("marketCap", 0) or 0
+                                vol    = (p.get("volume") or {}).get("h24", 0) or 0
+                                liq    = (p.get("liquidity") or {}).get("usd", 0) or 0
+                                name   = p.get("baseToken", {}).get("name", "Unknown")
+                                created_at = p.get("pairCreatedAt")
+                                age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
+                                if not price:
+                                    continue
+                                if age_min > 60:
+                                    continue
+                                if mc > 500_000:
+                                    continue
+                                if liq < 3000:
+                                    continue
+                                now = time.time()
+                                if now - _whale_mints.get(mint, 0) < 300:
+                                    continue
+                                _whale_mints[mint] = now
+                                _whale_buys.appendleft({
+                                    "wallet": wallet, "label": WHALE_LABELS.get(wallet, wallet[:8]+"..."),
+                                    "mint": mint, "name": name, "price": price,
+                                    "mc": mc, "vol": vol, "liq": liq,
+                                    "timestamp": now, "ts": time.strftime("%H:%M:%S"),
+                                })
+                                for bot in list(user_bots.values()):
+                                    if bot.running and mint not in bot.positions:
+                                        bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
+                                        try:
+                                            change = (p.get("priceChange") or {}).get("h1", 0) or 0
+                                            bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, change)
+                                        except Exception as _e:
+                                            print(f"[ERROR] {_e}", flush=True)
+                            except Exception as _e:
+                                print(f"[ERROR] {_e}", flush=True)
+                    if used_enhanced:
+                        continue
                     r = requests.post(HELIUS_RPC, json={
                         "jsonrpc": "2.0", "id": 1,
                         "method": "getSignaturesForAddress",
@@ -3941,7 +4006,6 @@ def check_whale_wallets():
                         if not sig or sig in _whale_seen:
                             continue
                         _whale_seen.add(sig)
-                        # get transaction details
                         tx_r = requests.post(HELIUS_RPC, json={
                             "jsonrpc": "2.0", "id": 1,
                             "method": "getTransaction",
@@ -3950,7 +4014,6 @@ def check_whale_wallets():
                         tx = tx_r.json().get("result")
                         if not tx:
                             continue
-                        # look for token transfers (buys) in post token balances
                         pre  = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances",  [])}
                         post = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("postTokenBalances", [])}
                         for idx, pb in post.items():
@@ -3960,7 +4023,6 @@ def check_whale_wallets():
                             pre_amt  = float((pre.get(idx)  or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
                             post_amt = float(pb.get("uiTokenAmount", {}).get("uiAmount") or 0)
                             if post_amt > pre_amt * 1.5 and post_amt > 0:
-                                # whale bought this token — get price info and signal bots
                                 try:
                                     _wr = dex_get(
                                         f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
@@ -3968,7 +4030,7 @@ def check_whale_wallets():
                                     )
                                     if _wr.status_code != 200:
                                         continue
-                                    pairs = _wr.json().get("pairs")
+                                    pairs = safe_json_response(_wr, {}).get("pairs") or []
                                     if not pairs:
                                         continue
                                     p = pairs[0]
@@ -3981,14 +4043,12 @@ def check_whale_wallets():
                                     age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
                                     if not price:
                                         continue
-                                    # pre-filter: skip old/huge/stable tokens
                                     if age_min > 60:
                                         continue
                                     if mc > 500_000:
                                         continue
                                     if liq < 3000:
                                         continue
-                                    # dedup: skip if we signalled this mint in last 5 min
                                     now = time.time()
                                     if now - _whale_mints.get(mint, 0) < 300:
                                         continue
