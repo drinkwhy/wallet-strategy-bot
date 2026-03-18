@@ -20,6 +20,7 @@ import string
 from collections import deque
 from datetime import datetime, timedelta
 from functools import wraps
+from zoneinfo import ZoneInfo
 from flask import Flask, request, redirect, url_for, session, jsonify, Response
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
@@ -100,6 +101,7 @@ SESSION_COOKIE_SECURE = os.getenv(
     "SESSION_COOKIE_SECURE",
     "1" if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("FLASK_ENV") == "production" else "0",
 ) == "1"
+CENTRAL_TZ = ZoneInfo("America/Chicago")
 
 RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 PUMP_FUN    = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -224,7 +226,7 @@ PRESETS = {
         "min_liq":10000,"min_mc":10000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":40,"cooldown_min":15,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":18,
-        "min_green_lights":2,"min_volume_spike_mult":8,"late_entry_mult":5.0,
+        "min_green_lights":1,"min_volume_spike_mult":8,"late_entry_mult":5.0,
         "offpeak_min_change":20,
         "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
@@ -238,7 +240,7 @@ PRESETS = {
         "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":30,"cooldown_min":10,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
-        "min_green_lights":2,"min_volume_spike_mult":6,"late_entry_mult":5.0,
+        "min_green_lights":1,"min_volume_spike_mult":6,"late_entry_mult":5.0,
         "offpeak_min_change":18,
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
@@ -252,7 +254,7 @@ PRESETS = {
         "min_liq":5000,"min_mc":3000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":20,"cooldown_min":7,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":25,"min_narrative_score":14,
-        "min_green_lights":2,"min_volume_spike_mult":5,"late_entry_mult":5.0,
+        "min_green_lights":1,"min_volume_spike_mult":5,"late_entry_mult":5.0,
         "offpeak_min_change":15,
         "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
@@ -270,6 +272,20 @@ PRESETS = {
         "offpeak_min_change":12,
         "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
+        "listing_sniper":True,
+    },
+    "custom": {
+        "label":"Custom — Manual Exit Tuning",
+        "description":"Balanced entry filters with your own take-profit and stop rules.",
+        "max_buy_sol":0.04,"tp1_mult":2.0,"tp2_mult":4.0,
+        "trail_pct":0.20,"stop_loss":0.70,"max_age_min":240,"time_stop_min":30,
+        "min_liq":5000,"min_mc":5000,"max_mc":250000,"priority_fee":30000,
+        "min_vol":3000,"min_score":30,"cooldown_min":10,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
+        "min_green_lights":1,"min_volume_spike_mult":6,"late_entry_mult":5.0,
+        "offpeak_min_change":18,
+        "nuclear_narrative_score":40,
+        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
 }
@@ -315,6 +331,11 @@ def strip_auto_relax_state(settings):
     return cleaned
 
 
+def central_trading_window():
+    now = datetime.now(CENTRAL_TZ)
+    return now, 6 <= now.hour < 24
+
+
 ADMIN_PRESET_FIELDS = {
     "max_buy_sol": "buy",
     "tp1_mult": "tp1",
@@ -356,7 +377,7 @@ def admin_preset_defaults():
 def dashboard_preset_settings():
     return {
         preset_name: dict(PRESETS[preset_name])
-        for preset_name in ("safe", "balanced", "aggressive", "degen")
+        for preset_name in ("safe", "balanced", "aggressive", "degen", "custom")
     }
 
 
@@ -1814,6 +1835,8 @@ class BotInstance:
                 "name":name,"entry_price":real_price,"peak_price":real_price,
                 "timestamp":time.time(),"tp1_hit":False,"entry_sol":trade_sol,
                 "dev_wallet": dev_wallet,
+                "surge_hold_active": False,
+                "surge_peak_price": real_price,
             }
             try:
                 _conn = db()
@@ -2081,6 +2104,7 @@ class BotInstance:
                     print(f"[ERROR] {_e}", flush=True)
             ratio      = cur / pos["entry_price"]
             peak_ratio = pos["peak_price"] / pos["entry_price"]
+            age_sec    = time.time() - pos["timestamp"]
             age_min    = (time.time() - pos["timestamp"]) / 60
             trail_line = pos["peak_price"] * (1 - s["trail_pct"])
 
@@ -2123,6 +2147,17 @@ class BotInstance:
                     continue
                 continue   # skip regular TP/SL logic for listing positions
 
+            if age_sec <= 10 and ratio >= 2.0 and not pos.get("surge_hold_active"):
+                pos["surge_hold_active"] = True
+                pos["surge_peak_price"] = pos["peak_price"]
+                self.log_msg(f"🚀 {pos['name']} entered surge hold — doubled in {age_sec:.1f}s")
+            if pos.get("surge_hold_active"):
+                pos["surge_peak_price"] = max(float(pos.get("surge_peak_price") or 0), pos["peak_price"])
+                surge_trail_line = float(pos.get("surge_peak_price") or pos["peak_price"]) * 0.86
+                if cur <= surge_trail_line:
+                    self.sell(mint, 1.0, f"SURGE TRAIL {ratio:.2f}x")
+                continue
+
             if ratio <= s["stop_loss"]:
                 self.sell(mint, 1.0, f"SL {ratio:.2f}x")
             elif age_min >= s["time_stop_min"] and ratio < 1.10:
@@ -2146,10 +2181,19 @@ class BotInstance:
         max_mc  = s.get("max_mc", 999999)
         min_liq = s.get("min_liq", 0)
         max_age = s.get("max_age_min", 999)
-        offpeak_min_change = float(s.get("offpeak_min_change", 30))
+        min_vol = s.get("min_vol", 0)
+        min_score = s.get("min_score", 0)
+        min_green_lights = max(1, int(s.get("min_green_lights", 1)))
+        min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
+        min_narrative_score = int(s.get("min_narrative_score", 16))
+        min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
+        late_entry_mult = float(s.get("late_entry_mult", 5.0))
+        nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
+        max_hot_change = 200.0
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
+        score_total = _sd["total"]
         self.evals_this_hour += 1
         sig_entry = {
             "mint": mint, "name": name, "price": price,
@@ -2157,19 +2201,26 @@ class BotInstance:
             "score": _sd, "passed": False, "reason": "",
             "filters": [
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
-                {"name": "Liquidity", "passed": liq == 0 or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
+                {"name": "Liquidity", "passed": liq >= min_liq, "value": f"${liq:,.0f}", "threshold": f"\u2265 ${min_liq:,}"},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": change >= -20, "value": f"{change:+.0f}%", "threshold": "> -20%"},
+                {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
+                {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
+                {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
-        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}%", flush=True)
+        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(min {min_liq:,}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if liq > 0 and liq < min_liq:
+        if liq <= 0:
+            sig_entry["reason"] = "No liquidity data available"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if liq < min_liq:
             sig_entry["reason"] = f"Liq ${liq:,.0f} < min ${min_liq:,}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
@@ -2179,24 +2230,136 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change < -20:
-            sig_entry["reason"] = f"1h change {change:.0f}% too negative"
+        if change <= 0:
+            sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        utc_hour = time.gmtime().tm_hour
-        if not (10 <= utc_hour < 23):
-            if change < offpeak_min_change:
-                sig_entry["reason"] = f"Off-peak hours ({utc_hour}:00 UTC) — change {change:.0f}% < {offpeak_min_change:.0f}%"
-                self.log_signal_entry(sig_entry)
-                self.log_filter(name, mint, False, sig_entry["reason"])
-                return
+        if change > max_hot_change:
+            sig_entry["reason"] = f"1h change {change:.0f}% too extended"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if vol < min_vol:
+            sig_entry["reason"] = f"Volume ${vol:,.0f} < min ${min_vol:,}"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if score_total < min_score:
+            sig_entry["reason"] = f"AI Score {score_total} < min {min_score}"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        central_now, can_trade = central_trading_window()
+        if not can_trade:
+            local_clock = central_now.strftime("%I:%M %p").lstrip("0")
+            sig_entry["reason"] = f"Trading window closed ({local_clock} CT) — resumes at 6:00 AM CT"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        intel = ensure_token_intel(mint, base_info={
+            "mint": mint,
+            "name": name,
+            "price": price,
+            "mc": mc,
+            "vol": vol,
+            "liq": liq,
+            "age_min": age_min,
+            "change": change,
+            "score": score_total,
+        })
+        threat_score = int(intel.get("threat_risk_score") or 0)
+        threat_flags = intel.get("threat_flags") or []
+        can_exit = intel.get("can_exit")
+        transfer_hook_enabled = bool(intel.get("transfer_hook_enabled"))
+        whale_score = int(intel.get("whale_score") or 0)
+        whale_action_score = int(intel.get("whale_action_score") or 0)
+        checklist = build_three_signal_checklist(_sinfo, intel, settings=s)
+        intel["checklist"] = checklist["items"]
+        intel["green_lights"] = checklist["green_lights"]
+        adaptive_green_override = (
+            checklist["green_lights"] + 1 >= min_green_lights and
+            whale_score >= 55 and
+            whale_action_score >= 40 and
+            threat_score < 25 and
+            score_total >= (min_score + 5)
+        )
+        sig_entry["intel"] = intel
+        sig_entry["filters"].extend([
+            {
+                "name": "Tracked Wallet Edge",
+                "passed": checklist["items"][0]["passed"],
+                "value": checklist["items"][0]["value"],
+                "threshold": checklist["items"][0]["threshold"],
+            },
+            {
+                "name": "Volume / Holder Acceleration",
+                "passed": checklist["items"][1]["passed"],
+                "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x | {float(intel.get('holder_growth_1h') or 0):+.0f}%",
+                "threshold": f">= {min_volume_spike_mult:.0f}x or >= {min_holder_growth_pct:.0f}%",
+            },
+            {
+                "name": "Narrative Timing",
+                "passed": checklist["items"][2]["passed"],
+                "value": f"{intel.get('narrative_score', 0)}",
+                "threshold": f">= {min_narrative_score}",
+            },
+            {
+                "name": "Whale / Entity Score",
+                "passed": whale_score >= 28,
+                "value": f"w {intel.get('whale_score', 0)} · a {intel.get('whale_action_score', 0)} · cc {intel.get('cluster_confidence', 0)}",
+                "threshold": "whale >= 28",
+            },
+            {
+                "name": "Green Lights",
+                "passed": checklist["green_lights"] >= min_green_lights or adaptive_green_override,
+                "value": f"{checklist['green_lights']}/3" + (" + whale override" if adaptive_green_override else ""),
+                "threshold": f">= {min_green_lights} or strong whale + low threat",
+            },
+            {
+                "name": "Late Entry Guard",
+                "passed": float(intel.get("max_multiple") or 1) <= late_entry_mult or int(intel.get("narrative_score") or 0) >= nuclear_narrative_score,
+                "value": f"{float(intel.get('max_multiple') or 1):.2f}x seen",
+                "threshold": f"<= {late_entry_mult:.1f}x unless narrative >= {nuclear_narrative_score}",
+            },
+            {
+                "name": "Threat / Exit Risk",
+                "passed": threat_score < 60 and can_exit is not False and not transfer_hook_enabled,
+                "value": f"{threat_score}/100 {' · '.join(threat_flags[:2]) if threat_flags else 'clean'}",
+                "threshold": "score < 60, exit route available, no transfer hook",
+            },
+        ])
+        if transfer_hook_enabled:
+            sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if can_exit is False:
+            sig_entry["reason"] = "No exit route available"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if threat_score >= 60:
+            sig_entry["reason"] = f"Threat risk {threat_score}/100 ({', '.join(threat_flags[:3]) or 'risk'})"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if checklist["green_lights"] < min_green_lights and not adaptive_green_override:
+            sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if float(intel.get("max_multiple") or 1) > late_entry_mult and int(intel.get("narrative_score") or 0) < nuclear_narrative_score:
+            sig_entry["reason"] = f"Late entry ({float(intel.get('max_multiple') or 1):.2f}x) without nuclear narrative"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
         sig_entry["passed"] = True
         sig_entry["reason"] = "Passed all filters"
         self.log_signal_entry(sig_entry)
-        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}%")
+        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, "Signal passed all filters")
-        self.buy(mint, name, price, liq=liq, dev_wallet=None, age_min=age_min)
+        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -3786,6 +3949,8 @@ def auto_restart_bots():
                             "tp1_hit":     bool(p["tp1_hit"]),
                             "entry_sol":   p["entry_sol"],
                             "dev_wallet":  p["dev_wallet"],
+                            "surge_hold_active": False,
+                            "surge_peak_price": p["peak_price"] or p["entry_price"],
                         }
                     if saved_pos:
                         print(f"[U{uid}] Restored {len(saved_pos)} open position(s) from DB")
@@ -4494,6 +4659,7 @@ def api_state():
     uid = session["user_id"]
     bot = user_bots.get(uid)
     pos_list = []
+    preset_name = normalize_preset_name(bot.preset_name if bot else "balanced")
     if bot:
         pos_snapshot = dict(bot.positions)  # thread-safe snapshot
         for mint, p in pos_snapshot.items():
@@ -4547,6 +4713,7 @@ def api_state():
     
     return jsonify({
         "running":    bot.running if bot else False,
+        "preset":     preset_name,
         "balance":    round(bot.sol_balance, 4) if bot else 0,
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
@@ -6155,6 +6322,20 @@ DASHBOARD_HTML = _CSS + """
 .preset-card{background:var(--surf);border:1px solid var(--b1);border-radius:10px;padding:12px 14px;cursor:pointer;transition:.15s}
 .preset-card:hover{border-color:var(--blue)}.preset-card.active{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue)}
 .preset-name{font-size:12px;font-weight:700;margin-bottom:2px}.preset-desc{font-size:10px;color:var(--t3)}
+.launch-config{display:flex;flex-direction:column;gap:12px}
+.preset-slider{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+.preset-chip{border:1px solid var(--b1);background:var(--surf);border-radius:12px;padding:10px 8px;color:var(--t2);cursor:pointer;text-align:center;transition:.15s}
+.preset-chip:hover{border-color:var(--blue);color:var(--t1)}
+.preset-chip.active{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue);background:rgba(37,99,235,.12);color:#fff}
+.preset-chip strong{display:block;font-size:11px;font-weight:800;letter-spacing:.02em}
+.preset-chip span{display:block;font-size:9px;color:var(--t3);margin-top:4px}
+.preset-chip.active span{color:#bfdbfe}
+.custom-panel{display:none;border-top:1px solid rgba(255,255,255,.06);padding-top:12px}
+.custom-panel.show{display:block}
+.launch-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.launch-grid .fgroup{margin:0}
+.launch-note{font-size:10px;line-height:1.5;color:var(--t3)}
+@media(max-width:860px){.preset-slider{grid-template-columns:repeat(2,minmax(0,1fr))}.launch-grid{grid-template-columns:1fr}}
 .ai-panel{background:linear-gradient(135deg,rgba(20,199,132,.14),rgba(59,130,246,.08));border:1px solid rgba(20,199,132,.24);border-radius:14px;padding:18px;margin-bottom:18px}
 .ai-panel h3{margin:0 0 6px;font-size:16px;color:var(--t1)}
 .ai-panel p{margin:0;color:var(--t2);font-size:12px;line-height:1.5}
@@ -6241,7 +6422,6 @@ DASHBOARD_HTML = _CSS + """
     <button class="tab-btn" onclick="switchTab('whales',this)">Whales</button>
     <button class="tab-btn" onclick="switchTab('positions',this)">Positions</button>
     <button class="tab-btn" onclick="switchTab('pnl',this)">P&L</button>
-    <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
   </div>
 
   <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
@@ -6254,6 +6434,77 @@ DASHBOARD_HTML = _CSS + """
             <button class="btn btn-ghost" onclick="cashout()" style="padding:9px 12px" title="Sell all">💰</button>
           </div>
           <input type="hidden" id="s-preset" value="balanced">
+          <div class="launch-config">
+            <div class="sec-label">Launch Bot</div>
+            <div class="preset-slider">
+              <button class="preset-chip" type="button" id="pc-safe" onclick="selectPreset('safe')">
+                <strong>Safe</strong>
+                <span>low risk</span>
+              </button>
+              <button class="preset-chip" type="button" id="pc-balanced" onclick="selectPreset('balanced')">
+                <strong>Balanced</strong>
+                <span>default</span>
+              </button>
+              <button class="preset-chip" type="button" id="pc-aggressive" onclick="selectPreset('aggressive')">
+                <strong>Aggressive</strong>
+                <span>higher heat</span>
+              </button>
+              <button class="preset-chip" type="button" id="pc-degen" onclick="selectPreset('degen')">
+                <strong>Degen</strong>
+                <span>full send</span>
+              </button>
+              <button class="preset-chip" type="button" id="pc-custom" onclick="selectPreset('custom')">
+                <strong>Custom</strong>
+                <span>manual exits</span>
+              </button>
+            </div>
+            <div id="custom-panel" class="custom-panel">
+              <div class="launch-grid">
+                <div class="fgroup">
+                  <label class="flabel">TP1</label>
+                  <select class="finput" id="s-tp1" onchange="markSettingsDirty()">
+                    <option value="1.2">1.2x quick bank</option>
+                    <option value="1.5">1.5x steady</option>
+                    <option value="2.0" selected>2.0x balanced</option>
+                    <option value="2.5">2.5x stretch</option>
+                  </select>
+                </div>
+                <div class="fgroup">
+                  <label class="flabel">TP2</label>
+                  <select class="finput" id="s-tp2" onchange="markSettingsDirty()">
+                    <option value="2.0">2.0x quick exit</option>
+                    <option value="3.0">3.0x runner</option>
+                    <option value="4.0" selected>4.0x moon bag</option>
+                    <option value="6.0">6.0x stretch</option>
+                    <option value="10.0">10.0x degen</option>
+                  </select>
+                </div>
+                <div class="fgroup">
+                  <label class="flabel">Stop Loss</label>
+                  <select class="finput" id="s-sl" onchange="markSettingsDirty()">
+                    <option value="0.75">25% stop</option>
+                    <option value="0.70" selected>30% stop</option>
+                    <option value="0.65">35% loose</option>
+                    <option value="0.60">40% full send</option>
+                  </select>
+                </div>
+                <div class="fgroup">
+                  <label class="flabel">Trailing Loss</label>
+                  <select class="finput" id="s-trail" onchange="markSettingsDirty()">
+                    <option value="0.14">14% rocket leash</option>
+                    <option value="0.20" selected>20% balanced</option>
+                    <option value="0.25">25% wide</option>
+                    <option value="0.30">30% loose</option>
+                    <option value="0.40">40% full send</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div class="launch-note">
+              Entries require at least 1 green light, run until midnight Central, and pause between 12:00 AM and 6:00 AM Central.
+            </div>
+            <button class="btn btn-ghost btn-full" type="button" onclick="saveSettings()">Save Mode</button>
+          </div>
         </div>
         <div class="glass">
           <div class="sec-label">Open Positions</div>
@@ -6422,92 +6673,6 @@ DASHBOARD_HTML = _CSS + """
     </div>
   </div>
 
-  <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
-  <div id="tab-settings" class="tab-pane">
-    <div class="ai-panel">
-      <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap">
-        <div style="flex:1;min-width:260px">
-          <h3>AI Market Recommendation</h3>
-          <p id="ai-reason">Loading market analysis…</p>
-          <div style="font-size:11px;color:var(--t3);margin-top:8px" id="ai-logic">Uses your last 24h realized trades to map the market to a preset.</div>
-        </div>
-        <button class="btn btn-primary" onclick="applyAISuggestion()" id="ai-apply-btn">Apply AI Recommendation</button>
-      </div>
-      <div class="ai-stats-grid" id="ai-stats">
-        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Trades (24h)</div></div>
-        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Win Rate</div></div>
-        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Avg Win</div></div>
-        <div class="ai-stat"><div class="ai-stat-value">—</div><div class="ai-stat-label">Avg Loss</div></div>
-      </div>
-    </div>
-    <div class="sec-label" style="margin-bottom:14px">Strategy Preset</div>
-    <div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">
-      <div class="preset-card" id="pc-safe" onclick="selectPreset('safe')">
-        <div class="preset-name">🛡️ Safe</div>
-        <div class="preset-desc">Conservative — low risk, steady gains</div>
-      </div>
-      <div class="preset-card active" id="pc-balanced" onclick="selectPreset('balanced')">
-        <div class="preset-name">⚖️ Balanced</div>
-        <div class="preset-desc">Mix of safety and opportunity</div>
-      </div>
-      <div class="preset-card" id="pc-aggressive" onclick="selectPreset('aggressive')">
-        <div class="preset-name">🔥 Aggressive</div>
-        <div class="preset-desc">Higher risk, bigger swings</div>
-      </div>
-      <div class="preset-card" id="pc-degen" onclick="selectPreset('degen')">
-        <div class="preset-name">💀 Degen</div>
-        <div class="preset-desc">Full send — maximum exposure</div>
-      </div>
-    </div>
-    <div class="sec-label">Trading Parameters</div>
-    <div class="settings-grid">
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Max Buy (SOL)</label><input class="finput" id="s-buy" type="number" step="0.01" value="0.04"></div>
-        <div class="fgroup"><label class="flabel">Max Positions</label><input class="finput" id="s-maxpos" type="number" value="5"></div>
-        <div class="fgroup"><label class="flabel">Cooldown (min)</label><input class="finput" id="s-cooldown" type="number" value="10"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">TP1 Multiplier</label><input class="finput" id="s-tp1" type="number" step="0.1" value="2.0"></div>
-        <div class="fgroup"><label class="flabel">TP2 Multiplier</label><input class="finput" id="s-tp2" type="number" step="0.1" value="4.0"></div>
-        <div class="fgroup"><label class="flabel">Stop Loss</label><input class="finput" id="s-sl" type="number" step="0.05" value="0.70"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Trailing Stop %</label><input class="finput" id="s-trail" type="number" step="0.05" value="0.20"></div>
-        <div class="fgroup"><label class="flabel">Session Drawdown Limit (SOL)</label><input class="finput" id="s-dd" type="number" step="0.1" value="0.5"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Min Volume ($)</label><input class="finput" id="s-minvol" type="number" step="100" value="3000"></div>
-        <div class="fgroup"><label class="flabel">Min AI Score (0-100)</label><input class="finput" id="s-minscore" type="number" min="0" max="100" value="30"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Max Token Age (min)</label><input class="finput" id="s-age" type="number" step="1" value="240"></div>
-        <div class="fgroup"><label class="flabel">Time Stop (min)</label><input class="finput" id="s-tstop" type="number" step="1" value="30"></div>
-        <div class="fgroup"><label class="flabel">Priority Fee</label><input class="finput" id="s-prio" type="number" step="10000" value="30000"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Min Liquidity ($)</label><input class="finput" id="s-liq" type="number" step="1000" value="8000"></div>
-        <div class="fgroup"><label class="flabel">Min Market Cap ($)</label><input class="finput" id="s-minmc" type="number" step="1000" value="5000"></div>
-        <div class="fgroup"><label class="flabel">Max Market Cap ($)</label><input class="finput" id="s-maxmc" type="number" step="10000" value="250000"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Risk Per Trade %</label><input class="finput" id="s-risk" type="number" step="0.1" value="2.0"></div>
-        <div class="fgroup"><label class="flabel">Holder Growth % (1h)</label><input class="finput" id="s-holders" type="number" step="5" value="50"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Volume Spike Multiple</label><input class="finput" id="s-volspike" type="number" step="0.5" value="10"></div>
-        <div class="fgroup"><label class="flabel">Min Narrative Score</label><input class="finput" id="s-narr" type="number" step="1" value="20"></div>
-      </div>
-      <div class="glass">
-        <div class="fgroup"><label class="flabel">Green Lights Required</label><input class="finput" id="s-lights" type="number" min="1" max="3" value="3"></div>
-        <div class="fgroup"><label class="flabel">Late Entry Max Multiple</label><input class="finput" id="s-latemult" type="number" step="0.5" value="5.0"></div>
-        <div class="fgroup"><label class="flabel">Nuclear Narrative Score</label><input class="finput" id="s-nuclear" type="number" step="1" value="40"></div>
-      </div>
-    </div>
-    <div style="margin-top:16px;display:flex;gap:10px">
-      <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
-      <button class="btn btn-ghost" onclick="switchTab('scanner',document.querySelector('.tab-btn'))">Back to Scanner</button>
-    </div>
-  </div>
 </div>
 
 <!-- Toast -->
@@ -6882,67 +7047,49 @@ async function pollListings() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {{PRESET_SETTINGS}};
-function selectPreset(name) {
-  document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('active'));
+function setPresetChoice(name) {
+  document.querySelectorAll('.preset-chip').forEach(c => c.classList.remove('active'));
   const el = document.getElementById('pc-' + name);
   if (el) el.classList.add('active');
   document.getElementById('s-preset').value = name;
+  const customPanel = document.getElementById('custom-panel');
+  if (customPanel) customPanel.classList.toggle('show', name === 'custom');
+}
+function selectPreset(name, applyDefaults = true) {
+  setPresetChoice(name);
   _settingsDirty = true;
   const p = PRESET_SETTINGS[name];
   if (!p) return;
-  const m = { 's-buy':p.max_buy_sol, 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss,
-              's-trail':p.trail_pct, 's-maxpos':p.max_correlated, 's-cooldown':p.cooldown_min, 's-dd':p.drawdown_limit_sol,
-              's-minvol':p.min_vol, 's-minscore':p.min_score, 's-age':p.max_age_min, 's-tstop':p.time_stop_min,
-              's-liq':p.min_liq, 's-minmc':p.min_mc, 's-maxmc':p.max_mc, 's-prio':p.priority_fee, 's-risk':p.risk_per_trade_pct,
-              's-holders':p.min_holder_growth_pct, 's-narr':p.min_narrative_score, 's-lights':p.min_green_lights,
-              's-volspike':p.min_volume_spike_mult, 's-latemult':p.late_entry_mult, 's-nuclear':p.nuclear_narrative_score };
-  for (const [id, val] of Object.entries(m)) {
+  if (!applyDefaults || name === 'custom') return;
+  const m = { 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss, 's-trail':p.trail_pct };
+  Object.entries(m).forEach(([id, val]) => {
     const inp = document.getElementById(id);
-    if (inp) inp.value = val;
-  }
+    if (inp) inp.value = String(val);
+  });
 }
 async function saveSettings() {
+  const presetName = document.getElementById('s-preset')?.value || 'balanced';
+  const customMode = presetName === 'custom';
   const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      preset:              document.getElementById('s-preset').value,
-      max_correlated:      parseInt(document.getElementById('s-maxpos')?.value || 5),
-      cooldown_min:        parseInt(document.getElementById('s-cooldown')?.value || 10),
-      tp1_mult:            parseFloat(document.getElementById('s-tp1')?.value || 2.0),
-      tp2_mult:            parseFloat(document.getElementById('s-tp2')?.value || 4.0),
-      stop_loss:           parseFloat(document.getElementById('s-sl')?.value || 0.70),
-      trail_pct:           parseFloat(document.getElementById('s-trail')?.value || 0.20),
-      max_buy_sol:         parseFloat(document.getElementById('s-buy')?.value || 0.04),
-      drawdown_limit_sol:  parseFloat(document.getElementById('s-dd')?.value || 0.5),
-      min_vol:             parseFloat(document.getElementById('s-minvol')?.value || 3000),
-      min_score:           parseInt(document.getElementById('s-minscore')?.value || 30),
-      max_age_min:         parseInt(document.getElementById('s-age')?.value || 240),
-      time_stop_min:       parseInt(document.getElementById('s-tstop')?.value || 30),
-      min_liq:             parseFloat(document.getElementById('s-liq')?.value || 8000),
-      min_mc:              parseFloat(document.getElementById('s-minmc')?.value || 5000),
-      max_mc:              parseFloat(document.getElementById('s-maxmc')?.value || 250000),
-      priority_fee:        parseInt(document.getElementById('s-prio')?.value || 30000),
-      risk_per_trade_pct:  parseFloat(document.getElementById('s-risk')?.value || 2.0),
-      min_holder_growth_pct: parseFloat(document.getElementById('s-holders')?.value || 50),
-      min_narrative_score: parseInt(document.getElementById('s-narr')?.value || 20),
-      min_green_lights:    parseInt(document.getElementById('s-lights')?.value || 3),
-      min_volume_spike_mult: parseFloat(document.getElementById('s-volspike')?.value || 10),
-      late_entry_mult:     parseFloat(document.getElementById('s-latemult')?.value || 5.0),
-      nuclear_narrative_score: parseInt(document.getElementById('s-nuclear')?.value || 40),
+      preset: presetName,
+      tp1_mult:  parseFloat(document.getElementById('s-tp1')?.value || 2.0),
+      tp2_mult:  parseFloat(document.getElementById('s-tp2')?.value || 4.0),
+      stop_loss: parseFloat(document.getElementById('s-sl')?.value || 0.70),
+      trail_pct: parseFloat(document.getElementById('s-trail')?.value || 0.20),
     })
   }).then(r => r.json()).catch(() => null);
   if (res && res.ok !== false) {
     _settingsDirty = false;
-    const presetName = String(res.preset || document.getElementById('s-preset')?.value || 'balanced');
     showToast('\u2713 Settings saved', true);
     showConfirmModal(
-      'Settings Saved',
-      `Your dashboard settings were saved successfully. Current mode: ${presetName}.`,
+      'Mode Saved',
+      `Launch mode updated to ${String(res.preset || presetName)}.`,
       [
-        `Mode: ${presetName}`,
-        `${res.overrides_count ?? 0} overrides saved`,
+        `Preset: ${String(res.preset || presetName)}`,
+        customMode ? 'Custom TP/SL/trail saved' : 'Preset exits restored',
         `${res.replayed_candidates ?? 0} recent coins rechecked`,
-        'Server confirmed',
       ]
     );
   } else {
@@ -7040,29 +7187,11 @@ async function refresh() {
   if (d.settings && Object.keys(d.settings).length && !document._settingsFocused) {
     const s = d.settings;
     const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
-    setVal('s-maxpos',   s.max_correlated   ?? 5);
-    setVal('s-cooldown', s.cooldown_min     ?? 10);
     setVal('s-tp1',      s.tp1_mult         ?? 2.0);
     setVal('s-tp2',      s.tp2_mult         ?? 4.0);
     setVal('s-sl',       s.stop_loss        ?? 0.70);
     setVal('s-trail',    s.trail_pct        ?? 0.20);
-    setVal('s-buy',      s.max_buy_sol      ?? 0.04);
-    setVal('s-dd',       s.drawdown_limit_sol ?? 0.5);
-    setVal('s-minvol',   s.min_vol          ?? 3000);
-    setVal('s-minscore', s.min_score        ?? 30);
-    setVal('s-age',      s.max_age_min      ?? 240);
-    setVal('s-tstop',    s.time_stop_min    ?? 30);
-    setVal('s-liq',      s.min_liq          ?? 8000);
-    setVal('s-minmc',    s.min_mc           ?? 5000);
-    setVal('s-maxmc',    s.max_mc           ?? 250000);
-    setVal('s-prio',     s.priority_fee     ?? 30000);
-    setVal('s-risk',     s.risk_per_trade_pct ?? 2.0);
-    setVal('s-holders',  s.min_holder_growth_pct ?? 50);
-    setVal('s-narr',     s.min_narrative_score ?? 20);
-    setVal('s-lights',   s.min_green_lights ?? 3);
-    setVal('s-volspike', s.min_volume_spike_mult ?? 10);
-    setVal('s-latemult', s.late_entry_mult ?? 5.0);
-    setVal('s-nuclear',  s.nuclear_narrative_score ?? 40);
+    setPresetChoice(d.preset || document.getElementById('s-preset')?.value || 'balanced');
     _settingsDirty = false;
   }
 }
@@ -7644,14 +7773,16 @@ async function loadPnl(range) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-(function() { selectPreset('{{PRESET}}' || 'balanced'); })();
+(function() {
+  selectPreset('{{PRESET}}' || 'balanced', false);
+  _settingsDirty = false;
+})();
 window.addEventListener('resize', () => {
   if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
     treeCanvas.width = treeCanvas.parentElement.clientWidth;
   }
 });
 refresh();
-loadAI();
 setInterval(refresh, 5000);
 pollFeed(); setInterval(pollFeed, 4000);
 pollListings(); setInterval(pollListings, 6000);
