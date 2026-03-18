@@ -509,6 +509,7 @@ def replay_recent_market_feed(bot, limit=40):
                 float(item.get("liq") or 0),
                 float(item.get("age_min") or 0),
                 float(item.get("change") or 0),
+                item.get("source"),
             )
             replayed += 1
         except Exception as _e:
@@ -2489,12 +2490,13 @@ class BotInstance:
             elif (pos["tp1_hit"] or peak_ratio >= 1.3) and cur < trail_line:
                 self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
 
-    def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change):
+    def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change, source=None):
         if mint in self.positions:
             return
         s = self.settings
         min_liq = float(s.get("min_liq", 0) or 0)
-        liq_filter_on = min_liq > 0
+        pumpfun_liq_bypass = "pumpfun" in str(source or "").lower()
+        liq_filter_on = min_liq > 0 and not pumpfun_liq_bypass
         min_mc  = s.get("min_mc", 0)
         max_mc  = s.get("max_mc", 999999)
         max_age = s.get("max_age_min", 999)
@@ -2518,7 +2520,7 @@ class BotInstance:
             "score": _sd, "passed": False, "reason": "",
             "filters": [
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
-                {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}"},
+                {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "pumpfun bypass" if pumpfun_liq_bypass else ("off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}")},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
                 {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
@@ -2526,7 +2528,7 @@ class BotInstance:
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
-        liq_text = f"min {min_liq:,.0f}" if liq_filter_on else "filter off"
+        liq_text = "pumpfun bypass" if pumpfun_liq_bypass else (f"min {min_liq:,.0f}" if liq_filter_on else "filter off")
         print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}({liq_text}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
@@ -4140,7 +4142,7 @@ def _broadcast_signal(info):
             bot.evaluate_signal(
                 mint, info["name"], info["price"],
                 info["mc"], info["vol"], info["liq"],
-                info["age_min"], effective_change
+                info["age_min"], effective_change, info.get("source")
             )
         except Exception as _be:
             print(f"[SCAN] evaluate_signal error: {_be}", flush=True)
