@@ -246,6 +246,7 @@ PRESETS = {
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":18,
         "min_green_lights":1,"min_volume_spike_mult":8,"late_entry_mult":5.0,
         "offpeak_min_change":20,
+        "max_hot_change":400.0,
         "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
@@ -260,6 +261,7 @@ PRESETS = {
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
         "min_green_lights":1,"min_volume_spike_mult":6,"late_entry_mult":5.0,
         "offpeak_min_change":18,
+        "max_hot_change":400.0,
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
@@ -274,6 +276,7 @@ PRESETS = {
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":25,"min_narrative_score":14,
         "min_green_lights":1,"min_volume_spike_mult":5,"late_entry_mult":5.0,
         "offpeak_min_change":15,
+        "max_hot_change":400.0,
         "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
@@ -288,6 +291,7 @@ PRESETS = {
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":12,
         "min_green_lights":1,"min_volume_spike_mult":4,"late_entry_mult":5.0,
         "offpeak_min_change":12,
+        "max_hot_change":400.0,
         "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
@@ -302,6 +306,7 @@ PRESETS = {
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":16,
         "min_green_lights":1,"min_volume_spike_mult":6,"late_entry_mult":5.0,
         "offpeak_min_change":18,
+        "max_hot_change":400.0,
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
@@ -321,7 +326,9 @@ BOT_OVERRIDE_FIELDS = [
     ("min_holder_growth_pct", float), ("min_narrative_score", int),
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
-    ("offpeak_min_change", float),
+    ("offpeak_min_change", float), ("max_hot_change", float),
+    ("anti_rug", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
+    ("check_holders", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
 ]
 
 AUTO_RELAX_STATE_FIELDS = (
@@ -2215,6 +2222,8 @@ class BotInstance:
         if mint in self.positions:
             return
         s = self.settings
+        min_liq = float(s.get("min_liq", 0) or 0)
+        liq_filter_on = min_liq > 0
         min_mc  = s.get("min_mc", 0)
         max_mc  = s.get("max_mc", 999999)
         max_age = s.get("max_age_min", 999)
@@ -2238,7 +2247,7 @@ class BotInstance:
             "score": _sd, "passed": False, "reason": "",
             "filters": [
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
-                {"name": "Liquidity", "passed": True, "value": f"${liq:,.0f}", "threshold": "off"},
+                {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}"},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
                 {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
@@ -2246,9 +2255,15 @@ class BotInstance:
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
-        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}(filter off) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
+        liq_text = f"min {min_liq:,.0f}" if liq_filter_on else "filter off"
+        print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}({liq_text}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            return
+        if liq_filter_on and liq < min_liq:
+            sig_entry["reason"] = f"Liquidity ${liq:,.0f} < min ${min_liq:,.0f}"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
@@ -4905,6 +4920,10 @@ def api_settings():
         "overrides_count": len(overrides),
         "saved_fields": sorted(overrides.keys()),
         "replayed_candidates": replayed,
+        "settings": strip_auto_relax_state(base_settings),
+        "run_mode": run_mode,
+        "run_duration_min": duration,
+        "profit_target_sol": profit,
     })
 
 @app.route("/api/chart/<mint>")
@@ -6363,6 +6382,29 @@ DASHBOARD_HTML = _CSS + """
 .launch-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
 .launch-grid .fgroup{margin:0}
 .launch-note{font-size:10px;line-height:1.5;color:var(--t3)}
+.settings-pane-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:16px;align-items:start}
+.settings-stack{display:flex;flex-direction:column;gap:14px}
+.settings-card{background:rgba(16,31,50,.6);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:16px}
+.settings-section-title{font-size:12px;font-weight:800;color:var(--t1);letter-spacing:.06em;text-transform:uppercase;margin-bottom:12px}
+.setting-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(116px,160px) 72px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.setting-row:last-child{border-bottom:none}
+.setting-label{font-size:13px;color:var(--t2);font-weight:700}
+.setting-desc{font-size:10px;color:var(--t3);margin-top:2px;line-height:1.4}
+.setting-input{background:var(--surf);border:1px solid var(--b1);color:var(--t1);padding:8px 10px;border-radius:8px;font-size:12px;width:100%;font-family:monospace}
+.setting-unit{font-size:11px;color:var(--t3);text-align:right}
+.setting-toggle-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06);gap:14px}
+.setting-toggle-row:last-child{border-bottom:none}
+.toggle-wrap{display:flex;align-items:center;gap:10px}
+.settings-echo{display:flex;gap:6px;flex-wrap:wrap}
+.checkpoint-path{display:flex;flex-direction:column;gap:10px}
+.checkpoint-card{border:1px solid rgba(59,130,246,.18);background:linear-gradient(180deg,rgba(8,16,26,.96),rgba(10,18,29,.82));border-radius:12px;padding:12px 14px}
+.checkpoint-step{display:flex;align-items:flex-start;gap:10px}
+.checkpoint-index{width:22px;height:22px;border-radius:999px;background:rgba(59,130,246,.14);border:1px solid rgba(59,130,246,.28);color:var(--blue2);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0}
+.checkpoint-meta{font-size:10px;color:var(--t3);margin-top:4px;line-height:1.45}
+.settings-save-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.save-pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(20,199,132,.24);background:rgba(20,199,132,.08);font-size:11px;color:var(--grn);font-weight:700}
+.save-pill.pending{border-color:rgba(245,158,11,.24);background:rgba(245,158,11,.08);color:var(--gold2)}
+@media(max-width:1080px){.settings-pane-grid{grid-template-columns:1fr}}
 @media(max-width:860px){.launch-grid{grid-template-columns:1fr}}
 .ai-panel{background:linear-gradient(135deg,rgba(20,199,132,.14),rgba(59,130,246,.08));border:1px solid rgba(20,199,132,.24);border-radius:14px;padding:18px;margin-bottom:18px}
 .ai-panel h3{margin:0 0 6px;font-size:16px;color:var(--t1)}
@@ -6446,6 +6488,7 @@ DASHBOARD_HTML = _CSS + """
   <!-- Tab Bar -->
   <div class="tab-bar">
     <button class="tab-btn active" onclick="switchTab('scanner',this)">Scanner</button>
+    <button class="tab-btn" onclick="switchTab('settings',this)">Settings</button>
     <button class="tab-btn" onclick="switchTab('signals',this)">Signals</button>
     <button class="tab-btn" onclick="switchTab('whales',this)">Whales</button>
     <button class="tab-btn" onclick="switchTab('positions',this)">Positions</button>
@@ -6463,62 +6506,13 @@ DASHBOARD_HTML = _CSS + """
           </div>
           <div class="launch-config">
             <div class="sec-label">Launch Bot</div>
-            <div class="fgroup launch-select">
-              <label class="flabel" for="s-preset">Mode</label>
-              <select class="finput" id="s-preset" onchange="selectPreset(this.value)">
-                <option value="safe">Safe</option>
-                <option value="balanced" selected>Balanced (Default)</option>
-                <option value="aggressive">Aggressive</option>
-                <option value="degen">Degen</option>
-                <option value="custom">Custom</option>
-              </select>
-            </div>
-            <div id="custom-panel" class="custom-panel">
-              <div class="launch-grid">
-                <div class="fgroup">
-                  <label class="flabel">TP1</label>
-                  <select class="finput" id="s-tp1" onchange="markSettingsDirty()">
-                    <option value="1.2">1.2x quick bank</option>
-                    <option value="1.5">1.5x steady</option>
-                    <option value="2.0" selected>2.0x balanced</option>
-                    <option value="2.5">2.5x stretch</option>
-                  </select>
-                </div>
-                <div class="fgroup">
-                  <label class="flabel">TP2</label>
-                  <select class="finput" id="s-tp2" onchange="markSettingsDirty()">
-                    <option value="2.0">2.0x quick exit</option>
-                    <option value="3.0">3.0x runner</option>
-                    <option value="4.0" selected>4.0x moon bag</option>
-                    <option value="6.0">6.0x stretch</option>
-                    <option value="10.0">10.0x degen</option>
-                  </select>
-                </div>
-                <div class="fgroup">
-                  <label class="flabel">Stop Loss</label>
-                  <select class="finput" id="s-sl" onchange="markSettingsDirty()">
-                    <option value="0.75">25% stop</option>
-                    <option value="0.70" selected>30% stop</option>
-                    <option value="0.65">35% loose</option>
-                    <option value="0.60">40% full send</option>
-                  </select>
-                </div>
-                <div class="fgroup">
-                  <label class="flabel">Trailing Loss</label>
-                  <select class="finput" id="s-trail" onchange="markSettingsDirty()">
-                    <option value="0.14">14% rocket leash</option>
-                    <option value="0.20" selected>20% balanced</option>
-                    <option value="0.25">25% wide</option>
-                    <option value="0.30">30% loose</option>
-                    <option value="0.40">40% full send</option>
-                  </select>
-                </div>
-              </div>
+            <div id="launch-summary" class="settings-echo">
+              <span class="badge bg-muted">Mode loading…</span>
             </div>
             <div class="launch-note">
-              Entries require at least 1 green light, run until midnight Central, and pause between 12:00 AM and 6:00 AM Central.
+              Open the Settings tab to edit every checkpoint in the coin path. Saved values stay visible there even when the bot is off.
             </div>
-            <button class="btn btn-ghost btn-full" type="button" onclick="saveSettings()">Save Settings</button>
+            <button class="btn btn-ghost btn-full" type="button" onclick="openSettingsTab()">Open Settings</button>
           </div>
         </div>
         <div class="glass">
@@ -6580,6 +6574,211 @@ DASHBOARD_HTML = _CSS + """
             <div id="tree-loading" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;color:var(--t3);font-size:12px">Loading wallet tree…</div>
           </div>
           <div id="tree-list" style="max-height:180px;overflow-y:auto;margin-top:8px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
+  <div id="tab-settings" class="tab-pane">
+    <div class="settings-pane-grid">
+      <div class="settings-stack">
+        <div class="settings-card">
+          <div class="settings-save-row">
+            <div>
+              <div class="settings-section-title" style="margin-bottom:6px">Saved Settings</div>
+              <div style="font-size:12px;color:var(--t2)">Edit the exact checkpoint values the bot uses, then save them before you start.</div>
+            </div>
+            <div id="settings-save-state" class="save-pill">Loaded from saved state</div>
+          </div>
+          <div style="height:12px"></div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Mode</div>
+              <div class="setting-desc">Choose a base profile, then fine-tune the checkpoints below.</div>
+            </div>
+            <select class="setting-input" id="s-preset" onchange="selectPreset(this.value)">
+              <option value="safe">Safe</option>
+              <option value="balanced">Balanced (Default)</option>
+              <option value="aggressive">Aggressive</option>
+              <option value="degen">Degen</option>
+              <option value="custom">Custom</option>
+            </select>
+            <div class="setting-unit">preset</div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-section-title">Trade Plan</div>
+          <div class="setting-row">
+            <div><div class="setting-label">Max Buy Size</div><div class="setting-desc">SOL committed when a coin clears every checkpoint.</div></div>
+            <input class="setting-input" id="s-max-buy" type="number" step="0.01">
+            <div class="setting-unit">SOL</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">TP1 Multiplier</div><div class="setting-desc">First partial sell trigger.</div></div>
+            <input class="setting-input" id="s-tp1" type="number" step="0.01">
+            <div class="setting-unit">x</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">TP2 Multiplier</div><div class="setting-desc">Second target for the remaining size.</div></div>
+            <input class="setting-input" id="s-tp2" type="number" step="0.01">
+            <div class="setting-unit">x</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Hard floor as an entry ratio. `0.70` means stop near -30%.</div></div>
+            <input class="setting-input" id="s-sl" type="number" step="0.01">
+            <div class="setting-unit">ratio</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Trailing Loss</div><div class="setting-desc">Peak retrace used after the trail is armed.</div></div>
+            <input class="setting-input" id="s-trail" type="number" step="0.01">
+            <div class="setting-unit">ratio</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Time Stop</div><div class="setting-desc">Exit if the position stalls too long.</div></div>
+            <input class="setting-input" id="s-tstop" type="number" step="1">
+            <div class="setting-unit">min</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Lamports added to compete for landing.</div></div>
+            <input class="setting-input" id="s-prio" type="number" step="1000">
+            <div class="setting-unit">lamports</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Drawdown Limit</div><div class="setting-desc">Session loss cap before the bot halts itself.</div></div>
+            <input class="setting-input" id="s-dd" type="number" step="0.01">
+            <div class="setting-unit">SOL</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Max Correlated Positions</div><div class="setting-desc">Maximum overlapping positions before new buys are skipped.</div></div>
+            <input class="setting-input" id="s-maxpos" type="number" step="1">
+            <div class="setting-unit">count</div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-section-title">Filter Path</div>
+          <div class="setting-row">
+            <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Set to `0` to disable the liquidity checkpoint entirely.</div></div>
+            <input class="setting-input" id="s-liq" type="number" step="100">
+            <div class="setting-unit">USD</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Min Market Cap</div><div class="setting-desc">Lowest market cap allowed into the path.</div></div>
+            <input class="setting-input" id="s-minmc" type="number" step="100">
+            <div class="setting-unit">USD</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Max Market Cap</div><div class="setting-desc">Upper market cap ceiling for new entries.</div></div>
+            <input class="setting-input" id="s-maxmc" type="number" step="1000">
+            <div class="setting-unit">USD</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Older coins fail the entry path.</div></div>
+            <input class="setting-input" id="s-age" type="number" step="1">
+            <div class="setting-unit">min</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Min Volume</div><div class="setting-desc">24h volume floor for the volume checkpoint.</div></div>
+            <input class="setting-input" id="s-minvol" type="number" step="100">
+            <div class="setting-unit">USD</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Min AI Score</div><div class="setting-desc">Score floor after the AI score breakdown is computed.</div></div>
+            <input class="setting-input" id="s-minscore" type="number" step="1">
+            <div class="setting-unit">/100</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Hot Change Cap</div><div class="setting-desc">Maximum 1h move before a coin is treated as too extended.</div></div>
+            <input class="setting-input" id="s-hotchg" type="number" step="1">
+            <div class="setting-unit">%</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Green Lights Required</div><div class="setting-desc">Minimum checklist confirmations to reach `SIGNAL`.</div></div>
+            <input class="setting-input" id="s-lights" type="number" step="1">
+            <div class="setting-unit">count</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Holder Growth</div><div class="setting-desc">Required holder acceleration for the quality checklist.</div></div>
+            <input class="setting-input" id="s-holders" type="number" step="1">
+            <div class="setting-unit">%</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Narrative Score</div><div class="setting-desc">Narrative timing floor before the buy path stays alive.</div></div>
+            <input class="setting-input" id="s-narr" type="number" step="1">
+            <div class="setting-unit">pts</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Volume Spike Multiple</div><div class="setting-desc">Minimum expansion multiple used in the three-signal checklist.</div></div>
+            <input class="setting-input" id="s-volspike" type="number" step="0.1">
+            <div class="setting-unit">x</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Late Entry Limit</div><div class="setting-desc">Reject coins already too extended unless narrative strength overrides it.</div></div>
+            <input class="setting-input" id="s-latemult" type="number" step="0.1">
+            <div class="setting-unit">x</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Nuclear Narrative Score</div><div class="setting-desc">Narrative score needed to override late-entry rejection.</div></div>
+            <input class="setting-input" id="s-nuclear" type="number" step="1">
+            <div class="setting-unit">pts</div>
+          </div>
+          <div class="setting-row">
+            <div><div class="setting-label">Off-Peak Change Floor</div><div class="setting-desc">Saved with the profile for off-peak logic, even if the current runtime keeps entries open all day.</div></div>
+            <input class="setting-input" id="s-offpeak" type="number" step="1">
+            <div class="setting-unit">%</div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-section-title">Safety Toggles</div>
+          <div class="setting-toggle-row">
+            <div>
+              <div class="setting-label">Authority / Rug Check</div>
+              <div class="setting-desc">Blocks older tokens when mint or freeze authority still looks unsafe.</div>
+            </div>
+            <label class="toggle-wrap"><input id="s-antirug" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
+          </div>
+          <div class="setting-toggle-row">
+            <div>
+              <div class="setting-label">Holder Concentration Check</div>
+              <div class="setting-desc">Blocks concentrated ownership once the token is old enough for holder analysis.</div>
+            </div>
+            <label class="toggle-wrap"><input id="s-checkholders" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
+          </div>
+          <div class="setting-toggle-row">
+            <div>
+              <div class="setting-label">Risk Per Trade</div>
+              <div class="setting-desc">Wallet percentage cap the buy logic can use as a secondary position-size guard.</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <input class="setting-input" id="s-risk" type="number" step="0.1" style="width:120px">
+              <span class="setting-unit">%</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-save-row">
+            <button class="btn btn-primary" type="button" onclick="saveSettings()">Save Settings</button>
+            <button class="btn btn-ghost" type="button" onclick="refresh()">Reload Saved Settings</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-stack">
+        <div class="settings-card">
+          <div class="settings-section-title">Checkpoint Map</div>
+          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">This is the live pass order. A coin has to survive these checkpoints before it reaches quote and buy.</div>
+          <div id="settings-checkpoint-path" class="checkpoint-path"></div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-section-title">Saved Snapshot</div>
+          <div id="settings-snapshot" class="settings-echo">
+            <span class="badge bg-muted">Waiting for saved settings…</span>
+          </div>
+          <div id="settings-snapshot-note" style="font-size:11px;color:var(--t3);margin-top:10px;line-height:1.5">Save while the bot is off and the exact persisted values stay visible here.</div>
         </div>
       </div>
     </div>
@@ -6790,9 +6989,11 @@ function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '�
 function markSettingsDirty() {
   _settingsDirty = true;
   document._settingsFocused = true;
+  setSettingsSaveState('Unsaved changes', true);
+  renderSettingsVisuals(getSettingsFromForm());
 }
 function bindSettingsInputs() {
-  ['s-preset', 's-tp1', 's-tp2', 's-sl', 's-trail'].forEach(id => {
+  getSettingsFocusIds().forEach(id => {
     const el = document.getElementById(id);
     if (!el || el._settingsBound) return;
     el._settingsBound = true;
@@ -6800,11 +7001,14 @@ function bindSettingsInputs() {
     el.addEventListener('blur', () => {
       setTimeout(() => {
         const active = document.activeElement;
-        const ids = ['s-preset', 's-tp1', 's-tp2', 's-sl', 's-trail'];
+        const ids = getSettingsFocusIds();
         document._settingsFocused = !!(active && ids.includes(active.id));
       }, 0);
     });
     el.addEventListener('change', markSettingsDirty);
+    if (el.tagName !== 'SELECT' && el.type !== 'checkbox') {
+      el.addEventListener('input', markSettingsDirty);
+    }
   });
 }
 function signalKey(s) { return `${s.mint || ''}|${s.logged_at || s.ts || ''}|${s.passed ? 1 : 0}|${s.reason || ''}`; }
@@ -7081,55 +7285,238 @@ async function pollListings() {
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 const PRESET_SETTINGS = {{PRESET_SETTINGS}};
+const SETTINGS_FIELD_IDS = [
+  's-preset', 's-max-buy', 's-tp1', 's-tp2', 's-sl', 's-trail',
+  's-age', 's-tstop', 's-liq', 's-minmc', 's-maxmc', 's-prio',
+  's-dd', 's-maxpos', 's-minvol', 's-minscore', 's-risk', 's-holders',
+  's-narr', 's-lights', 's-volspike', 's-latemult', 's-nuclear',
+  's-offpeak', 's-hotchg', 's-antirug', 's-checkholders',
+];
+const SETTINGS_DEFAULTS = {
+  max_buy_sol: 0.04,
+  tp1_mult: 2.0,
+  tp2_mult: 4.0,
+  stop_loss: 0.70,
+  trail_pct: 0.20,
+  max_age_min: 240,
+  time_stop_min: 30,
+  min_liq: 0,
+  min_mc: 5000,
+  max_mc: 250000,
+  priority_fee: 30000,
+  drawdown_limit_sol: 0.5,
+  max_correlated: 3,
+  min_vol: 3000,
+  min_score: 30,
+  risk_per_trade_pct: 2.0,
+  min_holder_growth_pct: 30,
+  min_narrative_score: 16,
+  min_green_lights: 1,
+  min_volume_spike_mult: 6,
+  late_entry_mult: 5.0,
+  nuclear_narrative_score: 40,
+  offpeak_min_change: 18,
+  max_hot_change: 400,
+  anti_rug: true,
+  check_holders: true,
+};
+const SETTINGS_META = [
+  ['Mode', s => String(s.preset || 'balanced')],
+  ['TP1', s => Number(s.tp1_mult || 0).toFixed(2) + 'x'],
+  ['TP2', s => Number(s.tp2_mult || 0).toFixed(2) + 'x'],
+  ['SL', s => Number(s.stop_loss || 0).toFixed(2)],
+  ['Trail', s => (Number(s.trail_pct || 0) * 100).toFixed(0) + '%'],
+  ['MC', s => '$' + Number(s.min_mc || 0).toLocaleString() + ' - $' + Number(s.max_mc || 0).toLocaleString()],
+  ['Age', s => Number(s.max_age_min || 0).toLocaleString() + 'm'],
+  ['Score', s => '>=' + Number(s.min_score || 0)],
+  ['Liquidity', s => Number(s.min_liq || 0) > 0 ? '>=$' + Number(s.min_liq || 0).toLocaleString() : 'off'],
+  ['Green Lights', s => Number(s.min_green_lights || 0)],
+  ['Holder Check', s => s.check_holders ? 'on' : 'off'],
+];
+function setSettingsSaveState(text, pending=false) {
+  const el = document.getElementById('settings-save-state');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('pending', pending);
+}
+function readNum(id, fallback=0) {
+  const el = document.getElementById(id);
+  const v = el ? Number(el.value) : NaN;
+  return Number.isFinite(v) ? v : fallback;
+}
 function setPresetChoice(name) {
   const presetInput = document.getElementById('s-preset');
   if (presetInput) presetInput.value = name;
-  const customPanel = document.getElementById('custom-panel');
-  if (customPanel) customPanel.classList.toggle('show', name === 'custom');
+}
+function applySettingsToForm(settings, presetName) {
+  const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
+  const setVal = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value;
+  };
+  const setChecked = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = !!value;
+  };
+  setPresetChoice(presetName || s.preset || 'balanced');
+  setVal('s-max-buy', s.max_buy_sol ?? SETTINGS_DEFAULTS.max_buy_sol);
+  setVal('s-tp1', s.tp1_mult ?? SETTINGS_DEFAULTS.tp1_mult);
+  setVal('s-tp2', s.tp2_mult ?? SETTINGS_DEFAULTS.tp2_mult);
+  setVal('s-sl', s.stop_loss ?? SETTINGS_DEFAULTS.stop_loss);
+  setVal('s-trail', s.trail_pct ?? SETTINGS_DEFAULTS.trail_pct);
+  setVal('s-age', s.max_age_min ?? SETTINGS_DEFAULTS.max_age_min);
+  setVal('s-tstop', s.time_stop_min ?? SETTINGS_DEFAULTS.time_stop_min);
+  setVal('s-liq', s.min_liq ?? SETTINGS_DEFAULTS.min_liq);
+  setVal('s-minmc', s.min_mc ?? SETTINGS_DEFAULTS.min_mc);
+  setVal('s-maxmc', s.max_mc ?? SETTINGS_DEFAULTS.max_mc);
+  setVal('s-prio', s.priority_fee ?? SETTINGS_DEFAULTS.priority_fee);
+  setVal('s-dd', s.drawdown_limit_sol ?? SETTINGS_DEFAULTS.drawdown_limit_sol);
+  setVal('s-maxpos', s.max_correlated ?? SETTINGS_DEFAULTS.max_correlated);
+  setVal('s-minvol', s.min_vol ?? SETTINGS_DEFAULTS.min_vol);
+  setVal('s-minscore', s.min_score ?? SETTINGS_DEFAULTS.min_score);
+  setVal('s-risk', s.risk_per_trade_pct ?? SETTINGS_DEFAULTS.risk_per_trade_pct);
+  setVal('s-holders', s.min_holder_growth_pct ?? SETTINGS_DEFAULTS.min_holder_growth_pct);
+  setVal('s-narr', s.min_narrative_score ?? SETTINGS_DEFAULTS.min_narrative_score);
+  setVal('s-lights', s.min_green_lights ?? SETTINGS_DEFAULTS.min_green_lights);
+  setVal('s-volspike', s.min_volume_spike_mult ?? SETTINGS_DEFAULTS.min_volume_spike_mult);
+  setVal('s-latemult', s.late_entry_mult ?? SETTINGS_DEFAULTS.late_entry_mult);
+  setVal('s-nuclear', s.nuclear_narrative_score ?? SETTINGS_DEFAULTS.nuclear_narrative_score);
+  setVal('s-offpeak', s.offpeak_min_change ?? SETTINGS_DEFAULTS.offpeak_min_change);
+  setVal('s-hotchg', s.max_hot_change ?? SETTINGS_DEFAULTS.max_hot_change);
+  setChecked('s-antirug', s.anti_rug ?? SETTINGS_DEFAULTS.anti_rug);
+  setChecked('s-checkholders', s.check_holders ?? SETTINGS_DEFAULTS.check_holders);
+  renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
+}
+function getSettingsFromForm() {
+  return {
+    preset: document.getElementById('s-preset')?.value || 'balanced',
+    max_buy_sol: readNum('s-max-buy', SETTINGS_DEFAULTS.max_buy_sol),
+    tp1_mult: readNum('s-tp1', SETTINGS_DEFAULTS.tp1_mult),
+    tp2_mult: readNum('s-tp2', SETTINGS_DEFAULTS.tp2_mult),
+    stop_loss: readNum('s-sl', SETTINGS_DEFAULTS.stop_loss),
+    trail_pct: readNum('s-trail', SETTINGS_DEFAULTS.trail_pct),
+    max_age_min: readNum('s-age', SETTINGS_DEFAULTS.max_age_min),
+    time_stop_min: readNum('s-tstop', SETTINGS_DEFAULTS.time_stop_min),
+    min_liq: readNum('s-liq', SETTINGS_DEFAULTS.min_liq),
+    min_mc: readNum('s-minmc', SETTINGS_DEFAULTS.min_mc),
+    max_mc: readNum('s-maxmc', SETTINGS_DEFAULTS.max_mc),
+    priority_fee: readNum('s-prio', SETTINGS_DEFAULTS.priority_fee),
+    drawdown_limit_sol: readNum('s-dd', SETTINGS_DEFAULTS.drawdown_limit_sol),
+    max_correlated: readNum('s-maxpos', SETTINGS_DEFAULTS.max_correlated),
+    min_vol: readNum('s-minvol', SETTINGS_DEFAULTS.min_vol),
+    min_score: readNum('s-minscore', SETTINGS_DEFAULTS.min_score),
+    risk_per_trade_pct: readNum('s-risk', SETTINGS_DEFAULTS.risk_per_trade_pct),
+    min_holder_growth_pct: readNum('s-holders', SETTINGS_DEFAULTS.min_holder_growth_pct),
+    min_narrative_score: readNum('s-narr', SETTINGS_DEFAULTS.min_narrative_score),
+    min_green_lights: readNum('s-lights', SETTINGS_DEFAULTS.min_green_lights),
+    min_volume_spike_mult: readNum('s-volspike', SETTINGS_DEFAULTS.min_volume_spike_mult),
+    late_entry_mult: readNum('s-latemult', SETTINGS_DEFAULTS.late_entry_mult),
+    nuclear_narrative_score: readNum('s-nuclear', SETTINGS_DEFAULTS.nuclear_narrative_score),
+    offpeak_min_change: readNum('s-offpeak', SETTINGS_DEFAULTS.offpeak_min_change),
+    max_hot_change: readNum('s-hotchg', SETTINGS_DEFAULTS.max_hot_change),
+    anti_rug: !!document.getElementById('s-antirug')?.checked,
+    check_holders: !!document.getElementById('s-checkholders')?.checked,
+  };
+}
+function renderSettingsSnapshot(settings) {
+  const el = document.getElementById('settings-snapshot');
+  if (!el) return;
+  el.innerHTML = SETTINGS_META.map(([label, getter]) => `<span class="badge bg-muted">${label}: ${getter(settings)}</span>`).join('');
+  const note = document.getElementById('settings-snapshot-note');
+  if (!note) return;
+  note.textContent = Number(settings.min_liq || 0) > 0
+    ? `Liquidity checkpoint is live at $${Number(settings.min_liq).toLocaleString()}. Save again any time you want the path to track different thresholds.`
+    : 'Liquidity checkpoint is off. Keeping the value at 0 means liquidity will never reject a coin in the main path.';
+}
+function renderLaunchSummary(settings) {
+  const el = document.getElementById('launch-summary');
+  if (!el) return;
+  el.innerHTML = [
+    `<span class="badge bg-blue">${String(settings.preset || 'balanced')}</span>`,
+    `<span class="badge bg-muted">TP1 ${Number(settings.tp1_mult || 0).toFixed(2)}x</span>`,
+    `<span class="badge bg-muted">TP2 ${Number(settings.tp2_mult || 0).toFixed(2)}x</span>`,
+    `<span class="badge bg-muted">Score >= ${Number(settings.min_score || 0)}</span>`,
+    `<span class="badge bg-muted">GL ${Number(settings.min_green_lights || 0)}</span>`,
+    `<span class="badge bg-muted">Liq ${Number(settings.min_liq || 0) > 0 ? '$' + Number(settings.min_liq || 0).toLocaleString() : 'off'}</span>`,
+    `<span class="badge bg-muted">Holders ${settings.check_holders ? 'on' : 'off'}</span>`,
+  ].join('');
+}
+function renderSettingsVisuals(settings) {
+  const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
+  renderLaunchSummary(s);
+  renderSettingsSnapshot(s);
+  const el = document.getElementById('settings-checkpoint-path');
+  if (!el) return;
+  const liqRule = Number(s.min_liq || 0) > 0 ? `Liquidity must be >= $${Number(s.min_liq).toLocaleString()}` : 'Liquidity checkpoint disabled';
+  const cards = [
+    ['1', 'Market Cap', `$${Number(s.min_mc).toLocaleString()} to $${Number(s.max_mc).toLocaleString()}`, 'The token has to land inside the market-cap lane before any later check matters.'],
+    ['2', 'Liquidity', liqRule, 'Set liquidity to 0 to leave this checkpoint open. Any non-zero value makes it a real gate again.'],
+    ['3', 'Token Age', `Age must be <= ${Number(s.max_age_min).toLocaleString()} minutes`, 'Older coins die here before the signal reaches momentum or score.'],
+    ['4', 'Price Change', `Change must be > 0% and <= ${Number(s.max_hot_change).toLocaleString()}%`, 'Negative change and overheated moves both fail on the same checkpoint.'],
+    ['5', 'Volume', `24h volume must be >= $${Number(s.min_vol).toLocaleString()}`, 'This is the first participation proof after the raw price filters.'],
+    ['6', 'AI Score', `Score must be >= ${Number(s.min_score).toLocaleString()}`, 'The score breakdown is computed first, then this floor decides if the coin survives.'],
+    ['7', 'Three-Signal Checklist', `${Number(s.min_green_lights)} green lights | holders >= ${Number(s.min_holder_growth_pct)}% | narrative >= ${Number(s.min_narrative_score)} | volume spike >= ${Number(s.min_volume_spike_mult)}x`, 'These values feed the same checklist and quality gates shown in the Signals tab.'],
+    ['8', 'Late Entry Guard', `Late entry <= ${Number(s.late_entry_mult)}x unless narrative >= ${Number(s.nuclear_narrative_score)}`, 'A coin that is already too extended only survives if narrative timing is strong enough to override the guard.'],
+    ['9', 'Safety Checks', `Authority check ${s.anti_rug ? 'on' : 'off'} | holder concentration ${s.check_holders ? 'on' : 'off'}`, 'These can still kill the trade later, after the numeric path passes.'],
+    ['10', 'Runtime Gates', `Drawdown ${Number(s.drawdown_limit_sol).toFixed(2)} SOL | max positions ${Number(s.max_correlated)} | trade risk ${Number(s.risk_per_trade_pct).toFixed(1)}%`, 'Even after the filter path passes, the bot can still skip on drawdown, position count, balance, or recent losing-mint rules.'],
+  ];
+  el.innerHTML = cards.map(([index, title, value, meta]) => `
+    <div class="checkpoint-card">
+      <div class="checkpoint-step">
+        <div class="checkpoint-index">${index}</div>
+        <div style="min-width:0">
+          <div style="font-size:13px;font-weight:700;color:var(--t1)">${title}</div>
+          <div style="font-size:12px;color:var(--t2);margin-top:4px">${value}</div>
+          <div class="checkpoint-meta">${meta}</div>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+function getSettingsFocusIds() {
+  return SETTINGS_FIELD_IDS;
 }
 function selectPreset(name, applyDefaults = true) {
   setPresetChoice(name);
-  _settingsDirty = true;
   const p = PRESET_SETTINGS[name];
-  if (!p) return;
-  if (!applyDefaults || name === 'custom') return;
-  const m = { 's-tp1':p.tp1_mult, 's-tp2':p.tp2_mult, 's-sl':p.stop_loss, 's-trail':p.trail_pct };
-  Object.entries(m).forEach(([id, val]) => {
-    const inp = document.getElementById(id);
-    if (inp) inp.value = String(val);
-  });
+  if (applyDefaults && name !== 'custom' && p) {
+    applySettingsToForm({ ...SETTINGS_DEFAULTS, ...p, preset: name }, name);
+  } else {
+    renderSettingsVisuals(getSettingsFromForm());
+  }
+  markSettingsDirty();
 }
 async function saveSettings() {
-  const presetName = document.getElementById('s-preset')?.value || 'balanced';
-  const customMode = presetName === 'custom';
+  const payload = getSettingsFromForm();
   const res = await fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      preset: presetName,
-      tp1_mult:  parseFloat(document.getElementById('s-tp1')?.value || 2.0),
-      tp2_mult:  parseFloat(document.getElementById('s-tp2')?.value || 4.0),
-      stop_loss: parseFloat(document.getElementById('s-sl')?.value || 0.70),
-      trail_pct: parseFloat(document.getElementById('s-trail')?.value || 0.20),
-    })
+    body: JSON.stringify(payload)
   }).then(r => r.json()).catch(() => null);
   if (res && res.ok !== false) {
     _settingsDirty = false;
     document._settingsFocused = false;
+    applySettingsToForm(res.settings || payload, res.preset || payload.preset);
+    setSettingsSaveState('Saved to bot settings');
     showToast('\u2713 Settings saved', true);
     showConfirmModal(
-      'Mode Saved',
-      `Launch mode updated to ${String(res.preset || presetName)}.`,
+      'Settings Saved',
+      `Checkpoint path updated for ${String(res.preset || payload.preset)}.`,
       [
-        `Preset: ${String(res.preset || presetName)}`,
-        customMode ? 'Custom TP/SL/trail saved' : 'Preset exits restored',
+        `Preset: ${String(res.preset || payload.preset)}`,
+        `Saved ${res.saved_fields?.length || 0} fields`,
         `${res.replayed_candidates ?? 0} recent coins rechecked`,
       ]
     );
   } else {
+    setSettingsSaveState('Save failed', true);
     showToast('\u26a0 Save failed', false);
   }
   setTimeout(refresh, 800);
   return res;
+}
+function openSettingsTab() {
+  const btn = [...document.querySelectorAll('.tab-btn')].find(el => (el.textContent || '').trim() === 'Settings');
+  if (btn) switchTab('settings', btn);
 }
 
 async function loadAI() {
@@ -7217,15 +7604,16 @@ async function refresh() {
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
   }
-  if (d.settings && Object.keys(d.settings).length && !document._settingsFocused && !_settingsDirty) {
-    const s = d.settings;
-    const setVal = (id, v) => { const el = document.getElementById(id); if (el && document.activeElement !== el) el.value = v; };
-    setVal('s-tp1',      s.tp1_mult         ?? 2.0);
-    setVal('s-tp2',      s.tp2_mult         ?? 4.0);
-    setVal('s-sl',       s.stop_loss        ?? 0.70);
-    setVal('s-trail',    s.trail_pct        ?? 0.20);
-    setPresetChoice(d.preset || document.getElementById('s-preset')?.value || 'balanced');
-    _settingsDirty = false;
+  if (d.settings && Object.keys(d.settings).length) {
+    const savedSettings = { ...d.settings, preset: d.preset || 'balanced' };
+    if (!document._settingsFocused && !_settingsDirty) {
+      applySettingsToForm(savedSettings, savedSettings.preset);
+      _settingsDirty = false;
+      setSettingsSaveState('Loaded from saved state');
+    } else {
+      renderLaunchSummary(savedSettings);
+      renderSettingsSnapshot(savedSettings);
+    }
   }
 }
 
@@ -7807,9 +8195,11 @@ async function loadPnl(range) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 (function() {
-  selectPreset('{{PRESET}}' || 'balanced', false);
+  const initialPreset = PRESET_SETTINGS['{{PRESET}}'] ? '{{PRESET}}' : 'balanced';
   _settingsDirty = false;
   document._settingsFocused = false;
+  setSettingsSaveState('Loading saved settings…');
+  applySettingsToForm({ ...SETTINGS_DEFAULTS, ...(PRESET_SETTINGS[initialPreset] || {}), preset: initialPreset }, initialPreset);
   bindSettingsInputs();
 })();
 window.addEventListener('resize', () => {
