@@ -4219,23 +4219,56 @@ def _sniper_emit_token(mint, source_label="helius-ws"):
         return False
 
 
+def _sniper_process_signature(sig, source_label, seen_signatures):
+    if not sig or sig in seen_signatures:
+        return False
+    seen_signatures.add(sig)
+    try:
+        tx_result = rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}], timeout=8) or {}
+        meta = (tx_result.get("meta") if isinstance(tx_result, dict) else {}) or {}
+        post_bals = meta.get("postTokenBalances") or []
+        for pb in post_bals:
+            mint = pb.get("mint") or ""
+            _sniper_emit_token(mint, source_label=source_label)
+        return True
+    except Exception as e:
+        print(f"[Sniper] tx parse error for {sig[:8]}...: {e}", flush=True)
+        return False
+
+
+def _run_rpc_poll_sniper(tracked_programs, seen_signatures):
+    print("[Sniper] Using RPC polling fallback", flush=True)
+    while True:
+        try:
+            for program_id, label in tracked_programs:
+                result = rpc_call("getSignaturesForAddress", [program_id, {"limit": 8}], timeout=8) or []
+                if not isinstance(result, list):
+                    continue
+                for sig_info in reversed(result):
+                    sig = (sig_info or {}).get("signature") or ""
+                    _sniper_process_signature(sig, f"rpc-poll:{label}", seen_signatures)
+                time.sleep(0.35)
+            time.sleep(3)
+        except Exception as e:
+            print(f"[Sniper] RPC polling error: {e}", flush=True)
+            time.sleep(10)
+
+
 def helius_pool_sniper():
     """Listen for fresh Pump.fun and Raydium transactions and feed them into the main signal path."""
     import json as _json
     ws_url = HELIUS_RPC.replace("https://", "wss://").replace("http://", "ws://")
-    api_key = get_helius_api_key()
     tracked_programs = [
         (PUMP_FUN, "pumpfun"),
         (RAYDIUM_AMM, "raydium"),
     ]
-    plan_retry_delay = 15 * 60
+    seen_signatures = set()
 
     while True:
         try:
             import websocket as ws_lib
-            wss = f"wss://atlas-mainnet.helius-rpc.com?api-key={api_key}" if api_key else ws_url
-            seen_signatures = set()
-            error_state = {"plan_blocked": False, "reason": ""}
+            wss = ws_url
+            error_state = {"plan_blocked": False, "reason": "", "fallback": False}
 
             def on_open(ws):
                 for idx, (program_id, label) in enumerate(tracked_programs, start=1):
@@ -4256,23 +4289,15 @@ def helius_pool_sniper():
                     value = (((data or {}).get("params") or {}).get("result") or {}).get("value") or {}
                     logs = value.get("logs") or []
                     sig = value.get("signature") or ""
-                    if not sig or sig in seen_signatures:
-                        return
                     if not any(token in (line or "").lower() for line in logs for token in ("initialize", "create", "buy", "swap")):
                         return
-                    seen_signatures.add(sig)
-                    tx_result = rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}], timeout=8) or {}
-                    meta = (tx_result.get("meta") if isinstance(tx_result, dict) else {}) or {}
-                    post_bals = meta.get("postTokenBalances") or []
                     source_label = "helius-ws"
                     joined_logs = " ".join(str(line or "").lower() for line in logs)
                     if PUMP_FUN.lower() in joined_logs:
                         source_label = "helius-ws:pumpfun"
                     elif RAYDIUM_AMM.lower() in joined_logs:
                         source_label = "helius-ws:raydium"
-                    for pb in post_bals:
-                        mint = pb.get("mint") or ""
-                        _sniper_emit_token(mint, source_label=source_label)
+                    _sniper_process_signature(sig, source_label, seen_signatures)
                 except Exception as e:
                     print(f"[Sniper] message error: {e}", flush=True)
 
@@ -4286,8 +4311,9 @@ def helius_pool_sniper():
                     )
                 ):
                     error_state["plan_blocked"] = True
-                    error_state["reason"] = "Helius websocket sniper requires a business plan or above"
-                    print(f"[Sniper] Plan gate hit: {error_state['reason']}", flush=True)
+                    error_state["fallback"] = True
+                    error_state["reason"] = "websocket stream not available on current Helius plan"
+                    print(f"[Sniper] Plan gate hit: {error_state['reason']} — falling back to RPC polling", flush=True)
                     try:
                         ws.close()
                     except Exception:
@@ -4296,7 +4322,7 @@ def helius_pool_sniper():
                 print(f"[Sniper] WS error: {err}", flush=True)
 
             def on_close(ws, *a):
-                if error_state["plan_blocked"]:
+                if error_state["fallback"]:
                     return
                 print("[Sniper] WS closed — reconnecting...", flush=True)
 
@@ -4308,17 +4334,17 @@ def helius_pool_sniper():
                 on_close=on_close,
             )
             ws_app.run_forever(ping_interval=30, ping_timeout=10)
-            if error_state["plan_blocked"]:
-                print(f"[Sniper] retrying after plan backoff ({int(plan_retry_delay/60)}m)", flush=True)
-                time.sleep(plan_retry_delay)
-                api_key = get_helius_api_key()
-                continue
+            if error_state["fallback"]:
+                _run_rpc_poll_sniper(tracked_programs, seen_signatures)
+                return
         except ImportError:
-            print("[Sniper] websocket-client not installed — skipping WS sniper", flush=True)
-            break
+            print("[Sniper] websocket-client not installed — using RPC polling fallback", flush=True)
+            _run_rpc_poll_sniper(tracked_programs, seen_signatures)
+            return
         except Exception as e:
-            print(f"[Sniper] reconnecting in 10s: {e}", flush=True)
-            time.sleep(10)
+            print(f"[Sniper] websocket path failed ({e}) — using RPC polling fallback", flush=True)
+            _run_rpc_poll_sniper(tracked_programs, seen_signatures)
+            return
 
 def auto_restart_bots():
     """Restart bots that were running before a server restart."""
