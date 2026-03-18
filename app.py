@@ -351,7 +351,7 @@ def strip_auto_relax_state(settings):
 
 def central_trading_window():
     now = datetime.now(CENTRAL_TZ)
-    return now, 6 <= now.hour < 24
+    return now, True
 
 
 ADMIN_PRESET_FIELDS = {
