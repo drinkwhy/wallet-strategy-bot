@@ -453,6 +453,34 @@ def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
     return overrides
 
 
+def load_user_effective_settings(user_id):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT preset, custom_settings, max_correlated, drawdown_limit_sol FROM bot_settings WHERE user_id=%s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        db_return(conn)
+    preset_name = normalize_preset_name((row or {}).get("preset", "balanced"))
+    settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
+    if row:
+        if row.get("max_correlated") is not None:
+            settings["max_correlated"] = row["max_correlated"]
+        if row.get("drawdown_limit_sol") is not None:
+            settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
+        if row.get("custom_settings"):
+            try:
+                custom = json.loads(row["custom_settings"])
+                if isinstance(custom, dict):
+                    settings.update(custom)
+            except Exception:
+                pass
+    return preset_name, strip_auto_relax_state(settings)
+
+
 def replay_recent_market_feed(bot, limit=40):
     """Re-evaluate the latest unique scanner candidates with current bot settings."""
     if not bot:
@@ -4853,14 +4881,18 @@ def api_settings():
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
     overrides = build_bot_overrides(data)
-    base_settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
+    if preset == "custom":
+        _, base_settings = load_user_effective_settings(uid)
+        if not base_settings:
+            base_settings = dict(PRESETS["custom"])
+    else:
+        base_settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
     base_settings.update(overrides)
     persist_bot_settings(uid, preset, run_mode, duration, profit, base_settings)
     bot = user_bots.get(uid)
     replayed = 0
     if bot:
-        bot.settings.update(PRESETS.get(preset, bot.settings))
-        bot.settings.update(overrides)
+        bot.settings.update(base_settings)
         bot.preset_name       = preset
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
