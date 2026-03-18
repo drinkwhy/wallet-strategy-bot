@@ -2512,6 +2512,8 @@ class BotInstance:
         nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
         min_change = min(float(s.get("min_change_pct", 0) or 0), -15.0)
         max_hot_change = float(s.get("max_hot_change", 400.0))
+        momentum_auto_buy_enabled = bool(s.get("momentum_auto_buy_enabled", True))
+        momentum_auto_buy_threshold = max(0, min(100, int(s.get("momentum_auto_buy_threshold", 85) or 85)))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
@@ -2528,11 +2530,33 @@ class BotInstance:
                 {"name": "Price Change", "passed": min_change < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> {min_change:+.0f}% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
                 {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
+                {"name": "Momentum Auto-Buy", "passed": (not momentum_auto_buy_enabled) or _sinfo["momentum"] >= momentum_auto_buy_threshold, "value": f"{_sinfo['momentum']}/100", "threshold": "off" if not momentum_auto_buy_enabled else f"\u2265 {momentum_auto_buy_threshold} bypasses entry filters"},
             ],
             "ts": time.strftime("%H:%M:%S"), "timestamp": time.time(),
         }
         liq_text = "pumpfun bypass" if pumpfun_liq_bypass else (f"min {min_liq:,.0f}" if liq_filter_on else "filter off")
         print(f"[EVAL U{self.user_id}] {name} MC=${mc:,.0f}({min_mc:,}-{max_mc:,}) Liq=${liq:,.0f}({liq_text}) Age={age_min:.0f}m(max {max_age}) Chg={change:+.0f}% Vol=${vol:,.0f}(min {min_vol:,}) Score={score_total}(min {min_score})", flush=True)
+        if momentum_auto_buy_enabled and _sinfo["momentum"] >= momentum_auto_buy_threshold:
+            intel = ensure_token_intel(mint, base_info={
+                "mint": mint,
+                "name": name,
+                "price": price,
+                "mc": mc,
+                "vol": vol,
+                "liq": liq,
+                "age_min": age_min,
+                "change": change,
+                "score": score_total,
+                "momentum": _sinfo["momentum"],
+            }) or {}
+            sig_entry["intel"] = intel
+            sig_entry["passed"] = True
+            sig_entry["reason"] = f"Momentum auto-buy ({_sinfo['momentum']}/100 >= {momentum_auto_buy_threshold})"
+            self.log_signal_entry(sig_entry)
+            self.log_msg(f"\u26a1 MOMENTUM AUTO-BUY {name} | vel={_sinfo['momentum']} >= {momentum_auto_buy_threshold}")
+            self.log_filter(name, mint, True, sig_entry["reason"])
+            self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
+            return
         if not (min_mc <= mc <= max_mc):
             sig_entry["reason"] = f"MC ${mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}]"
             self.log_signal_entry(sig_entry)
