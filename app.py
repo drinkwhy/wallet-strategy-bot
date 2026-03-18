@@ -2198,7 +2198,7 @@ class BotInstance:
         min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
         late_entry_mult = float(s.get("late_entry_mult", 5.0))
         nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
-        max_hot_change = 200.0
+        max_hot_change = float(s.get("max_hot_change", 400.0))
         # Build signal explorer entry with detailed AI score
         _sinfo = {"vol": vol, "liq": liq, "mc": mc, "age_min": age_min, "change": change, "momentum": volume_velocity(mint, vol)}
         _sd = ai_score_detailed(_sinfo)
