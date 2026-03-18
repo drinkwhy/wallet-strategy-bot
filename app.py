@@ -1892,6 +1892,104 @@ class BotInstance:
             print(f"[ERROR] {_e}", flush=True)
             return True
 
+    def pre_buy_safety_check(self, mint, name="", dev_wallet=None, age_min=0, liq=0):
+        """Run token-specific blocking checks in one place and return a structured result."""
+        s = self.settings
+        checks = {}
+        timings_ms = {}
+        warnings = []
+        risk_score = 0
+
+        future_map = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            if dev_wallet:
+                future_map["blacklist"] = pool.submit(check_dev_blacklist, dev_wallet)
+            if s.get("anti_rug") and age_min >= 30:
+                future_map["authority"] = pool.submit(self.is_safe_token, mint)
+            elif s.get("anti_rug"):
+                checks["authority"] = None
+                warnings.append("authority check skipped for token under 30m")
+            if s.get("check_holders") and age_min >= 30:
+                future_map["holders"] = pool.submit(check_holder_concentration, mint)
+            elif s.get("check_holders"):
+                checks["holders"] = None
+                warnings.append("holder concentration check skipped for token under 30m")
+            else:
+                checks["holders"] = None
+            future_map["honeypot"] = pool.submit(self.check_honeypot, mint, age_min)
+
+            started_at = {key: time.perf_counter() for key in future_map}
+            for key, fut in future_map.items():
+                try:
+                    checks[key] = fut.result()
+                except Exception as e:
+                    checks[key] = None
+                    warnings.append(f"{key} check failed: {e}")
+                finally:
+                    timings_ms[key] = round((time.perf_counter() - started_at[key]) * 1000)
+
+        if checks.get("blacklist") is False:
+            return {
+                "safe": False,
+                "reason": f"Dev blacklisted ({dev_wallet[:8]}...)",
+                "warnings": warnings,
+                "risk_score": 100,
+                "timings_ms": timings_ms,
+                "checks": checks,
+            }
+        if checks.get("authority") is False:
+            return {
+                "safe": False,
+                "reason": "RUG RISK — mint/freeze auth active",
+                "warnings": warnings,
+                "risk_score": 85,
+                "timings_ms": timings_ms,
+                "checks": checks,
+            }
+        if checks.get("honeypot") is False:
+            return {
+                "safe": False,
+                "reason": "HONEYPOT — no sell route found via Jupiter",
+                "warnings": warnings,
+                "risk_score": 95,
+                "timings_ms": timings_ms,
+                "checks": checks,
+            }
+        if checks.get("holders") is False:
+            return {
+                "safe": False,
+                "reason": "Top 5 holders own >50% of supply",
+                "warnings": warnings,
+                "risk_score": 70,
+                "timings_ms": timings_ms,
+                "checks": checks,
+            }
+
+        if checks.get("blacklist") is None:
+            warnings.append("dev blacklist check unavailable")
+        if checks.get("authority") is None and s.get("anti_rug") and age_min >= 30:
+            warnings.append("authority check unavailable")
+        if checks.get("holders") is None and s.get("check_holders") and age_min >= 30:
+            warnings.append("holder concentration check unavailable")
+        if checks.get("honeypot") is None:
+            warnings.append("sell-route probe unavailable")
+
+        if not checks.get("honeypot", True):
+            risk_score += 40
+        if checks.get("authority") is False:
+            risk_score += 30
+        if checks.get("holders") is False:
+            risk_score += 20
+
+        return {
+            "safe": True,
+            "reason": "",
+            "warnings": warnings,
+            "risk_score": min(100, risk_score),
+            "timings_ms": timings_ms,
+            "checks": checks,
+        }
+
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
         s = self.settings
         trade_sol = round(float(s["max_buy_sol"]), 4)
@@ -1909,10 +2007,12 @@ class BotInstance:
             self.log_filter(name, mint, False, rl)
             self.log_msg(f"SKIP {name} — {rl}")
             return
-        # ── Honeypot simulation (skip for tokens < 20m — Jupiter not indexed yet) ─
-        if not self.check_honeypot(mint, age_min=age_min):
-            self.log_filter(name, mint, False, "HONEYPOT — no sell route found via Jupiter")
-            self.log_msg(f"SKIP {name} — HONEYPOT detected")
+        # ── Consolidated token safety path ───────────────────────────────────
+        safety = self.pre_buy_safety_check(mint, name=name, dev_wallet=dev_wallet, age_min=age_min, liq=liq)
+        if not safety.get("safe"):
+            reason = safety.get("reason") or "Pre-buy safety check failed"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
             return
         # Drawdown limit
         if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
@@ -1933,22 +2033,6 @@ class BotInstance:
             return
         if mint in self.positions:
             self.log_msg(f"SKIP {name} — already in position")
-            return
-        # Anti-rug / mint auth check (skip for brand-new tokens — bonding curve has non-null mint auth by design)
-        if s.get("anti_rug") and age_min >= 30 and not self.is_safe_token(mint):
-            self.log_filter(name, mint, False, "RUG RISK — mint/freeze auth active")
-            self.log_msg(f"SKIP {name} — RUG RISK (mint/freeze auth)")
-            return
-        # Dev blacklist
-        if dev_wallet and not check_dev_blacklist(dev_wallet):
-            reason = f"Dev blacklisted ({dev_wallet[:8]}...)"
-            self.log_filter(name, mint, False, reason)
-            self.log_msg(f"SKIP {name} — {reason}")
-            return
-        # Holder concentration (skip for very new tokens — pump.fun always starts concentrated)
-        if s.get("check_holders") and age_min >= 30 and not check_holder_concentration(mint):
-            self.log_filter(name, mint, False, "Top 5 holders own >50% of supply")
-            self.log_msg(f"SKIP {name} — holder concentration too high")
             return
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
