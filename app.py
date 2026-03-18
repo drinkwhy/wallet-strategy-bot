@@ -4232,12 +4232,14 @@ def helius_pool_sniper():
         (PUMP_FUN, "pumpfun"),
         (RAYDIUM_AMM, "raydium"),
     ]
+    disabled_reason = ""
 
-    while True:
+    while not disabled_reason:
         try:
             import websocket as ws_lib
             wss = f"wss://atlas-mainnet.helius-rpc.com/?api-key={api_key}" if api_key else ws_url
             seen_signatures = set()
+            error_state = {"disabled": False, "reason": ""}
 
             def on_open(ws):
                 for idx, (program_id, label) in enumerate(tracked_programs, start=1):
@@ -4279,9 +4281,27 @@ def helius_pool_sniper():
                     print(f"[Sniper] message error: {e}", flush=True)
 
             def on_error(ws, err):
+                err_text = str(err or "")
+                if (
+                    "403 Forbidden" in err_text and (
+                        "only available for business plans" in err_text.lower() or
+                        "code': -32403" in err_text or
+                        '"code":-32403' in err_text.replace(" ", "")
+                    )
+                ):
+                    error_state["disabled"] = True
+                    error_state["reason"] = "Helius websocket sniper requires a business plan or above"
+                    print(f"[Sniper] Disabled: {error_state['reason']}", flush=True)
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
                 print(f"[Sniper] WS error: {err}", flush=True)
 
             def on_close(ws, *a):
+                if error_state["disabled"]:
+                    return
                 print("[Sniper] WS closed — reconnecting...", flush=True)
 
             ws_app = ws_lib.WebSocketApp(
@@ -4292,12 +4312,19 @@ def helius_pool_sniper():
                 on_close=on_close,
             )
             ws_app.run_forever(ping_interval=30, ping_timeout=10)
+            if error_state["disabled"]:
+                disabled_reason = error_state["reason"] or "Helius websocket sniper disabled"
+                break
         except ImportError:
             print("[Sniper] websocket-client not installed — skipping WS sniper", flush=True)
             break
         except Exception as e:
+            if disabled_reason:
+                break
             print(f"[Sniper] reconnecting in 10s: {e}", flush=True)
             time.sleep(10)
+    if disabled_reason:
+        print(f"[Sniper] stopped: {disabled_reason}", flush=True)
 
 def auto_restart_bots():
     """Restart bots that were running before a server restart."""
