@@ -29,6 +29,7 @@ import bcrypt
 import stripe
 
 from dotenv import load_dotenv
+from backtest_engine import simulate_backtest
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_feature_snapshot,
@@ -837,6 +838,46 @@ def init_db():
             feature_json TEXT,
             decision_json TEXT
         )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            id SERIAL PRIMARY KEY,
+            requested_by INTEGER,
+            name TEXT,
+            status TEXT DEFAULT 'queued',
+            days INTEGER DEFAULT 7,
+            strategy_filter TEXT,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            snapshots_processed INTEGER DEFAULT 0,
+            tokens_processed INTEGER DEFAULT 0,
+            trades_closed INTEGER DEFAULT 0,
+            summary_json TEXT,
+            config_json TEXT,
+            error_text TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_trades (
+            id SERIAL PRIMARY KEY,
+            run_id INTEGER NOT NULL,
+            strategy_name TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            name TEXT,
+            opened_at TIMESTAMP,
+            closed_at TIMESTAMP,
+            entry_price REAL,
+            exit_price REAL,
+            status TEXT,
+            score REAL,
+            confidence REAL,
+            max_upside_pct REAL,
+            max_drawdown_pct REAL,
+            realized_pnl_pct REAL,
+            exit_reason TEXT,
+            feature_json TEXT,
+            decision_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
         conn.commit()
         # indexes on columns added by migrate_db — safe to skip if column not yet present
         for _idx_sql in [
@@ -858,6 +899,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_positions_mint_status ON shadow_positions (mint, status, opened_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_backtest_runs_created_at ON backtest_runs (created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_backtest_runs_status ON backtest_runs (status, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id ON backtest_trades (run_id, strategy_name)",
         ]:
             try:
                 cur.execute(_idx_sql)
@@ -1112,6 +1156,42 @@ def migrate_db():
                 last_seen_at TIMESTAMP DEFAULT NOW(),
                 feature_json TEXT,
                 decision_json TEXT)""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS backtest_runs (
+                id SERIAL PRIMARY KEY,
+                requested_by INTEGER,
+                name TEXT,
+                status TEXT DEFAULT 'queued',
+                days INTEGER DEFAULT 7,
+                strategy_filter TEXT,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                snapshots_processed INTEGER DEFAULT 0,
+                tokens_processed INTEGER DEFAULT 0,
+                trades_closed INTEGER DEFAULT 0,
+                summary_json TEXT,
+                config_json TEXT,
+                error_text TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS backtest_trades (
+                id SERIAL PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                strategy_name TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                name TEXT,
+                opened_at TIMESTAMP,
+                closed_at TIMESTAMP,
+                entry_price REAL,
+                exit_price REAL,
+                status TEXT,
+                score REAL,
+                confidence REAL,
+                max_upside_pct REAL,
+                max_drawdown_pct REAL,
+                realized_pnl_pct REAL,
+                exit_reason TEXT,
+                feature_json TEXT,
+                decision_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
@@ -1123,6 +1203,9 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_mint_status ON shadow_positions (mint, status, opened_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_created_at ON backtest_runs (created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_status ON backtest_runs (status, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id ON backtest_trades (run_id, strategy_name)")
         except Exception:
             conn.rollback()
         conn.commit()
@@ -1262,6 +1345,8 @@ seen_tokens_lock = threading.Lock()
 market_feed  = deque(maxlen=100)   # live token stream for market board
 shadow_market_queue = deque(maxlen=400)
 shadow_market_lock = threading.Lock()
+_backtest_jobs = {}
+_backtest_jobs_lock = threading.Lock()
 BACKGROUND_WORKER_LOCK_ID = 48270431
 _background_workers_started = False
 _background_workers_lock = threading.Lock()
@@ -4550,6 +4635,152 @@ def shadow_position_monitor():
         time.sleep(45)
 
 
+def _load_backtest_snapshots(days=7, strategies=None, limit=50000):
+    cutoff = max(1, int(days))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT s.mint,
+                   COALESCE(mt.name, 'Unknown') AS name,
+                   s.source,
+                   s.price,
+                   s.feature_json,
+                   s.created_at
+            FROM token_feature_snapshots s
+            LEFT JOIN market_tokens mt ON mt.mint = s.mint
+            WHERE s.created_at >= NOW() - INTERVAL %s
+            ORDER BY s.created_at ASC
+            LIMIT %s
+        """, (f"{cutoff} days", limit))
+        return cur.fetchall()
+    finally:
+        db_return(conn)
+
+
+def _set_backtest_job(run_id, payload):
+    with _backtest_jobs_lock:
+        _backtest_jobs[run_id] = payload
+
+
+def _execute_backtest_run(run_id, requested_by, days, strategy_names, name):
+    _set_backtest_job(run_id, {"status": "running", "started_at": time.time()})
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE backtest_runs
+            SET status='running', started_at=NOW()
+            WHERE id=%s
+        """, (run_id,))
+        conn.commit()
+    finally:
+        db_return(conn)
+
+    try:
+        strategies = {
+            strategy_name: dict(PRESETS.get(strategy_name, PRESETS["balanced"]))
+            for strategy_name in (strategy_names or CANONICAL_STRATEGIES)
+            if strategy_name in PRESETS
+        }
+        rows = _load_backtest_snapshots(days=days, strategies=strategies)
+        result = simulate_backtest(run_id, rows, strategies)
+        trades = result["trades"]
+        summary = result["summary"]
+
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM backtest_trades WHERE run_id=%s", (run_id,))
+            if trades:
+                psycopg2.extras.execute_batch(cur, """
+                    INSERT INTO backtest_trades (
+                        run_id, strategy_name, mint, name, opened_at, closed_at,
+                        entry_price, exit_price, status, score, confidence,
+                        max_upside_pct, max_drawdown_pct, realized_pnl_pct,
+                        exit_reason, feature_json, decision_json
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, [trade.as_insert_tuple() for trade in trades], page_size=200)
+            cur.execute("""
+                UPDATE backtest_runs
+                SET status='completed',
+                    completed_at=NOW(),
+                    snapshots_processed=%s,
+                    tokens_processed=%s,
+                    trades_closed=%s,
+                    summary_json=%s,
+                    error_text=NULL
+                WHERE id=%s
+            """, (
+                summary.get("snapshots_processed", 0),
+                summary.get("tokens_processed", 0),
+                summary.get("trades_closed", 0),
+                json.dumps(summary),
+                run_id,
+            ))
+            conn.commit()
+        finally:
+            db_return(conn)
+        _set_backtest_job(run_id, {
+            "status": "completed",
+            "completed_at": time.time(),
+            "summary": summary,
+            "requested_by": requested_by,
+            "name": name,
+        })
+    except Exception as e:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE backtest_runs
+                SET status='failed', completed_at=NOW(), error_text=%s
+                WHERE id=%s
+            """, (str(e), run_id))
+            conn.commit()
+        finally:
+            db_return(conn)
+        _set_backtest_job(run_id, {"status": "failed", "error": str(e), "completed_at": time.time()})
+        print(f"[BACKTEST] run {run_id} failed: {e}", flush=True)
+
+
+def launch_backtest_run(requested_by, days=7, strategy_names=None, name=""):
+    strategy_names = [s for s in (strategy_names or list(CANONICAL_STRATEGIES)) if s in PRESETS]
+    if not strategy_names:
+        strategy_names = ["balanced"]
+    config = {
+        "days": max(1, int(days)),
+        "strategy_names": strategy_names,
+        "name": (name or f"{max(1, int(days))}d replay").strip()[:80],
+    }
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO backtest_runs (requested_by, name, status, days, strategy_filter, config_json)
+            VALUES (%s,%s,'queued',%s,%s,%s)
+            RETURNING id
+        """, (
+            requested_by,
+            config["name"],
+            config["days"],
+            ",".join(strategy_names),
+            json.dumps(config),
+        ))
+        run_id = int((cur.fetchone() or {}).get("id"))
+        conn.commit()
+    finally:
+        db_return(conn)
+
+    _set_backtest_job(run_id, {"status": "queued", "created_at": time.time(), **config})
+    threading.Thread(
+        target=_execute_backtest_run,
+        args=(run_id, requested_by, config["days"], strategy_names, config["name"]),
+        daemon=True,
+    ).start()
+    return run_id, config
+
+
 def _broadcast_signal(info):
     """Push info to market_feed and evaluate against all running bots."""
     info.setdefault("source", "scanner")
@@ -6243,6 +6474,148 @@ def api_quant_shadow_decisions():
     return jsonify(decisions)
 
 
+@app.route("/api/quant/backtests", methods=["GET", "POST"])
+@login_required
+def api_quant_backtests():
+    uid = session["user_id"]
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        days = int(data.get("days") or 7)
+        strategies = data.get("strategies") or list(CANONICAL_STRATEGIES)
+        if not isinstance(strategies, list):
+            strategies = [str(strategies)]
+        run_id, config = launch_backtest_run(
+            requested_by=uid,
+            days=days,
+            strategy_names=[str(s).strip().lower() for s in strategies],
+            name=(data.get("name") or "").strip(),
+        )
+        return jsonify({"ok": True, "run_id": run_id, "config": config})
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, requested_by, name, status, days, strategy_filter, started_at, completed_at,
+                   snapshots_processed, tokens_processed, trades_closed, summary_json, config_json,
+                   error_text, created_at
+            FROM backtest_runs
+            WHERE requested_by=%s
+            ORDER BY created_at DESC
+            LIMIT 30
+        """, (uid,))
+        rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    runs = []
+    for row in rows:
+        try:
+            summary = json.loads(row.get("summary_json") or "{}")
+        except Exception:
+            summary = {}
+        try:
+            config = json.loads(row.get("config_json") or "{}")
+        except Exception:
+            config = {}
+        runs.append({
+            "id": int(row.get("id") or 0),
+            "requested_by": row.get("requested_by"),
+            "name": row.get("name"),
+            "status": row.get("status"),
+            "days": int(row.get("days") or 0),
+            "strategy_filter": row.get("strategy_filter"),
+            "started_at": row.get("started_at").isoformat() if row.get("started_at") else None,
+            "completed_at": row.get("completed_at").isoformat() if row.get("completed_at") else None,
+            "snapshots_processed": int(row.get("snapshots_processed") or 0),
+            "tokens_processed": int(row.get("tokens_processed") or 0),
+            "trades_closed": int(row.get("trades_closed") or 0),
+            "summary": summary,
+            "config": config,
+            "error_text": row.get("error_text"),
+            "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        })
+    return jsonify(runs)
+
+
+@app.route("/api/quant/backtests/<int:run_id>")
+@login_required
+def api_quant_backtest_detail(run_id):
+    uid = session["user_id"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, requested_by, name, status, days, strategy_filter, started_at, completed_at,
+                   snapshots_processed, tokens_processed, trades_closed, summary_json, config_json,
+                   error_text, created_at
+            FROM backtest_runs
+            WHERE id=%s AND requested_by=%s
+            LIMIT 1
+        """, (run_id, uid))
+        run_row = cur.fetchone()
+        cur.execute("""
+            SELECT strategy_name, mint, name, opened_at, closed_at, entry_price, exit_price,
+                   status, score, confidence, max_upside_pct, max_drawdown_pct,
+                   realized_pnl_pct, exit_reason
+            FROM backtest_trades
+            WHERE run_id=%s
+            ORDER BY realized_pnl_pct DESC, closed_at DESC
+            LIMIT 200
+        """, (run_id,))
+        trade_rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    if not run_row:
+        return jsonify({"ok": False, "msg": "Backtest run not found"}), 404
+
+    try:
+        summary = json.loads(run_row.get("summary_json") or "{}")
+    except Exception:
+        summary = {}
+    try:
+        config = json.loads(run_row.get("config_json") or "{}")
+    except Exception:
+        config = {}
+
+    return jsonify({
+        "run": {
+            "id": int(run_row.get("id") or 0),
+            "requested_by": run_row.get("requested_by"),
+            "name": run_row.get("name"),
+            "status": run_row.get("status"),
+            "days": int(run_row.get("days") or 0),
+            "strategy_filter": run_row.get("strategy_filter"),
+            "started_at": run_row.get("started_at").isoformat() if run_row.get("started_at") else None,
+            "completed_at": run_row.get("completed_at").isoformat() if run_row.get("completed_at") else None,
+            "snapshots_processed": int(run_row.get("snapshots_processed") or 0),
+            "tokens_processed": int(run_row.get("tokens_processed") or 0),
+            "trades_closed": int(run_row.get("trades_closed") or 0),
+            "summary": summary,
+            "config": config,
+            "error_text": run_row.get("error_text"),
+            "created_at": run_row.get("created_at").isoformat() if run_row.get("created_at") else None,
+        },
+        "trades": [{
+            "strategy_name": row.get("strategy_name"),
+            "mint": row.get("mint"),
+            "name": row.get("name"),
+            "opened_at": row.get("opened_at").isoformat() if row.get("opened_at") else None,
+            "closed_at": row.get("closed_at").isoformat() if row.get("closed_at") else None,
+            "entry_price": float(row.get("entry_price") or 0),
+            "exit_price": float(row.get("exit_price") or 0),
+            "status": row.get("status"),
+            "score": float(row.get("score") or 0),
+            "confidence": float(row.get("confidence") or 0),
+            "max_upside_pct": float(row.get("max_upside_pct") or 0),
+            "max_drawdown_pct": float(row.get("max_drawdown_pct") or 0),
+            "realized_pnl_pct": float(row.get("realized_pnl_pct") or 0),
+            "exit_reason": row.get("exit_reason"),
+        } for row in trade_rows],
+    })
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENHANCED TRADING SYSTEM API ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7894,6 +8267,7 @@ DASHBOARD_HTML = _CSS + """
     <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
     <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
     <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
+    <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Replay runs and strategy research</span></button>
   </div>
 
   <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
@@ -8415,6 +8789,87 @@ DASHBOARD_HTML = _CSS + """
     </div>
   </div>
 
+  <!-- ═══════════════════════ QUANT TAB ═══════════════════════ -->
+  <div id="tab-quant" class="tab-pane">
+    <div class="tab-pane-header">
+      <div>
+        <div class="tab-kicker">Research Loop</div>
+        <div class="tab-pane-title">Replay Lab</div>
+        <div class="tab-pane-copy">Run historical replays over captured feature snapshots, compare strategy behavior, and inspect simulated trades without touching live capital.</div>
+      </div>
+      <div class="shortcut-row">
+        <span class="badge bg-muted">Backtests run asynchronously</span>
+      </div>
+    </div>
+
+    <div class="scanner-top-grid">
+      <div class="glass">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Quant Dataset</div>
+            <div class="panel-copy">This is the institutional data layer under the live bot: captured tokens, market ticks, feature snapshots, and simulated positions.</div>
+          </div>
+          <div class="panel-actions">
+            <button class="btn btn-ghost" type="button" onclick="pollQuant()">Refresh Quant</button>
+          </div>
+        </div>
+        <div class="control-action-grid" id="quant-overview-grid">
+          <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">Loading dataset</div></div>
+        </div>
+      </div>
+
+      <div class="glass">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Launch Backtest</div>
+            <div class="panel-copy">Replay the saved feature stream across the canonical strategy set and store run-by-run trade outcomes.</div>
+          </div>
+        </div>
+        <div class="field-row" style="margin-bottom:12px">
+          <div class="fgroup">
+            <label class="flabel">Window</label>
+            <select class="finput" id="quant-days">
+              <option value="1">Last 1 day</option>
+              <option value="3">Last 3 days</option>
+              <option value="7" selected>Last 7 days</option>
+              <option value="14">Last 14 days</option>
+            </select>
+          </div>
+          <div class="fgroup">
+            <label class="flabel">Label</label>
+            <input class="finput" id="quant-run-name" type="text" placeholder="e.g. Weekly replay">
+          </div>
+        </div>
+        <div class="helper-note">Strategies replayed: safe, balanced, aggressive, degen. This uses your captured market snapshots, not guessed candles.</div>
+        <div class="panel-actions" style="margin-top:14px">
+          <button class="btn btn-primary" type="button" onclick="runQuantBacktest()">Run Backtest</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="signals-layout">
+      <div style="min-width:0">
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b1)">
+            <div>
+              <div style="font-weight:700;font-size:13px;color:var(--t1)">Backtest Runs</div>
+              <div style="font-size:11px;color:var(--t3)">Recent replay runs with tokens processed, snapshots used, and closed simulated trades.</div>
+            </div>
+            <div id="quant-run-count" style="font-size:11px;color:var(--t3)">0 runs</div>
+          </div>
+          <div id="quant-runs" style="padding:14px">
+            <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">No backtest runs yet.</div>
+          </div>
+        </div>
+      </div>
+      <div class="signals-side">
+        <div class="glass" id="quant-run-detail">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Select a replay run to inspect strategy summaries and top simulated trades.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <!-- Toast -->
@@ -8464,6 +8919,7 @@ let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
+let _quantOverview = null, _quantRuns = [], _quantSelectedRunId = null;
 let _tabPollers = {};
 let _settingsDirty = false;
 let _enhancedData = null;
@@ -8492,6 +8948,7 @@ function switchTab(tab, btn) {
     const activeRange = document.querySelector('[data-range].sort-pill.active')?.dataset.range || '1';
     loadPnl(activeRange);
   }
+  if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
 }
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
@@ -8670,6 +9127,7 @@ async function refreshNow() {
     const activeRange = document.querySelector('[data-range].sort-pill.active')?.dataset.range || '7';
     await loadPnl(activeRange);
   }
+  if (_activeTab === 'quant') await pollQuant();
   await pollEnhancedDashboard();
   showToast('Dashboard refreshed');
 }
@@ -8688,7 +9146,7 @@ function registerKeyboardShortcuts() {
       if (event.key === 'Escape') document.activeElement?.blur?.();
       return;
     }
-    const tabMap = { '1': 'scanner', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl' };
+    const tabMap = { '1': 'scanner', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl', '7': 'quant' };
     if (tabMap[event.key]) {
       event.preventDefault();
       activateTab(tabMap[event.key]);
@@ -10010,6 +10468,145 @@ async function loadPnl(range) {
       });
     }
   } catch(e) {}
+}
+
+// ══════════════════════════ QUANT REPLAY LAB ══════════════════════════
+async function pollQuant() {
+  try {
+    const [overview, runs] = await Promise.all([
+      fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
+      fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
+    ]);
+    if (overview) _quantOverview = overview;
+    _quantRuns = Array.isArray(runs) ? runs : [];
+    renderQuantOverview();
+    renderQuantRuns();
+    if (_quantSelectedRunId) {
+      await showQuantRunDetail(_quantSelectedRunId, true);
+    }
+  } catch (e) {}
+}
+
+function renderQuantOverview() {
+  const grid = document.getElementById('quant-overview-grid');
+  if (!grid || !_quantOverview) return;
+  const dataset = _quantOverview.dataset || {};
+  const strategies = _quantOverview.strategy_summaries || [];
+  const best = strategies[0] || {};
+  grid.innerHTML = `
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">${dataset.tracked_tokens || 0}</div><div class="scanner-summary-copy">Observed in persistent market storage</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Market Events</div><div class="scanner-summary-value">${dataset.market_events || 0}</div><div class="scanner-summary-copy">Append-only event log</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Feature Snapshots</div><div class="scanner-summary-value">${dataset.feature_snapshots || 0}</div><div class="scanner-summary-copy">Replay-ready scoring inputs</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Shadow Decisions</div><div class="scanner-summary-value">${dataset.shadow_decisions || 0}</div><div class="scanner-summary-copy">Would-buy versus blocked decisions</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Open Shadow Positions</div><div class="scanner-summary-value">${dataset.open_shadow_positions || 0}</div><div class="scanner-summary-copy">Currently simulated live book</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Best Replay Avg</div><div class="scanner-summary-value">${best.strategy_name ? best.strategy_name + ' ' + (best.avg_pnl_pct > 0 ? '+' : '') + best.avg_pnl_pct + '%' : '—'}</div><div class="scanner-summary-copy">Current top strategy from completed replays</div></div>
+  `;
+}
+
+function renderQuantRuns() {
+  const box = document.getElementById('quant-runs');
+  if (!box) return;
+  document.getElementById('quant-run-count').textContent = `${_quantRuns.length} runs`;
+  if (!_quantRuns.length) {
+    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">No backtest runs yet.</div>';
+    return;
+  }
+  box.innerHTML = _quantRuns.map(run => {
+    const active = _quantSelectedRunId === run.id;
+    const strategies = Object.keys((run.summary || {}).strategies || {});
+    return `
+      <div onclick="showQuantRunDetail(${run.id})" style="padding:12px 14px;border:1px solid ${active ? 'rgba(96,165,250,.32)' : 'rgba(255,255,255,.06)'};border-radius:14px;background:${active ? 'rgba(47,107,255,.08)' : 'rgba(255,255,255,.02)'};margin-bottom:10px;cursor:pointer">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div style="font-size:13px;font-weight:800;color:var(--t1)">${run.name || ('Run #' + run.id)}</div>
+            <div style="font-size:10px;color:var(--t3);margin-top:3px">${run.days}d · ${run.strategy_filter || 'all strategies'} · ${run.created_at ? new Date(run.created_at).toLocaleString() : 'queued'}</div>
+          </div>
+          <span class="badge ${run.status === 'completed' ? 'bg-grn' : run.status === 'failed' ? 'bg-red' : 'bg-gold'}">${run.status}</span>
+        </div>
+        <div class="shortcut-row" style="margin-top:10px">
+          <span class="badge bg-muted">${run.tokens_processed || 0} tokens</span>
+          <span class="badge bg-muted">${run.snapshots_processed || 0} snapshots</span>
+          <span class="badge bg-muted">${run.trades_closed || 0} trades</span>
+          <span class="badge bg-muted">${strategies.length} strategies</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function runQuantBacktest() {
+  const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
+  const name = (document.getElementById('quant-run-name')?.value || '').trim();
+  const res = await fetch('/api/quant/backtests', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      days,
+      name,
+      strategies: ['safe', 'balanced', 'aggressive', 'degen'],
+    }),
+  }).then(r => r.json()).catch(() => null);
+  if (!res || !res.ok) {
+    showToast('Backtest launch failed', false);
+    return;
+  }
+  _quantSelectedRunId = res.run_id;
+  showToast(`Backtest queued (#${res.run_id})`);
+  pollQuant();
+}
+
+async function showQuantRunDetail(runId, silent=false) {
+  _quantSelectedRunId = runId;
+  renderQuantRuns();
+  const box = document.getElementById('quant-run-detail');
+  if (!box) return;
+  if (!silent) {
+    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Loading replay detail…</div>';
+  }
+  const data = await fetch('/api/quant/backtests/' + runId).then(r => r.json()).catch(() => null);
+  if (!data || !data.run) {
+    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Replay detail unavailable.</div>';
+    return;
+  }
+  const run = data.run;
+  const strategies = run.summary?.strategies || {};
+  const topTrades = (data.trades || []).slice(0, 10);
+  box.innerHTML = `
+    <div class="sec-label">Replay Detail</div>
+    <div style="font-size:17px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif;margin-bottom:6px">${run.name || ('Run #' + run.id)}</div>
+    <div style="font-size:11px;color:var(--t2);line-height:1.6;margin-bottom:12px">${run.status} · ${run.days}d window · ${run.tokens_processed || 0} tokens · ${run.snapshots_processed || 0} snapshots · ${run.trades_closed || 0} closed trades</div>
+    <div class="operator-rule-list" style="margin-bottom:12px">
+      ${Object.entries(strategies).map(([name, summary]) => `
+        <div class="operator-rule">
+          <div>
+            <div class="operator-rule-label">${name}</div>
+            <div style="font-size:10px;color:var(--t3);margin-top:3px">${summary.closed_trades || 0} trades · ${summary.win_rate || 0}% win rate</div>
+          </div>
+          <div class="operator-rule-value">${(summary.avg_pnl_pct || 0) > 0 ? '+' : ''}${summary.avg_pnl_pct || 0}% avg</div>
+        </div>
+      `).join('') || '<div style="font-size:11px;color:var(--t3)">No strategy summary available yet.</div>'}
+    </div>
+    <div class="sec-label">Top Simulated Trades</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${topTrades.map(trade => `
+        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div>
+              <div style="font-size:12px;font-weight:800;color:var(--t1)">${trade.name || trade.mint}</div>
+              <div style="font-size:10px;color:var(--t3);margin-top:3px">${trade.strategy_name} · ${trade.exit_reason || trade.status}</div>
+            </div>
+            <div style="font-size:12px;font-weight:800;color:${trade.realized_pnl_pct >= 0 ? 'var(--grn)' : 'var(--red2)'}">${trade.realized_pnl_pct >= 0 ? '+' : ''}${trade.realized_pnl_pct.toFixed(2)}%</div>
+          </div>
+          <div class="shortcut-row" style="margin-top:8px">
+            <span class="badge bg-muted">Score ${trade.score.toFixed(1)}</span>
+            <span class="badge bg-muted">Conf ${(trade.confidence * 100).toFixed(0)}%</span>
+            <span class="badge bg-muted">Up ${trade.max_upside_pct.toFixed(1)}%</span>
+            <span class="badge bg-muted">DD ${trade.max_drawdown_pct.toFixed(1)}%</span>
+          </div>
+        </div>
+      `).join('') || '<div style="font-size:11px;color:var(--t3)">No trades recorded yet.</div>'}
+    </div>
+  `;
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────

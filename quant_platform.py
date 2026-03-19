@@ -180,11 +180,11 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         blocker_reasons.append("holder_growth_below_threshold")
     if _safe_float(settings.get("min_volume_spike_mult", 0)) > 0 and snapshot["volume_spike_ratio"] < _safe_float(settings.get("min_volume_spike_mult", 0)):
         blocker_reasons.append("volume_spike_below_threshold")
-    if settings.get("anti_rug") and snapshot["can_exit"] is False:
+    if settings.get("anti_rug") and snapshot.get("can_exit") is False:
         blocker_reasons.append("cannot_exit")
-    if settings.get("anti_rug") and snapshot["transfer_hook_enabled"]:
+    if settings.get("anti_rug") and snapshot.get("transfer_hook_enabled"):
         blocker_reasons.append("transfer_hook_enabled")
-    if snapshot["threat_risk_score"] >= 70:
+    if _safe_int(snapshot.get("threat_risk_score")) >= 70:
         blocker_reasons.append("threat_risk_too_high")
 
     if snapshot["liq"] >= _safe_float(settings.get("min_liq", 0)):
@@ -201,7 +201,7 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         pass_reasons.append("holder_growth_ok")
     if snapshot["volume_spike_ratio"] >= _safe_float(settings.get("min_volume_spike_mult", 0)):
         pass_reasons.append("volume_spike_ok")
-    if snapshot["threat_risk_score"] < 45:
+    if _safe_int(snapshot.get("threat_risk_score")) < 45:
         pass_reasons.append("threat_risk_ok")
 
     score = snapshot["composite_score"]
