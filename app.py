@@ -11541,7 +11541,7 @@ function showSignalDetail(idx, fromRender=false) {
       ${tags.map(tag => `<span class="badge bg-blue">${tag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No narrative tags yet</span>'}
     </div>
     <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
-      ${links.slice(0,4).map(link => `<a class="badge bg-muted" href="${link}" target="_blank" rel="noreferrer">${link.replace(/^https?:\\/\\//,'').slice(0,28)}</a>`).join('') || '<span style="font-size:11px;color:var(--t3)">No socials found</span>'}
+      ${links.slice(0,4).map(link => `<a class="badge bg-muted" href="${link}" target="_blank" rel="noreferrer">${String(link || '').replace('https://','').replace('http://','').slice(0,28)}</a>`).join('') || '<span style="font-size:11px;color:var(--t3)">No socials found</span>'}
     </div>
     <div class="sec-label">AI Score Breakdown (${sc.total||0}/100)</div>
     <canvas id="sig-radar" height="200" style="margin-bottom:14px"></canvas>
@@ -12158,7 +12158,7 @@ function renderQuantComparison() {
     <div class="panel-head" style="margin-bottom:12px">
       <div>
         <div class="panel-title">Rules vs Models</div>
-        <div class="panel-copy">Compares the same captured entry snapshots under `balanced` rules, the global model, and the regime-auto model using identical exit assumptions.</div>
+        <div class="panel-copy">Compares the same captured entry snapshots under the balanced rule set, the global model, and the regime-auto model using identical exit assumptions.</div>
       </div>
       <span class="badge bg-muted">${_quantComparison.window_days || 7}d · threshold ${_quantComparison.model_threshold || 60}</span>
     </div>
