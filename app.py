@@ -30,7 +30,7 @@ import stripe
 
 from dotenv import load_dotenv
 from backtest_engine import simulate_backtest, simulate_event_tape_backtest
-from learning_engine import score_recent_candidates, train_feature_model
+from learning_engine import score_recent_candidates_for_regime, train_regime_model_family
 from optimizer_engine import build_outcome_labels, summarize_feature_edges, sweep_entry_filters
 from quant_platform import (
     CANONICAL_STRATEGIES,
@@ -6930,6 +6930,7 @@ def api_quant_optimizer():
 @login_required
 def api_quant_model():
     days = max(1, min(int(request.args.get("days") or 7), 30))
+    mode = (request.args.get("mode") or "auto").strip().lower()
     conn = db()
     try:
         cur = conn.cursor()
@@ -6963,6 +6964,15 @@ def api_quant_model():
         """, (f"{days} days",))
         token_rows = cur.fetchall()
         cur.execute("""
+            SELECT mint, buy_sell_ratio, net_flow_sol, threat_risk_score,
+                   liquidity_drop_pct, can_exit, flow_json, created_at
+            FROM token_flow_snapshots
+            WHERE created_at >= NOW() - INTERVAL %s
+            ORDER BY created_at ASC
+            LIMIT 12000
+        """, (f"{days} days",))
+        flow_rows = cur.fetchall()
+        cur.execute("""
             SELECT DISTINCT ON (s.mint)
                    s.mint,
                    COALESCE(mt.name, 'Unknown') AS name,
@@ -6977,16 +6987,35 @@ def api_quant_model():
             LIMIT 1000
         """)
         recent_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint, buy_sell_ratio, net_flow_sol, smart_wallet_buys, unique_buyer_count,
+                   threat_risk_score, can_exit, liquidity_drop_pct, created_at
+            FROM token_flow_snapshots
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        recent_flow_rows = cur.fetchall()
     finally:
         db_return(conn)
 
     outcomes = build_outcome_labels(token_rows)
-    model = train_feature_model(entry_rows, outcomes)
-    ranked = score_recent_candidates(recent_rows, model)
+    model_family = train_regime_model_family(entry_rows, outcomes, flow_rows)
+    regime_context = summarize_flow_regime(recent_flow_rows)
+    active_regime = regime_context.get("regime") or "neutral"
+    scored = score_recent_candidates_for_regime(
+        recent_rows,
+        model_family,
+        active_regime=active_regime,
+        mode=mode,
+        top_n=8,
+    )
     return jsonify({
         "window_days": days,
-        "model": model,
-        "ranked_candidates": ranked,
+        "mode": mode,
+        "regime_context": regime_context,
+        "model_family": model_family,
+        "selection": scored.get("selection") or {},
+        "ranked_candidates": scored.get("ranked_candidates") or [],
     })
 
 
@@ -9573,7 +9602,7 @@ let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantRuns = [], _quantSelectedRunId = null;
+let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantModelMode = 'auto', _quantRuns = [], _quantSelectedRunId = null;
 let _tabPollers = {};
 let _settingsDirty = false;
 let _enhancedData = null;
@@ -11131,7 +11160,7 @@ async function pollQuant() {
     const [overview, optimizer, model, runs] = await Promise.all([
       fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
       fetch('/api/quant/optimizer?days=' + days).then(r => r.json()).catch(() => null),
-      fetch('/api/quant/model?days=' + days).then(r => r.json()).catch(() => null),
+      fetch('/api/quant/model?days=' + days + '&mode=' + encodeURIComponent(_quantModelMode)).then(r => r.json()).catch(() => null),
       fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
     ]);
     if (overview) _quantOverview = overview;
@@ -11146,6 +11175,11 @@ async function pollQuant() {
       await showQuantRunDetail(_quantSelectedRunId, true);
     }
   } catch (e) {}
+}
+
+function setQuantModelMode(mode) {
+  _quantModelMode = mode || 'auto';
+  pollQuant();
 }
 
 function renderQuantOverview() {
@@ -11347,26 +11381,65 @@ function renderQuantOptimizer() {
 function renderQuantModel() {
   const box = document.getElementById('quant-model');
   if (!box || !_quantModel) return;
-  const model = _quantModel.model || {};
+  const family = _quantModel.model_family || {};
+  const globalModel = family.global || {};
+  const regimeModels = family.regimes || {};
+  const selection = _quantModel.selection || {};
+  const regimeContext = _quantModel.regime_context || {};
   const ranked = Array.isArray(_quantModel.ranked_candidates) ? _quantModel.ranked_candidates : [];
-  const weights = Array.isArray(model.weights) ? model.weights : [];
+  const selectedModel = selection.selected_model || globalModel || {};
+  const weights = Array.isArray(selectedModel.weights) ? selectedModel.weights : [];
+  const selectedKey = selection.selected_key || 'global';
+  const activeRegime = selection.active_regime || regimeContext.regime || 'neutral';
+  const selectedLabel = selectedKey === 'global' ? 'global' : selectedKey;
   box.innerHTML = `
     <div class="panel-head" style="margin-bottom:12px">
       <div>
-        <div class="panel-title">Learned Score Model</div>
-        <div class="panel-copy">Trains a transparent linear ranking model from winner-versus-rug labels and scores recent candidates with feature-level driver attribution.</div>
+        <div class="panel-title">Regime Model Desk</div>
+        <div class="panel-copy">Auto-selects a learned ranking model from the current tape regime and falls back to the global model when a regime-specific sample is too thin.</div>
       </div>
-      <span class="badge ${model.trained ? 'bg-grn' : 'bg-red'}">${model.trained ? 'trained' : 'insufficient labels'}</span>
+      <div class="shortcut-row">
+        <select class="finput" style="max-width:190px;height:36px" onchange="setQuantModelMode(this.value)">
+          <option value="auto" ${_quantModelMode === 'auto' ? 'selected' : ''}>Auto (Recommended)</option>
+          <option value="global" ${_quantModelMode === 'global' ? 'selected' : ''}>Global</option>
+          <option value="accumulation" ${_quantModelMode === 'accumulation' ? 'selected' : ''}>Accumulation</option>
+          <option value="distribution" ${_quantModelMode === 'distribution' ? 'selected' : ''}>Distribution</option>
+          <option value="defensive" ${_quantModelMode === 'defensive' ? 'selected' : ''}>Defensive</option>
+          <option value="neutral" ${_quantModelMode === 'neutral' ? 'selected' : ''}>Neutral</option>
+        </select>
+        <span class="badge ${selectedModel.trained ? 'bg-grn' : 'bg-red'}">${selectedModel.trained ? `${selectedLabel} active` : 'untrained'}</span>
+      </div>
     </div>
     <div class="shortcut-row" style="margin-bottom:12px">
       <span class="badge bg-muted">${_quantModel.window_days || 7}d train window</span>
-      <span class="badge bg-muted">${model.winner_count || 0} winners</span>
-      <span class="badge bg-muted">${model.rug_count || 0} rugs</span>
-      <span class="badge bg-blue">${model.accuracy_pct || 0}% in-sample accuracy</span>
+      <span class="badge bg-muted">Active regime ${activeRegime}</span>
+      <span class="badge bg-muted">${globalModel.winner_count || 0} global winners</span>
+      <span class="badge bg-muted">${globalModel.rug_count || 0} global rugs</span>
+      <span class="badge bg-blue">${selectedModel.accuracy_pct || 0}% ${selectedLabel} accuracy</span>
+      ${selection.using_global_fallback ? `<span class="badge bg-gold">Fallback ${selection.fallback_reason || ''}</span>` : ''}
     </div>
     <div class="scanner-top-grid">
       <div>
-        <div class="sec-label">Top Model Weights</div>
+        <div class="sec-label">Model Family</div>
+        <div class="operator-rule-list" style="margin-bottom:12px">
+          <div class="operator-rule">
+            <div>
+              <div class="operator-rule-label">global</div>
+              <div style="font-size:10px;color:var(--t3);margin-top:3px">${globalModel.token_count || 0} tokens · ${globalModel.winner_count || 0} winners · ${globalModel.rug_count || 0} rugs</div>
+            </div>
+            <div class="operator-rule-value">${globalModel.trained ? (globalModel.accuracy_pct || 0) + '%' : 'warmup'}</div>
+          </div>
+          ${Object.entries(regimeModels).map(([name, row]) => `
+            <div class="operator-rule">
+              <div>
+                <div class="operator-rule-label">${name}</div>
+                <div style="font-size:10px;color:var(--t3);margin-top:3px">${row.token_count || 0} tokens · ${row.winner_count || 0} winners · ${row.rug_count || 0} rugs</div>
+              </div>
+              <div class="operator-rule-value">${row.trained ? (row.accuracy_pct || 0) + '%' : 'warmup'}</div>
+            </div>
+          `).join('')}
+        </div>
+        <div class="sec-label">Selected Model Weights</div>
         <div class="operator-rule-list">
           ${weights.slice(0, 6).map(item => `
             <div class="operator-rule">
@@ -11396,6 +11469,7 @@ function renderQuantModel() {
                 <span class="badge bg-muted">Conf ${Math.round((item.features?.confidence || 0) * 100)}%</span>
                 <span class="badge bg-muted">B/S ${item.features?.buy_sell_ratio ?? 0}</span>
                 <span class="badge bg-muted">Net ${item.features?.net_flow_sol ?? 0} SOL</span>
+                <span class="badge bg-muted">${item.model_key || selectedKey}</span>
               </div>
               <div class="shortcut-row" style="margin-top:8px">
                 ${(item.top_drivers || []).slice(0, 3).map(driver => `<span class="badge bg-muted">${driver.label} ${driver.contribution > 0 ? '+' : ''}${driver.contribution}</span>`).join('')}

@@ -54,6 +54,57 @@ def _entry_rows(snapshot_rows):
     return list(entries.values())
 
 
+def _flow_value(row, key):
+    if key in row and row.get(key) is not None:
+        return row.get(key)
+    flow_json = _parse_json(row.get("flow_json"), {})
+    if isinstance(flow_json, dict):
+        return flow_json.get(key)
+    return None
+
+
+def classify_flow_regime_row(row):
+    buy_sell_ratio = _safe_float(_flow_value(row, "buy_sell_ratio"))
+    net_flow_sol = _safe_float(_flow_value(row, "net_flow_sol"))
+    threat_risk_score = _safe_float(_flow_value(row, "threat_risk_score"))
+    liquidity_drop_pct = _safe_float(_flow_value(row, "liquidity_drop_pct"))
+    can_exit = _flow_value(row, "can_exit")
+    if can_exit in (0, "0"):
+        can_exit = False
+    elif can_exit in (1, "1"):
+        can_exit = True
+    if threat_risk_score >= 70 or can_exit is False or liquidity_drop_pct >= 35:
+        return "defensive"
+    if net_flow_sol > 2.5 and buy_sell_ratio > 1.35 and threat_risk_score < 45:
+        return "accumulation"
+    if net_flow_sol < -1.5 or buy_sell_ratio < 0.9:
+        return "distribution"
+    return "neutral"
+
+
+def _flow_index(flow_rows):
+    by_mint = {}
+    for row in sorted(flow_rows or [], key=lambda item: (item.get("mint") or "", item.get("created_at") or "")):
+        mint = row.get("mint")
+        if not mint:
+            continue
+        by_mint.setdefault(mint, []).append(row)
+    return by_mint
+
+
+def _nearest_flow_regime(mint, created_at, flow_index):
+    candidates = flow_index.get(mint) or []
+    if not candidates:
+        return "neutral"
+    if created_at is None:
+        return classify_flow_regime_row(candidates[-1])
+    nearest = min(
+        candidates,
+        key=lambda row: abs(((row.get("created_at") or created_at) - created_at).total_seconds()) if row.get("created_at") else 10**12,
+    )
+    return classify_flow_regime_row(nearest)
+
+
 def _mean(values):
     return sum(values) / len(values) if values else 0.0
 
@@ -189,3 +240,74 @@ def score_recent_candidates(snapshot_rows, model, top_n=8):
             "created_at": entry["created_at"].isoformat() if hasattr(entry["created_at"], "isoformat") else entry["created_at"],
         })
     return sorted(ranked, key=lambda item: item["model_score"], reverse=True)[:top_n]
+
+
+def train_regime_model_family(snapshot_rows, outcome_labels, flow_rows):
+    global_model = train_feature_model(snapshot_rows, outcome_labels)
+    flow_index = _flow_index(flow_rows)
+    entries = _entry_rows(snapshot_rows)
+    regime_membership = {}
+    for entry in entries:
+        regime = _nearest_flow_regime(entry["mint"], entry.get("created_at"), flow_index)
+        regime_membership.setdefault(regime, []).append(entry["mint"])
+
+    labels_by_mint = {row["mint"]: row for row in (outcome_labels or []) if row.get("mint")}
+    regimes = {}
+    for regime_name in ("accumulation", "distribution", "defensive", "neutral"):
+        mints = set(regime_membership.get(regime_name) or [])
+        regime_snapshots = [row for row in snapshot_rows or [] if row.get("mint") in mints]
+        regime_outcomes = [labels_by_mint[mint] for mint in mints if mint in labels_by_mint]
+        model = train_feature_model(regime_snapshots, regime_outcomes)
+        model["regime"] = regime_name
+        model["token_count"] = len(mints)
+        model["trained"] = bool(model.get("trained"))
+        regimes[regime_name] = model
+
+    return {
+        "global": {**global_model, "regime": "global", "token_count": len(entries)},
+        "regimes": regimes,
+    }
+
+
+def select_model_for_regime(model_family, active_regime, mode="auto"):
+    family = model_family or {}
+    global_model = family.get("global") or {}
+    regime_models = family.get("regimes") or {}
+    normalized_mode = (mode or "auto").strip().lower()
+    chosen_key = "global"
+    fallback_reason = ""
+
+    if normalized_mode in regime_models and regime_models[normalized_mode].get("trained"):
+        chosen_key = normalized_mode
+    elif normalized_mode == "auto":
+        if regime_models.get(active_regime, {}).get("trained"):
+            chosen_key = active_regime
+        else:
+            fallback_reason = f"{active_regime}_model_untrained"
+    elif normalized_mode in regime_models and not regime_models[normalized_mode].get("trained"):
+        fallback_reason = f"{normalized_mode}_model_untrained"
+    elif normalized_mode not in {"auto", "global"}:
+        fallback_reason = "unknown_mode"
+
+    selected_model = global_model if chosen_key == "global" else regime_models.get(chosen_key) or global_model
+    return {
+        "mode": normalized_mode,
+        "active_regime": active_regime,
+        "selected_key": chosen_key,
+        "selected_model": selected_model,
+        "fallback_reason": fallback_reason,
+        "using_global_fallback": chosen_key == "global" and normalized_mode not in {"global", ""},
+    }
+
+
+def score_recent_candidates_for_regime(snapshot_rows, model_family, active_regime, mode="auto", top_n=8):
+    selection = select_model_for_regime(model_family, active_regime, mode=mode)
+    ranked = score_recent_candidates(snapshot_rows, selection["selected_model"], top_n=top_n)
+    for item in ranked:
+        item["model_key"] = selection["selected_key"]
+        item["active_regime"] = active_regime
+        item["selection_mode"] = selection["mode"]
+    return {
+        "selection": selection,
+        "ranked_candidates": ranked,
+    }
