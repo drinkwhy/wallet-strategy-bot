@@ -9179,6 +9179,29 @@ def api_backtest_results():
         """)
         open_shadow_rows = cur.fetchall()
 
+        # ── 6. Data source health: count rows in each table ──
+        data_health = {}
+        for tbl in ["shadow_decisions", "shadow_positions", "backtest_trades", "backtest_runs"]:
+            try:
+                cur.execute(f"SELECT COUNT(*) AS n FROM {tbl}")
+                data_health[tbl] = int(cur.fetchone().get("n", 0))
+            except Exception:
+                data_health[tbl] = 0
+        # Also check how many shadow_positions are open vs closed
+        try:
+            cur.execute("SELECT status, COUNT(*) AS n FROM shadow_positions GROUP BY status")
+            for row2 in cur.fetchall():
+                data_health[f"shadow_positions_{row2['status']}"] = int(row2.get("n", 0))
+        except Exception:
+            pass
+        # Check backtest_runs statuses
+        try:
+            cur.execute("SELECT status, COUNT(*) AS n FROM backtest_runs GROUP BY status")
+            for row2 in cur.fetchall():
+                data_health[f"backtest_runs_{row2['status']}"] = int(row2.get("n", 0))
+        except Exception:
+            pass
+
     finally:
         db_return(conn)
 
@@ -9261,14 +9284,65 @@ def api_backtest_results():
             },
         })
 
-    # If no closed trades yet but strategies exist in PRESETS, show them anyway
+    # If no closed trades, try to build strategy cards from shadow_decisions pass/fail stats
+    if not strategies:
+        conn2 = db()
+        try:
+            cur2 = conn2.cursor()
+            cur2.execute("""
+                SELECT strategy_name,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN passed THEN 1 ELSE 0 END) AS passed,
+                       ROUND(AVG(score)::numeric, 1) AS avg_score,
+                       ROUND(AVG(confidence)::numeric, 1) AS avg_confidence
+                FROM shadow_decisions
+                GROUP BY strategy_name
+                ORDER BY avg_score DESC
+            """)
+            for row in cur2.fetchall():
+                sname = row.get("strategy_name", "")
+                total = int(row.get("total") or 0)
+                passed = int(row.get("passed") or 0)
+                preset = PRESETS.get(sname, {})
+                strategies.append({
+                    "name": sname,
+                    "label": strategy_labels.get(sname, sname.title()),
+                    "data_source": f"Shadow Evaluations ({total} coins checked, {passed} would buy)",
+                    "total_trades": passed,
+                    "wins": 0, "losses": 0,
+                    "win_rate": round(passed / total * 100) if total else 0,
+                    "avg_profit_pct": 0,
+                    "best_trade_pct": float(row.get("avg_score") or 0),
+                    "worst_trade_pct": 0,
+                    "avg_best_gain_pct": float(row.get("avg_confidence") or 0),
+                    "avg_worst_drop_pct": 0,
+                    "settings": {
+                        "buy_amount": preset.get("max_buy_sol", 0),
+                        "first_sell_target": preset.get("tp1_mult", 0),
+                        "second_sell_target": preset.get("tp2_mult", 0),
+                        "cut_losses_at": preset.get("stop_loss", 0),
+                        "time_limit_min": preset.get("time_stop_min", 0),
+                        "trailing_stop": preset.get("trail_pct", 0),
+                        "max_trades": preset.get("max_correlated", 0),
+                        "max_loss_sol": preset.get("drawdown_limit_sol", 0),
+                        "min_liquidity": preset.get("min_liq", 0),
+                        "min_market_cap": preset.get("min_mc", 0),
+                        "max_market_cap": preset.get("max_mc", 0),
+                        "min_volume": preset.get("min_vol", 0),
+                        "min_score": preset.get("min_score", 0),
+                    },
+                })
+        finally:
+            db_return(conn2)
+
+    # If STILL no data, show the 4 preset cards as placeholders
     if not strategies:
         for name in ["safe", "balanced", "aggressive", "degen"]:
             preset = PRESETS.get(name, {})
             strategies.append({
                 "name": name,
                 "label": strategy_labels.get(name, name.title()),
-                "data_source": "No data yet",
+                "data_source": "No data yet — start the bot to begin collecting",
                 "total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0,
                 "avg_profit_pct": 0, "best_trade_pct": 0, "worst_trade_pct": 0,
                 "avg_best_gain_pct": 0, "avg_worst_drop_pct": 0,
@@ -9368,6 +9442,7 @@ def api_backtest_results():
         "runs": runs,
         "recent_trades": recent_trades,
         "open_positions": open_positions,
+        "data_health": data_health,
     })
 
 
@@ -11010,6 +11085,7 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
           <button class="btn btn-ghost" onclick="pollBacktest()">Refresh</button>
         </div>
       </div>
+      <div id="data-health" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px"></div>
       <div id="strategy-cards">
         <div class="empty-state">Loading backtest results...</div>
       </div>
@@ -11402,6 +11478,19 @@ function esc(s) {
 async function pollBacktest() {
   try {
     const d = await fetch('/api/backtest-results').then(r=>r.json());
+    // Data health chips
+    const dh = d.data_health || {};
+    const healthEl = document.getElementById('data-health');
+    if (healthEl) {
+      const chips = [];
+      if (dh.shadow_decisions !== undefined) chips.push(`<span class="summary-chip">${dh.shadow_decisions} evaluations recorded</span>`);
+      if (dh.shadow_positions !== undefined) chips.push(`<span class="summary-chip">${dh.shadow_positions} shadow trades</span>`);
+      if (dh.shadow_positions_open) chips.push(`<span class="summary-chip green">${dh.shadow_positions_open} still open</span>`);
+      if (dh.shadow_positions_closed) chips.push(`<span class="summary-chip">${dh.shadow_positions_closed} closed</span>`);
+      if (dh.backtest_trades !== undefined) chips.push(`<span class="summary-chip">${dh.backtest_trades} backtest trades</span>`);
+      if (dh.backtest_runs !== undefined) chips.push(`<span class="summary-chip">${dh.backtest_runs} backtest runs</span>`);
+      healthEl.innerHTML = chips.join('');
+    }
     // Strategy cards
     const strats = d.strategies || [];
     if (!strats.length) {
@@ -11411,15 +11500,33 @@ async function pollBacktest() {
         const pnlColor = s.avg_profit_pct >= 0 ? 'var(--grn)' : 'var(--red2)';
         const wrColor = s.win_rate >= 50 ? 'var(--grn)' : s.win_rate >= 30 ? 'var(--gold2)' : 'var(--red2)';
         const settingsJson = JSON.stringify(s.settings).replace(/'/g, "\\'");
-        return `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:18px;margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:12px">
-            <div>
-              <div style="font-size:16px;font-weight:700;color:var(--t1)">${esc(s.label)}</div>
-              <div style="font-size:11px;color:var(--t3);margin-top:2px">${s.total_trades} trades tested &middot; ${s.wins} won &middot; ${s.losses} lost &middot; <em>${esc(s.data_source)}</em></div>
+        const isEvalOnly = s.data_source && s.data_source.startsWith('Shadow Evaluations');
+        const isNoData = s.data_source && s.data_source.startsWith('No data');
+        // Stats section adapts based on data source
+        let statsHtml;
+        if (isEvalOnly) {
+          statsHtml = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Would Buy</div>
+              <div style="font-size:20px;font-weight:700;color:var(--grn)">${s.win_rate}%</div>
             </div>
-            <button class="btn btn-save" onclick='applyStrategy(${settingsJson}, "${s.name}")' style="font-size:11px;padding:6px 14px">Use These Settings</button>
-          </div>
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Avg Score</div>
+              <div style="font-size:20px;font-weight:700;color:var(--t1)">${s.best_trade_pct}</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Avg Confidence</div>
+              <div style="font-size:20px;font-weight:700;color:var(--t1)">${s.avg_best_gain_pct}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Status</div>
+              <div style="font-size:13px;font-weight:600;color:var(--gold2)">Collecting data...</div>
+            </div>
+          </div>`;
+        } else if (isNoData) {
+          statsHtml = `<div style="padding:10px 0;font-size:13px;color:var(--t3);text-align:center">No trade data yet — start the bot and it will shadow-trade with these settings automatically</div>`;
+        } else {
+          statsHtml = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">
             <div style="text-align:center">
               <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Win Rate</div>
               <div style="font-size:20px;font-weight:700;color:${wrColor}">${s.win_rate}%</div>
@@ -11436,7 +11543,17 @@ async function pollBacktest() {
               <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Worst Trade</div>
               <div style="font-size:20px;font-weight:700;color:var(--red2)">${s.worst_trade_pct}%</div>
             </div>
+          </div>`;
+        }
+        return `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:18px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+            <div>
+              <div style="font-size:16px;font-weight:700;color:var(--t1)">${esc(s.label)}</div>
+              <div style="font-size:11px;color:var(--t3);margin-top:2px">${isEvalOnly ? esc(s.data_source) : (s.total_trades + ' trades tested &middot; ' + s.wins + ' won &middot; ' + s.losses + ' lost &middot; <em>' + esc(s.data_source) + '</em>')}</div>
+            </div>
+            <button class="btn btn-save" onclick='applyStrategy(${settingsJson}, "${s.name}")' style="font-size:11px;padding:6px 14px">Use These Settings</button>
           </div>
+          ${statsHtml}
           <details style="margin-top:12px">
             <summary style="cursor:pointer;font-size:11px;color:var(--t3)">View settings used</summary>
             <div style="margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;font-size:11px;color:var(--t2)">
