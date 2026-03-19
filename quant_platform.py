@@ -297,7 +297,9 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     score = max(0.0, min(100.0, score))
 
     confidence = _clamp(snapshot["confidence"] + (len(pass_reasons) * 0.04) - (len(blocker_reasons) * 0.06))
-    passed = not blocker_reasons and score >= 40 and confidence >= 0.35
+    min_composite = _safe_float(settings.get("min_composite_score", 40))
+    min_conf = _safe_float(settings.get("min_confidence", 0.35))
+    passed = not blocker_reasons and score >= min_composite and confidence >= min_conf
 
     metrics = {
         "entry_price": snapshot["price"],
