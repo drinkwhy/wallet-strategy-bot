@@ -32,9 +32,12 @@ from dotenv import load_dotenv
 from backtest_engine import simulate_backtest
 from quant_platform import (
     CANONICAL_STRATEGIES,
+    build_flow_snapshot,
     build_feature_snapshot,
     evaluate_shadow_strategy,
     shadow_position_update,
+    summarize_flow_regime,
+    summarize_opportunity_matrix,
 )
 
 # ── Enhanced Trading Systems (Research Paper Implementation) ──────────────────
@@ -712,6 +715,12 @@ def init_db():
             first_buyer_count INTEGER DEFAULT 0,
             smart_wallet_buys INTEGER DEFAULT 0,
             smart_wallet_first10 INTEGER DEFAULT 0,
+            unique_buyer_count INTEGER DEFAULT 0,
+            unique_seller_count INTEGER DEFAULT 0,
+            total_buy_sol REAL DEFAULT 0,
+            total_sell_sol REAL DEFAULT 0,
+            net_flow_sol REAL DEFAULT 0,
+            buy_sell_ratio REAL DEFAULT 0,
             narrative_tags TEXT,
             social_links TEXT,
             social_keys TEXT,
@@ -790,6 +799,35 @@ def init_db():
             volume_spike_ratio REAL,
             threat_risk_score INTEGER,
             feature_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS token_flow_snapshots (
+            id SERIAL PRIMARY KEY,
+            mint TEXT NOT NULL,
+            source TEXT,
+            price REAL,
+            mc REAL,
+            liq REAL,
+            vol REAL,
+            age_min REAL,
+            holder_count INTEGER DEFAULT 0,
+            holder_growth_1h REAL DEFAULT 0,
+            unique_buyer_count INTEGER DEFAULT 0,
+            unique_seller_count INTEGER DEFAULT 0,
+            first_buyer_count INTEGER DEFAULT 0,
+            smart_wallet_buys INTEGER DEFAULT 0,
+            smart_wallet_first10 INTEGER DEFAULT 0,
+            total_buy_sol REAL DEFAULT 0,
+            total_sell_sol REAL DEFAULT 0,
+            net_flow_sol REAL DEFAULT 0,
+            buy_sell_ratio REAL DEFAULT 0,
+            buy_pressure_pct REAL DEFAULT 0,
+            liquidity_drop_pct REAL DEFAULT 0,
+            threat_risk_score INTEGER DEFAULT 0,
+            transfer_hook_enabled INTEGER DEFAULT 0,
+            can_exit INTEGER,
+            flow_json TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
@@ -895,6 +933,8 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_market_events_created_at ON market_events (created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_market_tokens_last_seen ON market_tokens (last_seen_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_token_feature_snapshots_mint_created_at ON token_feature_snapshots (mint, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_mint_created_at ON token_flow_snapshots (mint, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_created_at ON token_flow_snapshots (created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_strategy_created_at ON shadow_decisions (strategy_name, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)",
@@ -957,6 +997,12 @@ def migrate_db():
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS cluster_confidence INTEGER DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS infra_penalty INTEGER DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS liquidity_drop_pct REAL DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS unique_buyer_count INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS unique_seller_count INTEGER DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS total_buy_sol REAL DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS total_sell_sol REAL DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS net_flow_sol REAL DEFAULT 0",
+            "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS buy_sell_ratio REAL DEFAULT 0",
         ]
         for m in migrations:
             try:
@@ -1013,6 +1059,12 @@ def migrate_db():
                 first_buyer_count INTEGER DEFAULT 0,
                 smart_wallet_buys INTEGER DEFAULT 0,
                 smart_wallet_first10 INTEGER DEFAULT 0,
+                unique_buyer_count INTEGER DEFAULT 0,
+                unique_seller_count INTEGER DEFAULT 0,
+                total_buy_sol REAL DEFAULT 0,
+                total_sell_sol REAL DEFAULT 0,
+                net_flow_sol REAL DEFAULT 0,
+                buy_sell_ratio REAL DEFAULT 0,
                 narrative_tags TEXT,
                 social_links TEXT,
                 social_keys TEXT,
@@ -1114,6 +1166,33 @@ def migrate_db():
                 threat_risk_score INTEGER,
                 feature_json TEXT,
                 created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS token_flow_snapshots (
+                id SERIAL PRIMARY KEY,
+                mint TEXT NOT NULL,
+                source TEXT,
+                price REAL,
+                mc REAL,
+                liq REAL,
+                vol REAL,
+                age_min REAL,
+                holder_count INTEGER DEFAULT 0,
+                holder_growth_1h REAL DEFAULT 0,
+                unique_buyer_count INTEGER DEFAULT 0,
+                unique_seller_count INTEGER DEFAULT 0,
+                first_buyer_count INTEGER DEFAULT 0,
+                smart_wallet_buys INTEGER DEFAULT 0,
+                smart_wallet_first10 INTEGER DEFAULT 0,
+                total_buy_sol REAL DEFAULT 0,
+                total_sell_sol REAL DEFAULT 0,
+                net_flow_sol REAL DEFAULT 0,
+                buy_sell_ratio REAL DEFAULT 0,
+                buy_pressure_pct REAL DEFAULT 0,
+                liquidity_drop_pct REAL DEFAULT 0,
+                threat_risk_score INTEGER DEFAULT 0,
+                transfer_hook_enabled INTEGER DEFAULT 0,
+                can_exit INTEGER,
+                flow_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS shadow_decisions (
                 id SERIAL PRIMARY KEY,
                 strategy_name TEXT NOT NULL,
@@ -1199,6 +1278,8 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_market_events_created_at ON market_events (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_market_tokens_last_seen ON market_tokens (last_seen_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_feature_snapshots_mint_created_at ON token_feature_snapshots (mint, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_mint_created_at ON token_flow_snapshots (mint, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_created_at ON token_flow_snapshots (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_strategy_created_at ON shadow_decisions (strategy_name, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)")
@@ -3890,54 +3971,7 @@ def persist_token_intel(intel):
     conn = db()
     try:
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO token_intel (
-                mint, name, symbol, deployer_wallet, first_seen_at, last_seen_at,
-                first_price, max_price, first_mc, max_mc, first_vol, latest_vol,
-                first_liq, latest_liq, holder_count, holder_growth_1h, volume_spike_ratio,
-                first_buyer_count, smart_wallet_buys, smart_wallet_first10, narrative_tags,
-                social_links, social_keys, narrative_score, deployer_score, whale_score,
-                whale_action_score, cluster_confidence, infra_penalty, token_program,
-                transfer_hook_enabled, can_exit, threat_risk_score, threat_flags, infra_labels, liquidity_drop_pct,
-                max_multiple, green_lights, checklist_json, milestones_json, last_updated
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (mint) DO UPDATE SET
-                name=EXCLUDED.name,
-                symbol=EXCLUDED.symbol,
-                deployer_wallet=COALESCE(token_intel.deployer_wallet, EXCLUDED.deployer_wallet),
-                last_seen_at=GREATEST(token_intel.last_seen_at, EXCLUDED.last_seen_at),
-                max_price=GREATEST(COALESCE(token_intel.max_price, 0), COALESCE(EXCLUDED.max_price, 0)),
-                max_mc=GREATEST(COALESCE(token_intel.max_mc, 0), COALESCE(EXCLUDED.max_mc, 0)),
-                latest_vol=EXCLUDED.latest_vol,
-                latest_liq=EXCLUDED.latest_liq,
-                holder_count=EXCLUDED.holder_count,
-                holder_growth_1h=EXCLUDED.holder_growth_1h,
-                volume_spike_ratio=EXCLUDED.volume_spike_ratio,
-                first_buyer_count=EXCLUDED.first_buyer_count,
-                smart_wallet_buys=EXCLUDED.smart_wallet_buys,
-                smart_wallet_first10=EXCLUDED.smart_wallet_first10,
-                narrative_tags=EXCLUDED.narrative_tags,
-                social_links=EXCLUDED.social_links,
-                social_keys=EXCLUDED.social_keys,
-                narrative_score=EXCLUDED.narrative_score,
-                deployer_score=EXCLUDED.deployer_score,
-                whale_score=EXCLUDED.whale_score,
-                whale_action_score=EXCLUDED.whale_action_score,
-                cluster_confidence=EXCLUDED.cluster_confidence,
-                infra_penalty=EXCLUDED.infra_penalty,
-                token_program=EXCLUDED.token_program,
-                transfer_hook_enabled=EXCLUDED.transfer_hook_enabled,
-                can_exit=EXCLUDED.can_exit,
-                threat_risk_score=EXCLUDED.threat_risk_score,
-                threat_flags=EXCLUDED.threat_flags,
-                infra_labels=EXCLUDED.infra_labels,
-                liquidity_drop_pct=EXCLUDED.liquidity_drop_pct,
-                max_multiple=GREATEST(COALESCE(token_intel.max_multiple, 1), COALESCE(EXCLUDED.max_multiple, 1)),
-                green_lights=EXCLUDED.green_lights,
-                checklist_json=EXCLUDED.checklist_json,
-                milestones_json=EXCLUDED.milestones_json,
-                last_updated=EXCLUDED.last_updated
-        """, (
+        values = (
             intel["mint"],
             intel.get("name"),
             intel.get("symbol"),
@@ -3958,6 +3992,12 @@ def persist_token_intel(intel):
             int(intel.get("first_buyer_count") or 0),
             int(intel.get("smart_wallet_buys") or 0),
             int(intel.get("smart_wallet_first10") or 0),
+            int(intel.get("unique_buyer_count") or 0),
+            int(intel.get("unique_seller_count") or 0),
+            float(intel.get("total_buy_sol") or 0),
+            float(intel.get("total_sell_sol") or 0),
+            float(intel.get("net_flow_sol") or 0),
+            float(intel.get("buy_sell_ratio") or 0),
             json.dumps(_dedupe_keep_order(intel.get("narrative_tags") or [])),
             json.dumps(_dedupe_keep_order(intel.get("social_links") or [])),
             json.dumps(_dedupe_keep_order(intel.get("social_keys") or [])),
@@ -3979,7 +4019,63 @@ def persist_token_intel(intel):
             json.dumps(intel.get("checklist") or []),
             json.dumps(intel.get("milestones") or {}),
             _from_iso(intel.get("last_updated")) or _now_utc(),
-        ))
+        )
+        placeholders = ",".join(["%s"] * len(values))
+        cur.execute(f"""
+            INSERT INTO token_intel (
+                mint, name, symbol, deployer_wallet, first_seen_at, last_seen_at,
+                first_price, max_price, first_mc, max_mc, first_vol, latest_vol,
+                first_liq, latest_liq, holder_count, holder_growth_1h, volume_spike_ratio,
+                first_buyer_count, smart_wallet_buys, smart_wallet_first10, unique_buyer_count,
+                unique_seller_count, total_buy_sol, total_sell_sol, net_flow_sol, buy_sell_ratio,
+                narrative_tags, social_links, social_keys, narrative_score, deployer_score, whale_score,
+                whale_action_score, cluster_confidence, infra_penalty, token_program,
+                transfer_hook_enabled, can_exit, threat_risk_score, threat_flags, infra_labels, liquidity_drop_pct,
+                max_multiple, green_lights, checklist_json, milestones_json, last_updated
+            ) VALUES ({placeholders})
+            ON CONFLICT (mint) DO UPDATE SET
+                name=EXCLUDED.name,
+                symbol=EXCLUDED.symbol,
+                deployer_wallet=COALESCE(token_intel.deployer_wallet, EXCLUDED.deployer_wallet),
+                last_seen_at=GREATEST(token_intel.last_seen_at, EXCLUDED.last_seen_at),
+                max_price=GREATEST(COALESCE(token_intel.max_price, 0), COALESCE(EXCLUDED.max_price, 0)),
+                max_mc=GREATEST(COALESCE(token_intel.max_mc, 0), COALESCE(EXCLUDED.max_mc, 0)),
+                latest_vol=EXCLUDED.latest_vol,
+                latest_liq=EXCLUDED.latest_liq,
+                holder_count=EXCLUDED.holder_count,
+                holder_growth_1h=EXCLUDED.holder_growth_1h,
+                volume_spike_ratio=EXCLUDED.volume_spike_ratio,
+                first_buyer_count=EXCLUDED.first_buyer_count,
+                smart_wallet_buys=EXCLUDED.smart_wallet_buys,
+                smart_wallet_first10=EXCLUDED.smart_wallet_first10,
+                unique_buyer_count=EXCLUDED.unique_buyer_count,
+                unique_seller_count=EXCLUDED.unique_seller_count,
+                total_buy_sol=EXCLUDED.total_buy_sol,
+                total_sell_sol=EXCLUDED.total_sell_sol,
+                net_flow_sol=EXCLUDED.net_flow_sol,
+                buy_sell_ratio=EXCLUDED.buy_sell_ratio,
+                narrative_tags=EXCLUDED.narrative_tags,
+                social_links=EXCLUDED.social_links,
+                social_keys=EXCLUDED.social_keys,
+                narrative_score=EXCLUDED.narrative_score,
+                deployer_score=EXCLUDED.deployer_score,
+                whale_score=EXCLUDED.whale_score,
+                whale_action_score=EXCLUDED.whale_action_score,
+                cluster_confidence=EXCLUDED.cluster_confidence,
+                infra_penalty=EXCLUDED.infra_penalty,
+                token_program=EXCLUDED.token_program,
+                transfer_hook_enabled=EXCLUDED.transfer_hook_enabled,
+                can_exit=EXCLUDED.can_exit,
+                threat_risk_score=EXCLUDED.threat_risk_score,
+                threat_flags=EXCLUDED.threat_flags,
+                infra_labels=EXCLUDED.infra_labels,
+                liquidity_drop_pct=EXCLUDED.liquidity_drop_pct,
+                max_multiple=GREATEST(COALESCE(token_intel.max_multiple, 1), COALESCE(EXCLUDED.max_multiple, 1)),
+                green_lights=EXCLUDED.green_lights,
+                checklist_json=EXCLUDED.checklist_json,
+                milestones_json=EXCLUDED.milestones_json,
+                last_updated=EXCLUDED.last_updated
+        """, values)
         conn.commit()
     finally:
         db_return(conn)
@@ -4060,6 +4156,12 @@ def prime_token_intel(info, pair=None, source="scanner"):
             "first_buyer_count": int(cached.get("first_buyer_count") or 0),
             "smart_wallet_buys": int(cached.get("smart_wallet_buys") or 0),
             "smart_wallet_first10": int(cached.get("smart_wallet_first10") or 0),
+            "unique_buyer_count": int(cached.get("unique_buyer_count") or 0),
+            "unique_seller_count": int(cached.get("unique_seller_count") or 0),
+            "total_buy_sol": float(cached.get("total_buy_sol") or 0),
+            "total_sell_sol": float(cached.get("total_sell_sol") or 0),
+            "net_flow_sol": float(cached.get("net_flow_sol") or 0),
+            "buy_sell_ratio": float(cached.get("buy_sell_ratio") or 0),
             "narrative_tags": cached.get("narrative_tags") or [],
             "social_links": _dedupe_keep_order((cached.get("social_links") or []) + links),
             "social_keys": _dedupe_keep_order((cached.get("social_keys") or []) + keys),
@@ -4129,6 +4231,12 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
         deployer_stats = get_deployer_stats(deployer_wallet)
     holder_count = get_token_holder_count(mint, txns)
     holder_growth = update_holder_history(mint, holder_count)
+    unique_buyer_count = len({item.get("wallet") for item in (flow.get("buyers") or []) if item.get("wallet")})
+    unique_seller_count = len({item.get("wallet") for item in (flow.get("sellers") or []) if item.get("wallet")})
+    total_buy_sol = round(sum(float(item.get("sol") or 0) for item in (flow.get("buyers") or [])), 4)
+    total_sell_sol = round(sum(float(item.get("sol") or 0) for item in (flow.get("sellers") or [])), 4)
+    net_flow_sol = round(total_buy_sol - total_sell_sol, 4)
+    buy_sell_ratio = round(unique_buyer_count / max(unique_seller_count, 1), 2) if unique_buyer_count else 0.0
     narrative = build_narrative_profile(
         base_info.get("name") or seeded.get("name"),
         base_info.get("symbol") or seeded.get("symbol"),
@@ -4153,6 +4261,12 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
         "first_buyer_count": len(flow.get("first_buyers") or []),
         "smart_wallet_buys": int(flow.get("smart_wallet_buys") or 0),
         "smart_wallet_first10": int(flow.get("smart_wallet_first10") or 0),
+        "unique_buyer_count": unique_buyer_count,
+        "unique_seller_count": unique_seller_count,
+        "total_buy_sol": total_buy_sol,
+        "total_sell_sol": total_sell_sol,
+        "net_flow_sol": net_flow_sol,
+        "buy_sell_ratio": buy_sell_ratio,
         "narrative_tags": narrative["tags"],
         "social_keys": _dedupe_keep_order((seeded.get("social_keys") or []) + narrative["social_keys"]),
         "narrative_score": narrative["score"],
@@ -4438,6 +4552,7 @@ def _shadow_strategy_settings():
 def _record_market_intelligence(info):
     intel = info.get("intel") or {}
     snapshot = build_feature_snapshot(info, intel)
+    flow_snapshot = build_flow_snapshot(info, intel)
     strategies = _shadow_strategy_settings()
     conn = db()
     try:
@@ -4490,6 +4605,27 @@ def _record_market_intelligence(info):
             snapshot.get("green_lights"), snapshot.get("narrative_score"), snapshot.get("deployer_score"),
             snapshot.get("whale_score"), snapshot.get("whale_action_score"), snapshot.get("holder_growth_1h"),
             snapshot.get("volume_spike_ratio"), snapshot.get("threat_risk_score"), json.dumps(snapshot),
+        ))
+        cur.execute("""
+            INSERT INTO token_flow_snapshots (
+                mint, source, price, mc, liq, vol, age_min, holder_count, holder_growth_1h,
+                unique_buyer_count, unique_seller_count, first_buyer_count, smart_wallet_buys,
+                smart_wallet_first10, total_buy_sol, total_sell_sol, net_flow_sol, buy_sell_ratio,
+                buy_pressure_pct, liquidity_drop_pct, threat_risk_score, transfer_hook_enabled,
+                can_exit, flow_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            info.get("mint"), info.get("source") or "scanner", flow_snapshot.get("price"),
+            flow_snapshot.get("mc"), flow_snapshot.get("liq"), flow_snapshot.get("vol"), flow_snapshot.get("age_min"),
+            flow_snapshot.get("holder_count"), flow_snapshot.get("holder_growth_1h"),
+            flow_snapshot.get("unique_buyer_count"), flow_snapshot.get("unique_seller_count"),
+            flow_snapshot.get("first_buyer_count"), flow_snapshot.get("smart_wallet_buys"),
+            flow_snapshot.get("smart_wallet_first10"), flow_snapshot.get("total_buy_sol"),
+            flow_snapshot.get("total_sell_sol"), flow_snapshot.get("net_flow_sol"), flow_snapshot.get("buy_sell_ratio"),
+            flow_snapshot.get("buy_pressure_pct"), flow_snapshot.get("liquidity_drop_pct"),
+            flow_snapshot.get("threat_risk_score"), int(bool(flow_snapshot.get("transfer_hook_enabled"))),
+            None if flow_snapshot.get("can_exit") is None else int(bool(flow_snapshot.get("can_exit"))),
+            json.dumps(flow_snapshot),
         ))
 
         opened_positions = 0
@@ -6295,6 +6431,8 @@ def api_quant_overview():
         event_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM token_feature_snapshots")
         snapshot_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM token_flow_snapshots")
+        flow_snapshot_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_decisions")
         decision_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='open'")
@@ -6323,6 +6461,33 @@ def api_quant_overview():
             LIMIT 12
         """)
         recent_positions = cur.fetchall()
+        cur.execute("""
+            SELECT mint, price, unique_buyer_count, unique_seller_count, smart_wallet_buys,
+                   net_flow_sol, buy_sell_ratio, liquidity_drop_pct, threat_risk_score, can_exit, created_at
+            FROM token_flow_snapshots
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        recent_flow_rows = cur.fetchall()
+        cur.execute("""
+            SELECT DISTINCT ON (sd.strategy_name, sd.mint)
+                   sd.strategy_name,
+                   sd.mint,
+                   COALESCE(sd.name, mt.name, 'Unknown') AS name,
+                   sd.passed,
+                   sd.price,
+                   sd.blocker_reasons_json AS blocker_reasons,
+                   mt.first_price,
+                   mt.peak_price,
+                   mt.trough_price,
+                   mt.last_price
+            FROM shadow_decisions sd
+            JOIN market_tokens mt ON mt.mint = sd.mint
+            WHERE mt.first_price IS NOT NULL
+            ORDER BY sd.strategy_name, sd.mint, sd.created_at ASC
+            LIMIT 4000
+        """)
+        opportunity_rows = cur.fetchall()
     finally:
         db_return(conn)
 
@@ -6339,16 +6504,34 @@ def api_quant_overview():
             "avg_upside_pct": float(row.get("avg_upside") or 0),
             "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
         })
+    flow_regime = summarize_flow_regime(recent_flow_rows)
+    opportunity_map = summarize_opportunity_matrix(opportunity_rows)
 
     return jsonify({
         "dataset": {
             "tracked_tokens": token_count,
             "market_events": event_count,
             "feature_snapshots": snapshot_count,
+            "flow_snapshots": flow_snapshot_count,
             "shadow_decisions": decision_count,
             "open_shadow_positions": open_count,
             "closed_shadow_positions": closed_count,
         },
+        "flow_regime": flow_regime,
+        "recent_flow": [{
+            "mint": row.get("mint"),
+            "price": float(row.get("price") or 0),
+            "unique_buyer_count": int(row.get("unique_buyer_count") or 0),
+            "unique_seller_count": int(row.get("unique_seller_count") or 0),
+            "smart_wallet_buys": int(row.get("smart_wallet_buys") or 0),
+            "net_flow_sol": float(row.get("net_flow_sol") or 0),
+            "buy_sell_ratio": float(row.get("buy_sell_ratio") or 0),
+            "liquidity_drop_pct": float(row.get("liquidity_drop_pct") or 0),
+            "threat_risk_score": int(row.get("threat_risk_score") or 0),
+            "can_exit": None if row.get("can_exit") is None else bool(row.get("can_exit")),
+            "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        } for row in recent_flow_rows[:8]],
+        "opportunity_map": opportunity_map,
         "strategy_summaries": summaries,
         "recent_positions": [{
             "mint": row.get("mint"),
@@ -8847,6 +9030,15 @@ DASHBOARD_HTML = _CSS + """
       </div>
     </div>
 
+    <div class="scanner-top-grid" style="margin-top:16px">
+      <div class="glass" id="quant-flow-regime">
+        <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Flow regime analytics loading…</div>
+      </div>
+      <div class="glass" id="quant-opportunity-map">
+        <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Opportunity map loading…</div>
+      </div>
+    </div>
+
     <div class="signals-layout">
       <div style="min-width:0">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -10492,14 +10684,107 @@ function renderQuantOverview() {
   if (!grid || !_quantOverview) return;
   const dataset = _quantOverview.dataset || {};
   const strategies = _quantOverview.strategy_summaries || [];
+  const flow = _quantOverview.flow_regime || {};
+  const opportunity = _quantOverview.opportunity_map || {};
   const best = strategies[0] || {};
   grid.innerHTML = `
     <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">${dataset.tracked_tokens || 0}</div><div class="scanner-summary-copy">Observed in persistent market storage</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Market Events</div><div class="scanner-summary-value">${dataset.market_events || 0}</div><div class="scanner-summary-copy">Append-only event log</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Feature Snapshots</div><div class="scanner-summary-value">${dataset.feature_snapshots || 0}</div><div class="scanner-summary-copy">Replay-ready scoring inputs</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Snapshots</div><div class="scanner-summary-value">${dataset.flow_snapshots || 0}</div><div class="scanner-summary-copy">Wallet pressure and liquidity tape</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Shadow Decisions</div><div class="scanner-summary-value">${dataset.shadow_decisions || 0}</div><div class="scanner-summary-copy">Would-buy versus blocked decisions</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Regime</div><div class="scanner-summary-value">${flow.regime || '—'}</div><div class="scanner-summary-copy">${flow.sample_size || 0} recent snapshots · ${flow.avg_net_flow_sol > 0 ? '+' : ''}${flow.avg_net_flow_sol || 0} SOL net</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Missed Winners</div><div class="scanner-summary-value">${(opportunity.totals || {}).missed_winners || 0}</div><div class="scanner-summary-copy">Shadow blocks that later ran ${opportunity.winner_threshold_pct || 120}%+</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Open Shadow Positions</div><div class="scanner-summary-value">${dataset.open_shadow_positions || 0}</div><div class="scanner-summary-copy">Currently simulated live book</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Best Replay Avg</div><div class="scanner-summary-value">${best.strategy_name ? best.strategy_name + ' ' + (best.avg_pnl_pct > 0 ? '+' : '') + best.avg_pnl_pct + '%' : '—'}</div><div class="scanner-summary-copy">Current top strategy from completed replays</div></div>
+  `;
+  renderQuantFlowRegime();
+  renderQuantOpportunityMap();
+}
+
+function renderQuantFlowRegime() {
+  const box = document.getElementById('quant-flow-regime');
+  if (!box || !_quantOverview) return;
+  const flow = _quantOverview.flow_regime || {};
+  const recent = Array.isArray(_quantOverview.recent_flow) ? _quantOverview.recent_flow : [];
+  box.innerHTML = `
+    <div class="panel-head" style="margin-bottom:12px">
+      <div>
+        <div class="panel-title">Flow Regime</div>
+        <div class="panel-copy">Recent wallet participation, smart-money presence, and liquidity health across the live capture tape.</div>
+      </div>
+      <span class="badge ${flow.regime === 'accumulation' ? 'bg-grn' : flow.regime === 'defensive' || flow.regime === 'distribution' ? 'bg-red' : 'bg-muted'}">${flow.regime || 'neutral'}</span>
+    </div>
+    <div class="shortcut-row" style="margin-bottom:12px">
+      <span class="badge bg-muted">Buy/Sell ${flow.avg_buy_sell_ratio || 0}</span>
+      <span class="badge bg-muted">Net ${flow.avg_net_flow_sol > 0 ? '+' : ''}${flow.avg_net_flow_sol || 0} SOL</span>
+      <span class="badge bg-muted">Smart ${flow.avg_smart_wallet_buys || 0}</span>
+      <span class="badge bg-muted">Risk ${flow.high_risk_share_pct || 0}%</span>
+    </div>
+    <div class="operator-rule-list" style="margin-bottom:12px">
+      <div class="operator-rule"><div><div class="operator-rule-label">Liquidity Drain Share</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Tokens with 35%+ liquidity loss</div></div><div class="operator-rule-value">${flow.liquidity_drain_share_pct || 0}%</div></div>
+      <div class="operator-rule"><div><div class="operator-rule-label">Exit Blocked Share</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Tokens with no reliable exit route</div></div><div class="operator-rule-value">${flow.exit_blocked_share_pct || 0}%</div></div>
+      <div class="operator-rule"><div><div class="operator-rule-label">Avg Unique Buyers</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Breadth in the recent sample</div></div><div class="operator-rule-value">${flow.avg_unique_buyers || 0}</div></div>
+    </div>
+    <div class="sec-label">Recent Tape</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${recent.slice(0, 5).map(item => `
+        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div style="font-size:11px;font-weight:700;color:var(--t1)">${item.mint ? item.mint.slice(0, 6) + '...' + item.mint.slice(-4) : 'Unknown'}</div>
+            <div style="font-size:11px;font-weight:700;color:${item.net_flow_sol >= 0 ? 'var(--grn)' : 'var(--red2)'}">${item.net_flow_sol >= 0 ? '+' : ''}${(item.net_flow_sol || 0).toFixed(2)} SOL</div>
+          </div>
+          <div class="shortcut-row" style="margin-top:8px">
+            <span class="badge bg-muted">${item.unique_buyer_count || 0} buyers</span>
+            <span class="badge bg-muted">${item.unique_seller_count || 0} sellers</span>
+            <span class="badge bg-muted">Smart ${item.smart_wallet_buys || 0}</span>
+            <span class="badge ${item.can_exit === false ? 'bg-red' : 'bg-muted'}">${item.can_exit === false ? 'Exit risk' : 'Exit ok'}</span>
+          </div>
+        </div>
+      `).join('') || '<div style="font-size:11px;color:var(--t3)">No flow samples captured yet.</div>'}
+    </div>
+  `;
+}
+
+function renderQuantOpportunityMap() {
+  const box = document.getElementById('quant-opportunity-map');
+  if (!box || !_quantOverview) return;
+  const opportunity = _quantOverview.opportunity_map || {};
+  const totals = opportunity.totals || {};
+  const blockers = Array.isArray(opportunity.top_blockers) ? opportunity.top_blockers : [];
+  const samples = opportunity.samples || {};
+  box.innerHTML = `
+    <div class="panel-head" style="margin-bottom:12px">
+      <div>
+        <div class="panel-title">Opportunity Map</div>
+        <div class="panel-copy">Classifies the market tape into winners captured, winners missed, losers avoided, and bad longs that should be filtered harder.</div>
+      </div>
+      <span class="badge bg-muted">Winner threshold ${opportunity.winner_threshold_pct || 120}%</span>
+    </div>
+    <div class="control-action-grid" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:12px">
+      <div class="scanner-summary-card"><div class="scanner-summary-label">Captured Winners</div><div class="scanner-summary-value">${totals.captured_winners || 0}</div><div class="scanner-summary-copy">Passed and later ran</div></div>
+      <div class="scanner-summary-card"><div class="scanner-summary-label">False Positives</div><div class="scanner-summary-value">${totals.false_positives || 0}</div><div class="scanner-summary-copy">Passed and later broke down</div></div>
+      <div class="scanner-summary-card"><div class="scanner-summary-label">Missed Winners</div><div class="scanner-summary-value">${totals.missed_winners || 0}</div><div class="scanner-summary-copy">Blocked before major expansion</div></div>
+      <div class="scanner-summary-card"><div class="scanner-summary-label">Avoided Losers</div><div class="scanner-summary-value">${totals.avoided_losers || 0}</div><div class="scanner-summary-copy">Blocked before collapse</div></div>
+    </div>
+    <div class="sec-label">Top Blockers On Missed Winners</div>
+    <div class="shortcut-row" style="margin-bottom:12px">
+      ${blockers.map(item => `<span class="badge bg-muted">${item.reason.replaceAll('_', ' ')} · ${item.count}</span>`).join('') || '<span class="badge bg-muted">No blocker data yet</span>'}
+    </div>
+    <div class="sec-label">Missed Winners Sample</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${(samples.missed_winners || []).slice(0, 4).map(item => `
+        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div>
+              <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
+              <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.strategy_name} · ${(item.blocker_reasons || []).join(', ') || 'blocked'}</div>
+            </div>
+            <div style="font-size:12px;font-weight:800;color:var(--grn)">+${(item.peak_return_pct || 0).toFixed(1)}%</div>
+          </div>
+        </div>
+      `).join('') || '<div style="font-size:11px;color:var(--t3)">No missed-winner sample yet.</div>'}
+    </div>
   `;
 }
 

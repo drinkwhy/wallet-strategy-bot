@@ -1,3 +1,4 @@
+import json
 import math
 from dataclasses import dataclass
 
@@ -69,6 +70,16 @@ def build_feature_snapshot(info, intel=None):
     volume_spike_ratio = _safe_float(intel.get("volume_spike_ratio"))
     threat_risk_score = _safe_int(intel.get("threat_risk_score"))
     cluster_confidence = _safe_int(intel.get("cluster_confidence"))
+    unique_buyer_count = _safe_int(intel.get("unique_buyer_count"))
+    unique_seller_count = _safe_int(intel.get("unique_seller_count"))
+    first_buyer_count = _safe_int(intel.get("first_buyer_count"))
+    smart_wallet_buys = _safe_int(intel.get("smart_wallet_buys"))
+    smart_wallet_first10 = _safe_int(intel.get("smart_wallet_first10"))
+    total_buy_sol = _safe_float(intel.get("total_buy_sol"))
+    total_sell_sol = _safe_float(intel.get("total_sell_sol"))
+    net_flow_sol = _safe_float(intel.get("net_flow_sol"))
+    buy_sell_ratio = _safe_float(intel.get("buy_sell_ratio"))
+    liquidity_drop_pct = _safe_float(intel.get("liquidity_drop_pct"))
     transfer_hook_enabled = bool(intel.get("transfer_hook_enabled"))
     can_exit = intel.get("can_exit")
 
@@ -83,6 +94,13 @@ def build_feature_snapshot(info, intel=None):
     spike_quality = _normalize(volume_spike_ratio, 0, 20)
     age_freshness = 1.0 - _normalize(age_min, 0, 240)
     threat_penalty = _normalize(threat_risk_score, 0, 100)
+    wallet_participation_quality = _normalize(unique_buyer_count + first_buyer_count, 0, 40)
+    smart_money_quality = _normalize((smart_wallet_buys * 0.7) + (smart_wallet_first10 * 1.2), 0, 12)
+    flow_quality = (
+        _normalize(buy_sell_ratio, 0.5, 4.5) * 0.45
+        + _normalize(net_flow_sol, -2, 35) * 0.55
+    )
+    liquidity_retention_quality = 1.0 - _normalize(liquidity_drop_pct, 0, 70)
     exit_penalty = 0.4 if can_exit is False else 0.0
     hook_penalty = 0.25 if transfer_hook_enabled else 0.0
 
@@ -96,6 +114,10 @@ def build_feature_snapshot(info, intel=None):
         + whale_quality * 10
         + holder_quality * 4
         + spike_quality * 4
+        + wallet_participation_quality * 5
+        + smart_money_quality * 7
+        + flow_quality * 8
+        + liquidity_retention_quality * 4
         + age_freshness * 8
         - threat_penalty * 15
         - exit_penalty * 12
@@ -110,6 +132,10 @@ def build_feature_snapshot(info, intel=None):
         + (deployer_quality * 0.08)
         + (whale_quality * 0.12)
         + (holder_quality * 0.06)
+        + (wallet_participation_quality * 0.06)
+        + (smart_money_quality * 0.07)
+        + (flow_quality * 0.08)
+        + (liquidity_retention_quality * 0.05)
         + (age_freshness * 0.08)
         - (threat_penalty * 0.18)
         - exit_penalty
@@ -136,6 +162,16 @@ def build_feature_snapshot(info, intel=None):
         "volume_spike_ratio": volume_spike_ratio,
         "threat_risk_score": threat_risk_score,
         "cluster_confidence": cluster_confidence,
+        "unique_buyer_count": unique_buyer_count,
+        "unique_seller_count": unique_seller_count,
+        "first_buyer_count": first_buyer_count,
+        "smart_wallet_buys": smart_wallet_buys,
+        "smart_wallet_first10": smart_wallet_first10,
+        "total_buy_sol": round(total_buy_sol, 4),
+        "total_sell_sol": round(total_sell_sol, 4),
+        "net_flow_sol": round(net_flow_sol, 4),
+        "buy_sell_ratio": round(buy_sell_ratio, 4),
+        "liquidity_drop_pct": round(liquidity_drop_pct, 2),
         "transfer_hook_enabled": transfer_hook_enabled,
         "can_exit": can_exit,
         "liquidity_quality": round(liquidity_quality, 4),
@@ -147,10 +183,50 @@ def build_feature_snapshot(info, intel=None):
         "whale_quality": round(whale_quality, 4),
         "holder_quality": round(holder_quality, 4),
         "spike_quality": round(spike_quality, 4),
+        "wallet_participation_quality": round(wallet_participation_quality, 4),
+        "smart_money_quality": round(smart_money_quality, 4),
+        "flow_quality": round(flow_quality, 4),
+        "liquidity_retention_quality": round(liquidity_retention_quality, 4),
         "age_freshness": round(age_freshness, 4),
         "threat_penalty": round(threat_penalty, 4),
         "composite_score": round(composite_score, 2),
         "confidence": round(confidence, 4),
+    }
+
+
+def build_flow_snapshot(info, intel=None):
+    intel = intel or {}
+    unique_buyers = _safe_int(intel.get("unique_buyer_count"))
+    unique_sellers = _safe_int(intel.get("unique_seller_count"))
+    total_buy_sol = _safe_float(intel.get("total_buy_sol"))
+    total_sell_sol = _safe_float(intel.get("total_sell_sol"))
+    net_flow_sol = _safe_float(intel.get("net_flow_sol"), total_buy_sol - total_sell_sol)
+    participants = max(unique_buyers + unique_sellers, 1)
+    buy_pressure_pct = (unique_buyers / participants) * 100.0 if participants else 0.0
+    return {
+        "price": _safe_float(info.get("price")),
+        "liq": _safe_float(info.get("liq")),
+        "mc": _safe_float(info.get("mc")),
+        "vol": _safe_float(info.get("vol")),
+        "age_min": _safe_float(info.get("age_min"), 9999.0),
+        "holder_count": _safe_int(intel.get("holder_count")),
+        "holder_growth_1h": _safe_float(intel.get("holder_growth_1h")),
+        "unique_buyer_count": unique_buyers,
+        "unique_seller_count": unique_sellers,
+        "first_buyer_count": _safe_int(intel.get("first_buyer_count")),
+        "smart_wallet_buys": _safe_int(intel.get("smart_wallet_buys")),
+        "smart_wallet_first10": _safe_int(intel.get("smart_wallet_first10")),
+        "total_buy_sol": round(total_buy_sol, 4),
+        "total_sell_sol": round(total_sell_sol, 4),
+        "net_flow_sol": round(net_flow_sol, 4),
+        "buy_sell_ratio": round(_safe_float(intel.get("buy_sell_ratio")), 4),
+        "buy_pressure_pct": round(buy_pressure_pct, 2),
+        "liquidity_drop_pct": round(_safe_float(intel.get("liquidity_drop_pct")), 2),
+        "threat_risk_score": _safe_int(intel.get("threat_risk_score")),
+        "transfer_hook_enabled": bool(intel.get("transfer_hook_enabled")),
+        "can_exit": intel.get("can_exit"),
+        "narrative_tags": list(intel.get("narrative_tags") or []),
+        "infra_labels": list(intel.get("infra_labels") or []),
     }
 
 
@@ -268,4 +344,143 @@ def shadow_position_update(position, current_price, settings, age_min):
         "max_upside_pct": round(max_upside_pct, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "realized_pnl_pct": round(realized_pnl_pct, 2) if realized_pnl_pct is not None else None,
+    }
+
+
+def _json_list(value):
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def summarize_flow_regime(rows):
+    sample = [row for row in (rows or []) if isinstance(row, dict)]
+    count = len(sample)
+    if not count:
+        return {
+            "sample_size": 0,
+            "regime": "uninitialized",
+            "avg_buy_sell_ratio": 0.0,
+            "avg_net_flow_sol": 0.0,
+            "avg_smart_wallet_buys": 0.0,
+            "avg_unique_buyers": 0.0,
+            "high_risk_share_pct": 0.0,
+            "exit_blocked_share_pct": 0.0,
+            "liquidity_drain_share_pct": 0.0,
+        }
+
+    avg_buy_sell_ratio = sum(_safe_float(row.get("buy_sell_ratio")) for row in sample) / count
+    avg_net_flow_sol = sum(_safe_float(row.get("net_flow_sol")) for row in sample) / count
+    avg_smart_wallet_buys = sum(_safe_float(row.get("smart_wallet_buys")) for row in sample) / count
+    avg_unique_buyers = sum(_safe_float(row.get("unique_buyer_count")) for row in sample) / count
+    high_risk_share = sum(1 for row in sample if _safe_int(row.get("threat_risk_score")) >= 70) / count
+    exit_blocked_share = sum(1 for row in sample if row.get("can_exit") is False) / count
+    liquidity_drain_share = sum(1 for row in sample if _safe_float(row.get("liquidity_drop_pct")) >= 35) / count
+
+    regime = "neutral"
+    if high_risk_share >= 0.45 or exit_blocked_share >= 0.18 or liquidity_drain_share >= 0.35:
+        regime = "defensive"
+    elif avg_net_flow_sol > 2.5 and avg_buy_sell_ratio > 1.35 and high_risk_share < 0.3:
+        regime = "accumulation"
+    elif avg_net_flow_sol < -1.5 or avg_buy_sell_ratio < 0.9:
+        regime = "distribution"
+
+    return {
+        "sample_size": count,
+        "regime": regime,
+        "avg_buy_sell_ratio": round(avg_buy_sell_ratio, 2),
+        "avg_net_flow_sol": round(avg_net_flow_sol, 2),
+        "avg_smart_wallet_buys": round(avg_smart_wallet_buys, 2),
+        "avg_unique_buyers": round(avg_unique_buyers, 2),
+        "high_risk_share_pct": round(high_risk_share * 100.0, 1),
+        "exit_blocked_share_pct": round(exit_blocked_share * 100.0, 1),
+        "liquidity_drain_share_pct": round(liquidity_drain_share * 100.0, 1),
+    }
+
+
+def summarize_opportunity_matrix(rows, winner_threshold_pct=120.0, loser_threshold_pct=-35.0, sample_limit=5):
+    categories = {
+        "missed_winners": [],
+        "avoided_losers": [],
+        "captured_winners": [],
+        "false_positives": [],
+    }
+    blocker_counts = {}
+    by_strategy = {}
+
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        strategy_name = (row.get("strategy_name") or "unknown").lower()
+        passed = bool(row.get("passed"))
+        basis_price = _safe_float(row.get("price")) or _safe_float(row.get("first_price"))
+        peak_price = _safe_float(row.get("peak_price"))
+        trough_price = _safe_float(row.get("trough_price"))
+        last_price = _safe_float(row.get("last_price"))
+        if basis_price <= 0 or peak_price <= 0:
+            continue
+
+        peak_return_pct = ((peak_price / basis_price) - 1.0) * 100.0
+        trough_return_pct = ((trough_price / basis_price) - 1.0) * 100.0 if trough_price > 0 else 0.0
+        last_return_pct = ((last_price / basis_price) - 1.0) * 100.0 if last_price > 0 else 0.0
+        item = {
+            "strategy_name": strategy_name,
+            "mint": row.get("mint"),
+            "name": row.get("name") or row.get("mint") or "Unknown",
+            "passed": passed,
+            "peak_return_pct": round(peak_return_pct, 2),
+            "trough_return_pct": round(trough_return_pct, 2),
+            "last_return_pct": round(last_return_pct, 2),
+            "blocker_reasons": _json_list(row.get("blocker_reasons")),
+        }
+        by_strategy.setdefault(strategy_name, {
+            "missed_winners": 0,
+            "avoided_losers": 0,
+            "captured_winners": 0,
+            "false_positives": 0,
+        })
+
+        if not passed and peak_return_pct >= winner_threshold_pct:
+            categories["missed_winners"].append(item)
+            by_strategy[strategy_name]["missed_winners"] += 1
+            for reason in item["blocker_reasons"]:
+                blocker_counts[reason] = blocker_counts.get(reason, 0) + 1
+        elif not passed and trough_return_pct <= loser_threshold_pct and peak_return_pct < max(40.0, winner_threshold_pct * 0.5):
+            categories["avoided_losers"].append(item)
+            by_strategy[strategy_name]["avoided_losers"] += 1
+        elif passed and peak_return_pct >= winner_threshold_pct:
+            categories["captured_winners"].append(item)
+            by_strategy[strategy_name]["captured_winners"] += 1
+        elif passed and last_return_pct <= loser_threshold_pct and peak_return_pct < max(35.0, winner_threshold_pct * 0.45):
+            categories["false_positives"].append(item)
+            by_strategy[strategy_name]["false_positives"] += 1
+
+    def _sort_key(entry):
+        return (entry.get("peak_return_pct") or 0.0, entry.get("last_return_pct") or 0.0)
+
+    return {
+        "winner_threshold_pct": winner_threshold_pct,
+        "loser_threshold_pct": loser_threshold_pct,
+        "totals": {
+            key: len(value)
+            for key, value in categories.items()
+        },
+        "top_blockers": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(blocker_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+        ],
+        "by_strategy": [
+            {"strategy_name": strategy_name, **stats}
+            for strategy_name, stats in sorted(by_strategy.items(), key=lambda item: item[0])
+        ],
+        "samples": {
+            key: sorted(value, key=_sort_key, reverse=True)[:sample_limit]
+            for key, value in categories.items()
+        },
     }
