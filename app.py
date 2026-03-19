@@ -30,6 +30,7 @@ import stripe
 
 from dotenv import load_dotenv
 from backtest_engine import simulate_backtest, simulate_event_tape_backtest
+from learning_engine import score_recent_candidates, train_feature_model
 from optimizer_engine import build_outcome_labels, summarize_feature_edges, sweep_entry_filters
 from quant_platform import (
     CANONICAL_STRATEGIES,
@@ -6925,6 +6926,70 @@ def api_quant_optimizer():
     })
 
 
+@app.route("/api/quant/model")
+@login_required
+def api_quant_model():
+    days = max(1, min(int(request.args.get("days") or 7), 30))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (s.mint)
+                   s.mint,
+                   COALESCE(mt.name, 'Unknown') AS name,
+                   s.price,
+                   s.feature_json,
+                   s.created_at
+            FROM token_feature_snapshots s
+            JOIN market_tokens mt ON mt.mint = s.mint
+            WHERE s.created_at >= NOW() - INTERVAL %s
+              AND COALESCE(mt.first_price, 0) > 0
+            ORDER BY s.mint, s.created_at ASC
+            LIMIT 6000
+        """, (f"{days} days",))
+        entry_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint,
+                   COALESCE(name, 'Unknown') AS name,
+                   first_price,
+                   peak_price,
+                   trough_price,
+                   last_price
+            FROM market_tokens
+            WHERE last_seen_at >= NOW() - INTERVAL %s
+              AND COALESCE(first_price, 0) > 0
+            ORDER BY last_seen_at DESC
+            LIMIT 6000
+        """, (f"{days} days",))
+        token_rows = cur.fetchall()
+        cur.execute("""
+            SELECT DISTINCT ON (s.mint)
+                   s.mint,
+                   COALESCE(mt.name, 'Unknown') AS name,
+                   s.price,
+                   s.feature_json,
+                   s.created_at
+            FROM token_feature_snapshots s
+            JOIN market_tokens mt ON mt.mint = s.mint
+            WHERE s.created_at >= NOW() - INTERVAL '24 hours'
+              AND COALESCE(mt.first_price, 0) > 0
+            ORDER BY s.mint, s.created_at DESC
+            LIMIT 1000
+        """)
+        recent_rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    outcomes = build_outcome_labels(token_rows)
+    model = train_feature_model(entry_rows, outcomes)
+    ranked = score_recent_candidates(recent_rows, model)
+    return jsonify({
+        "window_days": days,
+        "model": model,
+        "ranked_candidates": ranked,
+    })
+
+
 @app.route("/api/quant/shadow-performance")
 @login_required
 def api_quant_shadow_performance():
@@ -9432,6 +9497,10 @@ DASHBOARD_HTML = _CSS + """
       <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Optimizer sweep loading…</div>
     </div>
 
+    <div class="glass" id="quant-model" style="margin-top:16px">
+      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Model scoring loading…</div>
+    </div>
+
     <div class="signals-layout">
       <div style="min-width:0">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -9504,7 +9573,7 @@ let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-let _quantOverview = null, _quantOptimizer = null, _quantRuns = [], _quantSelectedRunId = null;
+let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantRuns = [], _quantSelectedRunId = null;
 let _tabPollers = {};
 let _settingsDirty = false;
 let _enhancedData = null;
@@ -11059,17 +11128,20 @@ async function loadPnl(range) {
 async function pollQuant() {
   try {
     const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
-    const [overview, optimizer, runs] = await Promise.all([
+    const [overview, optimizer, model, runs] = await Promise.all([
       fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
       fetch('/api/quant/optimizer?days=' + days).then(r => r.json()).catch(() => null),
+      fetch('/api/quant/model?days=' + days).then(r => r.json()).catch(() => null),
       fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
     ]);
     if (overview) _quantOverview = overview;
     if (optimizer) _quantOptimizer = optimizer;
+    if (model) _quantModel = model;
     _quantRuns = Array.isArray(runs) ? runs : [];
     renderQuantOverview();
     renderQuantRuns();
     renderQuantOptimizer();
+    renderQuantModel();
     if (_quantSelectedRunId) {
       await showQuantRunDetail(_quantSelectedRunId, true);
     }
@@ -11266,6 +11338,70 @@ function renderQuantOptimizer() {
               </div>
             </div>
           `).join('') || '<div style="font-size:11px;color:var(--t3)">Outcome labels are still warming up.</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderQuantModel() {
+  const box = document.getElementById('quant-model');
+  if (!box || !_quantModel) return;
+  const model = _quantModel.model || {};
+  const ranked = Array.isArray(_quantModel.ranked_candidates) ? _quantModel.ranked_candidates : [];
+  const weights = Array.isArray(model.weights) ? model.weights : [];
+  box.innerHTML = `
+    <div class="panel-head" style="margin-bottom:12px">
+      <div>
+        <div class="panel-title">Learned Score Model</div>
+        <div class="panel-copy">Trains a transparent linear ranking model from winner-versus-rug labels and scores recent candidates with feature-level driver attribution.</div>
+      </div>
+      <span class="badge ${model.trained ? 'bg-grn' : 'bg-red'}">${model.trained ? 'trained' : 'insufficient labels'}</span>
+    </div>
+    <div class="shortcut-row" style="margin-bottom:12px">
+      <span class="badge bg-muted">${_quantModel.window_days || 7}d train window</span>
+      <span class="badge bg-muted">${model.winner_count || 0} winners</span>
+      <span class="badge bg-muted">${model.rug_count || 0} rugs</span>
+      <span class="badge bg-blue">${model.accuracy_pct || 0}% in-sample accuracy</span>
+    </div>
+    <div class="scanner-top-grid">
+      <div>
+        <div class="sec-label">Top Model Weights</div>
+        <div class="operator-rule-list">
+          ${weights.slice(0, 6).map(item => `
+            <div class="operator-rule">
+              <div>
+                <div class="operator-rule-label">${item.label}</div>
+                <div style="font-size:10px;color:var(--t3);margin-top:3px">Winner ${item.winner_mean} · Rug ${item.rug_mean}</div>
+              </div>
+              <div class="operator-rule-value">${item.weight > 0 ? '+' : ''}${item.weight}</div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Model weights unavailable.</div>'}
+        </div>
+      </div>
+      <div>
+        <div class="sec-label">Ranked Candidates</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${ranked.slice(0, 5).map(item => `
+            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+                <div>
+                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
+                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.mint || ''}</div>
+                </div>
+                <div style="font-size:13px;font-weight:800;color:${item.model_score >= 60 ? 'var(--grn)' : item.model_score >= 45 ? 'var(--gold)' : 'var(--red2)'}">${item.model_score.toFixed(1)}</div>
+              </div>
+              <div class="shortcut-row" style="margin-top:8px">
+                <span class="badge bg-muted">Comp ${item.features?.composite_score ?? 0}</span>
+                <span class="badge bg-muted">Conf ${Math.round((item.features?.confidence || 0) * 100)}%</span>
+                <span class="badge bg-muted">B/S ${item.features?.buy_sell_ratio ?? 0}</span>
+                <span class="badge bg-muted">Net ${item.features?.net_flow_sol ?? 0} SOL</span>
+              </div>
+              <div class="shortcut-row" style="margin-top:8px">
+                ${(item.top_drivers || []).slice(0, 3).map(driver => `<span class="badge bg-muted">${driver.label} ${driver.contribution > 0 ? '+' : ''}${driver.contribution}</span>`).join('')}
+              </div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Not enough trained candidates yet.</div>'}
         </div>
       </div>
     </div>
