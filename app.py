@@ -29,7 +29,7 @@ import bcrypt
 import stripe
 
 from dotenv import load_dotenv
-from backtest_engine import simulate_backtest
+from backtest_engine import simulate_backtest, simulate_event_tape_backtest
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_flow_snapshot,
@@ -883,6 +883,7 @@ def init_db():
             name TEXT,
             status TEXT DEFAULT 'queued',
             days INTEGER DEFAULT 7,
+            replay_mode TEXT DEFAULT 'snapshot',
             strategy_filter TEXT,
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
@@ -1003,6 +1004,7 @@ def migrate_db():
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS total_sell_sol REAL DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS net_flow_sol REAL DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS buy_sell_ratio REAL DEFAULT 0",
+            "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS replay_mode TEXT DEFAULT 'snapshot'",
         ]
         for m in migrations:
             try:
@@ -1241,6 +1243,7 @@ def migrate_db():
                 name TEXT,
                 status TEXT DEFAULT 'queued',
                 days INTEGER DEFAULT 7,
+                replay_mode TEXT DEFAULT 'snapshot',
                 strategy_filter TEXT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
@@ -4549,6 +4552,24 @@ def _shadow_strategy_settings():
     }
 
 
+def _classify_market_event(previous_row, info):
+    if not previous_row:
+        return "token_discovered"
+    current_price = float(info.get("price") or 0)
+    current_liq = float(info.get("liq") or 0)
+    previous_price = float(previous_row.get("last_price") or 0)
+    previous_liq = float(previous_row.get("last_liq") or 0)
+    if previous_liq > 0 and current_liq <= previous_liq * 0.72:
+        return "liquidity_drop"
+    if previous_liq > 0 and current_liq >= previous_liq * 1.28:
+        return "liquidity_add"
+    if previous_price > 0 and current_price >= previous_price * 1.22:
+        return "price_breakout"
+    if previous_price > 0 and current_price <= previous_price * 0.78:
+        return "price_flush"
+    return "market_tick"
+
+
 def _record_market_intelligence(info):
     intel = info.get("intel") or {}
     snapshot = build_feature_snapshot(info, intel)
@@ -4558,6 +4579,14 @@ def _record_market_intelligence(info):
     try:
         cur = conn.cursor()
         payload_json = json.dumps(info)
+        cur.execute("""
+            SELECT mint, last_price, last_liq, observations
+            FROM market_tokens
+            WHERE mint=%s
+            LIMIT 1
+        """, (info.get("mint"),))
+        previous_row = cur.fetchone()
+        event_type = _classify_market_event(previous_row, info)
         cur.execute("""
             INSERT INTO market_tokens (
                 mint, name, symbol, first_price, last_price, peak_price, trough_price,
@@ -4589,7 +4618,7 @@ def _record_market_intelligence(info):
                 change_pct, age_min, payload_json
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            info.get("mint"), "market_tick", info.get("source") or "scanner",
+            info.get("mint"), event_type, info.get("source") or "scanner",
             info.get("name"), info.get("symbol"), info.get("price"), info.get("mc"),
             info.get("liq"), info.get("vol"), info.get("change"), info.get("age_min"), payload_json,
         ))
@@ -4794,12 +4823,30 @@ def _load_backtest_snapshots(days=7, strategies=None, limit=50000):
         db_return(conn)
 
 
+def _load_backtest_event_tape(days=7, limit=80000):
+    cutoff = max(1, int(days))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mint, event_type, source, name, symbol, price, mc, liq, vol,
+                   change_pct, age_min, payload_json, created_at
+            FROM market_events
+            WHERE created_at >= NOW() - INTERVAL %s
+            ORDER BY created_at ASC
+            LIMIT %s
+        """, (f"{cutoff} days", limit))
+        return cur.fetchall()
+    finally:
+        db_return(conn)
+
+
 def _set_backtest_job(run_id, payload):
     with _backtest_jobs_lock:
         _backtest_jobs[run_id] = payload
 
 
-def _execute_backtest_run(run_id, requested_by, days, strategy_names, name):
+def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, replay_mode="snapshot"):
     _set_backtest_job(run_id, {"status": "running", "started_at": time.time()})
     conn = db()
     try:
@@ -4819,8 +4866,13 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name):
             for strategy_name in (strategy_names or CANONICAL_STRATEGIES)
             if strategy_name in PRESETS
         }
-        rows = _load_backtest_snapshots(days=days, strategies=strategies)
-        result = simulate_backtest(run_id, rows, strategies)
+        normalized_mode = "event_tape" if str(replay_mode).strip().lower() in {"event_tape", "tape", "events"} else "snapshot"
+        if normalized_mode == "event_tape":
+            rows = _load_backtest_event_tape(days=days)
+            result = simulate_event_tape_backtest(run_id, rows, strategies)
+        else:
+            rows = _load_backtest_snapshots(days=days, strategies=strategies)
+            result = simulate_backtest(run_id, rows, strategies)
         trades = result["trades"]
         summary = result["summary"]
 
@@ -4848,7 +4900,7 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name):
                     error_text=NULL
                 WHERE id=%s
             """, (
-                summary.get("snapshots_processed", 0),
+                summary.get("snapshots_processed", summary.get("events_processed", 0)),
                 summary.get("tokens_processed", 0),
                 summary.get("trades_closed", 0),
                 json.dumps(summary),
@@ -4863,6 +4915,7 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name):
             "summary": summary,
             "requested_by": requested_by,
             "name": name,
+            "replay_mode": normalized_mode,
         })
     except Exception as e:
         conn = db()
@@ -4880,26 +4933,29 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name):
         print(f"[BACKTEST] run {run_id} failed: {e}", flush=True)
 
 
-def launch_backtest_run(requested_by, days=7, strategy_names=None, name=""):
+def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="snapshot"):
     strategy_names = [s for s in (strategy_names or list(CANONICAL_STRATEGIES)) if s in PRESETS]
     if not strategy_names:
         strategy_names = ["balanced"]
+    normalized_mode = "event_tape" if str(replay_mode).strip().lower() in {"event_tape", "tape", "events"} else "snapshot"
     config = {
         "days": max(1, int(days)),
         "strategy_names": strategy_names,
         "name": (name or f"{max(1, int(days))}d replay").strip()[:80],
+        "replay_mode": normalized_mode,
     }
     conn = db()
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO backtest_runs (requested_by, name, status, days, strategy_filter, config_json)
-            VALUES (%s,%s,'queued',%s,%s,%s)
+            INSERT INTO backtest_runs (requested_by, name, status, days, replay_mode, strategy_filter, config_json)
+            VALUES (%s,%s,'queued',%s,%s,%s,%s)
             RETURNING id
         """, (
             requested_by,
             config["name"],
             config["days"],
+            normalized_mode,
             ",".join(strategy_names),
             json.dumps(config),
         ))
@@ -4911,7 +4967,7 @@ def launch_backtest_run(requested_by, days=7, strategy_names=None, name=""):
     _set_backtest_job(run_id, {"status": "queued", "created_at": time.time(), **config})
     threading.Thread(
         target=_execute_backtest_run,
-        args=(run_id, requested_by, config["days"], strategy_names, config["name"]),
+        args=(run_id, requested_by, config["days"], strategy_names, config["name"], normalized_mode),
         daemon=True,
     ).start()
     return run_id, config
@@ -6664,6 +6720,7 @@ def api_quant_backtests():
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         days = int(data.get("days") or 7)
+        replay_mode = (data.get("replay_mode") or "snapshot").strip().lower()
         strategies = data.get("strategies") or list(CANONICAL_STRATEGIES)
         if not isinstance(strategies, list):
             strategies = [str(strategies)]
@@ -6672,6 +6729,7 @@ def api_quant_backtests():
             days=days,
             strategy_names=[str(s).strip().lower() for s in strategies],
             name=(data.get("name") or "").strip(),
+            replay_mode=replay_mode,
         )
         return jsonify({"ok": True, "run_id": run_id, "config": config})
 
@@ -6679,7 +6737,7 @@ def api_quant_backtests():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, requested_by, name, status, days, strategy_filter, started_at, completed_at,
+            SELECT id, requested_by, name, status, days, replay_mode, strategy_filter, started_at, completed_at,
                    snapshots_processed, tokens_processed, trades_closed, summary_json, config_json,
                    error_text, created_at
             FROM backtest_runs
@@ -6707,6 +6765,7 @@ def api_quant_backtests():
             "name": row.get("name"),
             "status": row.get("status"),
             "days": int(row.get("days") or 0),
+            "replay_mode": row.get("replay_mode") or config.get("replay_mode") or "snapshot",
             "strategy_filter": row.get("strategy_filter"),
             "started_at": row.get("started_at").isoformat() if row.get("started_at") else None,
             "completed_at": row.get("completed_at").isoformat() if row.get("completed_at") else None,
@@ -6729,7 +6788,7 @@ def api_quant_backtest_detail(run_id):
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, requested_by, name, status, days, strategy_filter, started_at, completed_at,
+            SELECT id, requested_by, name, status, days, replay_mode, strategy_filter, started_at, completed_at,
                    snapshots_processed, tokens_processed, trades_closed, summary_json, config_json,
                    error_text, created_at
             FROM backtest_runs
@@ -6769,6 +6828,7 @@ def api_quant_backtest_detail(run_id):
             "name": run_row.get("name"),
             "status": run_row.get("status"),
             "days": int(run_row.get("days") or 0),
+            "replay_mode": run_row.get("replay_mode") or config.get("replay_mode") or "snapshot",
             "strategy_filter": run_row.get("strategy_filter"),
             "started_at": run_row.get("started_at").isoformat() if run_row.get("started_at") else None,
             "completed_at": run_row.get("completed_at").isoformat() if run_row.get("completed_at") else None,
@@ -9023,9 +9083,18 @@ DASHBOARD_HTML = _CSS + """
             <input class="finput" id="quant-run-name" type="text" placeholder="e.g. Weekly replay">
           </div>
         </div>
-        <div class="helper-note">Strategies replayed: safe, balanced, aggressive, degen. This uses your captured market snapshots, not guessed candles.</div>
+        <div class="field-row" style="margin-bottom:12px">
+          <div class="fgroup">
+            <label class="flabel">Replay Mode</label>
+            <select class="finput" id="quant-replay-mode">
+              <option value="snapshot">Snapshot Replay</option>
+              <option value="event_tape">Event Tape Replay</option>
+            </select>
+          </div>
+        </div>
+        <div class="helper-note">Strategies replayed: safe, balanced, aggressive, degen. Snapshot replay uses saved feature states. Event tape replay walks the classified market event stream in chronological order.</div>
         <div class="panel-actions" style="margin-top:14px">
-          <button class="btn btn-primary" type="button" onclick="runQuantBacktest()">Run Backtest</button>
+          <button class="btn btn-primary" type="button" onclick="runQuantBacktest()">Run Replay</button>
         </div>
       </div>
     </div>
@@ -10799,18 +10868,25 @@ function renderQuantRuns() {
   box.innerHTML = _quantRuns.map(run => {
     const active = _quantSelectedRunId === run.id;
     const strategies = Object.keys((run.summary || {}).strategies || {});
+    const replayMode = run.replay_mode || run.config?.replay_mode || 'snapshot';
+    const dataPoints = replayMode === 'event_tape'
+      ? ((run.summary || {}).events_processed || run.snapshots_processed || 0)
+      : (run.snapshots_processed || 0);
     return `
       <div onclick="showQuantRunDetail(${run.id})" style="padding:12px 14px;border:1px solid ${active ? 'rgba(96,165,250,.32)' : 'rgba(255,255,255,.06)'};border-radius:14px;background:${active ? 'rgba(47,107,255,.08)' : 'rgba(255,255,255,.02)'};margin-bottom:10px;cursor:pointer">
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
           <div>
             <div style="font-size:13px;font-weight:800;color:var(--t1)">${run.name || ('Run #' + run.id)}</div>
-            <div style="font-size:10px;color:var(--t3);margin-top:3px">${run.days}d · ${run.strategy_filter || 'all strategies'} · ${run.created_at ? new Date(run.created_at).toLocaleString() : 'queued'}</div>
+            <div style="font-size:10px;color:var(--t3);margin-top:3px">${run.days}d · ${replayMode === 'event_tape' ? 'event tape' : 'snapshots'} · ${run.strategy_filter || 'all strategies'} · ${run.created_at ? new Date(run.created_at).toLocaleString() : 'queued'}</div>
           </div>
-          <span class="badge ${run.status === 'completed' ? 'bg-grn' : run.status === 'failed' ? 'bg-red' : 'bg-gold'}">${run.status}</span>
+          <div class="shortcut-row">
+            <span class="badge bg-muted">${replayMode === 'event_tape' ? 'Tape' : 'Snapshot'}</span>
+            <span class="badge ${run.status === 'completed' ? 'bg-grn' : run.status === 'failed' ? 'bg-red' : 'bg-gold'}">${run.status}</span>
+          </div>
         </div>
         <div class="shortcut-row" style="margin-top:10px">
           <span class="badge bg-muted">${run.tokens_processed || 0} tokens</span>
-          <span class="badge bg-muted">${run.snapshots_processed || 0} snapshots</span>
+          <span class="badge bg-muted">${dataPoints} ${replayMode === 'event_tape' ? 'events' : 'snapshots'}</span>
           <span class="badge bg-muted">${run.trades_closed || 0} trades</span>
           <span class="badge bg-muted">${strategies.length} strategies</span>
         </div>
@@ -10822,12 +10898,14 @@ function renderQuantRuns() {
 async function runQuantBacktest() {
   const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
   const name = (document.getElementById('quant-run-name')?.value || '').trim();
+  const replayMode = (document.getElementById('quant-replay-mode')?.value || 'snapshot').trim();
   const res = await fetch('/api/quant/backtests', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       days,
       name,
+      replay_mode: replayMode,
       strategies: ['safe', 'balanced', 'aggressive', 'degen'],
     }),
   }).then(r => r.json()).catch(() => null);
@@ -10836,7 +10914,7 @@ async function runQuantBacktest() {
     return;
   }
   _quantSelectedRunId = res.run_id;
-  showToast(`Backtest queued (#${res.run_id})`);
+  showToast(`${replayMode === 'event_tape' ? 'Tape replay' : 'Snapshot replay'} queued (#${res.run_id})`);
   pollQuant();
 }
 
@@ -10855,11 +10933,20 @@ async function showQuantRunDetail(runId, silent=false) {
   }
   const run = data.run;
   const strategies = run.summary?.strategies || {};
+  const replayMode = run.replay_mode || run.config?.replay_mode || 'snapshot';
+  const sourceCounts = run.summary?.source_counts || {};
+  const eventTypeCounts = run.summary?.event_type_counts || {};
   const topTrades = (data.trades || []).slice(0, 10);
   box.innerHTML = `
     <div class="sec-label">Replay Detail</div>
     <div style="font-size:17px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif;margin-bottom:6px">${run.name || ('Run #' + run.id)}</div>
-    <div style="font-size:11px;color:var(--t2);line-height:1.6;margin-bottom:12px">${run.status} · ${run.days}d window · ${run.tokens_processed || 0} tokens · ${run.snapshots_processed || 0} snapshots · ${run.trades_closed || 0} closed trades</div>
+    <div style="font-size:11px;color:var(--t2);line-height:1.6;margin-bottom:12px">${run.status} · ${run.days}d window · ${replayMode === 'event_tape' ? 'event tape' : 'snapshot'} replay · ${run.tokens_processed || 0} tokens · ${(replayMode === 'event_tape' ? (run.summary?.events_processed || run.snapshots_processed || 0) : (run.snapshots_processed || 0))} ${replayMode === 'event_tape' ? 'events' : 'snapshots'} · ${run.trades_closed || 0} closed trades</div>
+    ${replayMode === 'event_tape' ? `
+      <div class="shortcut-row" style="margin-bottom:12px">
+        ${Object.entries(eventTypeCounts).slice(0, 4).map(([name, count]) => `<span class="badge bg-muted">${name.replaceAll('_', ' ')} · ${count}</span>`).join('')}
+        ${Object.entries(sourceCounts).slice(0, 3).map(([name, count]) => `<span class="badge bg-muted">${name} · ${count}</span>`).join('')}
+      </div>
+    ` : ''}
     <div class="operator-rule-list" style="margin-bottom:12px">
       ${Object.entries(strategies).map(([name, summary]) => `
         <div class="operator-rule">

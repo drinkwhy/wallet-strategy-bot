@@ -61,6 +61,35 @@ def _to_snapshot(row):
     return snapshot
 
 
+def _to_event_snapshot(row):
+    payload = row.get("payload_json") or "{}"
+    try:
+        info = json.loads(payload)
+    except Exception:
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    intel = info.get("intel") or {}
+    enriched = {
+        **info,
+        "price": row.get("price") or info.get("price") or 0,
+        "mc": row.get("mc") or info.get("mc") or 0,
+        "liq": row.get("liq") or info.get("liq") or 0,
+        "vol": row.get("vol") or info.get("vol") or 0,
+        "age_min": row.get("age_min") or info.get("age_min") or 0,
+        "change": row.get("change_pct") or info.get("change") or 0,
+        "mint": row.get("mint") or info.get("mint"),
+        "name": row.get("name") or info.get("name"),
+    }
+    snapshot = build_feature_snapshot(enriched, intel)
+    snapshot["price"] = float(enriched.get("price") or snapshot.get("price") or 0)
+    snapshot["mint"] = enriched.get("mint")
+    snapshot["name"] = enriched.get("name") or "Unknown"
+    snapshot["event_type"] = row.get("event_type") or "market_tick"
+    snapshot["source"] = row.get("source") or info.get("source") or "scanner"
+    return snapshot
+
+
 def simulate_backtest(run_id, snapshot_rows, strategy_settings):
     open_positions = {}
     completed = []
@@ -204,9 +233,175 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
     return {
         "trades": completed,
         "summary": {
+            "replay_mode": "snapshot",
             "tokens_processed": metrics["tokens_processed"],
             "snapshots_processed": metrics["snapshots_processed"],
             "trades_closed": len(completed),
+            "strategies": summaries,
+        },
+    }
+
+
+def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
+    open_positions = {}
+    completed = []
+    metrics = {
+        "events_processed": 0,
+        "tokens_processed": len({row.get("mint") for row in event_rows if row.get("mint")}),
+        "event_type_counts": {},
+        "source_counts": {},
+        "strategies": {},
+    }
+
+    for strategy_name in strategy_settings:
+        metrics["strategies"][strategy_name] = {
+            "decisions": 0,
+            "passed": 0,
+            "blocked": 0,
+            "trades_opened": 0,
+            "trades_closed": 0,
+        }
+
+    for row in event_rows:
+        mint = row.get("mint")
+        created_at = row.get("created_at")
+        if not mint or not created_at:
+            continue
+        snapshot = _to_event_snapshot(row)
+        name = snapshot.get("name") or row.get("name") or "Unknown"
+        metrics["events_processed"] += 1
+        event_type = snapshot.get("event_type") or "market_tick"
+        source = snapshot.get("source") or "scanner"
+        metrics["event_type_counts"][event_type] = metrics["event_type_counts"].get(event_type, 0) + 1
+        metrics["source_counts"][source] = metrics["source_counts"].get(source, 0) + 1
+
+        for strategy_name, settings in strategy_settings.items():
+            key = (strategy_name, mint)
+            tracker = metrics["strategies"][strategy_name]
+
+            if key in open_positions:
+                position = open_positions[key]
+                age_min = max(0.0, (created_at - position["opened_at"]).total_seconds() / 60.0)
+                update = shadow_position_update(position, snapshot.get("price"), settings, age_min)
+                position.update({
+                    "current_price": update["current_price"],
+                    "peak_price": update["peak_price"],
+                    "trough_price": update["trough_price"],
+                    "max_upside_pct": update["max_upside_pct"],
+                    "max_drawdown_pct": update["max_drawdown_pct"],
+                })
+                if update["status"] == "closed":
+                    tracker["trades_closed"] += 1
+                    completed.append(BacktestTrade(
+                        run_id=run_id,
+                        strategy_name=strategy_name,
+                        mint=mint,
+                        name=name,
+                        opened_at=position["opened_at"],
+                        closed_at=created_at,
+                        entry_price=position["entry_price"],
+                        exit_price=update["current_price"],
+                        status="closed",
+                        score=position["score"],
+                        confidence=position["confidence"],
+                        max_upside_pct=update["max_upside_pct"],
+                        max_drawdown_pct=update["max_drawdown_pct"],
+                        realized_pnl_pct=update["realized_pnl_pct"] or 0.0,
+                        exit_reason=update["exit_reason"] or event_type,
+                        feature_json=position["feature_json"],
+                        decision_json=position["decision_json"],
+                    ))
+                    del open_positions[key]
+                continue
+
+            tracker["decisions"] += 1
+            decision = evaluate_shadow_strategy(strategy_name, settings, snapshot)
+            if decision.passed:
+                tracker["passed"] += 1
+                tracker["trades_opened"] += 1
+                open_positions[key] = {
+                    "opened_at": created_at,
+                    "entry_price": snapshot.get("price") or 0.0,
+                    "current_price": snapshot.get("price") or 0.0,
+                    "peak_price": snapshot.get("price") or 0.0,
+                    "trough_price": snapshot.get("price") or 0.0,
+                    "take_profit_mult": decision.metrics.get("take_profit_mult"),
+                    "stop_loss_ratio": decision.metrics.get("stop_loss_ratio"),
+                    "time_stop_min": decision.metrics.get("time_stop_min"),
+                    "score": decision.score,
+                    "confidence": decision.confidence,
+                    "feature_json": json.dumps(snapshot),
+                    "decision_json": json.dumps(decision.as_dict()),
+                }
+            else:
+                tracker["blocked"] += 1
+
+    if event_rows:
+        final_ts = event_rows[-1].get("created_at")
+        final_prices = {}
+        final_names = {}
+        for row in event_rows:
+            mint = row.get("mint")
+            if not mint:
+                continue
+            final_prices[mint] = float(row.get("price") or 0.0)
+            final_names[mint] = row.get("name") or final_names.get(mint) or "Unknown"
+        for (strategy_name, mint), position in list(open_positions.items()):
+            settings = strategy_settings[strategy_name]
+            last_price = final_prices.get(mint) or position["current_price"]
+            age_min = max(0.0, (final_ts - position["opened_at"]).total_seconds() / 60.0) if final_ts else 0.0
+            update = shadow_position_update(position, last_price, settings, age_min)
+            metrics["strategies"][strategy_name]["trades_closed"] += 1
+            completed.append(BacktestTrade(
+                run_id=run_id,
+                strategy_name=strategy_name,
+                mint=mint,
+                name=final_names.get(mint, "Unknown"),
+                opened_at=position["opened_at"],
+                closed_at=final_ts,
+                entry_price=position["entry_price"],
+                exit_price=update["current_price"],
+                status="closed",
+                score=position["score"],
+                confidence=position["confidence"],
+                max_upside_pct=update["max_upside_pct"],
+                max_drawdown_pct=update["max_drawdown_pct"],
+                realized_pnl_pct=((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0,
+                exit_reason=update["exit_reason"] or "run_end",
+                feature_json=position["feature_json"],
+                decision_json=position["decision_json"],
+            ))
+
+    summaries = {}
+    for strategy_name in strategy_settings:
+        trades = [trade for trade in completed if trade.strategy_name == strategy_name]
+        wins = [trade for trade in trades if trade.realized_pnl_pct > 0]
+        losses = [trade for trade in trades if trade.realized_pnl_pct <= 0]
+        avg_pnl = round(sum(t.realized_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
+        avg_upside = round(sum(t.max_upside_pct for t in trades) / len(trades), 2) if trades else 0.0
+        avg_drawdown = round(sum(t.max_drawdown_pct for t in trades) / len(trades), 2) if trades else 0.0
+        summaries[strategy_name] = {
+            **metrics["strategies"][strategy_name],
+            "closed_trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round((len(wins) / len(trades)) * 100, 1) if trades else 0.0,
+            "avg_pnl_pct": avg_pnl,
+            "avg_upside_pct": avg_upside,
+            "avg_drawdown_pct": avg_drawdown,
+            "best_trade_pct": max((trade.realized_pnl_pct for trade in trades), default=0.0),
+            "worst_trade_pct": min((trade.realized_pnl_pct for trade in trades), default=0.0),
+        }
+
+    return {
+        "trades": completed,
+        "summary": {
+            "replay_mode": "event_tape",
+            "tokens_processed": metrics["tokens_processed"],
+            "events_processed": metrics["events_processed"],
+            "trades_closed": len(completed),
+            "event_type_counts": metrics["event_type_counts"],
+            "source_counts": metrics["source_counts"],
             "strategies": summaries,
         },
     }
