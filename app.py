@@ -29,6 +29,12 @@ import bcrypt
 import stripe
 
 from dotenv import load_dotenv
+from quant_platform import (
+    CANONICAL_STRATEGIES,
+    build_feature_snapshot,
+    evaluate_shadow_strategy,
+    shadow_position_update,
+)
 
 # ── Enhanced Trading Systems (Research Paper Implementation) ──────────────────
 # These modules implement whale detection, risk management, MEV protection,
@@ -727,6 +733,110 @@ def init_db():
             milestones_json TEXT,
             last_updated TIMESTAMP DEFAULT NOW()
         )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_tokens (
+            mint TEXT PRIMARY KEY,
+            name TEXT,
+            symbol TEXT,
+            first_seen_at TIMESTAMP DEFAULT NOW(),
+            last_seen_at TIMESTAMP DEFAULT NOW(),
+            first_price REAL,
+            last_price REAL,
+            peak_price REAL,
+            trough_price REAL,
+            first_mc REAL,
+            last_mc REAL,
+            first_liq REAL,
+            last_liq REAL,
+            first_vol REAL,
+            last_vol REAL,
+            latest_source TEXT,
+            latest_payload_json TEXT,
+            observations INTEGER DEFAULT 1
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_events (
+            id SERIAL PRIMARY KEY,
+            mint TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source TEXT,
+            name TEXT,
+            symbol TEXT,
+            price REAL,
+            mc REAL,
+            liq REAL,
+            vol REAL,
+            change_pct REAL,
+            age_min REAL,
+            payload_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS token_feature_snapshots (
+            id SERIAL PRIMARY KEY,
+            mint TEXT NOT NULL,
+            source TEXT,
+            price REAL,
+            composite_score REAL,
+            confidence REAL,
+            ai_score INTEGER,
+            green_lights INTEGER,
+            narrative_score INTEGER,
+            deployer_score INTEGER,
+            whale_score INTEGER,
+            whale_action_score INTEGER,
+            holder_growth_1h REAL,
+            volume_spike_ratio REAL,
+            threat_risk_score INTEGER,
+            feature_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS shadow_decisions (
+            id SERIAL PRIMARY KEY,
+            strategy_name TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            name TEXT,
+            source TEXT,
+            passed INTEGER DEFAULT 0,
+            score REAL,
+            confidence REAL,
+            price REAL,
+            pass_reasons_json TEXT,
+            blocker_reasons_json TEXT,
+            feature_json TEXT,
+            decision_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS shadow_positions (
+            id SERIAL PRIMARY KEY,
+            strategy_name TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            name TEXT,
+            source TEXT,
+            status TEXT DEFAULT 'open',
+            opened_at TIMESTAMP DEFAULT NOW(),
+            closed_at TIMESTAMP,
+            entry_price REAL,
+            current_price REAL,
+            exit_price REAL,
+            peak_price REAL,
+            trough_price REAL,
+            take_profit_mult REAL,
+            stop_loss_ratio REAL,
+            time_stop_min INTEGER,
+            score REAL,
+            confidence REAL,
+            max_upside_pct REAL DEFAULT 0,
+            max_drawdown_pct REAL DEFAULT 0,
+            realized_pnl_pct REAL,
+            exit_reason TEXT,
+            observations INTEGER DEFAULT 1,
+            last_seen_at TIMESTAMP DEFAULT NOW(),
+            feature_json TEXT,
+            decision_json TEXT
+        )""")
         conn.commit()
         # indexes on columns added by migrate_db — safe to skip if column not yet present
         for _idx_sql in [
@@ -740,6 +850,14 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_open_positions_user_id ON open_positions (user_id)",
             "CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)",
             "CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_market_events_mint_created_at ON market_events (mint, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_market_events_created_at ON market_events (created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_market_tokens_last_seen ON market_tokens (last_seen_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_token_feature_snapshots_mint_created_at ON token_feature_snapshots (mint, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_strategy_created_at ON shadow_decisions (strategy_name, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_shadow_positions_mint_status ON shadow_positions (mint, status, opened_at DESC)",
         ]:
             try:
                 cur.execute(_idx_sql)
@@ -900,9 +1018,111 @@ def migrate_db():
                 preset TEXT PRIMARY KEY,
                 overrides_json TEXT,
                 updated_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS market_tokens (
+                mint TEXT PRIMARY KEY,
+                name TEXT,
+                symbol TEXT,
+                first_seen_at TIMESTAMP DEFAULT NOW(),
+                last_seen_at TIMESTAMP DEFAULT NOW(),
+                first_price REAL,
+                last_price REAL,
+                peak_price REAL,
+                trough_price REAL,
+                first_mc REAL,
+                last_mc REAL,
+                first_liq REAL,
+                last_liq REAL,
+                first_vol REAL,
+                last_vol REAL,
+                latest_source TEXT,
+                latest_payload_json TEXT,
+                observations INTEGER DEFAULT 1)""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS market_events (
+                id SERIAL PRIMARY KEY,
+                mint TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                source TEXT,
+                name TEXT,
+                symbol TEXT,
+                price REAL,
+                mc REAL,
+                liq REAL,
+                vol REAL,
+                change_pct REAL,
+                age_min REAL,
+                payload_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS token_feature_snapshots (
+                id SERIAL PRIMARY KEY,
+                mint TEXT NOT NULL,
+                source TEXT,
+                price REAL,
+                composite_score REAL,
+                confidence REAL,
+                ai_score INTEGER,
+                green_lights INTEGER,
+                narrative_score INTEGER,
+                deployer_score INTEGER,
+                whale_score INTEGER,
+                whale_action_score INTEGER,
+                holder_growth_1h REAL,
+                volume_spike_ratio REAL,
+                threat_risk_score INTEGER,
+                feature_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS shadow_decisions (
+                id SERIAL PRIMARY KEY,
+                strategy_name TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                name TEXT,
+                source TEXT,
+                passed INTEGER DEFAULT 0,
+                score REAL,
+                confidence REAL,
+                price REAL,
+                pass_reasons_json TEXT,
+                blocker_reasons_json TEXT,
+                feature_json TEXT,
+                decision_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS shadow_positions (
+                id SERIAL PRIMARY KEY,
+                strategy_name TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                name TEXT,
+                source TEXT,
+                status TEXT DEFAULT 'open',
+                opened_at TIMESTAMP DEFAULT NOW(),
+                closed_at TIMESTAMP,
+                entry_price REAL,
+                current_price REAL,
+                exit_price REAL,
+                peak_price REAL,
+                trough_price REAL,
+                take_profit_mult REAL,
+                stop_loss_ratio REAL,
+                time_stop_min INTEGER,
+                score REAL,
+                confidence REAL,
+                max_upside_pct REAL DEFAULT 0,
+                max_drawdown_pct REAL DEFAULT 0,
+                realized_pnl_pct REAL,
+                exit_reason TEXT,
+                observations INTEGER DEFAULT 1,
+                last_seen_at TIMESTAMP DEFAULT NOW(),
+                feature_json TEXT,
+                decision_json TEXT)""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_intel_last_updated ON token_intel (last_updated DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deployer_stats_last_seen ON deployer_stats (last_seen_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_market_events_mint_created_at ON market_events (mint, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_market_events_created_at ON market_events (created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_market_tokens_last_seen ON market_tokens (last_seen_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_token_feature_snapshots_mint_created_at ON token_feature_snapshots (mint, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_strategy_created_at ON shadow_decisions (strategy_name, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_mint_status ON shadow_positions (mint, status, opened_at DESC)")
         except Exception:
             conn.rollback()
         conn.commit()
@@ -1040,6 +1260,8 @@ user_bots_lock = threading.Lock()
 seen_tokens  = set()
 seen_tokens_lock = threading.Lock()
 market_feed  = deque(maxlen=100)   # live token stream for market board
+shadow_market_queue = deque(maxlen=400)
+shadow_market_lock = threading.Lock()
 BACKGROUND_WORKER_LOCK_ID = 48270431
 _background_workers_started = False
 _background_workers_lock = threading.Lock()
@@ -4119,8 +4341,218 @@ def _process_dex_pair(p):
         print(f"[ERROR] {_e}", flush=True)
         return None
 
+
+def _shadow_strategy_settings():
+    return {
+        strategy_name: dict(PRESETS.get(strategy_name, {}))
+        for strategy_name in CANONICAL_STRATEGIES
+        if strategy_name in PRESETS
+    }
+
+
+def _record_market_intelligence(info):
+    intel = info.get("intel") or {}
+    snapshot = build_feature_snapshot(info, intel)
+    strategies = _shadow_strategy_settings()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        payload_json = json.dumps(info)
+        cur.execute("""
+            INSERT INTO market_tokens (
+                mint, name, symbol, first_price, last_price, peak_price, trough_price,
+                first_mc, last_mc, first_liq, last_liq, first_vol, last_vol,
+                latest_source, latest_payload_json, observations
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+            ON CONFLICT (mint) DO UPDATE SET
+                name = EXCLUDED.name,
+                symbol = EXCLUDED.symbol,
+                last_seen_at = NOW(),
+                last_price = EXCLUDED.last_price,
+                peak_price = GREATEST(COALESCE(market_tokens.peak_price, EXCLUDED.peak_price), EXCLUDED.peak_price),
+                trough_price = LEAST(COALESCE(market_tokens.trough_price, EXCLUDED.trough_price), EXCLUDED.trough_price),
+                last_mc = EXCLUDED.last_mc,
+                last_liq = EXCLUDED.last_liq,
+                last_vol = EXCLUDED.last_vol,
+                latest_source = EXCLUDED.latest_source,
+                latest_payload_json = EXCLUDED.latest_payload_json,
+                observations = COALESCE(market_tokens.observations, 0) + 1
+        """, (
+            info.get("mint"), info.get("name"), info.get("symbol"),
+            info.get("price"), info.get("price"), info.get("price"), info.get("price"),
+            info.get("mc"), info.get("mc"), info.get("liq"), info.get("liq"),
+            info.get("vol"), info.get("vol"), info.get("source") or "scanner", payload_json,
+        ))
+        cur.execute("""
+            INSERT INTO market_events (
+                mint, event_type, source, name, symbol, price, mc, liq, vol,
+                change_pct, age_min, payload_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            info.get("mint"), "market_tick", info.get("source") or "scanner",
+            info.get("name"), info.get("symbol"), info.get("price"), info.get("mc"),
+            info.get("liq"), info.get("vol"), info.get("change"), info.get("age_min"), payload_json,
+        ))
+        cur.execute("""
+            INSERT INTO token_feature_snapshots (
+                mint, source, price, composite_score, confidence, ai_score, green_lights,
+                narrative_score, deployer_score, whale_score, whale_action_score,
+                holder_growth_1h, volume_spike_ratio, threat_risk_score, feature_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            info.get("mint"), info.get("source") or "scanner", info.get("price"),
+            snapshot.get("composite_score"), snapshot.get("confidence"), snapshot.get("score"),
+            snapshot.get("green_lights"), snapshot.get("narrative_score"), snapshot.get("deployer_score"),
+            snapshot.get("whale_score"), snapshot.get("whale_action_score"), snapshot.get("holder_growth_1h"),
+            snapshot.get("volume_spike_ratio"), snapshot.get("threat_risk_score"), json.dumps(snapshot),
+        ))
+
+        opened_positions = 0
+        for strategy_name, settings in strategies.items():
+            decision = evaluate_shadow_strategy(strategy_name, settings, snapshot)
+            decision_json = json.dumps(decision.as_dict())
+            cur.execute("""
+                INSERT INTO shadow_decisions (
+                    strategy_name, mint, name, source, passed, score, confidence, price,
+                    pass_reasons_json, blocker_reasons_json, feature_json, decision_json
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                strategy_name, info.get("mint"), info.get("name"), info.get("source") or "scanner",
+                1 if decision.passed else 0, decision.score, decision.confidence, info.get("price"),
+                json.dumps(decision.pass_reasons), json.dumps(decision.blocker_reasons),
+                json.dumps(snapshot), decision_json,
+            ))
+            if not decision.passed:
+                continue
+            cur.execute("""
+                SELECT id
+                FROM shadow_positions
+                WHERE strategy_name=%s AND mint=%s AND status='open'
+                LIMIT 1
+            """, (strategy_name, info.get("mint")))
+            if cur.fetchone():
+                continue
+            cur.execute("""
+                SELECT id
+                FROM shadow_positions
+                WHERE strategy_name=%s AND mint=%s
+                LIMIT 1
+            """, (strategy_name, info.get("mint")))
+            if cur.fetchone():
+                continue
+            cur.execute("""
+                INSERT INTO shadow_positions (
+                    strategy_name, mint, name, source, status, entry_price, current_price,
+                    peak_price, trough_price, take_profit_mult, stop_loss_ratio, time_stop_min,
+                    score, confidence, feature_json, decision_json
+                ) VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                strategy_name, info.get("mint"), info.get("name"), info.get("source") or "scanner",
+                info.get("price"), info.get("price"), info.get("price"), info.get("price"),
+                decision.metrics.get("take_profit_mult"), decision.metrics.get("stop_loss_ratio"),
+                decision.metrics.get("time_stop_min"), decision.score, decision.confidence,
+                json.dumps(snapshot), decision_json,
+            ))
+            opened_positions += 1
+        conn.commit()
+        if opened_positions:
+            print(f"[SIM] opened {opened_positions} shadow position(s) for {info.get('name')}", flush=True)
+    except Exception as e:
+        conn.rollback()
+        print(f"[SIM] market intelligence record error: {e}", flush=True)
+    finally:
+        db_return(conn)
+
+
+def reconcile_shadow_positions(limit=40):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT *
+            FROM shadow_positions
+            WHERE status='open'
+            ORDER BY opened_at ASC
+            LIMIT %s
+        """, (limit,))
+        open_rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    if not open_rows:
+        return
+
+    now = time.time()
+    price_cache = {}
+    for row in open_rows:
+        mint = row.get("mint")
+        if not mint or mint in price_cache:
+            continue
+        try:
+            resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=6)
+            data = safe_json_response(resp, {})
+            pairs = data.get("pairs") or []
+            pair = pairs[0] if pairs else {}
+            price_cache[mint] = float(pair.get("priceUsd") or 0) if pair else 0.0
+        except Exception:
+            price_cache[mint] = 0.0
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        for row in open_rows:
+            mint = row.get("mint")
+            current_price = float(price_cache.get(mint) or 0)
+            if current_price <= 0:
+                continue
+            strategy_name = row.get("strategy_name") or "balanced"
+            settings = PRESETS.get(strategy_name, PRESETS["balanced"])
+            opened_at = row.get("opened_at")
+            age_min = ((now - opened_at.timestamp()) / 60.0) if opened_at else 0.0
+            update = shadow_position_update(row, current_price, settings, age_min)
+            cur.execute("""
+                UPDATE shadow_positions
+                SET current_price=%s,
+                    peak_price=%s,
+                    trough_price=%s,
+                    max_upside_pct=%s,
+                    max_drawdown_pct=%s,
+                    observations=COALESCE(observations, 0) + 1,
+                    last_seen_at=NOW(),
+                    status=%s,
+                    closed_at=CASE WHEN %s='closed' THEN NOW() ELSE closed_at END,
+                    exit_price=CASE WHEN %s='closed' THEN %s ELSE exit_price END,
+                    exit_reason=CASE WHEN %s='closed' THEN %s ELSE exit_reason END,
+                    realized_pnl_pct=CASE WHEN %s='closed' THEN %s ELSE realized_pnl_pct END
+                WHERE id=%s
+            """, (
+                update["current_price"], update["peak_price"], update["trough_price"],
+                update["max_upside_pct"], update["max_drawdown_pct"], update["status"],
+                update["status"], update["status"], update["current_price"],
+                update["status"], update["exit_reason"], update["status"], update["realized_pnl_pct"],
+                row["id"],
+            ))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SIM] shadow reconcile error: {e}", flush=True)
+    finally:
+        db_return(conn)
+
+
+def shadow_position_monitor():
+    time.sleep(20)
+    while True:
+        try:
+            reconcile_shadow_positions(limit=60)
+        except Exception as e:
+            print(f"[SIM] monitor error: {e}", flush=True)
+        time.sleep(45)
+
+
 def _broadcast_signal(info):
     """Push info to market_feed and evaluate against all running bots."""
+    info.setdefault("source", "scanner")
     mint = info["mint"]
     intel = ensure_token_intel(mint, base_info=info, pair=None, force=False)
     if intel:
@@ -4129,7 +4561,15 @@ def _broadcast_signal(info):
         info["deployer_score"] = intel.get("deployer_score", 0)
         info["narrative_score"] = intel.get("narrative_score", 0)
     market_feed.appendleft(info)
+    with shadow_market_lock:
+        shadow_market_queue.appendleft({
+            "mint": mint,
+            "price": info.get("price"),
+            "ts": int(time.time()),
+            "source": info.get("source") or "scanner",
+        })
     record_price(mint, info["price"])
+    _record_market_intelligence(info)
     with user_bots_lock:
         running_bots = [b for b in user_bots.values() if b.running]
     print(f"[SCAN] {info['name']} | MC:${info['mc']:,.0f} Liq:${info['liq']:,.0f} Age:{info['age_min']:.0f}m Chg:{info['change']:+.0f}% | bots={len(running_bots)}", flush=True)
@@ -4786,6 +5226,7 @@ def ensure_background_workers_started():
             warm_sender_connections,
             listing_scanner,
             process_listing_alerts,
+            shadow_position_monitor,
             _prune_seen_tokens,
         ]
         for target in worker_targets:
@@ -5605,6 +6046,201 @@ def api_filter_log():
     finally:
         db_return(conn)
     return jsonify([dict(r) for r in rows])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUANT DATA PLATFORM API ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/quant/overview")
+@login_required
+def api_quant_overview():
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS n FROM market_tokens")
+        token_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM market_events")
+        event_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM token_feature_snapshots")
+        snapshot_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM shadow_decisions")
+        decision_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='open'")
+        open_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='closed'")
+        closed_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("""
+            SELECT strategy_name,
+                   COUNT(*) AS trades,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_pnl,
+                   ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_pnl,
+                   ROUND(AVG(max_upside_pct)::numeric, 2) AS avg_upside,
+                   ROUND(AVG(max_drawdown_pct)::numeric, 2) AS avg_drawdown
+            FROM shadow_positions
+            WHERE status='closed'
+            GROUP BY strategy_name
+            ORDER BY avg_pnl DESC NULLS LAST, trades DESC
+        """)
+        strategy_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint, name, strategy_name, status, entry_price, current_price, score, confidence,
+                   opened_at, max_upside_pct, max_drawdown_pct
+            FROM shadow_positions
+            ORDER BY opened_at DESC
+            LIMIT 12
+        """)
+        recent_positions = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    summaries = []
+    for row in strategy_rows:
+        trades = int(row.get("trades") or 0)
+        avg_pnl = float(row.get("avg_pnl") or 0)
+        summaries.append({
+            "strategy_name": row.get("strategy_name"),
+            "trades": trades,
+            "avg_pnl_pct": avg_pnl,
+            "best_pnl_pct": float(row.get("best_pnl") or 0),
+            "worst_pnl_pct": float(row.get("worst_pnl") or 0),
+            "avg_upside_pct": float(row.get("avg_upside") or 0),
+            "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
+        })
+
+    return jsonify({
+        "dataset": {
+            "tracked_tokens": token_count,
+            "market_events": event_count,
+            "feature_snapshots": snapshot_count,
+            "shadow_decisions": decision_count,
+            "open_shadow_positions": open_count,
+            "closed_shadow_positions": closed_count,
+        },
+        "strategy_summaries": summaries,
+        "recent_positions": [{
+            "mint": row.get("mint"),
+            "name": row.get("name"),
+            "strategy_name": row.get("strategy_name"),
+            "status": row.get("status"),
+            "entry_price": float(row.get("entry_price") or 0),
+            "current_price": float(row.get("current_price") or 0),
+            "score": float(row.get("score") or 0),
+            "confidence": float(row.get("confidence") or 0),
+            "opened_at": row.get("opened_at").isoformat() if row.get("opened_at") else None,
+            "max_upside_pct": float(row.get("max_upside_pct") or 0),
+            "max_drawdown_pct": float(row.get("max_drawdown_pct") or 0),
+        } for row in recent_positions],
+    })
+
+
+@app.route("/api/quant/shadow-performance")
+@login_required
+def api_quant_shadow_performance():
+    strategy = (request.args.get("strategy") or "").strip().lower()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT strategy_name,
+                   COUNT(*) AS closed_trades,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND(AVG(max_upside_pct)::numeric, 2) AS avg_upside,
+                   ROUND(AVG(max_drawdown_pct)::numeric, 2) AS avg_drawdown,
+                   ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_trade,
+                   ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_trade
+            FROM shadow_positions
+            WHERE status='closed'
+        """
+        params = []
+        if strategy:
+            sql += " AND strategy_name=%s"
+            params.append(strategy)
+        sql += " GROUP BY strategy_name ORDER BY avg_pnl DESC NULLS LAST, closed_trades DESC"
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+    finally:
+        db_return(conn)
+    return jsonify([{
+        "strategy_name": row.get("strategy_name"),
+        "closed_trades": int(row.get("closed_trades") or 0),
+        "wins": int(row.get("wins") or 0),
+        "win_rate": round((int(row.get("wins") or 0) / int(row.get("closed_trades") or 1)) * 100, 1) if int(row.get("closed_trades") or 0) else 0,
+        "avg_pnl_pct": float(row.get("avg_pnl") or 0),
+        "avg_upside_pct": float(row.get("avg_upside") or 0),
+        "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
+        "best_trade_pct": float(row.get("best_trade") or 0),
+        "worst_trade_pct": float(row.get("worst_trade") or 0),
+    } for row in rows])
+
+
+@app.route("/api/quant/shadow-decisions")
+@login_required
+def api_quant_shadow_decisions():
+    strategy = (request.args.get("strategy") or "").strip().lower()
+    passed = request.args.get("passed")
+    mint = (request.args.get("mint") or "").strip()
+    conn = db()
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT strategy_name, mint, name, source, passed, score, confidence, price,
+                   pass_reasons_json, blocker_reasons_json, feature_json, decision_json, created_at
+            FROM shadow_decisions
+            WHERE 1=1
+        """
+        params = []
+        if strategy:
+            sql += " AND strategy_name=%s"
+            params.append(strategy)
+        if mint:
+            sql += " AND mint=%s"
+            params.append(mint)
+        if passed in {"0", "1"}:
+            sql += " AND passed=%s"
+            params.append(int(passed))
+        sql += " ORDER BY created_at DESC LIMIT 120"
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    decisions = []
+    for row in rows:
+        try:
+            features = json.loads(row.get("feature_json") or "{}")
+        except Exception:
+            features = {}
+        try:
+            decision_json = json.loads(row.get("decision_json") or "{}")
+        except Exception:
+            decision_json = {}
+        try:
+            pass_reasons = json.loads(row.get("pass_reasons_json") or "[]")
+        except Exception:
+            pass_reasons = []
+        try:
+            blocker_reasons = json.loads(row.get("blocker_reasons_json") or "[]")
+        except Exception:
+            blocker_reasons = []
+        decisions.append({
+            "strategy_name": row.get("strategy_name"),
+            "mint": row.get("mint"),
+            "name": row.get("name"),
+            "source": row.get("source"),
+            "passed": bool(row.get("passed")),
+            "score": float(row.get("score") or 0),
+            "confidence": float(row.get("confidence") or 0),
+            "price": float(row.get("price") or 0),
+            "pass_reasons": pass_reasons,
+            "blocker_reasons": blocker_reasons,
+            "features": features,
+            "decision": decision_json,
+            "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        })
+    return jsonify(decisions)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
