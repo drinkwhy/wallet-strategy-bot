@@ -2,7 +2,7 @@ import json
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from backtest_engine import simulate_backtest, simulate_event_tape_backtest
+from backtest_engine import simulate_backtest, simulate_event_tape_backtest, simulate_policy_comparison
 
 
 class BacktestEngineTests(unittest.TestCase):
@@ -181,6 +181,126 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertEqual(result["summary"]["event_type_counts"]["price_breakout"], 1)
         self.assertEqual(result["summary"]["trades_closed"], 1)
         self.assertGreater(result["trades"][0].realized_pnl_pct, 100)
+
+    def test_policy_comparison_compares_rules_and_models(self):
+        now = datetime.now(UTC)
+        snapshot_rows = [
+            {
+                "mint": "mint-cmp",
+                "name": "Compare",
+                "price": 1.0,
+                "created_at": now,
+                "feature_json": json.dumps({
+                    "price": 1.0,
+                    "liq": 15000,
+                    "vol": 22000,
+                    "mc": 80000,
+                    "composite_score": 78,
+                    "confidence": 0.74,
+                    "score": 70,
+                    "age_min": 1,
+                    "green_lights": 2,
+                    "narrative_score": 25,
+                    "holder_growth_1h": 60,
+                    "volume_spike_ratio": 10,
+                    "threat_risk_score": 8,
+                    "buy_sell_ratio": 3.2,
+                    "net_flow_sol": 9.5,
+                    "smart_wallet_buys": 2,
+                    "unique_buyer_count": 15,
+                    "liquidity_drop_pct": 4,
+                    "can_exit": True,
+                }),
+            },
+            {
+                "mint": "mint-cmp",
+                "name": "Compare",
+                "price": 2.1,
+                "created_at": now + timedelta(minutes=4),
+                "feature_json": json.dumps({
+                    "price": 2.1,
+                    "liq": 22000,
+                    "vol": 40000,
+                    "mc": 150000,
+                    "composite_score": 84,
+                    "confidence": 0.8,
+                    "score": 82,
+                    "age_min": 5,
+                    "green_lights": 3,
+                    "narrative_score": 30,
+                    "holder_growth_1h": 75,
+                    "volume_spike_ratio": 12,
+                    "threat_risk_score": 10,
+                    "buy_sell_ratio": 4.0,
+                    "net_flow_sol": 12.0,
+                    "smart_wallet_buys": 3,
+                    "unique_buyer_count": 18,
+                    "liquidity_drop_pct": 6,
+                    "can_exit": True,
+                }),
+            },
+        ]
+        flow_rows = [
+            {
+                "mint": "mint-cmp",
+                "created_at": now,
+                "buy_sell_ratio": 2.4,
+                "net_flow_sol": 6.0,
+                "threat_risk_score": 12,
+                "liquidity_drop_pct": 5,
+                "can_exit": True,
+            }
+        ]
+        model_family = {
+            "global": {
+                "trained": True,
+                "bias": 0.0,
+                "weights": [
+                    {"feature": "composite_score", "label": "Composite score", "weight": 0.08, "midpoint": 55, "scale": 10},
+                    {"feature": "buy_sell_ratio", "label": "Buy/sell ratio", "weight": 0.4, "midpoint": 1.5, "scale": 1},
+                    {"feature": "threat_risk_score", "label": "Threat risk", "weight": -0.08, "midpoint": 35, "scale": 10},
+                ],
+            },
+            "regimes": {
+                "accumulation": {
+                    "trained": True,
+                    "bias": 0.0,
+                    "weights": [
+                        {"feature": "net_flow_sol", "label": "Net SOL flow", "weight": 0.25, "midpoint": 3, "scale": 2},
+                        {"feature": "composite_score", "label": "Composite score", "weight": 0.06, "midpoint": 55, "scale": 10},
+                    ],
+                }
+            },
+        }
+        settings = {
+            "min_liq": 5000,
+            "min_mc": 5000,
+            "max_mc": 250000,
+            "min_vol": 3000,
+            "min_score": 30,
+            "max_age_min": 120,
+            "min_green_lights": 1,
+            "min_narrative_score": 12,
+            "min_holder_growth_pct": 20,
+            "min_volume_spike_mult": 4,
+            "anti_rug": True,
+            "tp2_mult": 2.0,
+            "stop_loss": 0.7,
+            "time_stop_min": 30,
+        }
+        result = simulate_policy_comparison(
+            run_id=0,
+            snapshot_rows=snapshot_rows,
+            flow_rows=flow_rows,
+            rule_settings=settings,
+            model_family=model_family,
+            model_threshold=60,
+        )
+        policy_names = {row["policy_name"] for row in result["summary"]["policies"]}
+        self.assertIn("rule_balanced", policy_names)
+        self.assertIn("model_global", policy_names)
+        self.assertIn("model_regime_auto", policy_names)
+        self.assertGreaterEqual(len(result["trades"]), 2)
 
 
 if __name__ == "__main__":

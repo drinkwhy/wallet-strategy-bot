@@ -199,6 +199,48 @@ def train_feature_model(snapshot_rows, outcome_labels):
     }
 
 
+def score_feature_snapshot(snapshot, model):
+    if not model or not model.get("trained"):
+        return {
+            "trained": False,
+            "model_score": 0.0,
+            "raw_score": 0.0,
+            "top_drivers": [],
+            "features": {},
+        }
+    weight_rows = model.get("weights") or []
+    bias = _safe_float(model.get("bias"))
+    raw_score = bias
+    contributions = []
+    for spec in weight_rows:
+        value = _safe_float((snapshot or {}).get(spec["feature"]))
+        scaled_value = (value - _safe_float(spec.get("midpoint"))) / max(_safe_float(spec.get("scale"), 1.0), 1e-6)
+        contribution = _safe_float(spec["weight"]) * scaled_value
+        raw_score += contribution
+        contributions.append({
+            "feature": spec["feature"],
+            "label": spec["label"],
+            "value": round(value, 4),
+            "contribution": round(contribution, 4),
+        })
+    probability = _sigmoid(raw_score / max(len(weight_rows), 1))
+    top_drivers = sorted(contributions, key=lambda item: abs(item["contribution"]), reverse=True)[:4]
+    return {
+        "trained": True,
+        "model_score": round(probability * 100.0, 1),
+        "raw_score": round(raw_score, 4),
+        "top_drivers": top_drivers,
+        "features": {
+            "composite_score": round(_safe_float((snapshot or {}).get("composite_score")), 2),
+            "confidence": round(_safe_float((snapshot or {}).get("confidence")), 4),
+            "buy_sell_ratio": round(_safe_float((snapshot or {}).get("buy_sell_ratio")), 2),
+            "net_flow_sol": round(_safe_float((snapshot or {}).get("net_flow_sol")), 2),
+            "smart_wallet_buys": round(_safe_float((snapshot or {}).get("smart_wallet_buys")), 2),
+            "threat_risk_score": round(_safe_float((snapshot or {}).get("threat_risk_score")), 2),
+        },
+    }
+
+
 def score_recent_candidates(snapshot_rows, model, top_n=8):
     if not model or not model.get("trained"):
         return []
@@ -298,6 +340,18 @@ def select_model_for_regime(model_family, active_regime, mode="auto"):
         "fallback_reason": fallback_reason,
         "using_global_fallback": chosen_key == "global" and normalized_mode not in {"global", ""},
     }
+
+
+def score_feature_snapshot_with_family(snapshot, model_family, active_regime, mode="auto"):
+    selection = select_model_for_regime(model_family, active_regime, mode=mode)
+    scored = score_feature_snapshot(snapshot, selection["selected_model"])
+    scored.update({
+        "model_key": selection["selected_key"],
+        "active_regime": active_regime,
+        "selection_mode": selection["mode"],
+        "selection": selection,
+    })
+    return scored
 
 
 def score_recent_candidates_for_regime(snapshot_rows, model_family, active_regime, mode="auto", top_n=8):

@@ -29,8 +29,12 @@ import bcrypt
 import stripe
 
 from dotenv import load_dotenv
-from backtest_engine import simulate_backtest, simulate_event_tape_backtest
-from learning_engine import score_recent_candidates_for_regime, train_regime_model_family
+from backtest_engine import simulate_backtest, simulate_event_tape_backtest, simulate_policy_comparison
+from learning_engine import (
+    score_feature_snapshot_with_family,
+    score_recent_candidates_for_regime,
+    train_regime_model_family,
+)
 from optimizer_engine import build_outcome_labels, summarize_feature_edges, sweep_entry_filters
 from quant_platform import (
     CANONICAL_STRATEGIES,
@@ -883,6 +887,25 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS model_decisions (
+            id SERIAL PRIMARY KEY,
+            mode TEXT NOT NULL,
+            model_key TEXT NOT NULL,
+            active_regime TEXT,
+            mint TEXT NOT NULL,
+            name TEXT,
+            passed INTEGER DEFAULT 0,
+            threshold REAL DEFAULT 60,
+            model_score REAL,
+            raw_score REAL,
+            price REAL,
+            fallback_reason TEXT,
+            feature_json TEXT,
+            driver_json TEXT,
+            decision_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS shadow_positions (
             id SERIAL PRIMARY KEY,
             strategy_name TEXT NOT NULL,
@@ -976,6 +999,8 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_created_at ON token_flow_snapshots (created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_strategy_created_at ON shadow_decisions (strategy_name, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_model_decisions_mode_created_at ON model_decisions (mode, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_model_decisions_mint_created_at ON model_decisions (mint, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_shadow_positions_mint_status ON shadow_positions (mint, status, opened_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_backtest_runs_created_at ON backtest_runs (created_at DESC)",
@@ -1277,6 +1302,23 @@ def migrate_db():
                 feature_json TEXT,
                 decision_json TEXT,
                 created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS model_decisions (
+                id SERIAL PRIMARY KEY,
+                mode TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                active_regime TEXT,
+                mint TEXT NOT NULL,
+                name TEXT,
+                passed INTEGER DEFAULT 0,
+                threshold REAL DEFAULT 60,
+                model_score REAL,
+                raw_score REAL,
+                price REAL,
+                fallback_reason TEXT,
+                feature_json TEXT,
+                driver_json TEXT,
+                decision_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS shadow_positions (
                 id SERIAL PRIMARY KEY,
                 strategy_name TEXT NOT NULL,
@@ -1355,6 +1397,8 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_created_at ON token_flow_snapshots (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_strategy_created_at ON shadow_decisions (strategy_name, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_mint_created_at ON shadow_decisions (mint, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_model_decisions_mode_created_at ON model_decisions (mode, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_model_decisions_mint_created_at ON model_decisions (mint, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_strategy_status ON shadow_positions (strategy_name, status, opened_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_positions_mint_status ON shadow_positions (mint, status, opened_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_created_at ON backtest_runs (created_at DESC)")
@@ -1501,6 +1545,11 @@ shadow_market_queue = deque(maxlen=400)
 shadow_market_lock = threading.Lock()
 _backtest_jobs = {}
 _backtest_jobs_lock = threading.Lock()
+MODEL_DECISION_THRESHOLD = 60.0
+MODEL_TRAIN_DAYS = 14
+MODEL_CACHE_REFRESH_SEC = 300
+_quant_model_cache = {"built_at": 0.0, "family": None, "days": MODEL_TRAIN_DAYS}
+_quant_model_cache_lock = threading.Lock()
 BACKGROUND_WORKER_LOCK_ID = 48270431
 _background_workers_started = False
 _background_workers_lock = threading.Lock()
@@ -4902,6 +4951,7 @@ def _record_market_intelligence(info):
             ))
             opened_positions += 1
         conn.commit()
+        _log_model_decisions(info, snapshot, flow_snapshot)
         if opened_positions:
             print(f"[SIM] opened {opened_positions} shadow position(s) for {info.get('name')}", flush=True)
     except Exception as e:
@@ -5074,6 +5124,173 @@ def _load_backtest_event_tape(days=7, limit=80000):
         return cur.fetchall()
     finally:
         db_return(conn)
+
+
+def _load_quant_model_rows(days=MODEL_TRAIN_DAYS, recent_hours=24, recent_limit=1000):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (s.mint)
+                   s.mint,
+                   COALESCE(mt.name, 'Unknown') AS name,
+                   s.price,
+                   s.feature_json,
+                   s.created_at
+            FROM token_feature_snapshots s
+            JOIN market_tokens mt ON mt.mint = s.mint
+            WHERE s.created_at >= NOW() - INTERVAL %s
+              AND COALESCE(mt.first_price, 0) > 0
+            ORDER BY s.mint, s.created_at ASC
+            LIMIT 6000
+        """, (f"{max(1, int(days))} days",))
+        entry_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint,
+                   COALESCE(name, 'Unknown') AS name,
+                   first_price,
+                   peak_price,
+                   trough_price,
+                   last_price
+            FROM market_tokens
+            WHERE last_seen_at >= NOW() - INTERVAL %s
+              AND COALESCE(first_price, 0) > 0
+            ORDER BY last_seen_at DESC
+            LIMIT 6000
+        """, (f"{max(1, int(days))} days",))
+        token_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint, buy_sell_ratio, net_flow_sol, threat_risk_score,
+                   liquidity_drop_pct, can_exit, flow_json, created_at
+            FROM token_flow_snapshots
+            WHERE created_at >= NOW() - INTERVAL %s
+            ORDER BY created_at ASC
+            LIMIT 12000
+        """, (f"{max(1, int(days))} days",))
+        flow_rows = cur.fetchall()
+        cur.execute("""
+            SELECT DISTINCT ON (s.mint)
+                   s.mint,
+                   COALESCE(mt.name, 'Unknown') AS name,
+                   s.price,
+                   s.feature_json,
+                   s.created_at
+            FROM token_feature_snapshots s
+            JOIN market_tokens mt ON mt.mint = s.mint
+            WHERE s.created_at >= NOW() - INTERVAL %s
+              AND COALESCE(mt.first_price, 0) > 0
+            ORDER BY s.mint, s.created_at DESC
+            LIMIT %s
+        """, (f"{max(1, int(recent_hours))} hours", recent_limit))
+        recent_rows = cur.fetchall()
+        return {
+            "entry_rows": entry_rows,
+            "token_rows": token_rows,
+            "flow_rows": flow_rows,
+            "recent_rows": recent_rows,
+        }
+    finally:
+        db_return(conn)
+
+
+def _build_quant_model_family(days=MODEL_TRAIN_DAYS):
+    rows = _load_quant_model_rows(days=days)
+    outcomes = build_outcome_labels(rows["token_rows"])
+    family = train_regime_model_family(rows["entry_rows"], outcomes, rows["flow_rows"])
+    return {"family": family, "outcomes": outcomes, "rows": rows}
+
+
+def get_cached_quant_model_bundle(days=MODEL_TRAIN_DAYS, refresh_sec=MODEL_CACHE_REFRESH_SEC, force=False):
+    now = time.time()
+    with _quant_model_cache_lock:
+        bundle = _quant_model_cache.get("bundle")
+        if (
+            not force
+            and bundle
+            and _quant_model_cache.get("days") == days
+            and now - float(_quant_model_cache.get("built_at") or 0) < refresh_sec
+        ):
+            return bundle
+    built = _build_quant_model_family(days=days)
+    with _quant_model_cache_lock:
+        _quant_model_cache["bundle"] = built
+        _quant_model_cache["family"] = built.get("family")
+        _quant_model_cache["days"] = days
+        _quant_model_cache["built_at"] = now
+    return built
+
+
+def _current_regime_context(include_flow_snapshot=None, limit=20):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mint, buy_sell_ratio, net_flow_sol, smart_wallet_buys, unique_buyer_count,
+                   threat_risk_score, can_exit, liquidity_drop_pct, created_at
+            FROM token_flow_snapshots
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (max(1, int(limit)),))
+        rows = cur.fetchall()
+    finally:
+        db_return(conn)
+    if include_flow_snapshot:
+        rows = [dict(include_flow_snapshot)] + list(rows)
+    return summarize_flow_regime(rows)
+
+
+def _log_model_decisions(info, snapshot, flow_snapshot):
+    try:
+        bundle = get_cached_quant_model_bundle(days=MODEL_TRAIN_DAYS)
+        family = bundle.get("family") or {}
+        regime_context = _current_regime_context(include_flow_snapshot=flow_snapshot, limit=20)
+        active_regime = regime_context.get("regime") or "neutral"
+        variants = [("global", "global"), ("regime_auto", "auto")]
+        rows = []
+        for mode_label, selection_mode in variants:
+            scored = score_feature_snapshot_with_family(snapshot, family, active_regime, mode=selection_mode)
+            selection = scored.get("selection") or {}
+            passed = float(scored.get("model_score") or 0) >= MODEL_DECISION_THRESHOLD and bool(scored.get("trained"))
+            decision_payload = {
+                "mode": mode_label,
+                "selection_mode": selection_mode,
+                "passed": passed,
+                "threshold": MODEL_DECISION_THRESHOLD,
+                "active_regime": active_regime,
+                "selection": selection,
+                "score": scored.get("model_score"),
+            }
+            rows.append((
+                mode_label,
+                scored.get("model_key") or "global",
+                active_regime,
+                info.get("mint"),
+                info.get("name"),
+                1 if passed else 0,
+                MODEL_DECISION_THRESHOLD,
+                float(scored.get("model_score") or 0),
+                float(scored.get("raw_score") or 0),
+                float(info.get("price") or 0),
+                selection.get("fallback_reason") or "",
+                json.dumps(snapshot),
+                json.dumps(scored.get("top_drivers") or []),
+                json.dumps(decision_payload),
+            ))
+        conn = db()
+        try:
+            cur = conn.cursor()
+            psycopg2.extras.execute_batch(cur, """
+                INSERT INTO model_decisions (
+                    mode, model_key, active_regime, mint, name, passed, threshold,
+                    model_score, raw_score, price, fallback_reason, feature_json,
+                    driver_json, decision_json
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, rows, page_size=50)
+            conn.commit()
+        finally:
+            db_return(conn)
+    except Exception as e:
+        print(f"[MODEL] decision log error: {e}", flush=True)
 
 
 def _set_backtest_job(run_id, payload):
@@ -6731,6 +6948,8 @@ def api_quant_overview():
         flow_snapshot_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_decisions")
         decision_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM model_decisions")
+        model_decision_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='open'")
         open_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='closed'")
@@ -6819,6 +7038,7 @@ def api_quant_overview():
             "feature_snapshots": snapshot_count,
             "flow_snapshots": flow_snapshot_count,
             "shadow_decisions": decision_count,
+            "model_decisions": model_decision_count,
             "open_shadow_positions": open_count,
             "closed_shadow_positions": closed_count,
         },
@@ -6931,84 +7151,31 @@ def api_quant_optimizer():
 def api_quant_model():
     days = max(1, min(int(request.args.get("days") or 7), 30))
     mode = (request.args.get("mode") or "auto").strip().lower()
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT ON (s.mint)
-                   s.mint,
-                   COALESCE(mt.name, 'Unknown') AS name,
-                   s.price,
-                   s.feature_json,
-                   s.created_at
-            FROM token_feature_snapshots s
-            JOIN market_tokens mt ON mt.mint = s.mint
-            WHERE s.created_at >= NOW() - INTERVAL %s
-              AND COALESCE(mt.first_price, 0) > 0
-            ORDER BY s.mint, s.created_at ASC
-            LIMIT 6000
-        """, (f"{days} days",))
-        entry_rows = cur.fetchall()
-        cur.execute("""
-            SELECT mint,
-                   COALESCE(name, 'Unknown') AS name,
-                   first_price,
-                   peak_price,
-                   trough_price,
-                   last_price
-            FROM market_tokens
-            WHERE last_seen_at >= NOW() - INTERVAL %s
-              AND COALESCE(first_price, 0) > 0
-            ORDER BY last_seen_at DESC
-            LIMIT 6000
-        """, (f"{days} days",))
-        token_rows = cur.fetchall()
-        cur.execute("""
-            SELECT mint, buy_sell_ratio, net_flow_sol, threat_risk_score,
-                   liquidity_drop_pct, can_exit, flow_json, created_at
-            FROM token_flow_snapshots
-            WHERE created_at >= NOW() - INTERVAL %s
-            ORDER BY created_at ASC
-            LIMIT 12000
-        """, (f"{days} days",))
-        flow_rows = cur.fetchall()
-        cur.execute("""
-            SELECT DISTINCT ON (s.mint)
-                   s.mint,
-                   COALESCE(mt.name, 'Unknown') AS name,
-                   s.price,
-                   s.feature_json,
-                   s.created_at
-            FROM token_feature_snapshots s
-            JOIN market_tokens mt ON mt.mint = s.mint
-            WHERE s.created_at >= NOW() - INTERVAL '24 hours'
-              AND COALESCE(mt.first_price, 0) > 0
-            ORDER BY s.mint, s.created_at DESC
-            LIMIT 1000
-        """)
-        recent_rows = cur.fetchall()
-        cur.execute("""
-            SELECT mint, buy_sell_ratio, net_flow_sol, smart_wallet_buys, unique_buyer_count,
-                   threat_risk_score, can_exit, liquidity_drop_pct, created_at
-            FROM token_flow_snapshots
-            ORDER BY created_at DESC
-            LIMIT 20
-        """)
-        recent_flow_rows = cur.fetchall()
-    finally:
-        db_return(conn)
-
-    outcomes = build_outcome_labels(token_rows)
-    model_family = train_regime_model_family(entry_rows, outcomes, flow_rows)
-    regime_context = summarize_flow_regime(recent_flow_rows)
+    bundle = get_cached_quant_model_bundle(days=days)
+    rows = bundle.get("rows") or {}
+    model_family = bundle.get("family") or {}
+    regime_context = _current_regime_context(limit=20)
     active_regime = regime_context.get("regime") or "neutral"
     scored = score_recent_candidates_for_regime(
-        recent_rows,
+        rows.get("recent_rows") or [],
         model_family,
         active_regime=active_regime,
         mode=mode,
         top_n=8,
     )
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mode, model_key, active_regime, mint, name, passed, threshold, model_score,
+                   fallback_reason, driver_json, created_at
+            FROM model_decisions
+            ORDER BY created_at DESC
+            LIMIT 16
+        """)
+        decision_rows = cur.fetchall()
+    finally:
+        db_return(conn)
     return jsonify({
         "window_days": days,
         "mode": mode,
@@ -7016,6 +7183,55 @@ def api_quant_model():
         "model_family": model_family,
         "selection": scored.get("selection") or {},
         "ranked_candidates": scored.get("ranked_candidates") or [],
+        "recent_decisions": [{
+            "mode": row.get("mode"),
+            "model_key": row.get("model_key"),
+            "active_regime": row.get("active_regime"),
+            "mint": row.get("mint"),
+            "name": row.get("name"),
+            "passed": bool(row.get("passed")),
+            "threshold": float(row.get("threshold") or 0),
+            "model_score": float(row.get("model_score") or 0),
+            "fallback_reason": row.get("fallback_reason"),
+            "drivers": _json_load(row.get("driver_json"), []),
+            "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        } for row in decision_rows],
+    })
+
+
+@app.route("/api/quant/comparison")
+@login_required
+def api_quant_comparison():
+    days = max(1, min(int(request.args.get("days") or 7), 30))
+    model_threshold = max(40.0, min(float(request.args.get("threshold") or MODEL_DECISION_THRESHOLD), 90.0))
+    bundle = get_cached_quant_model_bundle(days=days)
+    rows = bundle.get("rows") or {}
+    family = bundle.get("family") or {}
+    balanced_settings = dict(PRESETS.get("balanced", {}))
+    result = simulate_policy_comparison(
+        run_id=0,
+        snapshot_rows=rows.get("entry_rows") or [],
+        flow_rows=rows.get("flow_rows") or [],
+        rule_settings=balanced_settings,
+        model_family=family,
+        model_threshold=model_threshold,
+    )
+    top_trades = result.get("trades") or []
+    return jsonify({
+        "window_days": days,
+        "model_threshold": model_threshold,
+        "summary": result.get("summary") or {},
+        "top_trades": [{
+            "policy_name": trade.strategy_name,
+            "mint": trade.mint,
+            "name": trade.name,
+            "entry_price": float(trade.entry_price or 0),
+            "exit_price": float(trade.exit_price or 0),
+            "realized_pnl_pct": float(trade.realized_pnl_pct or 0),
+            "max_upside_pct": float(trade.max_upside_pct or 0),
+            "max_drawdown_pct": float(trade.max_drawdown_pct or 0),
+            "exit_reason": trade.exit_reason,
+        } for trade in top_trades[:12]],
     })
 
 
@@ -9530,6 +9746,10 @@ DASHBOARD_HTML = _CSS + """
       <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Model scoring loading…</div>
     </div>
 
+    <div class="glass" id="quant-comparison" style="margin-top:16px">
+      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Rules vs models comparison loading…</div>
+    </div>
+
     <div class="signals-layout">
       <div style="min-width:0">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -9602,7 +9822,7 @@ let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantModelMode = 'auto', _quantRuns = [], _quantSelectedRunId = null;
+let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantComparison = null, _quantModelMode = 'auto', _quantRuns = [], _quantSelectedRunId = null;
 let _tabPollers = {};
 let _settingsDirty = false;
 let _enhancedData = null;
@@ -11157,20 +11377,23 @@ async function loadPnl(range) {
 async function pollQuant() {
   try {
     const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
-    const [overview, optimizer, model, runs] = await Promise.all([
+    const [overview, optimizer, model, comparison, runs] = await Promise.all([
       fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
       fetch('/api/quant/optimizer?days=' + days).then(r => r.json()).catch(() => null),
       fetch('/api/quant/model?days=' + days + '&mode=' + encodeURIComponent(_quantModelMode)).then(r => r.json()).catch(() => null),
+      fetch('/api/quant/comparison?days=' + days).then(r => r.json()).catch(() => null),
       fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
     ]);
     if (overview) _quantOverview = overview;
     if (optimizer) _quantOptimizer = optimizer;
     if (model) _quantModel = model;
+    if (comparison) _quantComparison = comparison;
     _quantRuns = Array.isArray(runs) ? runs : [];
     renderQuantOverview();
     renderQuantRuns();
     renderQuantOptimizer();
     renderQuantModel();
+    renderQuantComparison();
     if (_quantSelectedRunId) {
       await showQuantRunDetail(_quantSelectedRunId, true);
     }
@@ -11198,6 +11421,7 @@ function renderQuantOverview() {
     <div class="scanner-summary-card"><div class="scanner-summary-label">Feature Snapshots</div><div class="scanner-summary-value">${dataset.feature_snapshots || 0}</div><div class="scanner-summary-copy">Replay-ready scoring inputs</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Snapshots</div><div class="scanner-summary-value">${dataset.flow_snapshots || 0}</div><div class="scanner-summary-copy">Wallet pressure and liquidity tape</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Shadow Decisions</div><div class="scanner-summary-value">${dataset.shadow_decisions || 0}</div><div class="scanner-summary-copy">Would-buy versus blocked decisions</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Model Decisions</div><div class="scanner-summary-value">${dataset.model_decisions || 0}</div><div class="scanner-summary-copy">Logged global and regime model picks</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Regime</div><div class="scanner-summary-value">${flow.regime || '—'}</div><div class="scanner-summary-copy">${flow.sample_size || 0} recent snapshots · ${flow.avg_net_flow_sol > 0 ? '+' : ''}${flow.avg_net_flow_sol || 0} SOL net</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Missed Winners</div><div class="scanner-summary-value">${(opportunity.totals || {}).missed_winners || 0}</div><div class="scanner-summary-copy">Shadow blocks that later ran ${opportunity.winner_threshold_pct || 120}%+</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Open Shadow Positions</div><div class="scanner-summary-value">${dataset.open_shadow_positions || 0}</div><div class="scanner-summary-copy">Currently simulated live book</div></div>
@@ -11392,6 +11616,7 @@ function renderQuantModel() {
   const selectedKey = selection.selected_key || 'global';
   const activeRegime = selection.active_regime || regimeContext.regime || 'neutral';
   const selectedLabel = selectedKey === 'global' ? 'global' : selectedKey;
+  const recentDecisions = Array.isArray(_quantModel.recent_decisions) ? _quantModel.recent_decisions : [];
   box.innerHTML = `
     <div class="panel-head" style="margin-bottom:12px">
       <div>
@@ -11476,6 +11701,86 @@ function renderQuantModel() {
               </div>
             </div>
           `).join('') || '<div style="font-size:11px;color:var(--t3)">Not enough trained candidates yet.</div>'}
+        </div>
+        <div class="sec-label" style="margin-top:12px">Recent Live Model Picks</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${recentDecisions.slice(0, 4).map(item => `
+            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+                <div>
+                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
+                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.mode} · ${item.model_key} · ${item.active_regime || 'neutral'}</div>
+                </div>
+                <div style="font-size:12px;font-weight:800;color:${item.model_score >= item.threshold ? 'var(--grn)' : 'var(--red2)'}">${item.model_score.toFixed(1)}</div>
+              </div>
+              <div class="shortcut-row" style="margin-top:8px">
+                <span class="badge ${item.passed ? 'bg-grn' : 'bg-red'}">${item.passed ? 'pass' : 'block'}</span>
+                ${(item.drivers || []).slice(0, 2).map(driver => `<span class="badge bg-muted">${driver.label} ${driver.contribution > 0 ? '+' : ''}${driver.contribution}</span>`).join('')}
+              </div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">No live model picks logged yet.</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderQuantComparison() {
+  const box = document.getElementById('quant-comparison');
+  if (!box || !_quantComparison) return;
+  const summary = _quantComparison.summary || {};
+  const policies = Array.isArray(summary.policies) ? summary.policies : [];
+  const topTrades = Array.isArray(_quantComparison.top_trades) ? _quantComparison.top_trades : [];
+  box.innerHTML = `
+    <div class="panel-head" style="margin-bottom:12px">
+      <div>
+        <div class="panel-title">Rules vs Models</div>
+        <div class="panel-copy">Compares the same captured entry snapshots under `balanced` rules, the global model, and the regime-auto model using identical exit assumptions.</div>
+      </div>
+      <span class="badge bg-muted">${_quantComparison.window_days || 7}d · threshold ${_quantComparison.model_threshold || 60}</span>
+    </div>
+    <div class="control-action-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:12px">
+      ${policies.map(item => `
+        <div class="scanner-summary-card">
+          <div class="scanner-summary-label">${item.policy_name.replaceAll('_', ' ')}</div>
+          <div class="scanner-summary-value">${item.avg_pnl_pct > 0 ? '+' : ''}${item.avg_pnl_pct || 0}%</div>
+          <div class="scanner-summary-copy">${item.closed_trades || 0} trades · ${item.win_rate || 0}% win rate</div>
+        </div>
+      `).join('') || '<div class="scanner-summary-card"><div class="scanner-summary-label">Comparison</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">No comparison data yet</div></div>'}
+    </div>
+    <div class="scanner-top-grid">
+      <div>
+        <div class="sec-label">Policy Summary</div>
+        <div class="operator-rule-list">
+          ${policies.map(item => `
+            <div class="operator-rule">
+              <div>
+                <div class="operator-rule-label">${item.policy_name.replaceAll('_', ' ')}</div>
+                <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.decisions || 0} decisions · ${item.passed || 0} entries · ${item.closed_trades || 0} closed</div>
+              </div>
+              <div class="operator-rule-value">${item.avg_pnl_pct > 0 ? '+' : ''}${item.avg_pnl_pct || 0}%</div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Waiting for comparison data.</div>'}
+        </div>
+      </div>
+      <div>
+        <div class="sec-label">Top Comparison Trades</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${topTrades.slice(0, 5).map(item => `
+            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+                <div>
+                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
+                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.policy_name.replaceAll('_', ' ')} · ${item.exit_reason || 'exit'}</div>
+                </div>
+                <div style="font-size:12px;font-weight:800;color:${item.realized_pnl_pct >= 0 ? 'var(--grn)' : 'var(--red2)'}">${item.realized_pnl_pct >= 0 ? '+' : ''}${item.realized_pnl_pct.toFixed(1)}%</div>
+              </div>
+              <div class="shortcut-row" style="margin-top:8px">
+                <span class="badge bg-muted">Up ${item.max_upside_pct.toFixed(1)}%</span>
+                <span class="badge bg-muted">DD ${item.max_drawdown_pct.toFixed(1)}%</span>
+              </div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">No comparison trades yet.</div>'}
         </div>
       </div>
     </div>
