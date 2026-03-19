@@ -30,6 +30,7 @@ import stripe
 
 from dotenv import load_dotenv
 from backtest_engine import simulate_backtest, simulate_event_tape_backtest
+from optimizer_engine import build_outcome_labels, summarize_feature_edges, sweep_entry_filters
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_flow_snapshot,
@@ -6862,6 +6863,68 @@ def api_quant_overview():
     })
 
 
+@app.route("/api/quant/optimizer")
+@login_required
+def api_quant_optimizer():
+    days = max(1, min(int(request.args.get("days") or 7), 30))
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (s.mint)
+                   s.mint,
+                   COALESCE(mt.name, 'Unknown') AS name,
+                   s.price,
+                   s.feature_json,
+                   s.created_at
+            FROM token_feature_snapshots s
+            JOIN market_tokens mt ON mt.mint = s.mint
+            WHERE s.created_at >= NOW() - INTERVAL %s
+              AND COALESCE(mt.first_price, 0) > 0
+            ORDER BY s.mint, s.created_at ASC
+            LIMIT 6000
+        """, (f"{days} days",))
+        snapshot_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint,
+                   COALESCE(name, 'Unknown') AS name,
+                   first_price,
+                   peak_price,
+                   trough_price,
+                   last_price
+            FROM market_tokens
+            WHERE last_seen_at >= NOW() - INTERVAL %s
+              AND COALESCE(first_price, 0) > 0
+            ORDER BY last_seen_at DESC
+            LIMIT 6000
+        """, (f"{days} days",))
+        token_rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    outcomes = build_outcome_labels(token_rows)
+    sweeps = sweep_entry_filters(snapshot_rows, outcomes)
+    feature_edges = summarize_feature_edges(snapshot_rows, outcomes)
+    label_counts = {}
+    for row in outcomes:
+        key = row.get("label") or "unknown"
+        label_counts[key] = label_counts.get(key, 0) + 1
+
+    top_outcomes = sorted(outcomes, key=lambda item: item.get("peak_return_pct") or 0, reverse=True)[:6]
+    return jsonify({
+        "window_days": days,
+        "dataset": {
+            "entry_snapshots": len(snapshot_rows),
+            "labeled_tokens": len(outcomes),
+            "label_counts": label_counts,
+        },
+        "best_thresholds": sweeps.get("best_by_feature") or [],
+        "top_sweeps": (sweeps.get("all") or [])[:10],
+        "feature_edges": feature_edges,
+        "top_outcomes": top_outcomes,
+    })
+
+
 @app.route("/api/quant/shadow-performance")
 @login_required
 def api_quant_shadow_performance():
@@ -9365,6 +9428,10 @@ DASHBOARD_HTML = _CSS + """
       </div>
     </div>
 
+    <div class="glass" id="quant-optimizer" style="margin-top:16px">
+      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Optimizer sweep loading…</div>
+    </div>
+
     <div class="signals-layout">
       <div style="min-width:0">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -9437,7 +9504,7 @@ let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-let _quantOverview = null, _quantRuns = [], _quantSelectedRunId = null;
+let _quantOverview = null, _quantOptimizer = null, _quantRuns = [], _quantSelectedRunId = null;
 let _tabPollers = {};
 let _settingsDirty = false;
 let _enhancedData = null;
@@ -10991,14 +11058,18 @@ async function loadPnl(range) {
 // ══════════════════════════ QUANT REPLAY LAB ══════════════════════════
 async function pollQuant() {
   try {
-    const [overview, runs] = await Promise.all([
+    const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
+    const [overview, optimizer, runs] = await Promise.all([
       fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
+      fetch('/api/quant/optimizer?days=' + days).then(r => r.json()).catch(() => null),
       fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
     ]);
     if (overview) _quantOverview = overview;
+    if (optimizer) _quantOptimizer = optimizer;
     _quantRuns = Array.isArray(runs) ? runs : [];
     renderQuantOverview();
     renderQuantRuns();
+    renderQuantOptimizer();
     if (_quantSelectedRunId) {
       await showQuantRunDetail(_quantSelectedRunId, true);
     }
@@ -11135,6 +11206,68 @@ function renderQuantOpportunityMap() {
           </div>
         </div>
       `).join('') || '<div style="font-size:11px;color:var(--t3)">No missed-winner sample yet.</div>'}
+    </div>
+  `;
+}
+
+function renderQuantOptimizer() {
+  const box = document.getElementById('quant-optimizer');
+  if (!box || !_quantOptimizer) return;
+  const dataset = _quantOptimizer.dataset || {};
+  const bestThresholds = Array.isArray(_quantOptimizer.best_thresholds) ? _quantOptimizer.best_thresholds : [];
+  const featureEdges = Array.isArray(_quantOptimizer.feature_edges) ? _quantOptimizer.feature_edges : [];
+  const topOutcomes = Array.isArray(_quantOptimizer.top_outcomes) ? _quantOptimizer.top_outcomes : [];
+  const counts = dataset.label_counts || {};
+  box.innerHTML = `
+    <div class="panel-head" style="margin-bottom:12px">
+      <div>
+        <div class="panel-title">Optimizer Sweep</div>
+        <div class="panel-copy">Uses first captured decision snapshots and realized token paths to rank thresholds that increase winner density while suppressing rugs.</div>
+      </div>
+      <span class="badge bg-muted">${_quantOptimizer.window_days || 7}d window</span>
+    </div>
+    <div class="shortcut-row" style="margin-bottom:12px">
+      <span class="badge bg-muted">${dataset.entry_snapshots || 0} entry snapshots</span>
+      <span class="badge bg-muted">${dataset.labeled_tokens || 0} labeled tokens</span>
+      <span class="badge bg-grn">${counts.winner || 0} winners</span>
+      <span class="badge bg-red">${counts.rug || 0} rugs</span>
+      <span class="badge bg-blue">${counts.volatile_winner || 0} volatile winners</span>
+    </div>
+    <div class="scanner-top-grid">
+      <div>
+        <div class="sec-label">Best Thresholds</div>
+        <div class="operator-rule-list">
+          ${bestThresholds.map(item => `
+            <div class="operator-rule">
+              <div>
+                <div class="operator-rule-label">${item.feature.replaceAll('_', ' ')}</div>
+                <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.selected} tokens · ${item.winner_rate_pct}% winners · ${item.rug_rate_pct}% rugs</div>
+              </div>
+              <div class="operator-rule-value">>= ${Number(item.threshold).toFixed(item.threshold % 1 ? 2 : 0)}</div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Optimizer data not ready yet.</div>'}
+        </div>
+      </div>
+      <div>
+        <div class="sec-label">Feature Edge</div>
+        <div class="shortcut-row" style="margin-bottom:10px">
+          ${featureEdges.map(item => `<span class="badge bg-muted">${item.label} ${item.edge > 0 ? '+' : ''}${item.edge}</span>`).join('') || '<span class="badge bg-muted">No feature edge yet</span>'}
+        </div>
+        <div class="sec-label">Top Outcomes</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${topOutcomes.slice(0, 4).map(item => `
+            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+                <div>
+                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
+                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.label.replaceAll('_', ' ')}</div>
+                </div>
+                <div style="font-size:12px;font-weight:800;color:${item.label === 'rug' ? 'var(--red2)' : 'var(--grn)'}">${item.peak_return_pct >= 0 ? '+' : ''}${item.peak_return_pct.toFixed(1)}%</div>
+              </div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Outcome labels are still warming up.</div>'}
+        </div>
+      </div>
     </div>
   `;
 }
