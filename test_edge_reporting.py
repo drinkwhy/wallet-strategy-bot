@@ -2,7 +2,7 @@ import json
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from edge_reporting import build_edge_report, summarize_edge_report_history
+from edge_reporting import build_edge_report, derive_edge_guard_state, summarize_edge_report_history
 
 
 class EdgeReportingTests(unittest.TestCase):
@@ -118,6 +118,119 @@ class EdgeReportingTests(unittest.TestCase):
         self.assertEqual(seven_day_trend["delta_leader_avg_pnl_pct"], 6.0)
         self.assertEqual(seven_day_trend["delta_regime_edge_pct"], 5.0)
         self.assertEqual(summary["leaderboard"][0]["policy_name"], "model_regime_auto")
+
+    def test_guard_state_goes_halted_when_edge_turns_negative(self):
+        now = datetime.now(UTC)
+        latest = build_edge_report(
+            report_kind="scheduled",
+            window_days=7,
+            model_threshold=60,
+            active_regime="defensive",
+            comparison_summary={
+                "policies": [
+                    {"policy_name": "rule_balanced", "avg_pnl_pct": -3.0, "win_rate": 22.0, "closed_trades": 4},
+                    {"policy_name": "model_global", "avg_pnl_pct": -9.0, "win_rate": 19.0, "closed_trades": 4},
+                    {"policy_name": "model_regime_auto", "avg_pnl_pct": -12.0, "win_rate": 18.0, "closed_trades": 4},
+                ],
+            },
+            generated_at=now,
+        )
+        previous = build_edge_report(
+            report_kind="scheduled",
+            window_days=7,
+            model_threshold=60,
+            active_regime="distribution",
+            comparison_summary={
+                "policies": [
+                    {"policy_name": "rule_balanced", "avg_pnl_pct": -1.0, "win_rate": 25.0, "closed_trades": 4},
+                    {"policy_name": "model_global", "avg_pnl_pct": -4.0, "win_rate": 23.0, "closed_trades": 4},
+                    {"policy_name": "model_regime_auto", "avg_pnl_pct": -6.0, "win_rate": 21.0, "closed_trades": 4},
+                ],
+            },
+            generated_at=now - timedelta(days=7),
+        )
+        summary = summarize_edge_report_history([
+            {
+                "id": 2,
+                "report_kind": latest["report_kind"],
+                "window_days": latest["window_days"],
+                "model_threshold": latest["model_threshold"],
+                "active_regime": latest["active_regime"],
+                "summary_json": json.dumps(latest["summary"]),
+                "policy_json": json.dumps({"policies": latest["policies"]}),
+                "generated_at": now,
+            },
+            {
+                "id": 1,
+                "report_kind": previous["report_kind"],
+                "window_days": previous["window_days"],
+                "model_threshold": previous["model_threshold"],
+                "active_regime": previous["active_regime"],
+                "summary_json": json.dumps(previous["summary"]),
+                "policy_json": json.dumps({"policies": previous["policies"]}),
+                "generated_at": now - timedelta(days=7),
+            },
+        ], focus_window_days=7)
+        guard = derive_edge_guard_state(summary)
+        self.assertEqual(guard["status"], "halted")
+        self.assertFalse(guard["allow_new_entries"])
+
+    def test_guard_state_throttles_when_edge_softens(self):
+        now = datetime.now(UTC)
+        latest = build_edge_report(
+            report_kind="scheduled",
+            window_days=7,
+            model_threshold=60,
+            active_regime="accumulation",
+            comparison_summary={
+                "policies": [
+                    {"policy_name": "rule_balanced", "avg_pnl_pct": 10.0, "win_rate": 31.0, "closed_trades": 6},
+                    {"policy_name": "model_global", "avg_pnl_pct": 11.0, "win_rate": 33.0, "closed_trades": 6},
+                    {"policy_name": "model_regime_auto", "avg_pnl_pct": 11.5, "win_rate": 34.0, "closed_trades": 6},
+                ],
+            },
+            generated_at=now,
+        )
+        previous = build_edge_report(
+            report_kind="scheduled",
+            window_days=7,
+            model_threshold=60,
+            active_regime="accumulation",
+            comparison_summary={
+                "policies": [
+                    {"policy_name": "rule_balanced", "avg_pnl_pct": 8.0, "win_rate": 29.0, "closed_trades": 6},
+                    {"policy_name": "model_global", "avg_pnl_pct": 14.0, "win_rate": 35.0, "closed_trades": 6},
+                    {"policy_name": "model_regime_auto", "avg_pnl_pct": 15.0, "win_rate": 36.0, "closed_trades": 6},
+                ],
+            },
+            generated_at=now - timedelta(days=7),
+        )
+        summary = summarize_edge_report_history([
+            {
+                "id": 2,
+                "report_kind": latest["report_kind"],
+                "window_days": latest["window_days"],
+                "model_threshold": latest["model_threshold"],
+                "active_regime": latest["active_regime"],
+                "summary_json": json.dumps(latest["summary"]),
+                "policy_json": json.dumps({"policies": latest["policies"]}),
+                "generated_at": now,
+            },
+            {
+                "id": 1,
+                "report_kind": previous["report_kind"],
+                "window_days": previous["window_days"],
+                "model_threshold": previous["model_threshold"],
+                "active_regime": previous["active_regime"],
+                "summary_json": json.dumps(previous["summary"]),
+                "policy_json": json.dumps({"policies": previous["policies"]}),
+                "generated_at": now - timedelta(days=7),
+            },
+        ], focus_window_days=7)
+        guard = derive_edge_guard_state(summary)
+        self.assertEqual(guard["status"], "throttled")
+        self.assertTrue(guard["allow_new_entries"])
+        self.assertLess(guard["size_multiplier"], 1.0)
 
 
 if __name__ == "__main__":

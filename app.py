@@ -30,7 +30,7 @@ import stripe
 
 from dotenv import load_dotenv
 from backtest_engine import simulate_backtest, simulate_event_tape_backtest, simulate_policy_comparison
-from edge_reporting import build_edge_report, summarize_edge_report_history
+from edge_reporting import build_edge_report, derive_edge_guard_state, summarize_edge_report_history
 from learning_engine import (
     score_feature_snapshot_with_family,
     score_recent_candidates_for_regime,
@@ -1466,6 +1466,19 @@ def send_telegram(chat_id, msg):
     except Exception as _e:
         print(f"[ERROR] Telegram send failed: {_e}", flush=True)
 
+
+def get_user_telegram_chat_id(user_id):
+    if not user_id:
+        return ""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT telegram_chat_id FROM users WHERE id=%s", (user_id,))
+        row = cur.fetchone() or {}
+        return row.get("telegram_chat_id") or ""
+    finally:
+        db_return(conn)
+
 # ── Email notifications (SendGrid) ────────────────────────────────────────────
 def send_email(to_email, subject, body_html):
     if not SENDGRID_API_KEY:
@@ -1567,8 +1580,11 @@ EDGE_REPORT_AUTO_WINDOWS = (
     (14, 12 * 3600),
     (30, 24 * 3600),
 )
+EDGE_GUARD_REFRESH_SEC = 300
 _quant_model_cache = {"built_at": 0.0, "family": None, "days": MODEL_TRAIN_DAYS}
 _quant_model_cache_lock = threading.Lock()
+_edge_guard_cache = {"built_at": 0.0, "state": None}
+_edge_guard_cache_lock = threading.Lock()
 BACKGROUND_WORKER_LOCK_ID = 48270431
 _background_workers_started = False
 _background_workers_lock = threading.Lock()
@@ -1760,6 +1776,9 @@ class BotInstance:
         self.cooldown_until     = 0.0   # retained for API compatibility; cooldown is disabled
         self.loss_mints         = {}    # mint -> epoch when the bot last realized a loss on that mint
         self.auto_relax_level   = 0
+        self.edge_guard_state   = None
+        self.edge_guard_key     = ""
+        self.edge_guard_checked_at = 0.0
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
         self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
@@ -1795,6 +1814,72 @@ class BotInstance:
             self.profit_target,
             self.settings,
         )
+
+    def _edge_guard_signature(self, state):
+        if not state:
+            return ""
+        return "|".join([
+            str(state.get("status") or ""),
+            str(state.get("source_report_id") or ""),
+            str(state.get("source_generated_at") or ""),
+            str(state.get("reason") or ""),
+        ])
+
+    def _notify_edge_guard_change(self, state):
+        if not state:
+            return
+        status = str(state.get("status") or "normal").upper()
+        action = state.get("action_label") or "Risk update"
+        reason = state.get("reason") or "No reason provided."
+        size_pct = round(float(state.get("size_multiplier") or 0) * 100)
+        max_positions = state.get("max_positions_cap")
+        report_window = state.get("focus_window_days") or 7
+        model_edge = float(state.get("model_edge_pct") or 0)
+        regime_edge = float(state.get("regime_edge_pct") or 0)
+        msg = (
+            f"🛡️ EDGE GUARD {status} — {action}. "
+            f"{reason} Window {report_window}d, model edge {model_edge:+.1f}%, regime edge {regime_edge:+.1f}%, "
+            f"size {size_pct}%"
+        )
+        if max_positions is not None:
+            msg += f", max positions {max_positions}"
+        self.log_msg(msg)
+        try:
+            chat_id = get_user_telegram_chat_id(self.user_id)
+            if chat_id:
+                send_telegram(
+                    chat_id,
+                    (
+                        f"🛡️ <b>Edge Guard {status}</b>\n"
+                        f"{action}\n"
+                        f"{reason}\n"
+                        f"Window: {report_window}d\n"
+                        f"Model edge: {model_edge:+.1f}%\n"
+                        f"Regime edge: {regime_edge:+.1f}%\n"
+                        f"Size: {size_pct}%"
+                    ),
+                )
+        except Exception as _e:
+            print(f"[ERROR] edge guard telegram failed: {_e}", flush=True)
+
+    def refresh_edge_guard(self, force=False):
+        now = time.time()
+        if not force and self.edge_guard_state and now - self.edge_guard_checked_at < EDGE_GUARD_REFRESH_SEC:
+            return self.edge_guard_state
+        state = get_quant_edge_guard_state(refresh_sec=EDGE_GUARD_REFRESH_SEC, force=force)
+        self.edge_guard_checked_at = now
+        signature = self._edge_guard_signature(state)
+        if signature != self.edge_guard_key:
+            self.edge_guard_state = state
+            self.edge_guard_key = signature
+            self._notify_edge_guard_change(state)
+        else:
+            self.edge_guard_state = state
+        return self.edge_guard_state
+
+    def entry_settings(self):
+        guard_state = self.refresh_edge_guard()
+        return apply_edge_guard_to_settings(self.settings, guard_state)
 
     def maybe_relax_guards(self):
         now = time.time()
@@ -2523,8 +2608,19 @@ class BotInstance:
         }
 
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
-        s = self.settings
-        trade_sol = round(float(s["max_buy_sol"]), 4)
+        s = self.entry_settings()
+        edge_guard = s.get("_edge_guard") or {}
+        if not edge_guard.get("allow_new_entries", True):
+            reason = edge_guard.get("reason") or "Edge guard blocked new entries"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
+            return
+        trade_sol = round(float(s.get("max_buy_sol") or 0), 4)
+        if trade_sol <= 0:
+            reason = edge_guard.get("reason") or "Effective trade size is zero"
+            self.log_filter(name, mint, False, reason)
+            self.log_msg(f"SKIP {name} — {reason}")
+            return
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
 
         # ── Circuit breakers ─────────────────────────────────────────────────
@@ -3223,6 +3319,7 @@ class BotInstance:
         self.log_msg(f"Bot started | Wallet: {self.wallet} | Balance: {self.sol_balance:.4f} SOL")
         while self.running:
             try:
+                self.refresh_edge_guard()
                 self.maybe_relax_guards()
                 if self.should_stop():
                     self.cashout_all()
@@ -5377,6 +5474,8 @@ def generate_quant_edge_report(window_days=7, report_kind="manual", model_thresh
         top_trades=[_serialize_comparison_trade(trade) for trade in (comparison.get("trades") or [])[:12]],
     )
     if not persist:
+        with _edge_guard_cache_lock:
+            _edge_guard_cache["built_at"] = 0.0
         return report
 
     conn = db()
@@ -5404,6 +5503,9 @@ def generate_quant_edge_report(window_days=7, report_kind="manual", model_thresh
         if inserted.get("generated_at"):
             report["generated_at"] = inserted["generated_at"].isoformat()
             report["summary"]["generated_at"] = report["generated_at"]
+        with _edge_guard_cache_lock:
+            _edge_guard_cache["built_at"] = 0.0
+            _edge_guard_cache["state"] = None
         return report
     finally:
         db_return(conn)
@@ -5437,6 +5539,49 @@ def quant_edge_report_monitor():
         except Exception as e:
             print(f"[REPORT] quant edge monitor error: {e}", flush=True)
         time.sleep(600)
+
+
+def get_quant_edge_guard_state(refresh_sec=EDGE_GUARD_REFRESH_SEC, force=False, focus_window_days=7):
+    now = time.time()
+    with _edge_guard_cache_lock:
+        cached_state = _edge_guard_cache.get("state")
+        if not force and cached_state and now - float(_edge_guard_cache.get("built_at") or 0) < refresh_sec:
+            return cached_state
+    rows = load_quant_edge_reports(limit=36)
+    history = summarize_edge_report_history(rows, focus_window_days=focus_window_days)
+    state = derive_edge_guard_state(history)
+    state["history"] = history
+    with _edge_guard_cache_lock:
+        _edge_guard_cache["state"] = state
+        _edge_guard_cache["built_at"] = now
+    return state
+
+
+def apply_edge_guard_to_settings(settings, guard_state):
+    base = strip_auto_relax_state(dict(settings or {}))
+    state = guard_state or {}
+    adjusted = dict(base)
+    size_multiplier = max(0.0, float(state.get("size_multiplier") or 1.0))
+    risk_multiplier = max(0.0, float(state.get("risk_multiplier") or 1.0))
+    drawdown_multiplier = max(0.1, float(state.get("drawdown_multiplier") or 1.0))
+    adjusted["max_buy_sol"] = round(max(0.0, float(base.get("max_buy_sol") or 0.0) * size_multiplier), 4)
+    adjusted["risk_per_trade_pct"] = round(max(0.0, float(base.get("risk_per_trade_pct") or 0.0) * risk_multiplier), 2)
+    if base.get("drawdown_limit_sol") is not None:
+        adjusted["drawdown_limit_sol"] = round(max(0.0, float(base.get("drawdown_limit_sol") or 0.0) * drawdown_multiplier), 4)
+    max_positions_cap = state.get("max_positions_cap")
+    if max_positions_cap is not None:
+        adjusted["max_correlated"] = min(int(base.get("max_correlated") or 0), int(max_positions_cap))
+    adjusted["_edge_guard"] = {
+        "status": state.get("status") or "normal",
+        "action_label": state.get("action_label") or "Normal risk",
+        "reason": state.get("reason") or "",
+        "allow_new_entries": bool(state.get("allow_new_entries", True)),
+        "size_multiplier": size_multiplier,
+        "risk_multiplier": risk_multiplier,
+        "max_positions_cap": max_positions_cap,
+        "source_generated_at": state.get("source_generated_at"),
+    }
+    return adjusted
 
 
 def _set_backtest_job(run_id, payload):
@@ -7398,7 +7543,7 @@ def api_quant_reports():
             model_threshold=threshold,
             persist=True,
         )
-        return jsonify({"ok": True, "report": report})
+        return jsonify({"ok": True, "report": report, "guard_state": get_quant_edge_guard_state(force=True, focus_window_days=days)})
 
     days = max(1, min(int(request.args.get("days") or 7), 30))
     rows = load_quant_edge_reports(limit=36)
@@ -7409,6 +7554,7 @@ def api_quant_reports():
         except Exception as e:
             print(f"[REPORT] bootstrap report generation failed: {e}", flush=True)
     summary = summarize_edge_report_history(rows, focus_window_days=days)
+    summary["guard_state"] = get_quant_edge_guard_state(force=True, focus_window_days=days)
     return jsonify(summary)
 
 
@@ -7688,6 +7834,7 @@ def api_enhanced_dashboard():
             "active_alerts": [a.to_dict() for a in bot.observability.alert_manager.get_active_alerts()],
             "mev_stats": bot.mev_system.get_health_report(),
             "circuit_breaker": bot.risk_engine.get_circuit_breaker_state(uid),
+            "edge_guard": bot.refresh_edge_guard(),
         }
         return jsonify(data)
     except Exception as e:
@@ -7959,6 +8106,7 @@ def api_pattern_lab():
 def api_ops_metrics():
     uid = session["user_id"]
     bot = user_bots.get(uid)
+    edge_guard = bot.refresh_edge_guard() if bot else get_quant_edge_guard_state()
     conn = db()
     try:
         cur = conn.cursor()
@@ -8064,6 +8212,7 @@ def api_ops_metrics():
             "offpeak_min_change": float((bot.settings if bot else {}).get("offpeak_min_change") or 0),
             "last_relax_at": None,
         },
+        "edge_guard": edge_guard,
         "top_whales": top_whales,
         "threat_map": threat_map,
         "liquidity_risks": liquidity_risks,
@@ -10179,12 +10328,15 @@ function renderEnhancedDashboard(data) {
   const trading = data.trading_stats || {};
   const mev = data.mev_stats || {};
   const circuit = data.circuit_breaker || {};
+  const edgeGuard = data.edge_guard || {};
   const alerts = Array.isArray(data.active_alerts) ? data.active_alerts : [];
   const circuitActive = firstBool(circuit, ['active', 'triggered', 'tripped', 'halted']);
   const circuitLabel = circuitActive === true ? 'Triggered' : circuitActive === false ? 'Armed' : compactValue(firstValue(circuit, ['status', 'state'], 'Armed'));
   const mevLabel = compactValue(firstValue(mev, ['status', 'strategy', 'mode', 'submission_strategy'], firstBool(mev, ['enabled', 'protection_enabled']) ? 'Protected' : 'Monitoring'));
   const healthLabel = compactValue(firstValue(health, ['overall_status', 'status', 'summary'], 'Monitoring'));
   const tradeLabel = compactValue(firstValue(trading, ['total_trades', 'trades_24h', 'executions_24h', 'total_executions'], '—'));
+  const edgeLabel = compactValue(firstValue(edgeGuard, ['action_label', 'status'], 'Normal risk'));
+  const edgeStatus = String(edgeGuard.status || '').toLowerCase();
 
   statusEl.textContent = `Enhanced systems ${alerts.length ? 'live' : 'stable'}`;
   summaryEl.textContent = `Observability, risk, and MEV telemetry are online. ${alerts.length ? alerts.length + ' active alert' + (alerts.length === 1 ? '' : 's') + ' need attention.' : 'No active enhanced alerts are currently open.'}`;
@@ -10193,10 +10345,11 @@ function renderEnhancedDashboard(data) {
     <div class="intel-metric"><div class="intel-label">Alerts</div><div class="intel-value">${alerts.length}</div><div class="intel-copy">Active alert count</div></div>
     <div class="intel-metric"><div class="intel-label">MEV Guard</div><div class="intel-value">${mevLabel}</div><div class="intel-copy">Execution protection mode</div></div>
     <div class="intel-metric"><div class="intel-label">Circuit</div><div class="intel-value">${circuitLabel}</div><div class="intel-copy">Break-glass state</div></div>
+    <div class="intel-metric"><div class="intel-label">Edge Guard</div><div class="intel-value">${edgeLabel}</div><div class="intel-copy">${edgeGuard.reason || 'Report-driven sizing posture'}</div></div>
   `;
   alertsEl.innerHTML = alerts.length
     ? alerts.slice(0, 4).map(a => `<span class="badge ${String(a.severity || '').toLowerCase().includes('high') ? 'bg-red' : 'bg-gold'}">${titleCase(a.severity || 'Alert')}: ${a.title || a.message || 'Unnamed alert'}</span>`).join('')
-    : `<span class="badge bg-blue">Trades tracked ${tradeLabel}</span><span class="badge bg-muted">Health ${healthLabel}</span>`;
+    : `<span class="badge bg-blue">Trades tracked ${tradeLabel}</span><span class="badge bg-muted">Health ${healthLabel}</span>${edgeStatus && edgeStatus !== 'normal' ? `<span class="badge ${edgeStatus === 'halted' ? 'bg-red' : edgeStatus === 'defensive' ? 'bg-gold' : 'bg-blue'}">Edge guard ${edgeStatus}</span>` : ''}`;
 }
 async function pollEnhancedDashboard() {
   try {
@@ -11171,6 +11324,7 @@ function renderOpsRadar() {
   const stats = _opsMetrics.stats || {};
   const rpc = _opsMetrics.rpc_health || {};
   const adaptive = _opsMetrics.adaptive || {};
+  const edgeGuard = _opsMetrics.edge_guard || {};
   const whales = _opsMetrics.top_whales || [];
   const threats = _opsMetrics.threat_map || [];
   const liquidity = _opsMetrics.liquidity_risks || [];
@@ -11208,6 +11362,11 @@ function renderOpsRadar() {
         <div style="font-size:10px;color:var(--t3)">Adaptive Guard</div>
         <div style="font-size:15px;font-weight:800;color:var(--t1)">L${adaptive.relax_level||0}</div>
         <div style="font-size:10px;color:var(--t3)">${adaptive.zero_buy_hours||0} zero-buy hrs</div>
+      </div>
+      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
+        <div style="font-size:10px;color:var(--t3)">Edge Guard</div>
+        <div style="font-size:15px;font-weight:800;color:var(--t1)">${edgeGuard.action_label||edgeGuard.status||'Normal risk'}</div>
+        <div style="font-size:10px;color:var(--t3)">size ${Math.round((edgeGuard.size_multiplier ?? 1)*100)}%</div>
       </div>
     </div>
     <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Whale Radar</div>
@@ -11995,6 +12154,7 @@ function renderQuantReports() {
   if (!box || !_quantReports) return;
   const focus = _quantReports.focus_report || {};
   const focusSummary = focus.summary || {};
+  const guard = _quantReports.guard_state || {};
   const latestByWindow = Array.isArray(_quantReports.latest_by_window) ? _quantReports.latest_by_window : [];
   const trendCards = Array.isArray(_quantReports.trend_cards) ? _quantReports.trend_cards : [];
   const leaderboard = Array.isArray(_quantReports.leaderboard) ? _quantReports.leaderboard : [];
@@ -12013,7 +12173,17 @@ function renderQuantReports() {
       <span class="badge bg-muted">${_quantReports.report_count || 0} stored reports</span>
       <span class="badge bg-muted">Focus ${_quantReports.focus_window_days || 7}d</span>
       <span class="badge bg-muted">Leader ${prettyPolicyName(focusSummary.leader_policy)}</span>
+      <span class="badge ${guard.status === 'halted' ? 'bg-red' : guard.status === 'defensive' ? 'bg-gold' : guard.status === 'throttled' ? 'bg-blue' : 'bg-muted'}">${guard.action_label || prettyPolicyName(guard.status || 'normal')}</span>
       <span class="badge bg-muted">Last ${fmtDateTime(focus.generated_at || focusSummary.generated_at)}</span>
+    </div>
+    <div class="operator-rule-list" style="margin-bottom:12px">
+      <div class="operator-rule">
+        <div>
+          <div class="operator-rule-label">Live Safety Gate</div>
+          <div style="font-size:10px;color:var(--t3);margin-top:3px">${guard.reason || 'Using normal report-driven posture.'}</div>
+        </div>
+        <div class="operator-rule-value">${guard.allow_new_entries === false ? 'blocked' : 'size ' + Math.round((guard.size_multiplier ?? 1) * 100) + '%'}</div>
+      </div>
     </div>
     <div class="control-action-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:12px">
       ${latestByWindow.map(item => `
