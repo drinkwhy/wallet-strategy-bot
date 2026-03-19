@@ -8535,9 +8535,9 @@ def api_quant_backtest_detail(run_id):
                    snapshots_processed, tokens_processed, trades_closed, summary_json, config_json,
                    error_text, created_at
             FROM backtest_runs
-            WHERE id=%s AND requested_by=%s
+            WHERE id=%s
             LIMIT 1
-        """, (run_id, uid))
+        """, (run_id,))
         run_row = cur.fetchone()
         cur.execute("""
             SELECT strategy_name, mint, name, opened_at, closed_at, entry_price, exit_price,
@@ -8862,9 +8862,10 @@ def _plain_reason(reason):
 @app.route("/api/market-watch")
 @login_required
 def api_market_watch():
-    """All coins being evaluated + what would have happened if bought."""
+    """New coins being evaluated right now — newest first, no dedup."""
     uid = session["user_id"]
     bot = user_bots.get(uid)
+    now_ts = time.time()
 
     # Gather evaluations from in-memory log first, then DB fallbacks
     entries = []
@@ -8890,16 +8891,15 @@ def api_market_watch():
         finally:
             db_return(conn)
     if not entries:
-        # Fallback 2: shadow_decisions table (global — all strategy evaluations)
+        # Fallback 2: shadow_decisions table (global — newest evaluations)
         conn = db()
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT DISTINCT ON (mint)
-                       strategy_name, mint, name, passed, score, confidence, price,
+                SELECT strategy_name, mint, name, passed, score, confidence, price,
                        blocker_reasons_json, created_at
                 FROM shadow_decisions
-                ORDER BY mint, created_at DESC
+                ORDER BY created_at DESC
                 LIMIT 200
             """)
             for row in cur.fetchall():
@@ -8918,30 +8918,29 @@ def api_market_watch():
                     "reason": reason,
                     "timestamp": row["created_at"].timestamp() if row.get("created_at") and hasattr(row["created_at"], "timestamp") else 0,
                     "filters": [],
+                    "strategy": row.get("strategy_name", ""),
                 })
         finally:
             db_return(conn)
 
-    # Dedupe by mint (keep most recent)
-    seen = {}
-    deduped = []
-    for e in entries:
-        mint = e.get("mint")
-        if not mint or mint in seen:
-            continue
-        seen[mint] = True
-        deduped.append(e)
+    # Sort newest first (no dedup — show each evaluation as it happens)
+    def _get_ts(e):
+        t = e.get("timestamp") or e.get("ts") or 0
+        if isinstance(t, (int, float)):
+            return t
+        return 0
+    entries.sort(key=_get_ts, reverse=True)
 
-    # Collect mints we need current prices for
-    mints_need_price = [e["mint"] for e in deduped if e.get("mint")]
+    # Collect unique mints for price fetching
+    unique_mints = list(dict.fromkeys(e.get("mint") for e in entries if e.get("mint")))
     current_prices = {}
-    for mint in mints_need_price:
+    for mint in unique_mints:
         hist = _price_history.get(mint)
         if hist:
             current_prices[mint] = hist[-1][1]
 
     # Batch-fetch missing prices (max 20 to avoid API hammering)
-    missing = [m for m in mints_need_price if m not in current_prices][:20]
+    missing = [m for m in unique_mints if m not in current_prices][:20]
     if missing and bot:
         try:
             fetched = bot._batch_token_prices(missing)
@@ -8955,7 +8954,7 @@ def api_market_watch():
     best_missed = None
     worst_avoided = None
 
-    for e in deduped[:80]:  # Cap at 80 for performance
+    for e in entries[:100]:  # Cap at 100 recent evaluations
         mint = e.get("mint", "")
         name = e.get("name", "Unknown")
         passed = e.get("passed", False)
@@ -8984,28 +8983,39 @@ def api_market_watch():
         else:
             total_bought += 1
 
-        # Track best missed / worst avoided
+        # Track best missed / worst avoided (unique per mint)
         if not passed and price_then > 0 and price_now > 0:
             if best_missed is None or change_pct > best_missed["change_pct"]:
                 best_missed = {"name": name, "change_pct": change_pct}
             if worst_avoided is None or change_pct < worst_avoided["change_pct"]:
                 worst_avoided = {"name": name, "change_pct": change_pct}
 
-        # Format time
-        ts_raw = e.get("timestamp") or e.get("ts") or ""
+        # Time formatting — both clock time and "X min ago"
+        ts_raw = _get_ts(e)
         eval_time = ""
-        if isinstance(ts_raw, (int, float)) and ts_raw > 1000000000:
+        time_ago = ""
+        if ts_raw > 1000000000:
             try:
                 eval_time = datetime.fromtimestamp(ts_raw).strftime("%I:%M %p")
             except Exception:
-                eval_time = str(ts_raw)
-        elif isinstance(ts_raw, str):
-            eval_time = ts_raw
+                eval_time = ""
+            ago_sec = now_ts - ts_raw
+            if ago_sec < 60:
+                time_ago = "just now"
+            elif ago_sec < 3600:
+                time_ago = f"{int(ago_sec / 60)}m ago"
+            elif ago_sec < 86400:
+                time_ago = f"{int(ago_sec / 3600)}h ago"
+            else:
+                time_ago = f"{int(ago_sec / 86400)}d ago"
+        elif isinstance(e.get("ts"), str):
+            eval_time = e.get("ts", "")
 
         coins.append({
             "name": name,
             "mint": mint,
             "evaluated_at": eval_time,
+            "time_ago": time_ago,
             "price_then": price_then,
             "price_now": price_now,
             "change_pct": change_pct,
@@ -9014,6 +9024,7 @@ def api_market_watch():
             "skip_reason": reason,
             "volume": e.get("vol", 0),
             "market_cap": e.get("mc", 0),
+            "is_new": (ts_raw > 1000000000 and (now_ts - ts_raw) < 300),
         })
 
     return jsonify({
@@ -10062,6 +10073,7 @@ select.finput{cursor:pointer}
 .sdot-on{background:var(--grn2);box-shadow:0 0 8px var(--grn2);animation:blink 2s infinite}
 .sdot-off{background:var(--t3)}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.3)}}
 .stxt{font-size:12px;font-weight:500;color:var(--t2)}
 .tbl{width:100%;border-collapse:collapse}
 .tbl th{font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.9px;padding:9px 10px;border-bottom:1px solid rgba(255,255,255,.07);text-align:left}
@@ -10775,8 +10787,8 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
   <!-- ═══════════ TABS ═══════════ -->
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="watch" onclick="switchTab('watch')">
-      Market Watch
-      <span class="tab-desc">Coins being checked right now</span>
+      New Coins
+      <span class="tab-desc">Coins being evaluated right now</span>
     </button>
     <button class="tab-btn" data-tab="trades" onclick="switchTab('trades')">
       My Trades
@@ -10797,8 +10809,8 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
     <div class="glass">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
-          <div style="font-size:18px;font-weight:700;color:var(--t1)">Coins We're Watching</div>
-          <div style="font-size:12px;color:var(--t3);margin-top:2px">Every coin the bot looked at, and what would have happened if you bought it</div>
+          <div style="font-size:18px;font-weight:700;color:var(--t1)">New Coins Being Evaluated</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">Live feed of coins the bot is checking — newest first</div>
         </div>
         <div class="summary-row" id="watch-summary">
           <span class="summary-chip"><span class="num" id="sum-checked">0</span> checked</span>
@@ -10822,7 +10834,7 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
             </tr>
           </thead>
           <tbody id="watch-body">
-            <tr><td colspan="8" class="empty-state">Waiting for bot to start scanning coins...</td></tr>
+            <tr><td colspan="8" class="empty-state">No coins evaluated yet — start the bot to see new coins appear here live</td></tr>
           </tbody>
         </table>
       </div>
@@ -11023,19 +11035,84 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
           <div style="font-size:18px;font-weight:700;color:var(--t1)">Which Settings Worked Best</div>
           <div style="font-size:12px;color:var(--t3);margin-top:2px">Results from shadow trading &mdash; the bot tested these strategies on real coins without spending real money</div>
         </div>
-        <button class="btn btn-ghost" onclick="pollBacktest()">Refresh</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="btn btn-ghost" onclick="pollBacktest()">Refresh</button>
+        </div>
       </div>
       <div id="strategy-cards">
         <div class="empty-state">Loading backtest results...</div>
       </div>
     </div>
     <div class="glass">
-      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Recent Backtest Runs</div>
-      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Your simulation history</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-size:18px;font-weight:700;color:var(--t1)">Run a New Backtest</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">Test strategies against recent market data to see what would have worked</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+        <div>
+          <div style="font-size:11px;color:var(--t3);margin-bottom:4px">How many days of data?</div>
+          <select class="setting-input" id="bt-days" style="width:120px;text-align:left">
+            <option value="1">1 day</option>
+            <option value="3">3 days</option>
+            <option value="7" selected>7 days</option>
+            <option value="14">14 days</option>
+            <option value="30">30 days</option>
+          </select>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--t3);margin-bottom:4px">Which strategies?</div>
+          <select class="setting-input" id="bt-strategies" style="width:160px;text-align:left">
+            <option value="all">All strategies</option>
+            <option value="safe">Careful only</option>
+            <option value="balanced">Balanced only</option>
+            <option value="aggressive">Aggressive only</option>
+            <option value="degen">Full Send only</option>
+          </select>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--t3);margin-bottom:4px">Name (optional)</div>
+          <input class="setting-input" id="bt-name" type="text" placeholder="e.g. Weekly test" style="width:160px;text-align:left">
+        </div>
+        <button class="btn btn-save" id="bt-run-btn" onclick="runBacktest()">Run Backtest</button>
+      </div>
+      <div id="bt-status" style="font-size:12px;margin-top:10px;display:none"></div>
+    </div>
+
+    <div class="glass">
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Previous Backtest Runs</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Click any run to see the full trade breakdown</div>
       <div id="backtest-runs">
         <div class="empty-state">No backtests run yet</div>
       </div>
     </div>
+    <div class="glass" id="bt-detail-panel" style="display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <div>
+          <div style="font-size:18px;font-weight:700;color:var(--t1)" id="bt-detail-title">Backtest Details</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px" id="bt-detail-meta"></div>
+        </div>
+        <button class="btn btn-ghost" onclick="closeBtDetail()">Close</button>
+      </div>
+      <div id="bt-detail-summary" style="margin-bottom:14px"></div>
+      <table class="clean">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Coin</th>
+            <th>Entry</th>
+            <th>Exit</th>
+            <th>Profit</th>
+            <th>Why Sold</th>
+            <th>Score</th>
+          </tr>
+        </thead>
+        <tbody id="bt-detail-trades">
+        </tbody>
+      </table>
+    </div>
+
     <div class="glass">
       <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Currently Tracking (Open Positions)</div>
       <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Coins the bot is watching with fake money right now</div>
@@ -11174,7 +11251,7 @@ async function refresh() {
   } catch(e) { console.error('refresh error', e); }
 }
 
-// ── Market Watch polling ──
+// ── New Coins polling ──
 async function pollWatch() {
   try {
     const d = await fetch('/api/market-watch').then(r=>r.json());
@@ -11186,7 +11263,7 @@ async function pollWatch() {
     // Highlight best missed / worst avoided
     let hl = '';
     if (sum.best_missed && sum.best_missed.change_pct > 0) {
-      hl += `<span class="summary-chip green">Best one you missed: <strong>${sum.best_missed.name}</strong> (${sum.best_missed.change_pct > 0 ? '+' : ''}${sum.best_missed.change_pct.toFixed(1)}%)</span> `;
+      hl += `<span class="summary-chip green">Best one you missed: <strong>${sum.best_missed.name}</strong> (+${sum.best_missed.change_pct.toFixed(1)}%)</span> `;
     }
     if (sum.worst_avoided && sum.worst_avoided.change_pct < 0) {
       hl += `<span class="summary-chip red">Worst one you dodged: <strong>${sum.worst_avoided.name}</strong> (${sum.worst_avoided.change_pct.toFixed(1)}%)</span>`;
@@ -11194,16 +11271,19 @@ async function pollWatch() {
     document.getElementById('watch-highlight').innerHTML = hl;
     // Table
     if (!coins.length) {
-      document.getElementById('watch-body').innerHTML = '<tr><td colspan="8" class="empty-state">Waiting for bot to start scanning coins...</td></tr>';
+      document.getElementById('watch-body').innerHTML = '<tr><td colspan="8" class="empty-state">No coins evaluated yet — start the bot to see new coins appear here live</td></tr>';
       return;
     }
     document.getElementById('watch-body').innerHTML = coins.map(c => {
       const verdictBadge = c.verdict === 'Bought'
-        ? '<span class="badge-bought">Bought</span>'
+        ? '<span class="badge-bought">Bought ✓</span>'
         : '<span class="badge-skipped">Skipped</span>';
-      return `<tr>
-        <td><span class="coin-name">${esc(c.name)}</span></td>
-        <td style="font-size:11px;color:var(--t3)">${esc(c.evaluated_at)}</td>
+      const newDot = c.is_new ? '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--grn);margin-right:5px;animation:pulse 1.5s infinite"></span>' : '';
+      const timeStr = c.time_ago ? `<div style="font-size:10px;color:var(--t3)">${esc(c.time_ago)}</div>` : '';
+      const rowBg = c.is_new ? 'background:rgba(0,255,136,.04);' : '';
+      return `<tr style="${rowBg}">
+        <td>${newDot}<span class="coin-name">${esc(c.name)}</span></td>
+        <td style="font-size:11px;color:var(--t3)">${esc(c.evaluated_at)}${timeStr}</td>
         <td>${fmtPrice(c.price_then)}</td>
         <td>${fmtPrice(c.price_now)}</td>
         <td>${fmtPct(c.change_pct)}</td>
@@ -11425,7 +11505,7 @@ async function pollBacktest() {
             </span>`;
           }).join('') + '</div>';
         }
-        return `<div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,.04)">
+        return `<div onclick="loadBtDetail(${r.id})" style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;transition:background .15s" onmouseenter="this.style.background='rgba(255,255,255,.03)'" onmouseleave="this.style.background='transparent'">
           <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
             <div>
               <span style="color:var(--t1);font-weight:700">${esc(r.name)}</span>
@@ -11434,6 +11514,7 @@ async function pollBacktest() {
             <div>
               <span style="color:${statusColor};font-weight:600">${statusLabel}</span>
               <span style="color:var(--t3);margin-left:8px">${esc(r.when)}</span>
+              <span style="color:var(--t3);margin-left:6px;font-size:10px">▶ Click for details</span>
             </div>
           </div>
           ${stratHtml}
@@ -11489,6 +11570,150 @@ async function pollBacktest() {
       }).join('');
     }
   } catch(e) { console.error('pollBacktest error', e); }
+}
+
+// ── Run new backtest ──
+async function runBacktest() {
+  const btn = document.getElementById('bt-run-btn');
+  const status = document.getElementById('bt-status');
+  const days = parseInt(document.getElementById('bt-days').value);
+  const stratVal = document.getElementById('bt-strategies').value;
+  const name = document.getElementById('bt-name').value.trim();
+  const strategies = stratVal === 'all' ? ['safe','balanced','aggressive','degen'] : [stratVal];
+
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  status.style.display = 'block';
+  status.style.color = 'var(--gold2)';
+  status.textContent = 'Launching backtest simulation...';
+
+  try {
+    const r = await fetch('/api/quant/backtests', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({days, strategies, name: name || `${days}d test`, replay_mode: 'snapshot'})
+    }).then(r => r.json());
+
+    if (r.ok) {
+      status.style.color = 'var(--grn)';
+      status.textContent = `Backtest started! Run #${r.run_id} is processing ${days} days of data. Results will appear below when done.`;
+      // Start polling for completion
+      pollBacktestUntilDone(r.run_id);
+    } else {
+      status.style.color = 'var(--red2)';
+      status.textContent = r.msg || 'Failed to start backtest';
+    }
+  } catch(e) {
+    status.style.color = 'var(--red2)';
+    status.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Run Backtest';
+}
+
+async function pollBacktestUntilDone(runId) {
+  const status = document.getElementById('bt-status');
+  let checks = 0;
+  const interval = setInterval(async () => {
+    checks++;
+    try {
+      const r = await fetch(`/api/quant/backtests/${runId}`).then(r => r.json());
+      if (r.run && r.run.status === 'completed') {
+        clearInterval(interval);
+        status.style.color = 'var(--grn)';
+        status.textContent = `Backtest #${runId} complete! ${r.run.trades_closed} trades simulated. Refreshing results...`;
+        pollBacktest();
+        setTimeout(() => { status.style.display = 'none'; }, 5000);
+      } else if (r.run && r.run.status === 'failed') {
+        clearInterval(interval);
+        status.style.color = 'var(--red2)';
+        status.textContent = `Backtest #${runId} failed: ${r.run.error_text || 'Unknown error'}`;
+      } else {
+        status.textContent = `Backtest #${runId} running... (${r.run ? r.run.snapshots_processed + ' snapshots, ' + r.run.trades_closed + ' trades so far' : 'processing'})`;
+      }
+    } catch(e) { /* ignore polling errors */ }
+    if (checks > 120) { // 10 min timeout
+      clearInterval(interval);
+      status.textContent = 'Backtest is still running in the background. Refresh the page to check.';
+    }
+  }, 5000);
+}
+
+// ── Load backtest detail ──
+async function loadBtDetail(runId) {
+  const panel = document.getElementById('bt-detail-panel');
+  const stratLabels = {
+    safe: 'Careful', balanced: 'Balanced', aggressive: 'Aggressive', degen: 'Full Send'
+  };
+  const exitLabels = {
+    take_profit: 'Hit profit target', stop_loss: 'Hit loss limit', time_stop: 'Ran out of time'
+  };
+
+  panel.style.display = 'block';
+  document.getElementById('bt-detail-title').textContent = 'Loading...';
+  document.getElementById('bt-detail-meta').textContent = '';
+  document.getElementById('bt-detail-summary').innerHTML = '';
+  document.getElementById('bt-detail-trades').innerHTML = '';
+
+  try {
+    const d = await fetch(`/api/quant/backtests/${runId}`).then(r => r.json());
+    if (!d.run) {
+      document.getElementById('bt-detail-title').textContent = 'Run not found';
+      return;
+    }
+    const r = d.run;
+    document.getElementById('bt-detail-title').textContent = r.name || `Backtest #${r.id}`;
+    document.getElementById('bt-detail-meta').textContent =
+      `${r.days} days | ${r.trades_closed} trades | ${r.tokens_processed} tokens | ${r.snapshots_processed} snapshots | Status: ${r.status}`;
+
+    // Summary by strategy from the summary JSON
+    const summary = r.summary || {};
+    let sumHtml = '<div style="display:flex;gap:10px;flex-wrap:wrap">';
+    for (const [sname, sdata] of Object.entries(summary)) {
+      if (typeof sdata !== 'object' || !sdata.closed) continue;
+      const avgPnl = parseFloat(sdata.avg_pnl_pct || 0);
+      const c = avgPnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+      const label = stratLabels[sname] || sname;
+      sumHtml += `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:12px;min-width:140px;text-align:center">
+        <div style="font-size:12px;font-weight:700;color:var(--t1)">${esc(label)}</div>
+        <div style="font-size:20px;font-weight:700;color:${c};margin:4px 0">${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%</div>
+        <div style="font-size:10px;color:var(--t3)">${sdata.closed || 0} trades &middot; ${parseFloat(sdata.win_rate || 0).toFixed(0)}% wins</div>
+      </div>`;
+    }
+    sumHtml += '</div>';
+    document.getElementById('bt-detail-summary').innerHTML = sumHtml;
+
+    // Trades table
+    const trades = d.trades || [];
+    if (!trades.length) {
+      document.getElementById('bt-detail-trades').innerHTML = '<tr><td colspan="7" class="empty-state">No trades in this run</td></tr>';
+    } else {
+      document.getElementById('bt-detail-trades').innerHTML = trades.map(t => {
+        const pct = parseFloat(t.realized_pnl_pct || 0);
+        const pctCls = pct >= 0 ? 'pct-pos' : 'pct-neg';
+        const exitR = t.exit_reason || '';
+        return `<tr>
+          <td style="font-size:11px">${esc(stratLabels[t.strategy_name] || t.strategy_name)}</td>
+          <td><span class="coin-name">${esc(t.name)}</span></td>
+          <td>${fmtPrice(t.entry_price)}</td>
+          <td>${fmtPrice(t.exit_price)}</td>
+          <td><span class="${pctCls}">${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%</span></td>
+          <td style="font-size:11px;color:var(--t3)">${esc(exitLabels[exitR] || exitR.replace(/_/g, ' '))}</td>
+          <td>${ratingBar(t.score)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // Scroll to it
+    panel.scrollIntoView({behavior: 'smooth', block: 'start'});
+  } catch(e) {
+    document.getElementById('bt-detail-title').textContent = 'Error loading details';
+    console.error(e);
+  }
+}
+
+function closeBtDetail() {
+  document.getElementById('bt-detail-panel').style.display = 'none';
 }
 
 // ── Apply strategy settings from backtest results ──
