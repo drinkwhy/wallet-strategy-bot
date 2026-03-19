@@ -18,7 +18,7 @@ import psycopg2.extras
 import psycopg2.pool
 import string
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from zoneinfo import ZoneInfo
 from flask import Flask, request, redirect, url_for, session, jsonify, Response
@@ -30,6 +30,7 @@ import stripe
 
 from dotenv import load_dotenv
 from backtest_engine import simulate_backtest, simulate_event_tape_backtest, simulate_policy_comparison
+from edge_reporting import build_edge_report, summarize_edge_report_history
 from learning_engine import (
     score_feature_snapshot_with_family,
     score_recent_candidates_for_regime,
@@ -975,6 +976,17 @@ def init_db():
             decision_json TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS quant_edge_reports (
+            id SERIAL PRIMARY KEY,
+            report_kind TEXT DEFAULT 'scheduled',
+            window_days INTEGER DEFAULT 7,
+            model_threshold REAL DEFAULT 60,
+            active_regime TEXT,
+            summary_json TEXT,
+            policy_json TEXT,
+            generated_at TIMESTAMP DEFAULT NOW()
+        )""")
         conn.commit()
         # indexes on columns added by migrate_db — safe to skip if column not yet present
         for _idx_sql in [
@@ -1006,6 +1018,8 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_backtest_runs_created_at ON backtest_runs (created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_backtest_runs_status ON backtest_runs (status, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id ON backtest_trades (run_id, strategy_name)",
+            "CREATE INDEX IF NOT EXISTS idx_quant_edge_reports_window_generated_at ON quant_edge_reports (window_days, generated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_quant_edge_reports_kind_generated_at ON quant_edge_reports (report_kind, generated_at DESC)",
         ]:
             try:
                 cur.execute(_idx_sql)
@@ -1548,6 +1562,11 @@ _backtest_jobs_lock = threading.Lock()
 MODEL_DECISION_THRESHOLD = 60.0
 MODEL_TRAIN_DAYS = 14
 MODEL_CACHE_REFRESH_SEC = 300
+EDGE_REPORT_AUTO_WINDOWS = (
+    (7, 6 * 3600),
+    (14, 12 * 3600),
+    (30, 24 * 3600),
+)
 _quant_model_cache = {"built_at": 0.0, "family": None, "days": MODEL_TRAIN_DAYS}
 _quant_model_cache_lock = threading.Lock()
 BACKGROUND_WORKER_LOCK_ID = 48270431
@@ -5293,6 +5312,133 @@ def _log_model_decisions(info, snapshot, flow_snapshot):
         print(f"[MODEL] decision log error: {e}", flush=True)
 
 
+def _serialize_comparison_trade(trade):
+    return {
+        "policy_name": trade.strategy_name,
+        "mint": trade.mint,
+        "name": trade.name,
+        "entry_price": float(trade.entry_price or 0),
+        "exit_price": float(trade.exit_price or 0),
+        "realized_pnl_pct": float(trade.realized_pnl_pct or 0),
+        "max_upside_pct": float(trade.max_upside_pct or 0),
+        "max_drawdown_pct": float(trade.max_drawdown_pct or 0),
+        "exit_reason": trade.exit_reason,
+    }
+
+
+def load_quant_edge_reports(limit=24, window_days=None, report_kind=None):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        sql = """
+            SELECT id, report_kind, window_days, model_threshold, active_regime,
+                   summary_json, policy_json, generated_at
+            FROM quant_edge_reports
+        """
+        params = []
+        conditions = []
+        if window_days is not None:
+            conditions.append("window_days=%s")
+            params.append(max(1, int(window_days)))
+        if report_kind:
+            conditions.append("report_kind=%s")
+            params.append((report_kind or "").strip().lower())
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY generated_at DESC LIMIT %s"
+        params.append(max(1, int(limit)))
+        cur.execute(sql, tuple(params))
+        return cur.fetchall()
+    finally:
+        db_return(conn)
+
+
+def generate_quant_edge_report(window_days=7, report_kind="manual", model_threshold=MODEL_DECISION_THRESHOLD, persist=True):
+    window_days = max(1, min(int(window_days or 7), 30))
+    model_threshold = max(40.0, min(float(model_threshold or MODEL_DECISION_THRESHOLD), 90.0))
+    bundle = get_cached_quant_model_bundle(days=window_days, force=(report_kind == "manual"))
+    rows = bundle.get("rows") or {}
+    family = bundle.get("family") or {}
+    comparison = simulate_policy_comparison(
+        run_id=0,
+        snapshot_rows=rows.get("entry_rows") or [],
+        flow_rows=rows.get("flow_rows") or [],
+        rule_settings=dict(PRESETS.get("balanced", {})),
+        model_family=family,
+        model_threshold=model_threshold,
+    )
+    regime_context = _current_regime_context(limit=20)
+    report = build_edge_report(
+        report_kind=report_kind,
+        window_days=window_days,
+        model_threshold=model_threshold,
+        active_regime=regime_context.get("regime") or "neutral",
+        comparison_summary=comparison.get("summary") or {},
+        top_trades=[_serialize_comparison_trade(trade) for trade in (comparison.get("trades") or [])[:12]],
+    )
+    if not persist:
+        return report
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO quant_edge_reports (
+                report_kind, window_days, model_threshold, active_regime, summary_json, policy_json
+            ) VALUES (%s,%s,%s,%s,%s,%s)
+            RETURNING id, generated_at
+        """, (
+            report["report_kind"],
+            report["window_days"],
+            report["model_threshold"],
+            report["active_regime"],
+            json.dumps(report["summary"]),
+            json.dumps({
+                "policies": report["policies"],
+                "top_trades": report["top_trades"],
+            }),
+        ))
+        inserted = cur.fetchone() or {}
+        conn.commit()
+        report["id"] = inserted.get("id")
+        if inserted.get("generated_at"):
+            report["generated_at"] = inserted["generated_at"].isoformat()
+            report["summary"]["generated_at"] = report["generated_at"]
+        return report
+    finally:
+        db_return(conn)
+
+
+def quant_edge_report_monitor():
+    while True:
+        try:
+            rows = load_quant_edge_reports(limit=60, report_kind="scheduled")
+            history = summarize_edge_report_history(rows)
+            latest_by_window = {
+                int(item.get("window_days") or 0): item
+                for item in (history.get("latest_by_window") or [])
+            }
+            now = datetime.utcnow()
+            for window_days, max_age_sec in EDGE_REPORT_AUTO_WINDOWS:
+                latest = latest_by_window.get(window_days) or {}
+                generated_at = latest.get("generated_at")
+                stale = True
+                if generated_at:
+                    try:
+                        generated_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+                        if generated_dt.tzinfo is not None:
+                            generated_dt = generated_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                        stale = (now - generated_dt).total_seconds() >= max_age_sec
+                    except Exception:
+                        stale = True
+                if stale:
+                    generate_quant_edge_report(window_days=window_days, report_kind="scheduled")
+                    time.sleep(2)
+        except Exception as e:
+            print(f"[REPORT] quant edge monitor error: {e}", flush=True)
+        time.sleep(600)
+
+
 def _set_backtest_job(run_id, payload):
     with _backtest_jobs_lock:
         _backtest_jobs[run_id] = payload
@@ -6103,6 +6249,7 @@ def ensure_background_workers_started():
             process_listing_alerts,
             shadow_position_monitor,
             execution_tape_monitor,
+            quant_edge_report_monitor,
             _prune_seen_tokens,
         ]
         for target in worker_targets:
@@ -6950,6 +7097,8 @@ def api_quant_overview():
         decision_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM model_decisions")
         model_decision_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM quant_edge_reports")
+        edge_report_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='open'")
         open_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM shadow_positions WHERE status='closed'")
@@ -7039,6 +7188,7 @@ def api_quant_overview():
             "flow_snapshots": flow_snapshot_count,
             "shadow_decisions": decision_count,
             "model_decisions": model_decision_count,
+            "edge_reports": edge_report_count,
             "open_shadow_positions": open_count,
             "closed_shadow_positions": closed_count,
         },
@@ -7233,6 +7383,33 @@ def api_quant_comparison():
             "exit_reason": trade.exit_reason,
         } for trade in top_trades[:12]],
     })
+
+
+@app.route("/api/quant/reports", methods=["GET", "POST"])
+@login_required
+def api_quant_reports():
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        days = max(1, min(int(data.get("days") or 7), 30))
+        threshold = max(40.0, min(float(data.get("threshold") or MODEL_DECISION_THRESHOLD), 90.0))
+        report = generate_quant_edge_report(
+            window_days=days,
+            report_kind="manual",
+            model_threshold=threshold,
+            persist=True,
+        )
+        return jsonify({"ok": True, "report": report})
+
+    days = max(1, min(int(request.args.get("days") or 7), 30))
+    rows = load_quant_edge_reports(limit=36)
+    if not rows:
+        try:
+            generate_quant_edge_report(window_days=days, report_kind="bootstrap", persist=True)
+            rows = load_quant_edge_reports(limit=36)
+        except Exception as e:
+            print(f"[REPORT] bootstrap report generation failed: {e}", flush=True)
+    summary = summarize_edge_report_history(rows, focus_window_days=days)
+    return jsonify(summary)
 
 
 @app.route("/api/quant/shadow-performance")
@@ -9750,6 +9927,10 @@ DASHBOARD_HTML = _CSS + """
       <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Rules vs models comparison loading…</div>
     </div>
 
+    <div class="glass" id="quant-reports" style="margin-top:16px">
+      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Persistent edge reports loading…</div>
+    </div>
+
     <div class="signals-layout">
       <div style="min-width:0">
         <div class="glass" style="padding:0;overflow:hidden">
@@ -9822,7 +10003,7 @@ let _activeTab = 'scanner';
 let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
 let _patternLab = { tokens: [], deployers: [], themes: [] };
 let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantComparison = null, _quantModelMode = 'auto', _quantRuns = [], _quantSelectedRunId = null;
+let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantComparison = null, _quantReports = null, _quantModelMode = 'auto', _quantRuns = [], _quantSelectedRunId = null;
 let _tabPollers = {};
 let _settingsDirty = false;
 let _enhancedData = null;
@@ -9918,6 +10099,9 @@ function fmtDateTime(ts) {
   if (!ts) return '—';
   const d = new Date(ts);
   return Number.isNaN(d.getTime()) ? (ts || '—') : d.toLocaleString();
+}
+function prettyPolicyName(name) {
+  return (name || 'unknown').replaceAll('_', ' ');
 }
 function getSignalChecklist(s) {
   const checklist = s.intel?.checklist;
@@ -11377,23 +11561,26 @@ async function loadPnl(range) {
 async function pollQuant() {
   try {
     const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
-    const [overview, optimizer, model, comparison, runs] = await Promise.all([
+    const [overview, optimizer, model, comparison, reports, runs] = await Promise.all([
       fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
       fetch('/api/quant/optimizer?days=' + days).then(r => r.json()).catch(() => null),
       fetch('/api/quant/model?days=' + days + '&mode=' + encodeURIComponent(_quantModelMode)).then(r => r.json()).catch(() => null),
       fetch('/api/quant/comparison?days=' + days).then(r => r.json()).catch(() => null),
+      fetch('/api/quant/reports?days=' + days).then(r => r.json()).catch(() => null),
       fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
     ]);
     if (overview) _quantOverview = overview;
     if (optimizer) _quantOptimizer = optimizer;
     if (model) _quantModel = model;
     if (comparison) _quantComparison = comparison;
+    if (reports) _quantReports = reports;
     _quantRuns = Array.isArray(runs) ? runs : [];
     renderQuantOverview();
     renderQuantRuns();
     renderQuantOptimizer();
     renderQuantModel();
     renderQuantComparison();
+    renderQuantReports();
     if (_quantSelectedRunId) {
       await showQuantRunDetail(_quantSelectedRunId, true);
     }
@@ -11422,6 +11609,7 @@ function renderQuantOverview() {
     <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Snapshots</div><div class="scanner-summary-value">${dataset.flow_snapshots || 0}</div><div class="scanner-summary-copy">Wallet pressure and liquidity tape</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Shadow Decisions</div><div class="scanner-summary-value">${dataset.shadow_decisions || 0}</div><div class="scanner-summary-copy">Would-buy versus blocked decisions</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Model Decisions</div><div class="scanner-summary-value">${dataset.model_decisions || 0}</div><div class="scanner-summary-copy">Logged global and regime model picks</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Edge Reports</div><div class="scanner-summary-value">${dataset.edge_reports || 0}</div><div class="scanner-summary-copy">Persistent weekly and monthly scorecards</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Regime</div><div class="scanner-summary-value">${flow.regime || '—'}</div><div class="scanner-summary-copy">${flow.sample_size || 0} recent snapshots · ${flow.avg_net_flow_sol > 0 ? '+' : ''}${flow.avg_net_flow_sol || 0} SOL net</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Missed Winners</div><div class="scanner-summary-value">${(opportunity.totals || {}).missed_winners || 0}</div><div class="scanner-summary-copy">Shadow blocks that later ran ${opportunity.winner_threshold_pct || 120}%+</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Open Shadow Positions</div><div class="scanner-summary-value">${dataset.open_shadow_positions || 0}</div><div class="scanner-summary-copy">Currently simulated live book</div></div>
@@ -11783,6 +11971,115 @@ function renderQuantComparison() {
           `).join('') || '<div style="font-size:11px;color:var(--t3)">No comparison trades yet.</div>'}
         </div>
       </div>
+    </div>
+  `;
+}
+
+async function runQuantReport() {
+  const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
+  const res = await fetch('/api/quant/reports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ days, threshold: _quantComparison?.model_threshold || 60 }),
+  }).then(r => r.json()).catch(() => null);
+  if (!res || !res.ok) {
+    showToast('Edge report generation failed', false);
+    return;
+  }
+  showToast(`Edge report captured for ${days}d window`);
+  await pollQuant();
+}
+
+function renderQuantReports() {
+  const box = document.getElementById('quant-reports');
+  if (!box || !_quantReports) return;
+  const focus = _quantReports.focus_report || {};
+  const focusSummary = focus.summary || {};
+  const latestByWindow = Array.isArray(_quantReports.latest_by_window) ? _quantReports.latest_by_window : [];
+  const trendCards = Array.isArray(_quantReports.trend_cards) ? _quantReports.trend_cards : [];
+  const leaderboard = Array.isArray(_quantReports.leaderboard) ? _quantReports.leaderboard : [];
+  const recentReports = Array.isArray(_quantReports.recent_reports) ? _quantReports.recent_reports : [];
+  box.innerHTML = `
+    <div class="panel-head" style="margin-bottom:12px">
+      <div>
+        <div class="panel-title">Edge Reports</div>
+        <div class="panel-copy">Persistent comparison snapshots and automated scorecards so you can see whether rules, the global model, or the regime model are actually improving over time.</div>
+      </div>
+      <div class="panel-actions">
+        <button class="btn btn-ghost" type="button" onclick="runQuantReport()">Generate Report</button>
+      </div>
+    </div>
+    <div class="shortcut-row" style="margin-bottom:12px">
+      <span class="badge bg-muted">${_quantReports.report_count || 0} stored reports</span>
+      <span class="badge bg-muted">Focus ${_quantReports.focus_window_days || 7}d</span>
+      <span class="badge bg-muted">Leader ${prettyPolicyName(focusSummary.leader_policy)}</span>
+      <span class="badge bg-muted">Last ${fmtDateTime(focus.generated_at || focusSummary.generated_at)}</span>
+    </div>
+    <div class="control-action-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:12px">
+      ${latestByWindow.map(item => `
+        <div class="scanner-summary-card">
+          <div class="scanner-summary-label">${item.window_days}d latest</div>
+          <div class="scanner-summary-value">${item.leader_avg_pnl_pct > 0 ? '+' : ''}${(item.leader_avg_pnl_pct || 0).toFixed(1)}%</div>
+          <div class="scanner-summary-copy">${prettyPolicyName(item.leader_policy)} · edge ${(item.model_edge_pct || 0) > 0 ? '+' : ''}${(item.model_edge_pct || 0).toFixed(1)}%</div>
+        </div>
+      `).join('') || '<div class="scanner-summary-card"><div class="scanner-summary-label">Reports</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">No persistent reports yet</div></div>'}
+    </div>
+    <div class="scanner-top-grid">
+      <div>
+        <div class="sec-label">Trend Deltas</div>
+        <div class="operator-rule-list">
+          ${trendCards.map(item => `
+            <div class="operator-rule">
+              <div>
+                <div class="operator-rule-label">${item.window_days}d · ${prettyPolicyName(item.leader_policy)}</div>
+                <div style="font-size:10px;color:var(--t3);margin-top:3px">
+                  Leader ${(item.delta_leader_avg_pnl_pct ?? 0) >= 0 ? '+' : ''}${item.delta_leader_avg_pnl_pct == null ? 'n/a' : item.delta_leader_avg_pnl_pct + '%'}
+                  · Regime edge ${(item.delta_regime_edge_pct ?? 0) >= 0 ? '+' : ''}${item.delta_regime_edge_pct == null ? 'n/a' : item.delta_regime_edge_pct + '%'}
+                </div>
+              </div>
+              <div class="operator-rule-value">${(item.model_edge_pct || 0) >= 0 ? '+' : ''}${(item.model_edge_pct || 0).toFixed(1)}%</div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Need at least one persisted report before trends appear.</div>'}
+        </div>
+      </div>
+      <div>
+        <div class="sec-label">Policy Leaderboard</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${leaderboard.slice(0, 5).map(item => `
+            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+                <div>
+                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${prettyPolicyName(item.policy_name)}</div>
+                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.windows || 0} latest-window snapshots</div>
+                </div>
+                <div style="font-size:12px;font-weight:800;color:${item.avg_pnl_pct >= 0 ? 'var(--grn)' : 'var(--red2)'}">${item.avg_pnl_pct >= 0 ? '+' : ''}${item.avg_pnl_pct.toFixed(1)}%</div>
+              </div>
+              <div class="shortcut-row" style="margin-top:8px">
+                <span class="badge bg-muted">Win ${item.avg_win_rate.toFixed(1)}%</span>
+              </div>
+            </div>
+          `).join('') || '<div style="font-size:11px;color:var(--t3)">Leaderboard will populate after reports are generated.</div>'}
+        </div>
+      </div>
+    </div>
+    <div class="sec-label" style="margin-top:12px">Recent Snapshots</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${recentReports.slice(0, 5).map(item => `
+        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div>
+              <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.window_days}d · ${prettyPolicyName(item.summary?.leader_policy)}</div>
+              <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.report_kind} · ${item.active_regime || 'neutral'} · ${fmtDateTime(item.generated_at)}</div>
+            </div>
+            <div style="font-size:12px;font-weight:800;color:${(item.summary?.model_edge_pct || 0) >= 0 ? 'var(--grn)' : 'var(--red2)'}">${(item.summary?.model_edge_pct || 0) >= 0 ? '+' : ''}${(item.summary?.model_edge_pct || 0).toFixed(1)}%</div>
+          </div>
+          <div class="shortcut-row" style="margin-top:8px">
+            <span class="badge bg-muted">Rule ${(item.summary?.rule_avg_pnl_pct || 0).toFixed(1)}%</span>
+            <span class="badge bg-muted">Regime ${(item.summary?.regime_edge_pct || 0) >= 0 ? '+' : ''}${(item.summary?.regime_edge_pct || 0).toFixed(1)}%</span>
+            <span class="badge bg-muted">${(item.policies || []).length} policies</span>
+          </div>
+        </div>
+      `).join('') || '<div style="font-size:11px;color:var(--t3)">No report history stored yet.</div>'}
     </div>
   `;
 }
