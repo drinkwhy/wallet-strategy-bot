@@ -6877,6 +6877,7 @@ def api_state():
             db_return(conn)
     except Exception:
         db_settings = strip_auto_relax_state(bot.settings) if bot else {}
+    telegram_chat_id = get_user_telegram_chat_id(uid)
     
     return jsonify({
         "running":    bot.running if bot else False,
@@ -6892,6 +6893,8 @@ def api_state():
             "zero_buy_hours": 0,
             "offpeak_min_change": float(db_settings.get("offpeak_min_change") or 0),
         },
+        "telegram_chat_id": telegram_chat_id,
+        "telegram_connected": bool(telegram_chat_id),
     })
 
 @app.route("/api/start", methods=["POST"])
@@ -9416,6 +9419,23 @@ DASHBOARD_HTML = _CSS + """
           {{UPGRADE_BTN}}
           <a href="/setup" class="btn btn-ghost">Wallet Setup</a>
         </div>
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--b1)">
+          <div style="font-size:12px;font-weight:700;color:var(--t1);margin-bottom:6px">Telegram Alerts</div>
+          <div style="font-size:11px;color:var(--t3);line-height:1.6;margin-bottom:10px">Paste your Telegram `chat_id` once. Saving here sends a confirmation message and enables buy, sell, and edge-guard alerts.</div>
+          <div class="field-row" style="margin-bottom:8px">
+            <div class="fgroup" style="margin:0">
+              <label class="flabel">Chat ID</label>
+              <input class="finput" id="telegram-chat-id" type="text" placeholder="e.g. 6803261718">
+            </div>
+          </div>
+          <div class="shortcut-row" style="margin-bottom:10px">
+            <span class="badge bg-muted" id="telegram-status-badge">Checking Telegram status…</span>
+          </div>
+          <div class="panel-actions">
+            <button class="btn btn-primary" type="button" onclick="saveTelegramChat()">Save Telegram</button>
+            <button class="btn btn-ghost" type="button" onclick="clearTelegramChat()">Clear</button>
+          </div>
+        </div>
       </div>
 
       <div class="hero-panel">
@@ -11132,6 +11152,7 @@ async function refresh() {
       renderSettingsSnapshot(savedSettings);
     }
   }
+  renderTelegramStatus(d.telegram_chat_id || '');
 }
 
 async function toggleBot() {
@@ -11169,6 +11190,61 @@ function showConfirmModal(title, body, meta=[]) {
 }
 function hideConfirmModal() {
   document.getElementById('confirm-modal')?.classList.remove('show');
+}
+
+function renderTelegramStatus(chatId) {
+  const input = document.getElementById('telegram-chat-id');
+  const badge = document.getElementById('telegram-status-badge');
+  if (!input || !badge) return;
+  const active = document.activeElement === input;
+  if (!active) input.value = chatId || '';
+  if (chatId) {
+    badge.className = 'badge bg-grn';
+    badge.textContent = `Connected ${chatId}`;
+  } else {
+    badge.className = 'badge bg-muted';
+    badge.textContent = 'Not connected';
+  }
+}
+
+async function saveTelegramChat() {
+  const input = document.getElementById('telegram-chat-id');
+  const raw = (input?.value || '').trim();
+  if (!raw) {
+    showToast('Enter a Telegram chat ID first', false);
+    return;
+  }
+  if (!/^-?[0-9]+$/.test(raw)) {
+    showToast('Chat ID must be numeric', false);
+    return;
+  }
+  const res = await fetch('/api/telegram', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: raw }),
+  }).then(r => r.json()).catch(() => null);
+  if (!res || !res.ok) {
+    showToast('Telegram save failed', false);
+    return;
+  }
+  renderTelegramStatus(raw);
+  showToast('Telegram connected. Check for the confirmation message.');
+  refresh();
+}
+
+async function clearTelegramChat() {
+  const res = await fetch('/api/telegram', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: '' }),
+  }).then(r => r.json()).catch(() => null);
+  if (!res || !res.ok) {
+    showToast('Telegram clear failed', false);
+    return;
+  }
+  renderTelegramStatus('');
+  showToast('Telegram alerts disconnected');
+  refresh();
 }
 
 // ══════════════════════════ SIGNAL EXPLORER ══════════════════════════
