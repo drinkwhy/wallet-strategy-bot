@@ -11622,6 +11622,13 @@ async function pollBacktest() {
             </span>`;
           }).join('') + '</div>';
         }
+        // Warning badge if no trades
+        let warnHtml = '';
+        if (r.status === 'completed' && r.trades === 0 && r.snapshots === 0) {
+          warnHtml = '<div style="font-size:10px;color:var(--gold2);margin-top:4px">⚠ No snapshots found — bot needs to run first to collect data</div>';
+        } else if (r.status === 'completed' && r.trades === 0 && r.snapshots > 0) {
+          warnHtml = '<div style="font-size:10px;color:var(--gold2);margin-top:4px">⚠ Had ' + r.snapshots + ' snapshots but all coins were blocked — click for details</div>';
+        }
         return `<div onclick="loadBtDetail(${r.id})" style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,.04);cursor:pointer;transition:background .15s" onmouseenter="this.style.background='rgba(255,255,255,.03)'" onmouseleave="this.style.background='transparent'">
           <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
             <div>
@@ -11635,6 +11642,7 @@ async function pollBacktest() {
             </div>
           </div>
           ${stratHtml}
+          ${warnHtml}
         </div>`;
       }).join('');
     }
@@ -11785,25 +11793,96 @@ async function loadBtDetail(runId) {
 
     // Summary by strategy from the summary JSON
     const summary = r.summary || {};
-    let sumHtml = '<div style="display:flex;gap:10px;flex-wrap:wrap">';
+    const blockerLabels = {
+      missing_price: 'Missing price data',
+      liquidity_below_threshold: 'Not enough liquidity',
+      market_cap_below_floor: 'Market cap too low',
+      market_cap_above_ceiling: 'Market cap too high',
+      volume_below_threshold: 'Volume too low',
+      ai_score_below_threshold: 'AI score too low',
+      token_too_old: 'Token too old',
+      green_lights_below_threshold: 'Not enough green lights',
+      narrative_below_threshold: 'Low narrative score',
+      holder_growth_below_threshold: 'Not enough new holders',
+      volume_spike_below_threshold: 'No volume spike',
+      cannot_exit: 'Cannot exit (locked)',
+      transfer_hook_enabled: 'Transfer hook (risky)',
+      threat_risk_too_high: 'High scam risk',
+      score_below_minimum: 'Score below 40',
+      confidence_below_minimum: 'Confidence below 35%'
+    };
+    let sumHtml = '';
+    let anyStratHasData = false;
+    let diagnosticHtml = '';
     for (const [sname, sdata] of Object.entries(summary)) {
-      if (typeof sdata !== 'object' || !sdata.closed) continue;
-      const avgPnl = parseFloat(sdata.avg_pnl_pct || 0);
-      const c = avgPnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+      if (typeof sdata !== 'object') continue;
       const label = stratLabels[sname] || sname;
-      sumHtml += `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:12px;min-width:140px;text-align:center">
-        <div style="font-size:12px;font-weight:700;color:var(--t1)">${esc(label)}</div>
-        <div style="font-size:20px;font-weight:700;color:${c};margin:4px 0">${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%</div>
-        <div style="font-size:10px;color:var(--t3)">${sdata.closed || 0} trades &middot; ${parseFloat(sdata.win_rate || 0).toFixed(0)}% wins</div>
-      </div>`;
+      const decisions = parseInt(sdata.decisions || 0);
+      const passed = parseInt(sdata.passed || 0);
+      const blocked = parseInt(sdata.blocked || 0);
+      const closed = parseInt(sdata.closed || 0);
+      if (closed > 0) {
+        anyStratHasData = true;
+        const avgPnl = parseFloat(sdata.avg_pnl_pct || 0);
+        const c = avgPnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+        sumHtml += `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:12px;min-width:140px;text-align:center">
+          <div style="font-size:12px;font-weight:700;color:var(--t1)">${esc(label)}</div>
+          <div style="font-size:20px;font-weight:700;color:${c};margin:4px 0">${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%</div>
+          <div style="font-size:10px;color:var(--t3)">${closed} trades &middot; ${parseFloat(sdata.win_rate || 0).toFixed(0)}% wins</div>
+        </div>`;
+      }
+      // Diagnostic info per strategy
+      if (decisions > 0) {
+        const blockers = sdata.blocker_counts || {};
+        let blockerList = '';
+        for (const [bk, bv] of Object.entries(blockers).sort((a,b) => b[1]-a[1])) {
+          if (bv > 0) blockerList += `<div style="display:flex;justify-content:space-between;padding:2px 0"><span>${blockerLabels[bk] || bk.replace(/_/g, ' ')}</span><span style="font-weight:700">${bv}</span></div>`;
+        }
+        diagnosticHtml += `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:14px;min-width:200px;flex:1">
+          <div style="font-size:13px;font-weight:700;color:var(--t1);margin-bottom:8px">${esc(label)}</div>
+          <div style="display:flex;gap:16px;margin-bottom:8px;font-size:12px">
+            <span style="color:var(--t3)">${decisions} checked</span>
+            <span style="color:var(--grn)">${passed} passed</span>
+            <span style="color:var(--red2)">${blocked} blocked</span>
+            <span style="color:var(--t2)">${closed} traded</span>
+          </div>
+          ${blockerList ? '<div style="font-size:11px;color:var(--t2);border-top:1px solid rgba(255,255,255,.06);padding-top:8px"><div style="font-size:10px;color:var(--t3);margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em">Why coins were blocked:</div>' + blockerList + '</div>' : '<div style="font-size:11px;color:var(--t3)">No blocker data</div>'}
+        </div>`;
+      }
     }
-    sumHtml += '</div>';
+    // Show strategy summary cards if any have trades
+    if (anyStratHasData) {
+      sumHtml = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">' + sumHtml + '</div>';
+    }
+    // Always show diagnostics
+    if (diagnosticHtml) {
+      sumHtml += '<div style="margin-bottom:6px;font-size:14px;font-weight:700;color:var(--t1)">Diagnostic Breakdown</div>';
+      sumHtml += '<div style="font-size:11px;color:var(--t3);margin-bottom:10px">Shows how many coins each strategy checked, how many passed all filters, and what blocked the rest</div>';
+      sumHtml += '<div style="display:flex;gap:10px;flex-wrap:wrap">' + diagnosticHtml + '</div>';
+    }
+    // If NO data at all in summary, show a helpful message
+    if (!sumHtml && r.snapshots_processed === 0) {
+      sumHtml = '<div style="padding:16px;text-align:center;font-size:13px;color:var(--gold2);background:rgba(255,193,7,.06);border:1px solid rgba(255,193,7,.15);border-radius:10px">' +
+        '<strong>No market snapshots found for this date range.</strong><br>' +
+        '<span style="font-size:12px;color:var(--t3)">Snapshots are only created while the bot is running and scanning coins. ' +
+        'Start the bot and let it run for a while, then try backtesting again.</span></div>';
+    } else if (!sumHtml) {
+      sumHtml = '<div style="padding:16px;text-align:center;font-size:13px;color:var(--gold2);background:rgba(255,193,7,.06);border:1px solid rgba(255,193,7,.15);border-radius:10px">' +
+        '<strong>No strategy results available.</strong><br>' +
+        '<span style="font-size:12px;color:var(--t3)">The backtest may have encountered an error or had no data to process.</span></div>';
+    }
     document.getElementById('bt-detail-summary').innerHTML = sumHtml;
 
     // Trades table
     const trades = d.trades || [];
     if (!trades.length) {
-      document.getElementById('bt-detail-trades').innerHTML = '<tr><td colspan="7" class="empty-state">No trades in this run</td></tr>';
+      let noTradeMsg = 'No trades were simulated in this run.';
+      if (r.snapshots_processed === 0) {
+        noTradeMsg = 'No snapshots found — the bot needs to be running to collect market data for backtesting.';
+      } else if (r.snapshots_processed > 0 && r.trades_closed === 0) {
+        noTradeMsg = `${r.snapshots_processed} snapshots were checked but all coins were blocked by entry filters. See the diagnostic breakdown above to see why.`;
+      }
+      document.getElementById('bt-detail-trades').innerHTML = `<tr><td colspan="7" class="empty-state">${noTradeMsg}</td></tr>`;
     } else {
       document.getElementById('bt-detail-trades').innerHTML = trades.map(t => {
         const pct = parseFloat(t.realized_pnl_pct || 0);
