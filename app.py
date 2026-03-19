@@ -8786,6 +8786,401 @@ def api_signal_explorer():
     })
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# SIMPLIFIED DASHBOARD API ENDPOINTS
+# ──────────────────────────────────────────────────────────────────────────────
+
+_BLOCKER_PLAIN_ENGLISH = {
+    "market_cap_above_ceiling": "Market cap too high",
+    "market_cap_below_floor": "Market cap too low",
+    "liquidity_below_floor": "Not enough buyers/sellers",
+    "volume_below_floor": "Trading volume too low",
+    "threat_risk_too_high": "Looks risky (possible scam)",
+    "holder_growth_below_threshold": "Not enough new buyers",
+    "volume_spike_below_threshold": "No sudden interest spike",
+    "age_too_old": "Token too old",
+    "age_too_young": "Token too new",
+    "price_dropping": "Price was going down",
+    "score_below_threshold": "Score too low",
+    "confidence_below_threshold": "Not confident enough",
+    "hot_change_above_ceiling": "Price pumped too much already",
+    "anti_rug_fail": "Failed safety check",
+    "blacklisted_dev": "Developer is blacklisted",
+    "duplicate_position": "Already holding this coin",
+    "cooldown_active": "Recently checked, waiting",
+    "max_positions_reached": "Too many open trades",
+    "drawdown_limit_hit": "Loss limit reached",
+    "narrative_below_floor": "No clear story/hype",
+    "deployer_below_floor": "Developer not trusted",
+    "green_lights_below_floor": "Not enough positive signals",
+}
+
+def _plain_reason(reason):
+    """Convert a technical blocker reason to plain English."""
+    if not reason:
+        return "Didn't pass checks"
+    r = str(reason).strip()
+    if r in _BLOCKER_PLAIN_ENGLISH:
+        return _BLOCKER_PLAIN_ENGLISH[r]
+    # Try partial match
+    for key, val in _BLOCKER_PLAIN_ENGLISH.items():
+        if key in r:
+            return val
+    # Fallback: make the string readable
+    return r.replace("_", " ").capitalize()
+
+
+@app.route("/api/market-watch")
+@login_required
+def api_market_watch():
+    """All coins being evaluated + what would have happened if bought."""
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+
+    # Gather evaluations from in-memory log first, DB fallback
+    entries = []
+    if bot and bot.signal_explorer_log:
+        entries = list(bot.signal_explorer_log)
+    if not entries:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT payload_json, ts
+                FROM signal_explorer_log
+                WHERE user_id=%s ORDER BY ts DESC LIMIT 120
+            """, (uid,))
+            for row in cur.fetchall():
+                try:
+                    p = json.loads(row.get("payload_json") or "{}")
+                    if isinstance(p, dict) and p:
+                        entries.append(p)
+                except Exception:
+                    pass
+        finally:
+            db_return(conn)
+
+    # Dedupe by mint (keep most recent)
+    seen = {}
+    deduped = []
+    for e in entries:
+        mint = e.get("mint")
+        if not mint or mint in seen:
+            continue
+        seen[mint] = True
+        deduped.append(e)
+
+    # Collect mints we need current prices for
+    mints_need_price = [e["mint"] for e in deduped if e.get("mint")]
+    current_prices = {}
+    for mint in mints_need_price:
+        hist = _price_history.get(mint)
+        if hist:
+            current_prices[mint] = hist[-1][1]
+
+    # Batch-fetch missing prices (max 20 to avoid API hammering)
+    missing = [m for m in mints_need_price if m not in current_prices][:20]
+    if missing and bot:
+        try:
+            fetched = bot._batch_token_prices(missing)
+            current_prices.update(fetched)
+        except Exception:
+            pass
+
+    coins = []
+    total_bought = 0
+    total_skipped = 0
+    best_missed = None
+    worst_avoided = None
+
+    for e in deduped[:80]:  # Cap at 80 for performance
+        mint = e.get("mint", "")
+        name = e.get("name", "Unknown")
+        passed = e.get("passed", False)
+        score = e.get("score", 0)
+        price_then = e.get("price", 0) or 0
+        price_now = current_prices.get(mint, 0)
+
+        # Compute hypothetical change
+        change_pct = 0
+        if price_then > 0 and price_now > 0:
+            change_pct = round(((price_now / price_then) - 1) * 100, 1)
+
+        # Determine reason
+        reason = ""
+        if not passed:
+            total_skipped += 1
+            reason = e.get("reason", "")
+            if not reason:
+                # Check filters list
+                filters = e.get("filters", [])
+                for f in filters:
+                    if isinstance(f, dict) and not f.get("passed"):
+                        reason = f.get("name", "")
+                        break
+            reason = _plain_reason(reason)
+        else:
+            total_bought += 1
+
+        # Track best missed / worst avoided
+        if not passed and price_then > 0 and price_now > 0:
+            if best_missed is None or change_pct > best_missed["change_pct"]:
+                best_missed = {"name": name, "change_pct": change_pct}
+            if worst_avoided is None or change_pct < worst_avoided["change_pct"]:
+                worst_avoided = {"name": name, "change_pct": change_pct}
+
+        # Format time
+        ts_raw = e.get("timestamp") or e.get("ts") or ""
+        eval_time = ""
+        if isinstance(ts_raw, (int, float)) and ts_raw > 1000000000:
+            try:
+                eval_time = datetime.fromtimestamp(ts_raw).strftime("%I:%M %p")
+            except Exception:
+                eval_time = str(ts_raw)
+        elif isinstance(ts_raw, str):
+            eval_time = ts_raw
+
+        coins.append({
+            "name": name,
+            "mint": mint,
+            "evaluated_at": eval_time,
+            "price_then": price_then,
+            "price_now": price_now,
+            "change_pct": change_pct,
+            "rating": score,
+            "verdict": "Bought" if passed else "Skipped",
+            "skip_reason": reason,
+            "volume": e.get("vol", 0),
+            "market_cap": e.get("mc", 0),
+        })
+
+    return jsonify({
+        "coins": coins,
+        "summary": {
+            "total_checked": len(coins),
+            "total_bought": total_bought,
+            "total_skipped": total_skipped,
+            "best_missed": best_missed,
+            "worst_avoided": worst_avoided,
+        }
+    })
+
+
+@app.route("/api/my-trades")
+@login_required
+def api_my_trades():
+    """Simplified view of open trades + recent sells + totals."""
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+
+    open_trades = []
+    if bot:
+        pos_snapshot = dict(bot.positions)
+        for mint, p in pos_snapshot.items():
+            try:
+                cur_price = bot.get_token_price(mint)
+                entry = p["entry_price"]
+                profit_pct = round(((cur_price / entry) - 1) * 100, 1) if cur_price and entry else 0
+                age_sec = time.time() - p["timestamp"]
+                if age_sec < 3600:
+                    held_for = f"{int(age_sec/60)}m"
+                else:
+                    held_for = f"{age_sec/3600:.1f}h"
+                open_trades.append({
+                    "name": p["name"],
+                    "mint": mint,
+                    "bought_at_price": entry,
+                    "current_price": cur_price,
+                    "profit_pct": profit_pct,
+                    "bought_when": time.strftime("%I:%M %p", time.localtime(p["timestamp"])),
+                    "held_for": held_for,
+                    "amount_sol": p.get("sol_in", 0),
+                })
+            except Exception:
+                pass
+
+    # Recent sells from DB
+    recent_sells = []
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mint, name, action, price, pnl_sol, timestamp
+            FROM trades WHERE user_id=%s AND action ILIKE 'sell%%'
+            ORDER BY timestamp DESC LIMIT 20
+        """, (uid,))
+        for row in cur.fetchall():
+            pnl = row.get("pnl_sol") or 0
+            ts = row.get("timestamp")
+            ts_str = ""
+            if ts:
+                try:
+                    ts_str = ts.strftime("%I:%M %p") if hasattr(ts, "strftime") else str(ts)
+                except Exception:
+                    ts_str = str(ts)
+            recent_sells.append({
+                "name": row.get("name", "Unknown"),
+                "mint": row.get("mint", ""),
+                "result": "Won" if pnl > 0 else "Lost",
+                "profit_sol": round(pnl, 4),
+                "sold_when": ts_str,
+            })
+    finally:
+        db_return(conn)
+
+    stats = bot.stats if bot else {"wins": 0, "losses": 0, "total_pnl_sol": 0}
+    total_t = stats["wins"] + stats["losses"]
+
+    return jsonify({
+        "open_trades": open_trades,
+        "recent_sells": recent_sells,
+        "totals": {
+            "balance_sol": round(bot.sol_balance, 4) if bot else 0,
+            "wins": stats["wins"],
+            "losses": stats["losses"],
+            "win_rate": round(stats["wins"] / total_t * 100) if total_t else 0,
+            "total_profit_sol": round(stats["total_pnl_sol"], 4),
+        }
+    })
+
+
+@app.route("/api/backtest-results")
+@login_required
+def api_backtest_results():
+    """Simplified backtest results: strategy performance + settings for each."""
+    uid = session["user_id"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Shadow performance by strategy
+        cur.execute("""
+            SELECT strategy_name,
+                   COUNT(*) AS closed_trades,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_trade,
+                   ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_trade,
+                   ROUND(AVG(max_upside_pct)::numeric, 2) AS avg_upside,
+                   ROUND(AVG(max_drawdown_pct)::numeric, 2) AS avg_drawdown
+            FROM shadow_positions
+            WHERE status='closed'
+            GROUP BY strategy_name
+            ORDER BY avg_pnl DESC NULLS LAST
+        """)
+        perf_rows = cur.fetchall()
+        # Recent backtest runs
+        cur.execute("""
+            SELECT id, name, status, days, strategy_filter, trades_closed, summary_json,
+                   config_json, created_at
+            FROM backtest_runs
+            WHERE requested_by=%s
+            ORDER BY created_at DESC
+            LIMIT 10
+        """, (uid,))
+        run_rows = cur.fetchall()
+        # Recent shadow trades (most recent 30)
+        cur.execute("""
+            SELECT strategy_name, mint, name, entry_price, exit_price, realized_pnl_pct,
+                   exit_reason, opened_at, closed_at, score
+            FROM shadow_positions
+            WHERE status='closed'
+            ORDER BY closed_at DESC NULLS LAST
+            LIMIT 30
+        """)
+        trade_rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    # Plain-English strategy names
+    strategy_labels = {
+        "safe": "Careful (Low Risk)",
+        "balanced": "Balanced (Medium Risk)",
+        "aggressive": "Aggressive (Higher Risk)",
+        "degen": "Full Send (Max Risk)",
+    }
+    # Plain-English exit reasons
+    exit_labels = {
+        "take_profit": "Hit profit target",
+        "stop_loss": "Hit loss limit",
+        "time_stop": "Ran out of time",
+    }
+
+    strategies = []
+    for row in perf_rows:
+        name = row.get("strategy_name", "")
+        trades = int(row.get("closed_trades") or 0)
+        wins = int(row.get("wins") or 0)
+        preset = PRESETS.get(name, {})
+        strategies.append({
+            "name": name,
+            "label": strategy_labels.get(name, name.title()),
+            "total_trades": trades,
+            "wins": wins,
+            "losses": trades - wins,
+            "win_rate": round(wins / trades * 100) if trades else 0,
+            "avg_profit_pct": float(row.get("avg_pnl") or 0),
+            "best_trade_pct": float(row.get("best_trade") or 0),
+            "worst_trade_pct": float(row.get("worst_trade") or 0),
+            "avg_best_gain_pct": float(row.get("avg_upside") or 0),
+            "avg_worst_drop_pct": float(row.get("avg_drawdown") or 0),
+            "settings": {
+                "buy_amount": preset.get("max_buy_sol", 0),
+                "first_sell_target": preset.get("tp1_mult", 0),
+                "second_sell_target": preset.get("tp2_mult", 0),
+                "cut_losses_at": preset.get("stop_loss", 0),
+                "time_limit_min": preset.get("time_stop_min", 0),
+                "trailing_stop": preset.get("trail_pct", 0),
+                "max_trades": preset.get("max_correlated", 0),
+                "max_loss_sol": preset.get("drawdown_limit_sol", 0),
+                "min_liquidity": preset.get("min_liq", 0),
+                "min_market_cap": preset.get("min_mc", 0),
+                "max_market_cap": preset.get("max_mc", 0),
+                "min_volume": preset.get("min_vol", 0),
+                "min_score": preset.get("min_score", 0),
+            },
+        })
+
+    runs = []
+    for row in run_rows:
+        try:
+            summary = json.loads(row.get("summary_json") or "{}")
+        except Exception:
+            summary = {}
+        try:
+            config = json.loads(row.get("config_json") or "{}")
+        except Exception:
+            config = {}
+        runs.append({
+            "id": int(row.get("id") or 0),
+            "name": row.get("name") or f"Run #{row.get('id')}",
+            "status": row.get("status"),
+            "days": int(row.get("days") or 0),
+            "trades": int(row.get("trades_closed") or 0),
+            "strategies": row.get("strategy_filter") or "all",
+            "summary": summary,
+            "when": row.get("created_at").strftime("%b %d, %I:%M %p") if row.get("created_at") and hasattr(row["created_at"], "strftime") else str(row.get("created_at") or ""),
+        })
+
+    recent_trades = []
+    for row in trade_rows:
+        exit_r = row.get("exit_reason") or ""
+        recent_trades.append({
+            "strategy": strategy_labels.get(row.get("strategy_name", ""), row.get("strategy_name", "")),
+            "coin": row.get("name") or "Unknown",
+            "profit_pct": float(row.get("realized_pnl_pct") or 0),
+            "exit_reason": exit_labels.get(exit_r, exit_r.replace("_", " ").title() if exit_r else "Unknown"),
+            "score": float(row.get("score") or 0),
+            "entry_price": float(row.get("entry_price") or 0),
+            "exit_price": float(row.get("exit_price") or 0),
+        })
+
+    return jsonify({
+        "strategies": strategies,
+        "runs": runs,
+        "recent_trades": recent_trades,
+    })
+
+
 @app.route("/api/pattern-lab")
 @login_required
 def api_pattern_lab():
@@ -9883,3505 +10278,997 @@ function toggleStop(v){
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
 DASHBOARD_HTML = _CSS + """
 <style>
-.dashboard-shell{max-width:1520px;padding-top:18px}
-.ticker-strip{background:rgba(11,21,36,.82);border-bottom:1px solid rgba(255,255,255,.06);overflow:hidden;height:38px;display:flex;align-items:center;backdrop-filter:blur(14px)}
-.dashboard-hero{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.85fr);gap:18px;margin-bottom:18px}
-.hero-panel,.glass,.settings-card{
+.dashboard-shell{max-width:1100px;padding-top:18px;margin:0 auto}
+.dashboard-shell{max-width:1100px;padding-top:18px;margin:0 auto}
+.glass{
   background:linear-gradient(180deg, rgba(17,31,51,.94), rgba(10,19,32,.9));
   border:1px solid rgba(255,255,255,.07);
   border-radius:20px;
   box-shadow:var(--shadow);
   backdrop-filter:blur(16px);
+  padding:20px;
+  margin-bottom:16px;
 }
-.hero-panel{padding:22px}
-.glass{padding:18px}
-.hero-panel-primary{position:relative;overflow:hidden}
-.hero-panel-primary::after{content:"";position:absolute;right:-60px;top:-60px;width:220px;height:220px;border-radius:50%;background:radial-gradient(circle, rgba(96,165,250,.18), transparent 65%)}
-.hero-kicker,.tab-kicker,.panel-kicker{font-size:10px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:var(--blue2);margin-bottom:10px}
-.hero-title{font-family:'Space Grotesk','Manrope',sans-serif;font-size:36px;line-height:1.05;letter-spacing:-1.4px;max-width:760px;margin-bottom:12px}
-.hero-copy{font-size:14px;color:var(--t2);max-width:720px;line-height:1.7}
-.hero-chip-row,.settings-echo,.intel-alerts,.shortcut-row{display:flex;gap:8px;flex-wrap:wrap}
-.hero-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
-.hero-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:18px}
-.hero-mini{padding:12px 14px;border-radius:16px;background:rgba(7,14,23,.42);border:1px solid rgba(255,255,255,.06)}
-.hero-mini-label{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-bottom:5px}
-.hero-mini-value{font-family:'Space Grotesk','Manrope',sans-serif;font-size:20px;letter-spacing:-.6px;color:var(--t1)}
-.hero-mini-copy{font-size:11px;color:var(--t2);margin-top:3px;line-height:1.45}
-.hero-side-stack{display:flex;flex-direction:column;gap:14px}
-.account-grid,.intel-metrics,.scanner-summary-grid,.pnl-summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-.account-cell,.intel-metric,.scanner-summary-card,.pnl-summary-card{
-  padding:12px 14px;
-  border-radius:16px;
-  background:rgba(7,14,23,.42);
+.hero-bar{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:16px;
+  flex-wrap:wrap;
+  margin-bottom:18px;
+}
+.hero-left{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.hero-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px}
+.status-dot.on{background:var(--grn);box-shadow:0 0 8px var(--grn)}
+.status-dot.off{background:var(--red2);box-shadow:0 0 8px var(--red)}
+.stat-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px}
+.stat-box{
+  background:rgba(7,14,23,.5);
   border:1px solid rgba(255,255,255,.06);
+  border-radius:14px;
+  padding:14px;
+  text-align:center;
 }
-.account-label,.intel-label,.scanner-summary-label,.pnl-summary-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px}
-.account-value,.intel-value,.scanner-summary-value,.pnl-summary-value{font-size:14px;font-weight:800;color:var(--t1)}
-.account-copy,.intel-copy,.scanner-summary-copy,.pnl-summary-copy{font-size:11px;color:var(--t2);margin-top:3px;line-height:1.45}
-.shortcut-row .badge{background:rgba(255,255,255,.04);color:var(--t2);border:1px solid rgba(255,255,255,.08)}
-.overview-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
-.overview-strip .stat{min-height:102px}
+.stat-label{font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+.stat-val{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;color:var(--t1);letter-spacing:-.5px}
 .tab-bar{
   display:flex;
-  gap:10px;
-  padding:10px;
-  margin-bottom:16px;
+  gap:0;
+  margin-bottom:18px;
   background:rgba(9,17,29,.78);
   border:1px solid rgba(255,255,255,.06);
-  border-radius:18px;
-  overflow-x:auto;
-  -webkit-overflow-scrolling:touch;
-  backdrop-filter:blur(16px);
-  position:sticky;
-  top:74px;
-  z-index:70;
+  border-radius:14px;
+  overflow:hidden;
 }
 .tab-btn{
-  min-width:170px;
+  flex:1;
   padding:14px 16px;
-  font-size:12px;
+  font-size:14px;
   font-weight:700;
   color:var(--t3);
   border:none;
-  background:rgba(255,255,255,.02);
+  background:transparent;
   cursor:pointer;
-  white-space:nowrap;
-  border-radius:14px;
   transition:.18s;
-  letter-spacing:.2px;
+  text-align:center;
+}
+.tab-btn:hover{color:var(--t2);background:rgba(255,255,255,.03)}
+.tab-btn.active{color:var(--t1);background:linear-gradient(135deg, rgba(47,107,255,.22), rgba(96,165,250,.12))}
+.tab-desc{display:block;font-size:11px;color:var(--t3);margin-top:3px;font-weight:400}
+.tab-btn.active .tab-desc{color:var(--t2)}
+.tab-pane{display:none}.tab-pane.active{display:block}
+.summary-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.summary-chip{
+  padding:8px 14px;
+  border-radius:10px;
+  font-size:12px;
+  font-weight:600;
+  background:rgba(7,14,23,.5);
+  border:1px solid rgba(255,255,255,.06);
+  color:var(--t2);
+}
+.summary-chip .num{color:var(--t1);font-weight:800}
+.summary-chip.green{border-color:rgba(20,199,132,.2);color:var(--grn)}
+.summary-chip.red{border-color:rgba(220,38,38,.2);color:var(--red2)}
+table.clean{width:100%;border-collapse:collapse}
+table.clean th{
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:.1em;
+  color:var(--t3);
+  padding:10px 12px;
   text-align:left;
+  border-bottom:1px solid rgba(255,255,255,.08);
+  font-weight:600;
 }
-.tab-btn:hover{color:var(--t2);background:rgba(255,255,255,.04)}
-.tab-btn.active{color:var(--t1);background:linear-gradient(135deg, rgba(47,107,255,.22), rgba(96,165,250,.12));box-shadow:inset 0 0 0 1px rgba(96,165,250,.25)}
-.tab-btn-label{display:block;font-family:'Space Grotesk','Manrope',sans-serif;font-size:15px;letter-spacing:-.3px}
-.tab-btn-meta{display:block;font-size:11px;color:var(--t3);margin-top:4px}
-.tab-btn.active .tab-btn-meta{color:var(--t2)}
-.tab-pane{display:none;padding:4px 0 0}
-.tab-pane.active{display:block}
-.tab-pane-header{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.tab-pane-title{font-family:'Space Grotesk','Manrope',sans-serif;font-size:26px;letter-spacing:-.8px}
-.tab-pane-copy{font-size:13px;color:var(--t2);max-width:780px;line-height:1.65}
-.scanner-top-grid{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(320px,.92fr);gap:14px;margin-bottom:14px}
-.scanner-layout{display:grid;grid-template-columns:minmax(280px,320px) minmax(0,1fr);gap:14px}
-.scanner-sidebar,.settings-stack{display:flex;flex-direction:column;gap:14px}
-.scanner-sidebar{position:sticky;top:148px;align-self:start}
-.scanner-main{min-width:0;display:flex;flex-direction:column;gap:14px}
-.panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-.panel-title{font-family:'Space Grotesk','Manrope',sans-serif;font-size:18px;letter-spacing:-.5px}
-.panel-copy{font-size:12px;color:var(--t2);line-height:1.6;max-width:720px}
-.panel-actions{display:flex;gap:8px;flex-wrap:wrap}
-.control-note,.launch-note,.helper-note{font-size:11px;line-height:1.6;color:var(--t2)}
-.control-action-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-top:14px}
-.scanner-header-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.scanner-search{background:rgba(7,16,29,.72);border:1px solid rgba(255,255,255,.08);color:var(--t1);padding:8px 11px;border-radius:10px;font-size:11px;width:180px}
-.scanner-search:focus{outline:none;border-color:rgba(96,165,250,.35);box-shadow:0 0 0 3px rgba(37,99,235,.15)}
-.dex-row{cursor:pointer;transition:.12s}.dex-row:hover td{background:rgba(255,255,255,.03)}.dex-row.selected td{background:rgba(37,99,235,.08)}
-.tok-icon{width:34px;height:34px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;margin-right:10px;flex-shrink:0}
-.tok-name{font-size:12px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
-.tok-sym{font-size:10px;color:var(--t3)}
-.chg-pos{color:var(--grn);font-weight:700;font-size:11px}.chg-neg{color:var(--red2);font-weight:700;font-size:11px}.chg-0{color:var(--t3);font-size:11px}
-.price-val,.num-val{font-size:11px;color:var(--t2)}
-.score-mini{width:52px;height:6px;background:rgba(255,255,255,.06);border-radius:999px;overflow:hidden}.score-fill{height:100%;border-radius:999px}
-.sort-pill{padding:6px 11px;font-size:10px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02);color:var(--t3);cursor:pointer;font-weight:700}
-.sort-pill.active{background:var(--blue);border-color:var(--blue);color:#fff}
-.buy-btn-mini{padding:5px 10px;font-size:10px;font-weight:800;border:1px solid rgba(20,199,132,.35);background:rgba(20,199,132,.1);color:var(--grn);border-radius:8px;cursor:pointer;white-space:nowrap}
-.buy-btn-mini:hover{background:var(--grn);color:#03140d}
-.settings-pane-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:16px;align-items:start}
-.settings-section-title{font-size:12px;font-weight:800;color:var(--t1);letter-spacing:.08em;text-transform:uppercase;margin-bottom:12px}
-.setting-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(116px,160px) 72px;gap:10px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+table.clean td{
+  padding:10px 12px;
+  font-size:13px;
+  color:var(--t2);
+  border-bottom:1px solid rgba(255,255,255,.04);
+  vertical-align:middle;
+}
+table.clean tr:hover td{background:rgba(255,255,255,.02)}
+.coin-name{font-weight:700;color:var(--t1);font-size:13px}
+.badge-bought{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:700;
+  background:rgba(20,199,132,.15);
+  color:var(--grn);
+  border:1px solid rgba(20,199,132,.25);
+}
+.badge-skipped{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:700;
+  background:rgba(100,116,139,.12);
+  color:var(--t3);
+  border:1px solid rgba(100,116,139,.2);
+}
+.badge-won{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:700;
+  background:rgba(20,199,132,.15);
+  color:var(--grn);
+  border:1px solid rgba(20,199,132,.25);
+}
+.badge-lost{
+  display:inline-block;
+  padding:3px 10px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:700;
+  background:rgba(220,38,38,.12);
+  color:var(--red2);
+  border:1px solid rgba(220,38,38,.2);
+}
+.pct-pos{color:var(--grn);font-weight:700}
+.pct-neg{color:var(--red2);font-weight:700}
+.pct-zero{color:var(--t3)}
+.rating-bar{width:50px;height:6px;background:rgba(255,255,255,.06);border-radius:999px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:6px}
+.rating-fill{height:100%;border-radius:999px}
+.reason-text{font-size:11px;color:var(--t3);font-style:italic;max-width:200px}
+.btn{
+  padding:8px 18px;
+  border-radius:10px;
+  font-size:12px;
+  font-weight:700;
+  border:none;
+  cursor:pointer;
+  transition:.15s;
+}
+.btn-start{background:var(--grn);color:#03140d}.btn-start:hover{background:#0fa86a}
+.btn-stop{background:var(--red);color:#fff}.btn-stop:hover{background:#b91c1c}
+.btn-sell{background:rgba(220,38,38,.12);color:var(--red2);border:1px solid rgba(220,38,38,.2);padding:5px 12px;font-size:11px}
+.btn-sell:hover{background:var(--red);color:#fff}
+.btn-save{background:var(--blue);color:#fff}.btn-save:hover{background:var(--blue3)}
+.btn-ghost{background:rgba(255,255,255,.04);color:var(--t2);border:1px solid rgba(255,255,255,.08)}
+.btn-ghost:hover{background:rgba(255,255,255,.08);color:var(--t1)}
+.trade-card{
+  background:rgba(7,14,23,.5);
+  border:1px solid rgba(255,255,255,.06);
+  border-radius:14px;
+  padding:16px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+}
+.trade-card+.trade-card{margin-top:10px}
+.trade-info{display:flex;flex-direction:column;gap:3px}
+.trade-name{font-weight:700;color:var(--t1);font-size:14px}
+.trade-meta{font-size:11px;color:var(--t3)}
+.trade-pnl{font-family:'Space Grotesk',sans-serif;font-size:22px;font-weight:700;letter-spacing:-.5px;text-align:right}
+.settings-group{margin-bottom:20px}
+.settings-title{font-size:13px;font-weight:700;color:var(--t1);margin-bottom:12px;text-transform:uppercase;letter-spacing:.06em}
+.setting-row{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  padding:10px 0;
+  border-bottom:1px solid rgba(255,255,255,.05);
+  gap:12px;
+}
 .setting-row:last-child{border-bottom:none}
-.setting-label{font-size:13px;color:var(--t2);font-weight:800}
-.setting-desc{font-size:10px;color:var(--t3);margin-top:2px;line-height:1.45}
-.setting-input{background:rgba(7,16,29,.72);border:1px solid rgba(255,255,255,.08);color:var(--t1);padding:9px 10px;border-radius:10px;font-size:12px;width:100%}
-.setting-unit{font-size:11px;color:var(--t3);text-align:right}
-.setting-toggle-row{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid rgba(255,255,255,.06);gap:14px}
-.setting-toggle-row:last-child{border-bottom:none}
-.toggle-wrap{display:flex;align-items:center;gap:10px}
-.checkpoint-path{display:flex;flex-direction:column;gap:10px}
-.checkpoint-card{border:1px solid rgba(59,130,246,.18);background:linear-gradient(180deg,rgba(8,16,26,.96),rgba(10,18,29,.82));border-radius:14px;padding:12px 14px}
-.checkpoint-step{display:flex;align-items:flex-start;gap:10px}
-.checkpoint-index{width:24px;height:24px;border-radius:999px;background:rgba(59,130,246,.14);border:1px solid rgba(59,130,246,.28);color:var(--blue2);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0}
-.checkpoint-meta{font-size:10px;color:var(--t3);margin-top:4px;line-height:1.45}
-.operator-map{display:flex;flex-direction:column;gap:14px}
-.operator-lane{border:1px solid rgba(255,255,255,.06);background:linear-gradient(180deg,rgba(8,16,26,.92),rgba(11,21,34,.82));border-radius:16px;padding:14px}
-.operator-lane-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px;flex-wrap:wrap}
-.operator-lane-title{font-size:12px;font-weight:800;color:var(--t1);text-transform:uppercase;letter-spacing:.08em}
-.operator-lane-note{font-size:11px;color:var(--t3);line-height:1.45;max-width:520px}
-.operator-chip-row{display:flex;flex-wrap:wrap;gap:8px}
-.operator-chip{padding:7px 10px;border-radius:999px;border:1px solid rgba(59,130,246,.24);background:rgba(59,130,246,.08);font-size:11px;color:var(--t2);font-weight:700}
-.operator-chip.feed{border-color:rgba(20,199,132,.22);background:rgba(20,199,132,.08);color:var(--grn)}
-.operator-chip.guard{border-color:rgba(245,158,11,.24);background:rgba(245,158,11,.08);color:var(--gold2)}
-.operator-chip.exit{border-color:rgba(220,38,38,.24);background:rgba(220,38,38,.08);color:#ff8b8b}
-.operator-stage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
-.operator-stage{border:1px solid rgba(59,130,246,.12);background:rgba(14,23,36,.82);border-radius:14px;padding:12px}
-.operator-stage-num{font-size:10px;font-weight:800;color:var(--blue2);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px}
-.operator-stage-title{font-size:13px;font-weight:700;color:var(--t1);margin-bottom:5px}
-.operator-stage-value{font-size:11px;color:var(--t2);line-height:1.5}
-.operator-stage-meta{font-size:10px;color:var(--t3);line-height:1.45;margin-top:6px}
-.operator-arrow-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 10px}
-.operator-arrow{font-size:12px;color:var(--blue2);font-weight:800}
-.operator-rule-list{display:flex;flex-direction:column;gap:7px}
-.operator-rule{display:flex;justify-content:space-between;gap:10px;padding:8px 10px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:rgba(7,13,23,.4);font-size:11px}
-.operator-rule-label{font-weight:700;color:var(--t2)}
-.operator-rule-value{color:var(--t3);text-align:right}
-.settings-save-row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-.save-pill{padding:7px 12px;border-radius:999px;border:1px solid rgba(20,199,132,.24);background:rgba(20,199,132,.08);font-size:11px;color:var(--grn);font-weight:700}
-.save-pill.pending{border-color:rgba(245,158,11,.24);background:rgba(245,158,11,.08);color:var(--gold2)}
-.ai-panel{background:linear-gradient(135deg,rgba(20,199,132,.14),rgba(59,130,246,.08));border:1px solid rgba(20,199,132,.24);border-radius:18px;padding:18px;margin-bottom:18px}
-.ai-panel h3{margin:0 0 6px;font-size:16px;color:var(--t1)}
-.ai-panel p{margin:0;color:var(--t2);font-size:12px;line-height:1.6}
-.ai-stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin:14px 0}
-.ai-stat{background:rgba(7,13,23,.45);border:1px solid rgba(255,255,255,.07);border-radius:12px;padding:12px}
-.ai-stat-value{font-size:20px;font-weight:800;color:var(--t1)}
-.ai-stat-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-top:4px}
-.signals-layout{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:16px;align-items:start}
-.signals-side{display:flex;flex-direction:column;gap:14px;position:sticky;top:148px}
-.sig-table-wrap{max-height:660px;overflow:auto}
-.sig-table{width:100%;border-collapse:collapse;font-size:11px;min-width:1520px}
-.sig-table th{position:sticky;top:0;background:#0c1522;color:var(--t3);font-size:10px;text-transform:uppercase;letter-spacing:.08em;padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.08);z-index:1}
-.sig-table td{padding:10px 8px;border-bottom:1px solid rgba(26,46,69,.5);vertical-align:top}
-.sig-table tbody tr{cursor:pointer;transition:.12s}
-.sig-table tbody tr:hover{background:rgba(255,255,255,.025)}
-.sig-table tbody tr.active{background:rgba(37,99,235,.08)}
-.sig-cell-token{min-width:180px}
-.sig-token-name{font-weight:700;color:var(--t1);font-size:12px}
-.sig-token-meta{font-size:10px;color:var(--t3)}
-.sig-checks{display:flex;gap:4px;flex-wrap:wrap;min-width:180px}
-.sig-check{padding:3px 6px;border-radius:999px;font-size:9px;font-weight:700;border:1px solid transparent;white-space:nowrap}
-.sig-check.pass{color:var(--grn);border-color:rgba(20,199,132,.35);background:rgba(20,199,132,.08)}
-.sig-check.fail{color:var(--red2);border-color:rgba(220,38,38,.35);background:rgba(220,38,38,.08)}
-.sig-reason{max-width:300px;color:var(--t2);line-height:1.35}
-.sig-mini-muted{font-size:10px;color:var(--t3)}
-.sig-badge{padding:2px 8px;border-radius:12px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.3px}
-.sig-pass{background:rgba(20,199,132,.15);color:var(--grn)}.sig-fail{background:rgba(220,38,38,.15);color:var(--red2)}
-.score-bar{height:6px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden;width:60px;flex-shrink:0}
-.score-bar-fill{height:100%;border-radius:999px}
-.filter-step{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:12px;color:var(--t2)}
-.filter-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.filter-dot.pass{background:var(--grn)}.filter-dot.fail{background:var(--red2)}
-.whale-card-row{display:flex;gap:12px;margin-bottom:16px;overflow-x:auto;padding-bottom:4px}
-.whale-entry{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.06);animation:wslide .3s ease}
-@keyframes wslide{from{opacity:0;transform:translateX(-16px)}to{opacity:1;transform:translateX(0)}}
-.whale-card{border-radius:18px;padding:16px;min-width:220px}
-.positions-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px}
-.pos-card{border-radius:18px;padding:16px;margin-bottom:12px;transition:.2s}
-.pos-card:hover{border-color:rgba(96,165,250,.28)}
-.risk-bar{height:8px;border-radius:999px;background:rgba(255,255,255,.06);overflow:hidden;margin-top:4px}
-.risk-fill{height:100%;border-radius:999px;transition:width .3s}
-.pnl-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,.75fr);gap:16px}
-.tree-wallet-row{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.06);font-size:11px;cursor:pointer;transition:.1s}
-.tree-wallet-row:hover{background:rgba(255,255,255,.03)}
-.tree-wallet-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.tree-wallet-addr{flex:1;color:var(--t2);font-size:10px;overflow:hidden;text-overflow:ellipsis}
-.tree-wallet-sol{color:var(--t1);font-weight:700;font-size:10px}
-.fp-item{display:flex;align-items:center;gap:6px;padding:4px 0;font-size:11px}
-.fp-pass{color:var(--grn);font-weight:700;font-size:10px}.fp-fail{color:var(--red2);font-weight:700;font-size:10px}
-.fp-name{color:var(--t2);font-weight:500}.fp-reason{color:var(--t3);font-size:10px;flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.confirm-modal{position:fixed;inset:0;background:rgba(2,6,23,.76);display:none;align-items:center;justify-content:center;z-index:260;padding:20px}
-.confirm-modal.show{display:flex}
-.confirm-card{width:min(420px,100%);background:linear-gradient(180deg,#0d1726,#08101a);border:1px solid rgba(59,130,246,.28);border-radius:20px;padding:20px;box-shadow:0 24px 80px rgba(0,0,0,.45)}
-.confirm-title{font-family:'Space Grotesk','Manrope',sans-serif;font-size:18px;font-weight:700;color:var(--t1);margin-bottom:8px}
-.confirm-body{font-size:13px;line-height:1.6;color:var(--t2);margin-bottom:16px}
-.confirm-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
-.activity-shell{position:fixed;bottom:0;left:0;right:0;height:210px;background:rgba(6,13,23,.92);border-top:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;z-index:90;backdrop-filter:blur(18px);transition:height .2s;box-shadow:0 -18px 42px rgba(2,8,23,.25)}
-.activity-head{display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0}
-.activity-title{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:700;color:var(--t2)}
-.activity-actions{display:flex;align-items:center;gap:8px}
-.activity-log{flex:1;overflow-y:auto;display:flex;flex-direction:column-reverse;padding:4px 0}
-@media(max-width:1220px){
-  .dashboard-hero,.scanner-top-grid,.signals-layout,.positions-layout,.pnl-layout,.settings-pane-grid{grid-template-columns:1fr}
-  .signals-side,.scanner-sidebar{position:static}
+.setting-name{font-size:13px;color:var(--t2);font-weight:600}
+.setting-help{font-size:10px;color:var(--t3);margin-top:2px}
+.setting-input{
+  background:rgba(7,16,29,.72);
+  border:1px solid rgba(255,255,255,.08);
+  color:var(--t1);
+  padding:8px 10px;
+  border-radius:10px;
+  font-size:12px;
+  width:120px;
+  text-align:right;
 }
-@media(max-width:860px){
-  .hero-title{font-size:30px}
-  .hero-grid,.account-grid,.intel-metrics,.scanner-summary-grid,.pnl-summary-grid,.launch-grid{grid-template-columns:1fr}
-  .scanner-layout{grid-template-columns:1fr}
-  .tab-bar{top:70px;padding:8px}
-  .tab-btn{min-width:150px;padding:12px 14px}
+.setting-input:focus{outline:none;border-color:rgba(96,165,250,.35)}
+select.setting-input{width:160px;text-align:left;cursor:pointer}
+.activity-drawer{
+  position:fixed;
+  bottom:0;left:0;right:0;
+  background:rgba(7,14,23,.95);
+  border-top:1px solid rgba(255,255,255,.08);
+  backdrop-filter:blur(18px);
+  max-height:180px;
+  overflow-y:auto;
+  z-index:80;
+  padding:10px 20px;
+  font-size:11px;
+  color:var(--t3);
+  display:none;
 }
-@media(max-width:640px){
-  .dashboard-shell{padding-top:12px}
-  .wrap{padding-left:16px;padding-right:16px}
-  .hero-panel,.glass,.settings-card{padding:16px}
-  .hero-actions,.panel-actions,.scanner-header-actions{flex-direction:column;align-items:stretch}
-  .scanner-search{width:100%}
-  .setting-row{grid-template-columns:1fr}
-  .setting-unit{text-align:left}
-  .activity-shell{height:190px}
+.activity-drawer.open{display:block}
+.activity-toggle{
+  position:fixed;
+  bottom:8px;right:20px;
+  z-index:81;
+  padding:6px 14px;
+  border-radius:999px;
+  font-size:10px;
+  font-weight:700;
+  background:rgba(9,17,29,.9);
+  border:1px solid rgba(255,255,255,.08);
+  color:var(--t3);
+  cursor:pointer;
+}
+.activity-toggle:hover{color:var(--t1)}
+.empty-state{text-align:center;padding:40px 20px;color:var(--t3);font-size:13px}
+@media(max-width:768px){
+  .dashboard-shell{padding:10px}
+  .hero-bar{flex-direction:column;align-items:flex-start}
+  .stat-strip{grid-template-columns:repeat(2,1fr)}
+  .tab-btn{font-size:12px;padding:10px 8px}
+  table.clean td,table.clean th{padding:8px 6px;font-size:11px}
 }
 </style>
 
+<!-- ═══════════════ NAV ═══════════════ -->
 <nav class="nav">
-  <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
+  <a href="/dashboard" class="logo"><div class="logo-mark">ST</div> SolTrader</a>
   <div class="nav-r">
-    <div class="status"><div id="sdot" class="sdot sdot-off"></div><span id="stxt" class="stxt">Loading…</span></div>
-    <a href="/logout">Sign Out</a>
+    <span style="font-size:12px;color:var(--t3)">{{EMAIL}}</span>
+    <span style="font-size:11px;color:var(--t3);background:rgba(255,255,255,.04);padding:4px 10px;border-radius:6px">{{PLAN_LABEL}}</span>
+    {{UPGRADE_BTN}}
+    <a href="/logout" style="font-size:12px">Log out</a>
   </div>
 </nav>
 
-<div class="ticker-strip">
-  <div id="ticker-inner" style="display:flex;gap:28px;white-space:nowrap;animation:tickscroll 40s linear infinite;font-size:12px;color:var(--t2)">Loading market data…</div>
-</div>
-<style>.tick-item{display:inline-flex;gap:6px;align-items:center}.tick-name{font-weight:700;color:var(--t1);font-size:11px}@keyframes tickscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}</style>
-
 <div class="wrap dashboard-shell">
-  <div class="dashboard-hero">
-    <div class="hero-panel hero-panel-primary">
-      <div class="hero-kicker">Trading Cockpit</div>
-      <div class="hero-title">One workspace for discovery, execution, and risk control.</div>
-      <div class="hero-copy">
-        Scan new Solana flow, inspect every rejection, watch whale activity, and manage live positions without jumping between disconnected panels.
-      </div>
-      <div class="hero-chip-row" style="margin-top:14px">
-        <span class="badge bg-blue" id="hero-preset-badge">Preset loading…</span>
-        <span class="badge bg-muted">{{PLAN_LABEL}}</span>
-        <span class="badge bg-muted" id="hero-live-state">Connecting…</span>
-        <span class="badge bg-muted" id="hero-execution-badge">Execution lane loading…</span>
-        <span class="badge bg-muted">Operator {{EMAIL}}</span>
-      </div>
-      <div class="hero-actions">
-        <button id="toggle-btn" class="btn btn-success" onclick="toggleBot()">▶ Start Bot</button>
-        <button class="btn btn-ghost" type="button" onclick="refreshNow()">Refresh Now</button>
-        <button class="btn btn-ghost" type="button" onclick="openSettingsTab()">Tune Settings</button>
-        <button class="btn btn-ghost" type="button" onclick="focusActivityLog()">Activity Log</button>
-        <button class="btn btn-danger" type="button" onclick="cashout()">Emergency Cashout</button>
-      </div>
-      <div class="hero-grid">
-        <div class="hero-mini">
-          <div class="hero-mini-label">Saved Launch Profile</div>
-          <div class="hero-mini-value" id="hero-launch-mode">Balanced</div>
-          <div class="hero-mini-copy">Persisted settings drive the engine every time you start it.</div>
-        </div>
-        <div class="hero-mini">
-          <div class="hero-mini-label">Last Sync</div>
-          <div class="hero-mini-value" id="hero-sync-time">Waiting…</div>
-          <div class="hero-mini-copy">Market feed, scanner state, and risk panels update continuously.</div>
-        </div>
-      </div>
-    </div>
 
-    <div class="hero-side-stack">
-      <div class="hero-panel">
-        <div class="panel-kicker">Account & Access</div>
-        <div class="account-grid">
-          <div class="account-cell">
-            <div class="account-label">Plan</div>
-            <div class="account-value">{{PLAN_LABEL}}</div>
-            <div class="account-copy">Upgrade paths stay available without leaving the dashboard.</div>
-          </div>
-          <div class="account-cell">
-            <div class="account-label">Wallet</div>
-            <div class="account-value" style="font-size:13px;word-break:break-all">{{WALLET}}</div>
-            <div class="account-copy">Execution signs directly from your configured Solana wallet.</div>
-          </div>
-        </div>
-        <div class="panel-actions" style="margin-top:14px">
-          {{UPGRADE_BTN}}
-          <a href="/setup" class="btn btn-ghost">Wallet Setup</a>
-        </div>
-        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--b1)">
-          <div style="font-size:12px;font-weight:700;color:var(--t1);margin-bottom:6px">Telegram Alerts</div>
-          <div style="font-size:11px;color:var(--t3);line-height:1.6;margin-bottom:10px">Paste your Telegram `chat_id` once. Saving here sends a confirmation message and enables buy, sell, and edge-guard alerts.</div>
-          <div class="field-row" style="margin-bottom:8px">
-            <div class="fgroup" style="margin:0">
-              <label class="flabel">Chat ID</label>
-              <input class="finput" id="telegram-chat-id" type="text" placeholder="e.g. 6803261718">
-            </div>
-          </div>
-          <div class="shortcut-row" style="margin-bottom:10px">
-            <span class="badge bg-muted" id="telegram-status-badge">Checking Telegram status…</span>
-          </div>
-          <div class="panel-actions">
-            <button class="btn btn-primary" type="button" onclick="saveTelegramChat()">Save Telegram</button>
-            <button class="btn btn-ghost" type="button" onclick="clearTelegramChat()">Clear</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="hero-panel">
-        <div class="panel-kicker">Advanced Telemetry</div>
-        <div style="font-size:13px;color:var(--t2);line-height:1.65;margin-bottom:12px" id="enhanced-summary">
-          Checking enhanced risk, MEV, and observability services…
-        </div>
-        <div class="intel-metrics" id="enhanced-metrics">
-          <div class="intel-metric">
-            <div class="intel-label">System</div>
-            <div class="intel-value">Loading…</div>
-            <div class="intel-copy">Waiting for telemetry</div>
-          </div>
-          <div class="intel-metric">
-            <div class="intel-label">Alerts</div>
-            <div class="intel-value">—</div>
-            <div class="intel-copy">No data yet</div>
-          </div>
-        </div>
-        <div class="intel-alerts" id="enhanced-alerts" style="margin-top:12px">
-          <span class="badge bg-muted">Telemetry initializing</span>
-        </div>
-        <div class="shortcut-row" style="margin-top:14px">
-          <span class="badge">`1-6` switch tabs</span>
-          <span class="badge">`/` focus search</span>
-          <span class="badge">`R` refresh</span>
-          <span class="badge">`S` settings</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="overview-strip">
-    <div class="stat"><div class="slabel">Balance</div><div class="sval"><span id="balance">—</span> <span style="font-size:12px;color:var(--t3)">SOL</span></div></div>
-    <div class="stat"><div class="slabel">Positions</div><div class="sval" id="pos-count">0</div></div>
-    <div class="stat"><div class="slabel">Wins</div><div class="sval c-grn" id="wins">0</div></div>
-    <div class="stat"><div class="slabel">Losses</div><div class="sval c-red" id="losses">0</div></div>
-    <div class="stat"><div class="slabel">Win Rate</div><div class="sval c-blue" id="win-rate">—</div></div>
-    <div class="stat"><div class="slabel">Session P&L</div><div class="sval" id="pnl">—</div></div>
-    <div class="stat"><div class="slabel">Streak</div><div class="sval" id="streak">—</div></div>
-  </div>
-
-  <!-- Tab Bar -->
-  <div class="tab-bar">
-    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scanner</span><span class="tab-btn-meta">Discovery, quick buy, wallet tree</span></button>
-    <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
-    <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
-    <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
-    <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
-    <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
-    <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Replay runs and strategy research</span></button>
-  </div>
-
-  <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
-  <div id="tab-scanner" class="tab-pane active">
-    <div class="tab-pane-header">
+  <!-- ═══════════ STATUS BAR ═══════════ -->
+  <div class="hero-bar glass">
+    <div class="hero-left">
       <div>
-        <div class="tab-kicker">Live Operations</div>
-        <div class="tab-pane-title">Scanner Command Center</div>
-        <div class="tab-pane-copy">The scanner feed, launch profile, filter pipeline, listings, and wallet tree stay together here so you can move from discovery to action with less friction.</div>
+        <span class="status-dot off" id="status-dot"></span>
+        <span style="font-size:15px;font-weight:700" id="status-text">Bot Stopped</span>
       </div>
-      <div class="shortcut-row">
-        <span class="badge bg-blue" id="scanner-active-tab">Scanner focus</span>
-        <span class="badge bg-muted" id="scanner-sync-copy">Waiting for sync…</span>
+      <span style="font-size:12px;color:var(--t3)" id="wallet-display">{{WALLET}}</span>
+    </div>
+    <div class="hero-right">
+      <button class="btn btn-start" id="btn-start" onclick="startBot()">Start Bot</button>
+      <button class="btn btn-stop" id="btn-stop" onclick="stopBot()" style="display:none">Stop Bot</button>
+      <button class="btn btn-ghost" onclick="sellAll()">Sell Everything</button>
+    </div>
+  </div>
+
+  <!-- ═══════════ QUICK STATS ═══════════ -->
+  <div class="stat-strip">
+    <div class="stat-box">
+      <div class="stat-label">Your Balance</div>
+      <div class="stat-val" id="balance">--</div>
+      <div style="font-size:10px;color:var(--t3)">SOL</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Open Trades</div>
+      <div class="stat-val" id="pos-count">0</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Success Rate</div>
+      <div class="stat-val" id="win-rate" style="color:var(--blue2)">--</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Total Profit</div>
+      <div class="stat-val" id="total-pnl">--</div>
+      <div style="font-size:10px;color:var(--t3)">SOL</div>
+    </div>
+  </div>
+
+  <!-- ═══════════ TABS ═══════════ -->
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="watch" onclick="switchTab('watch')">
+      Market Watch
+      <span class="tab-desc">Coins being checked right now</span>
+    </button>
+    <button class="tab-btn" data-tab="trades" onclick="switchTab('trades')">
+      My Trades
+      <span class="tab-desc">Your open and closed trades</span>
+    </button>
+    <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">
+      Settings
+      <span class="tab-desc">Control how the bot trades</span>
+    </button>
+    <button class="tab-btn" data-tab="backtest" onclick="switchTab('backtest')">
+      Backtest Results
+      <span class="tab-desc">Which settings worked best</span>
+    </button>
+  </div>
+
+  <!-- ═══════════════════════ MARKET WATCH TAB ═══════════════════════ -->
+  <div id="tab-watch" class="tab-pane active">
+    <div class="glass">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-size:18px;font-weight:700;color:var(--t1)">Coins We're Watching</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">Every coin the bot looked at, and what would have happened if you bought it</div>
+        </div>
+        <div class="summary-row" id="watch-summary">
+          <span class="summary-chip"><span class="num" id="sum-checked">0</span> checked</span>
+          <span class="summary-chip"><span class="num" id="sum-bought">0</span> bought</span>
+          <span class="summary-chip"><span class="num" id="sum-skipped">0</span> skipped</span>
+        </div>
+      </div>
+      <div id="watch-highlight" style="margin-bottom:14px"></div>
+      <div style="overflow-x:auto">
+        <table class="clean" id="watch-table">
+          <thead>
+            <tr>
+              <th>Coin</th>
+              <th>When</th>
+              <th>Price Then</th>
+              <th>Price Now</th>
+              <th>Change</th>
+              <th>Rating</th>
+              <th>Result</th>
+              <th>Why Skipped</th>
+            </tr>
+          </thead>
+          <tbody id="watch-body">
+            <tr><td colspan="8" class="empty-state">Waiting for bot to start scanning coins...</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
+  </div>
 
-    <div class="scanner-top-grid">
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Launch Summary</div>
-            <div class="panel-copy">Saved settings stay visible here before the bot is armed, so the current operating profile is obvious at a glance.</div>
-          </div>
-          <div class="panel-actions">
-            <button class="btn btn-ghost" type="button" onclick="openSettingsTab()">Open Settings</button>
-            <button class="btn btn-ghost" type="button" onclick="refreshNow()">Sync State</button>
-          </div>
-        </div>
-        <div id="launch-summary" class="settings-echo">
-          <span class="badge bg-muted">Mode loading…</span>
-        </div>
-        <div class="control-action-grid">
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Scanner Feed</div>
-            <div class="scanner-summary-value" id="scanner-token-live">0</div>
-            <div class="scanner-summary-copy">Live tokens visible</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Open Trades</div>
-            <div class="scanner-summary-value" id="scanner-position-live">0</div>
-            <div class="scanner-summary-copy">Currently active positions</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Filter Checks</div>
-            <div class="scanner-summary-value" id="scanner-filter-live">0</div>
-            <div class="scanner-summary-copy">Recent pipeline decisions</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">CEX Catches</div>
-            <div class="scanner-summary-value" id="scanner-listing-live">0</div>
-            <div class="scanner-summary-copy">Listings surfaced this session</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Operator Notes</div>
-            <div class="panel-copy">Shortcuts and live telemetry make the dashboard easier to run fast without losing context.</div>
-          </div>
-        </div>
-        <div class="control-note">
-          Slash jumps to search, number keys move tabs, and the activity drawer stays available while you work inside the scanner and settings surfaces.
-        </div>
-        <div class="shortcut-row" style="margin-top:12px">
-          <span class="badge bg-muted" id="enhanced-status-copy">Telemetry loading…</span>
-          <span class="badge bg-muted" id="scanner-last-market">Market feed waiting…</span>
-          <span class="badge bg-muted" id="scanner-last-listing">Listings waiting…</span>
-        </div>
+  <!-- ═══════════════════════ MY TRADES TAB ═══════════════════════ -->
+  <div id="tab-trades" class="tab-pane">
+    <div class="glass">
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Open Trades</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Coins the bot is currently holding</div>
+      <div id="open-trades">
+        <div class="empty-state">No open trades right now</div>
       </div>
     </div>
-
-    <div class="scanner-layout">
-      <div class="scanner-sidebar">
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Open Positions</div>
-              <div class="panel-copy">Live trade P&L stays visible while you scan new opportunities.</div>
-            </div>
-          </div>
-          <div id="pos-tbl" style="max-height:220px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">No open positions</div></div>
-        </div>
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Filter Pipeline</div>
-              <div class="panel-copy">Recent pass/fail reasons show where flow is getting filtered out.</div>
-            </div>
-          </div>
-          <div id="filter-pipe" style="max-height:160px;overflow-y:auto"><div style="font-size:11px;color:var(--t3)">Scanning…</div></div>
-        </div>
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">CEX Sniper</div>
-              <div class="panel-copy">Fresh centralized exchange listings show up here as the monitor catches them.</div>
-            </div>
-            <span id="listing-count-badge" class="badge bg-gold">monitoring</span>
-          </div>
-          <div id="listing-feed" style="max-height:120px;overflow-y:auto;font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
-          <div style="margin-top:8px;font-size:11px;color:var(--t2)">Catches: <span id="listing-stat" style="color:var(--gold2);font-weight:800">0</span></div>
-        </div>
-      </div>
-      <div class="scanner-main">
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap">
-            <div>
-              <div style="font-weight:800;font-size:16px;font-family:'Space Grotesk','Manrope',sans-serif">Live Scanner</div>
-              <div id="token-count" style="font-size:11px;color:var(--t3);margin-top:3px">0 tokens</div>
-            </div>
-            <div class="scanner-header-actions">
-              <input id="scan-search" class="scanner-search" type="text" placeholder="Search token or symbol…" oninput="renderTokenRows()">
-              <button class="sort-pill active" onclick="setSortCol('score',this)">Score</button>
-              <button class="sort-pill" onclick="setSortCol('vol',this)">Vol</button>
-              <button class="sort-pill" onclick="setSortCol('chg',this)">Chg</button>
-              <button class="sort-pill" onclick="setSortCol('age',this)">Age</button>
-              <button style="background:none;border:none;cursor:pointer;font-size:14px" onclick="openDexScreener()" title="Open DexScreener">↗</button>
-            </div>
-          </div>
-          <div style="max-height:550px;overflow-y:auto">
-            <table class="tbl" style="font-size:11px">
-              <thead><tr><th>#</th><th>Token</th><th>Price</th><th>1h</th><th>Vol</th><th>MCap</th><th>Liq</th><th>Age</th><th>Score</th><th></th></tr></thead>
-            </table>
-            <div id="token-rows"></div>
-          </div>
-        </div>
-        <!-- Wallet Tree Panel -->
-        <div id="tree-panel" style="display:none;margin-top:14px" class="glass">
-          <div class="panel-head">
-            <div>
-              <div id="tree-tok-name" class="panel-title" style="font-size:18px"></div>
-              <div id="tree-tok-mint" style="font-size:10px;color:var(--t3);font-family:monospace"></div>
-            </div>
-            <div style="display:flex;gap:10px;align-items:center">
-              <span id="tree-buy-count" class="badge bg-grn">0</span>
-              <span id="tree-sell-count" class="badge bg-red">0</span>
-              <a id="tree-dex-link" href="#" target="_blank" style="font-size:11px;color:var(--blue2)">DexScreener ↗</a>
-              <button onclick="closeTree()" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:16px">&times;</button>
-            </div>
-          </div>
-          <div style="position:relative">
-            <canvas id="tree-canvas" style="width:100%;border-radius:8px;background:#070d17"></canvas>
-            <div id="tree-loading" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;color:var(--t3);font-size:12px">Loading wallet tree…</div>
-          </div>
-          <div id="tree-list" style="max-height:180px;overflow-y:auto;margin-top:8px"></div>
-        </div>
-      </div>
+    <div class="glass">
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Recent Sells</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Trades that have been closed</div>
+      <table class="clean">
+        <thead>
+          <tr>
+            <th>Coin</th>
+            <th>Result</th>
+            <th>Profit (SOL)</th>
+            <th>When</th>
+          </tr>
+        </thead>
+        <tbody id="sells-body">
+          <tr><td colspan="4" class="empty-state">No sells yet</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
   <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
   <div id="tab-settings" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Configuration</div>
-        <div class="tab-pane-title">Saved Strategy Controls</div>
-        <div class="tab-pane-copy">These values are the exact checkpoints your bot uses. Edit them here, save them once, and the launch surface reflects the persisted profile immediately.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-muted" id="settings-header-preset">Preset loading…</span>
-        <span class="badge bg-blue" id="settings-save-state-copy">Waiting for saved state…</span>
-      </div>
-    </div>
-    <div class="settings-pane-grid">
-      <div class="settings-stack">
-        <div class="settings-card">
-          <div class="settings-save-row">
-            <div>
-              <div class="settings-section-title" style="margin-bottom:6px">Saved Settings</div>
-              <div style="font-size:12px;color:var(--t2)">Edit the exact checkpoint values the bot uses, then save them before you start.</div>
-            </div>
-            <div id="settings-save-state" class="save-pill">Loaded from saved state</div>
-          </div>
-          <div style="height:12px"></div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Mode</div>
-              <div class="setting-desc">Choose a base profile, then fine-tune the checkpoints below.</div>
-            </div>
-            <select class="setting-input" id="s-preset" onchange="selectPreset(this.value)">
-              <option value="safe">Safe</option>
-              <option value="balanced">Balanced (Default)</option>
-              <option value="aggressive">Aggressive</option>
-              <option value="degen">Degen</option>
-              <option value="custom">Custom</option>
-            </select>
-            <div class="setting-unit">preset</div>
-          </div>
+    <div class="glass">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-size:18px;font-weight:700;color:var(--t1)">Trading Settings</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">Control how your bot finds and trades coins</div>
         </div>
-
-        <div class="settings-card">
-          <div class="settings-section-title">Execution Desk</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">Control whether the app spends capital or only learns, and decide whether entries follow rules, a model, or auto-promoted report winners.</div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Execution Mode</div>
-              <div class="setting-desc">`Paper` keeps the scanner and models learning without broadcasting live buys.</div>
-            </div>
-            <select class="setting-input" id="s-execution-mode">
-              <option value="live">Live</option>
-              <option value="paper">Paper</option>
-            </select>
-            <div class="setting-unit">capital</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Decision Policy</div>
-              <div class="setting-desc">`Auto` follows report leadership with guardrails. Manual modes stay fixed until you change them.</div>
-            </div>
-            <select class="setting-input" id="s-policy-mode">
-              <option value="rules">Rules</option>
-              <option value="auto">Auto</option>
-              <option value="model_global">Global model</option>
-              <option value="model_regime_auto">Regime model</option>
-            </select>
-            <div class="setting-unit">policy</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Model Threshold</div>
-              <div class="setting-desc">Score floor used when the live lane is model-driven.</div>
-            </div>
-            <input class="setting-input" id="s-model-threshold" type="number" min="40" max="90" step="0.5">
-            <div class="setting-unit">score</div>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Auto Promote Leader</div>
-              <div class="setting-desc">When `Auto` is selected, persist the leading policy and lock it for a cooldown window instead of flipping every refresh.</div>
-            </div>
-            <label class="toggle-wrap"><input id="s-auto-promote" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Promotion Window</div>
-              <div class="setting-desc">Report window used for auto policy leadership checks.</div>
-            </div>
-            <input class="setting-input" id="s-auto-window" type="number" min="3" max="30" step="1">
-            <div class="setting-unit">days</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Min Reports</div>
-              <div class="setting-desc">Required report count before auto mode trusts the leaderboard.</div>
-            </div>
-            <input class="setting-input" id="s-auto-min-reports" type="number" min="2" max="12" step="1">
-            <div class="setting-unit">reports</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Promotion Lock</div>
-              <div class="setting-desc">Cooldown after a promotion before auto mode can switch again.</div>
-            </div>
-            <input class="setting-input" id="s-auto-lock" type="number" min="30" max="10080" step="30">
-            <div class="setting-unit">min</div>
-          </div>
-          <div id="execution-control-summary" class="settings-echo" style="margin-top:12px">
-            <span class="badge bg-muted">Execution lane loading…</span>
-          </div>
-        </div>
-
-        <div class="settings-card">
-          <div class="settings-section-title">Trade Plan</div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Buy Size</div><div class="setting-desc">SOL committed when a coin clears every checkpoint.</div></div>
-            <input class="setting-input" id="s-max-buy" type="number" step="0.01">
-            <div class="setting-unit">SOL</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">TP1 Multiplier</div><div class="setting-desc">First partial sell trigger.</div></div>
-            <input class="setting-input" id="s-tp1" type="number" step="0.01">
-            <div class="setting-unit">x</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">TP2 Multiplier</div><div class="setting-desc">Second target for the remaining size.</div></div>
-            <input class="setting-input" id="s-tp2" type="number" step="0.01">
-            <div class="setting-unit">x</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Hard floor as an entry ratio. `0.70` means stop near -30%.</div></div>
-            <input class="setting-input" id="s-sl" type="number" step="0.01">
-            <div class="setting-unit">ratio</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Trailing Loss</div><div class="setting-desc">Peak retrace used after the trail is armed.</div></div>
-            <input class="setting-input" id="s-trail" type="number" step="0.01">
-            <div class="setting-unit">ratio</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Time Stop</div><div class="setting-desc">Exit if the position stalls too long.</div></div>
-            <input class="setting-input" id="s-tstop" type="number" step="1">
-            <div class="setting-unit">min</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Lamports added to compete for landing.</div></div>
-            <input class="setting-input" id="s-prio" type="number" step="1000">
-            <div class="setting-unit">lamports</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Drawdown Limit</div><div class="setting-desc">Session loss cap before the bot halts itself.</div></div>
-            <input class="setting-input" id="s-dd" type="number" step="0.01">
-            <div class="setting-unit">SOL</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Correlated Positions</div><div class="setting-desc">Maximum overlapping positions before new buys are skipped.</div></div>
-            <input class="setting-input" id="s-maxpos" type="number" step="1">
-            <div class="setting-unit">count</div>
-          </div>
-        </div>
-
-        <div class="settings-card">
-          <div class="settings-section-title">Filter Path</div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Set to `0` to disable the liquidity checkpoint entirely.</div></div>
-            <input class="setting-input" id="s-liq" type="number" step="100">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min Market Cap</div><div class="setting-desc">Lowest market cap allowed into the path.</div></div>
-            <input class="setting-input" id="s-minmc" type="number" step="100">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Market Cap</div><div class="setting-desc">Upper market cap ceiling for new entries.</div></div>
-            <input class="setting-input" id="s-maxmc" type="number" step="1000">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Older coins fail the entry path.</div></div>
-            <input class="setting-input" id="s-age" type="number" step="1">
-            <div class="setting-unit">min</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min Volume</div><div class="setting-desc">24h volume floor for the volume checkpoint.</div></div>
-            <input class="setting-input" id="s-minvol" type="number" step="100">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min AI Score</div><div class="setting-desc">Score floor after the AI score breakdown is computed.</div></div>
-            <input class="setting-input" id="s-minscore" type="number" step="1">
-            <div class="setting-unit">/100</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Hot Change Cap</div><div class="setting-desc">Maximum 1h move before a coin is treated as too extended.</div></div>
-            <input class="setting-input" id="s-hotchg" type="number" step="1">
-            <div class="setting-unit">%</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Green Lights Required</div><div class="setting-desc">Minimum checklist confirmations to reach `SIGNAL`.</div></div>
-            <input class="setting-input" id="s-lights" type="number" step="1">
-            <div class="setting-unit">count</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Holder Growth</div><div class="setting-desc">Required holder acceleration for the quality checklist.</div></div>
-            <input class="setting-input" id="s-holders" type="number" step="1">
-            <div class="setting-unit">%</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Narrative Score</div><div class="setting-desc">Narrative timing floor before the buy path stays alive.</div></div>
-            <input class="setting-input" id="s-narr" type="number" step="1">
-            <div class="setting-unit">pts</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Volume Spike Multiple</div><div class="setting-desc">Minimum expansion multiple used in the three-signal checklist.</div></div>
-            <input class="setting-input" id="s-volspike" type="number" step="0.1">
-            <div class="setting-unit">x</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Late Entry Limit</div><div class="setting-desc">Reject coins already too extended unless narrative strength overrides it.</div></div>
-            <input class="setting-input" id="s-latemult" type="number" step="0.1">
-            <div class="setting-unit">x</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Nuclear Narrative Score</div><div class="setting-desc">Narrative score needed to override late-entry rejection.</div></div>
-            <input class="setting-input" id="s-nuclear" type="number" step="1">
-            <div class="setting-unit">pts</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Off-Peak Change Floor</div><div class="setting-desc">Saved with the profile for off-peak logic, even if the current runtime keeps entries open all day.</div></div>
-            <input class="setting-input" id="s-offpeak" type="number" step="1">
-            <div class="setting-unit">%</div>
-          </div>
-        </div>
-
-        <div class="settings-card">
-          <div class="settings-section-title">Safety Toggles</div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Authority / Rug Check</div>
-              <div class="setting-desc">Blocks older tokens when mint or freeze authority still looks unsafe.</div>
-            </div>
-            <label class="toggle-wrap"><input id="s-antirug" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Holder Concentration Check</div>
-              <div class="setting-desc">Blocks concentrated ownership once the token is old enough for holder analysis.</div>
-            </div>
-            <label class="toggle-wrap"><input id="s-checkholders" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Risk Per Trade</div>
-              <div class="setting-desc">Wallet percentage cap the buy logic can use as a secondary position-size guard.</div>
-            </div>
-            <div style="display:flex;align-items:center;gap:10px">
-              <input class="setting-input" id="s-risk" type="number" step="0.1" style="width:120px">
-              <span class="setting-unit">%</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="settings-card">
-          <div class="settings-save-row">
-            <button class="btn btn-primary" type="button" onclick="saveSettings()">Save Settings</button>
-            <button class="btn btn-ghost" type="button" onclick="refresh()">Reload Saved Settings</button>
-          </div>
-        </div>
+        <button class="btn btn-save" onclick="saveSettings()">Save Changes</button>
       </div>
 
-      <div class="settings-stack">
-        <div class="settings-card">
-          <div class="settings-section-title">Operator Map</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">One shared engine handles every coin. Whales, snipes, scanners, and listings only change how a token enters the path, not how it gets approved.</div>
-          <div id="settings-operator-map" class="operator-map">
-            <div style="font-size:12px;color:var(--t3)">Building operator map…</div>
-          </div>
-        </div>
-        <div class="settings-card">
-          <div class="settings-section-title">Checkpoint Map</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">This is the live pass order. A coin has to survive these checkpoints before it reaches quote and buy.</div>
-          <div id="settings-checkpoint-path" class="checkpoint-path"></div>
-        </div>
-        <div class="settings-card">
-          <div class="settings-section-title">Saved Snapshot</div>
-          <div id="settings-snapshot" class="settings-echo">
-            <span class="badge bg-muted">Waiting for saved settings…</span>
-          </div>
-          <div id="settings-snapshot-note" style="font-size:11px;color:var(--t3);margin-top:10px;line-height:1.5">Save while the bot is off and the exact persisted values stay visible here.</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════ SIGNALS TAB ═══════════════════════ -->
-  <div id="tab-signals" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Decision Trace</div>
-        <div class="tab-pane-title">Signal Explorer</div>
-        <div class="tab-pane-copy">Every evaluated token stays here with the exact reason it passed or failed, the checklist scores behind it, and the downstream operational context around that decision.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-muted">Row click opens full checklist</span>
-        <span class="badge bg-muted">Search matches token, mint, tags, and reason</span>
-      </div>
-    </div>
-    <div class="stats" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
-      <div class="stat"><div class="slabel">Evaluated</div><div class="sval" id="sig-total">0</div></div>
-      <div class="stat"><div class="slabel">Pass Rate</div><div class="sval c-grn" id="sig-pass-rate">0%</div></div>
-      <div class="stat"><div class="slabel">Top Rejection</div><div class="sval" id="sig-top-reject" style="font-size:13px;color:var(--t2)">—</div></div>
-    </div>
-    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap">
-      <button class="sort-pill active" onclick="sigFilter='all';renderSignals();this.classList.add('active');this.nextElementSibling.classList.remove('active');this.nextElementSibling.nextElementSibling.classList.remove('active')">All</button>
-      <button class="sort-pill" onclick="sigFilter='pass';renderSignals();this.classList.add('active');this.previousElementSibling.classList.remove('active');this.nextElementSibling.classList.remove('active')">Passed</button>
-      <button class="sort-pill" onclick="sigFilter='fail';renderSignals();this.classList.add('active');this.previousElementSibling.classList.remove('active');this.previousElementSibling.previousElementSibling.classList.remove('active')">Rejected</button>
-      <input id="sig-search" type="text" placeholder="Search token, mint, reason, tag…" oninput="renderSignals()" style="margin-left:auto;background:var(--surf);border:1px solid var(--b1);color:var(--t1);padding:7px 12px;border-radius:8px;font-size:11px;min-width:260px">
-    </div>
-    <div class="signals-layout">
-      <div style="min-width:0">
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b1)">
-            <div>
-              <div style="font-weight:700;font-size:13px;color:var(--t1)">All Evaluated Coins</div>
-              <div style="font-size:11px;color:var(--t3)">Every evaluated token is logged here with the three-signal checklist, timing, and reject reason.</div>
-            </div>
-            <div id="sig-visible-count" style="font-size:11px;color:var(--t3)">0 rows</div>
-          </div>
-          <div id="sig-list" class="sig-table-wrap"></div>
-        </div>
-      </div>
-      <div class="signals-side">
-        <div class="glass" id="sig-detail">
-          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Click any evaluated coin row to inspect the full checklist and score breakdown.</div>
-        </div>
-        <div class="glass" id="pattern-lab" style="margin-top:14px">
-          <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Pattern lab loading…</div>
-        </div>
-        <div class="glass" id="ops-radar" style="margin-top:14px">
-          <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Ops radar loading…</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════ WHALES TAB ═══════════════════════ -->
-  <div id="tab-whales" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Smart Money</div>
-        <div class="tab-pane-title">Whale Activity</div>
-        <div class="tab-pane-copy">Tracked whale wallets, recent buys, and post-entry performance stay grouped here so you can see who is active and whether their flow is still worth following.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-muted">Live feed auto-refreshes</span>
-      </div>
-    </div>
-    <div class="whale-card-row" id="whale-cards"></div>
-    <div class="glass" style="padding:0">
-      <div style="padding:12px 16px;border-bottom:1px solid var(--b1);font-weight:700;font-size:13px">Live Whale Feed</div>
-      <div id="whale-feed" style="max-height:500px;overflow-y:auto">
-        <div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">Waiting for whale activity…</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════ POSITIONS TAB ═══════════════════════ -->
-  <div id="tab-positions" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Execution Risk</div>
-        <div class="tab-pane-title">Position Monitor</div>
-        <div class="tab-pane-copy">Open positions, mini charts, manual exits, and drawdown posture live together here so you can manage active exposure without losing market context.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-muted">Manual partial exits available per card</span>
-      </div>
-    </div>
-    <div class="positions-layout">
-      <div id="pos-cards">
-        <div style="text-align:center;color:var(--t3);font-size:13px;padding:40px">No open positions</div>
-      </div>
-      <div>
-        <div class="glass">
-          <div class="sec-label">Risk Dashboard</div>
-          <div id="risk-panel">
-            <div style="margin-bottom:12px">
-              <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2)"><span>Drawdown</span><span id="risk-dd-val">0 / 0.5 SOL</span></div>
-              <div class="risk-bar"><div class="risk-fill" id="risk-dd-bar" style="width:0;background:var(--red2)"></div></div>
-            </div>
-            <div style="margin-bottom:12px">
-              <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--t2)"><span>Positions</span><span id="risk-pos-val">0 / 5</span></div>
-              <div class="risk-bar"><div class="risk-fill" id="risk-pos-bar" style="width:0;background:var(--blue2)"></div></div>
-            </div>
-            <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Consecutive Losses: <b id="risk-losses">0</b></div>
-            <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Cooldown: <span id="risk-cooldown" style="color:var(--t3)">None</span></div>
-            <div style="font-size:11px;color:var(--t2)">Peak: <b id="risk-peak">—</b> SOL &nbsp; Now: <b id="risk-now">—</b> SOL</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════ P&L TAB ═══════════════════════ -->
-  <div id="tab-pnl" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Performance</div>
-        <div class="tab-pane-title">P&L Curves</div>
-        <div class="tab-pane-copy">Track realized performance, compare time windows, and inspect drawdown behavior with a cleaner equity view.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-muted">24h, 7d, and all-time views</span>
-      </div>
-    </div>
-    <div style="display:flex;gap:8px;margin-bottom:14px">
-      <button class="sort-pill active" onclick="loadPnl('1');document.querySelectorAll('.pnl-range').forEach(b=>b.classList.remove('active'));this.classList.add('active')" data-range="1">24h</button>
-      <button class="sort-pill pnl-range" onclick="loadPnl('7');document.querySelectorAll('.pnl-range').forEach(b=>b.classList.remove('active'));this.classList.add('active')" data-range="7">7d</button>
-      <button class="sort-pill pnl-range" onclick="loadPnl('all');document.querySelectorAll('.pnl-range').forEach(b=>b.classList.remove('active'));this.classList.add('active')" data-range="all">All</button>
-    </div>
-    <div class="stats" style="grid-template-columns:repeat(auto-fit,minmax(130px,1fr));margin-bottom:16px">
-      <div class="stat"><div class="slabel">Total P&L</div><div class="sval" id="pnl-total">—</div></div>
-      <div class="stat"><div class="slabel">Win Rate</div><div class="sval" id="pnl-winrate">—</div></div>
-      <div class="stat"><div class="slabel">Best Trade</div><div class="sval c-grn" id="pnl-best">—</div></div>
-      <div class="stat"><div class="slabel">Worst Trade</div><div class="sval c-red" id="pnl-worst">—</div></div>
-      <div class="stat"><div class="slabel">Max Drawdown</div><div class="sval c-red" id="pnl-dd">—</div></div>
-      <div class="stat"><div class="slabel">Trades</div><div class="sval" id="pnl-trades">—</div></div>
-    </div>
-    <div class="pnl-layout">
-      <div class="glass" style="margin-bottom:14px">
-        <div style="font-weight:700;font-size:15px;margin-bottom:8px;font-family:'Space Grotesk','Manrope',sans-serif">Cumulative P&L</div>
-        <canvas id="pnl-chart" height="220"></canvas>
-      </div>
-      <div class="glass">
-        <div style="font-weight:700;font-size:15px;margin-bottom:8px;font-family:'Space Grotesk','Manrope',sans-serif">Drawdown</div>
-        <canvas id="dd-chart" height="120"></canvas>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════════ QUANT TAB ═══════════════════════ -->
-  <div id="tab-quant" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Research Loop</div>
-        <div class="tab-pane-title">Replay Lab</div>
-        <div class="tab-pane-copy">Run historical replays over captured feature snapshots, compare strategy behavior, and inspect simulated trades without touching live capital.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-muted">Backtests run asynchronously</span>
-      </div>
-    </div>
-
-    <div class="scanner-top-grid">
-      <div class="glass">
-        <div class="panel-head">
+      <div class="settings-group">
+        <div class="settings-title">Trading Speed</div>
+        <div class="setting-row">
           <div>
-            <div class="panel-title">Quant Dataset</div>
-            <div class="panel-copy">This is the institutional data layer under the live bot: captured tokens, market ticks, feature snapshots, and simulated positions.</div>
+            <div class="setting-name">Strategy Preset</div>
+            <div class="setting-help">How aggressive should the bot be?</div>
           </div>
-          <div class="panel-actions">
-            <button class="btn btn-ghost" type="button" onclick="pollQuant()">Refresh Quant</button>
-          </div>
-        </div>
-        <div class="control-action-grid" id="quant-overview-grid">
-          <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">Loading dataset</div></div>
+          <select class="setting-input" id="s-preset" onchange="loadPresetDefaults()">
+            <option value="safe">Careful (Low Risk)</option>
+            <option value="balanced" selected>Balanced (Medium Risk)</option>
+            <option value="aggressive">Aggressive (Higher Risk)</option>
+            <option value="degen">Full Send (Max Risk)</option>
+          </select>
         </div>
       </div>
 
-      <div class="glass">
-        <div class="panel-head">
+      <div class="settings-group">
+        <div class="settings-title">How Much to Trade</div>
+        <div class="setting-row">
           <div>
-            <div class="panel-title">Launch Backtest</div>
-            <div class="panel-copy">Replay the saved feature stream across the canonical strategy set and store run-by-run trade outcomes.</div>
+            <div class="setting-name">Amount per Trade</div>
+            <div class="setting-help">SOL to spend on each buy</div>
           </div>
+          <input class="setting-input" id="s-buy" type="number" step="0.01" value="0.04">
         </div>
-        <div class="field-row" style="margin-bottom:12px">
-          <div class="fgroup">
-            <label class="flabel">Window</label>
-            <select class="finput" id="quant-days">
-              <option value="1">Last 1 day</option>
-              <option value="3">Last 3 days</option>
-              <option value="7" selected>Last 7 days</option>
-              <option value="14">Last 14 days</option>
-            </select>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">Max Trades at Once</div>
+            <div class="setting-help">How many coins to hold at the same time</div>
           </div>
-          <div class="fgroup">
-            <label class="flabel">Label</label>
-            <input class="finput" id="quant-run-name" type="text" placeholder="e.g. Weekly replay">
-          </div>
+          <input class="setting-input" id="s-maxpos" type="number" step="1" value="3">
         </div>
-        <div class="field-row" style="margin-bottom:12px">
-          <div class="fgroup">
-            <label class="flabel">Replay Mode</label>
-            <select class="finput" id="quant-replay-mode">
-              <option value="snapshot">Snapshot Replay</option>
-              <option value="event_tape">Event Tape Replay</option>
-            </select>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">Max Loss Allowed</div>
+            <div class="setting-help">Stop trading after losing this much SOL total</div>
           </div>
-        </div>
-        <div class="helper-note">Strategies replayed: safe, balanced, aggressive, degen. Snapshot replay uses saved feature states. Event tape replay walks the classified market event stream in chronological order.</div>
-        <div class="panel-actions" style="margin-top:14px">
-          <button class="btn btn-primary" type="button" onclick="runQuantBacktest()">Run Replay</button>
+          <input class="setting-input" id="s-dd" type="number" step="0.1" value="0.5">
         </div>
       </div>
-    </div>
 
-    <div class="scanner-top-grid" style="margin-top:16px">
-      <div class="glass" id="quant-flow-regime">
-        <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Flow regime analytics loading…</div>
+      <div class="settings-group">
+        <div class="settings-title">When to Sell</div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">First Sell Target</div>
+            <div class="setting-help">Sell half when price doubles (2x), triples (3x), etc.</div>
+          </div>
+          <input class="setting-input" id="s-tp1" type="number" step="0.1" value="2.0">
+        </div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">Second Sell Target</div>
+            <div class="setting-help">Sell the rest at this multiplier</div>
+          </div>
+          <input class="setting-input" id="s-tp2" type="number" step="0.1" value="4.0">
+        </div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">Cut Losses At</div>
+            <div class="setting-help">Sell if price drops to this % of buy price (0.7 = sell at 30% loss)</div>
+          </div>
+          <input class="setting-input" id="s-sl" type="number" step="0.05" value="0.70">
+        </div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">Time Limit (minutes)</div>
+            <div class="setting-help">Auto-sell if still holding after this many minutes</div>
+          </div>
+          <input class="setting-input" id="s-time" type="number" step="1" value="30">
+        </div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-name">Trailing Stop</div>
+            <div class="setting-help">After hitting first target, sell if price drops by this %</div>
+          </div>
+          <input class="setting-input" id="s-trail" type="number" step="0.01" value="0.20">
+        </div>
       </div>
-      <div class="glass" id="quant-opportunity-map">
-        <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Opportunity map loading…</div>
-      </div>
-    </div>
 
-    <div class="glass" id="quant-optimizer" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Optimizer sweep loading…</div>
-    </div>
-
-    <div class="glass" id="quant-model" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Model scoring loading…</div>
-    </div>
-
-    <div class="glass" id="quant-comparison" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Rules vs models comparison loading…</div>
-    </div>
-
-    <div class="glass" id="quant-reports" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Persistent edge reports loading…</div>
-    </div>
-
-    <div class="signals-layout">
-      <div style="min-width:0">
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b1)">
-            <div>
-              <div style="font-weight:700;font-size:13px;color:var(--t1)">Backtest Runs</div>
-              <div style="font-size:11px;color:var(--t3)">Recent replay runs with tokens processed, snapshots used, and closed simulated trades.</div>
+      <div class="settings-group">
+        <details>
+          <summary style="cursor:pointer;font-size:13px;font-weight:700;color:var(--t2);padding:8px 0">Advanced Settings (click to expand)</summary>
+          <div style="margin-top:12px">
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Min Liquidity ($)</div>
+                <div class="setting-help">Only buy coins with at least this much money in the pool</div>
+              </div>
+              <input class="setting-input" id="s-liq" type="number" step="1000" value="5000">
             </div>
-            <div id="quant-run-count" style="font-size:11px;color:var(--t3)">0 runs</div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Min Market Cap ($)</div>
+                <div class="setting-help">Skip coins worth less than this</div>
+              </div>
+              <input class="setting-input" id="s-minmc" type="number" step="1000" value="5000">
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Max Market Cap ($)</div>
+                <div class="setting-help">Skip coins worth more than this</div>
+              </div>
+              <input class="setting-input" id="s-maxmc" type="number" step="10000" value="250000">
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Min Trading Volume ($)</div>
+                <div class="setting-help">Only buy coins with this much daily trading</div>
+              </div>
+              <input class="setting-input" id="s-minvol" type="number" step="500" value="3000">
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Min Quality Score</div>
+                <div class="setting-help">0-100, higher = stricter (recommended: 20-40)</div>
+              </div>
+              <input class="setting-input" id="s-minscore" type="number" step="1" value="30">
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Max Coin Age (minutes)</div>
+                <div class="setting-help">Only buy coins younger than this</div>
+              </div>
+              <input class="setting-input" id="s-maxage" type="number" step="10" value="240">
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Cooldown Between Buys (min)</div>
+                <div class="setting-help">Wait this long before buying same coin again</div>
+              </div>
+              <input class="setting-input" id="s-cool" type="number" step="1" value="10">
+            </div>
+            <div class="setting-row">
+              <div>
+                <div class="setting-name">Transaction Speed Fee</div>
+                <div class="setting-help">Higher = faster but costs more (in microlamports)</div>
+              </div>
+              <input class="setting-input" id="s-prio" type="number" step="5000" value="30000">
+            </div>
           </div>
-          <div id="quant-runs" style="padding:14px">
-            <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">No backtest runs yet.</div>
-          </div>
-        </div>
+        </details>
       </div>
-      <div class="signals-side">
-        <div class="glass" id="quant-run-detail">
-          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Select a replay run to inspect strategy summaries and top simulated trades.</div>
+      <div id="settings-status" style="font-size:12px;color:var(--grn);margin-top:10px;display:none"></div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════ BACKTEST RESULTS TAB ═══════════════════════ -->
+  <div id="tab-backtest" class="tab-pane">
+    <div class="glass">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+        <div>
+          <div style="font-size:18px;font-weight:700;color:var(--t1)">Which Settings Worked Best</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:2px">Results from shadow trading &mdash; the bot tested these strategies on real coins without spending real money</div>
         </div>
+        <button class="btn btn-ghost" onclick="pollBacktest()">Refresh</button>
+      </div>
+      <div id="strategy-cards">
+        <div class="empty-state">Loading backtest results...</div>
       </div>
     </div>
-  </div>
-
-</div>
-
-<!-- Toast -->
-<div id="toast" style="position:fixed;bottom:230px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:8px;font-size:13px;font-weight:600;z-index:200;opacity:0;transition:opacity .3s;pointer-events:none"></div>
-<style>#toast.show{opacity:1}</style>
-<div id="confirm-modal" class="confirm-modal" onclick="if(event.target===this)hideConfirmModal()">
-  <div class="confirm-card">
-    <div class="confirm-title" id="confirm-title">Settings Saved</div>
-    <div class="confirm-body" id="confirm-body">Your settings were saved successfully.</div>
-    <div class="confirm-meta" id="confirm-meta"></div>
-    <button class="btn btn-primary btn-full" onclick="hideConfirmModal()">OK</button>
-  </div>
-</div>
-
-<!-- Activity Bar -->
-<div id="activity-bar" class="activity-shell">
-  <div class="activity-head">
-    <div class="activity-title">
-      <span style="width:6px;height:6px;border-radius:50%;background:#14c784;display:inline-block;animation:blink 2s infinite"></span>
-      <span>Activity Log</span>
-      <span id="log-count" style="font-size:10px;color:var(--t3)"></span>
+    <div class="glass">
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Recent Backtest Runs</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Your simulation history</div>
+      <div id="backtest-runs">
+        <div class="empty-state">No backtests run yet</div>
+      </div>
     </div>
-    <div class="activity-actions">
-      <button onclick="toggleLogBar()" id="log-toggle-btn" style="background:none;border:none;color:var(--t3);font-size:11px;cursor:pointer;padding:2px 6px">▼ collapse</button>
+    <div class="glass">
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Recent Shadow Trades</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Simulated trades the bot would have made</div>
+      <table class="clean">
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Coin</th>
+            <th>Profit</th>
+            <th>Why Sold</th>
+            <th>Score</th>
+          </tr>
+        </thead>
+        <tbody id="shadow-trades-body">
+          <tr><td colspan="5" class="empty-state">No shadow trades yet</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
-  <div id="log" class="activity-log"></div>
+
 </div>
 
-<style>
-.lline{font-size:12px;padding:3px 16px;border-bottom:1px solid rgba(255,255,255,.03);color:#64748b;font-family:'SF Mono','Courier New',monospace;line-height:1.65}
-.lline:hover{background:rgba(255,255,255,.02)}
-.lbuy{color:#4ade80!important;font-weight:600}.lsell{color:#f87171!important;font-weight:600}
-.lsig{color:#fbbf24!important;font-weight:600}.linfo{color:#60a5fa!important}.lscan{color:#818cf8}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-</style>
+<!-- ═══════════ ACTIVITY DRAWER ═══════════ -->
+<button class="activity-toggle" onclick="toggleActivity()">Recent Activity</button>
+<div class="activity-drawer" id="activity-drawer">
+  <div id="activity-log">Waiting for activity...</div>
+</div>
 
 <script>
-document.querySelector('.wrap').style.paddingBottom = '214px';
+// ── State ──
+let currentTab = 'watch';
+const presetDefaults = {{PRESET_SETTINGS}};
+let initialPreset = '{{PRESET}}';
 
-// ── State ─────────────────────────────────────────────────────────────────────
-let running = false, allTokens = [], sortCol = 'score', feedSince = 0;
-let selectedMint = null, logBarExpanded = true;
-let treeCanvas = null, treeCtx = null;
-let _charts = {};
-let _activeTab = 'scanner';
-let _sigData = [], _sigView = [], _sigSelected = null, _sigSelectedKey = null, sigFilter = 'all';
-let _patternLab = { tokens: [], deployers: [], themes: [] };
-let _opsMetrics = { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-let _quantOverview = null, _quantOptimizer = null, _quantModel = null, _quantComparison = null, _quantReports = null, _quantModelMode = 'auto', _quantRuns = [], _quantSelectedRunId = null;
-let _tabPollers = {};
-let _settingsDirty = false;
-let _enhancedData = null;
-let aiSuggestion = null;
-
-// ── Tab System ────────────────────────────────────────────────────────────────
-function activateTab(tab) {
-  const btn = document.querySelector(`.tab-btn[data-tab="${tab}"]`);
-  switchTab(tab, btn);
-}
-function switchTab(tab, btn) {
-  _activeTab = tab;
+// ── Tab switching ──
+function switchTab(tab) {
+  currentTab = tab;
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + tab).classList.add('active');
-  if (btn) btn.classList.add('active');
-  const scannerActive = document.getElementById('scanner-active-tab');
-  if (scannerActive) scannerActive.textContent = `${(btn?.querySelector('.tab-btn-label')?.textContent || tab)} focus`;
-  // Start tab-specific polling
-  Object.values(_tabPollers).forEach(id => clearInterval(id));
-  _tabPollers = {};
-  if (tab === 'signals') { pollSignals(); _tabPollers.sig = setInterval(pollSignals, 6000); }
-  if (tab === 'whales') { pollWhales(); _tabPollers.whale = setInterval(pollWhales, 8000); }
-  if (tab === 'positions') { pollPositions(); _tabPollers.pos = setInterval(pollPositions, 5000); }
-  if (tab === 'pnl') {
-    const activeRange = document.querySelector('[data-range].sort-pill.active')?.dataset.range || '1';
-    loadPnl(activeRange);
-  }
-  if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
+  document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
 }
 
-// ── Activity bar ──────────────────────────────────────────────────────────────
-function toggleLogBar() {
-  const bar = document.getElementById('activity-bar');
-  const btn = document.getElementById('log-toggle-btn');
-  logBarExpanded = !logBarExpanded;
-  bar.style.height = logBarExpanded ? '210px' : '38px';
-  btn.textContent  = logBarExpanded ? '▼ collapse' : '▲ expand';
-}
-function focusActivityLog() {
-  if (!logBarExpanded) toggleLogBar();
-  document.getElementById('log')?.scrollTo({ top: 0, behavior: 'smooth' });
+// ── Activity drawer ──
+function toggleActivity() {
+  document.getElementById('activity-drawer').classList.toggle('open');
 }
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
-function fmtK(n) {
-  if (!n) return '\u2014';
-  if (n >= 1e9) return '$' + (n/1e9).toFixed(1) + 'B';
-  if (n >= 1e6) return '$' + (n/1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return '$' + (n/1e3).toFixed(0) + 'K';
-  return '$' + n.toFixed(0);
-}
+// ── Number formatting ──
 function fmtPrice(p) {
-  if (!p) return '\u2014';
-  if (p < 0.000001) return '$' + p.toExponential(2);
-  if (p < 0.0001)   return '$' + p.toFixed(8);
-  if (p < 0.01)     return '$' + p.toFixed(6);
-  if (p < 1)        return '$' + p.toFixed(4);
-  return '$' + p.toFixed(2);
+  if (!p || p <= 0) return '--';
+  if (p >= 1) return '$' + p.toFixed(2);
+  if (p >= 0.001) return '$' + p.toFixed(4);
+  return '$' + p.toFixed(8);
 }
-function fmtAge(m) { return m < 60 ? m.toFixed(0) + 'm' : (m/60).toFixed(1) + 'h'; }
-function chgClass(v) { return v > 0 ? 'chg-pos' : v < 0 ? 'chg-neg' : 'chg-0'; }
-function chgStr(v) { return (v >= 0 ? '+' : '') + v.toFixed(1) + '%'; }
-function scoreColor(s) { return s >= 70 ? '#14c784' : s >= 45 ? '#f5a623' : '#f23645'; }
-function shortWallet(w) { return w ? (w.slice(0, 6) + '…' + w.slice(-4)) : '—'; }
-function markSettingsDirty() {
-  _settingsDirty = true;
-  document._settingsFocused = true;
-  setSettingsSaveState('Unsaved changes', true);
-  renderSettingsVisuals(getSettingsFromForm());
+function fmtUsd(v) {
+  if (!v || v <= 0) return '--';
+  if (v >= 1e6) return '$' + (v/1e6).toFixed(1) + 'M';
+  if (v >= 1e3) return '$' + (v/1e3).toFixed(0) + 'K';
+  return '$' + v.toFixed(0);
 }
-function bindSettingsInputs() {
-  getSettingsFocusIds().forEach(id => {
-    const el = document.getElementById(id);
-    if (!el || el._settingsBound) return;
-    el._settingsBound = true;
-    el.addEventListener('focus', () => { document._settingsFocused = true; });
-    el.addEventListener('blur', () => {
-      setTimeout(() => {
-        const active = document.activeElement;
-        const ids = getSettingsFocusIds();
-        document._settingsFocused = !!(active && ids.includes(active.id));
-      }, 0);
-    });
-    el.addEventListener('change', markSettingsDirty);
-    if (el.tagName !== 'SELECT' && el.type !== 'checkbox') {
-      el.addEventListener('input', markSettingsDirty);
-    }
-  });
+function fmtPct(pct) {
+  if (pct === null || pct === undefined) return '--';
+  const cls = pct > 0 ? 'pct-pos' : pct < 0 ? 'pct-neg' : 'pct-zero';
+  return `<span class="${cls}">${pct > 0 ? '+' : ''}${pct.toFixed(1)}%</span>`;
 }
-function signalKey(s) { return `${s.mint || ''}|${s.logged_at || s.ts || ''}|${s.passed ? 1 : 0}|${s.reason || ''}`; }
-function fmtDateTime(ts) {
-  if (!ts) return '—';
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? (ts || '—') : d.toLocaleString();
-}
-function prettyPolicyName(name) {
-  return (name || 'unknown').replaceAll('_', ' ');
-}
-function getSignalChecklist(s) {
-  const checklist = s.intel?.checklist;
-  return Array.isArray(checklist) && checklist.length ? checklist : [];
-}
-function signalSearchText(s) {
-  const tags = (s.intel?.narrative_tags || []).join(' ');
-  const links = (s.intel?.social_links || []).join(' ');
-  return [
-    s.name, s.mint, s.reason, tags, links,
-    s.intel?.deployer_wallet, s.intel?.deployer_score,
-  ].join(' ').toLowerCase();
-}
-function renderChecklistMini(s) {
-  const checklist = getSignalChecklist(s);
-  if (!checklist.length) return '<span class="sig-mini-muted">Waiting for intel</span>';
-  return checklist.slice(0, 3).map(c => `<span class="sig-check ${c.passed ? 'pass' : 'fail'}">${c.passed ? '✓' : '✕'} ${c.name}</span>`).join('');
-}
-function tokColor(name) {
-  const h = [...(name||'?')].reduce((a,c) => a + c.charCodeAt(0), 0);
-  return ['#14c784','#3b82f6','#f59e0b','#a855f7','#06b6d4','#f43f5e','#84cc16','#f97316'][h % 8];
-}
-function openDexScreener() { window.open('https://dexscreener.com/solana', '_blank'); }
-function fmtClock(ts = Date.now()) {
-  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-function titleCase(value) {
-  return String(value || '')
-    .replace(/[_-]+/g, ' ')
-    .replace(/\\b\\w/g, m => m.toUpperCase());
-}
-function setText(id, value) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = value;
-}
-function firstValue(obj, keys, fallback='—') {
-  for (const key of keys) {
-    if (obj && obj[key] !== undefined && obj[key] !== null && obj[key] !== '') return obj[key];
-  }
-  return fallback;
-}
-function firstBool(obj, keys) {
-  for (const key of keys) {
-    if (obj && typeof obj[key] === 'boolean') return obj[key];
-  }
-  return null;
-}
-function compactValue(value) {
-  if (value === null || value === undefined || value === '') return '—';
-  if (typeof value === 'boolean') return value ? 'On' : 'Off';
-  if (typeof value === 'number') return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(1);
-  return String(value);
-}
-function renderEnhancedDashboard(data) {
-  const summaryEl = document.getElementById('enhanced-summary');
-  const metricsEl = document.getElementById('enhanced-metrics');
-  const alertsEl = document.getElementById('enhanced-alerts');
-  const statusEl = document.getElementById('enhanced-status-copy');
-  if (!summaryEl || !metricsEl || !alertsEl || !statusEl) return;
-
-  if (!data || !data.enabled) {
-    statusEl.textContent = 'Core mode active';
-    summaryEl.textContent = 'Enhanced risk, MEV, and observability services are not active for this bot session, so the dashboard is showing the core trading surface only.';
-    metricsEl.innerHTML = `
-      <div class="intel-metric"><div class="intel-label">System</div><div class="intel-value">Core</div><div class="intel-copy">Standard trading loop</div></div>
-      <div class="intel-metric"><div class="intel-label">Alerts</div><div class="intel-value">0</div><div class="intel-copy">No enhanced alerts</div></div>
-      <div class="intel-metric"><div class="intel-label">MEV Guard</div><div class="intel-value">Standby</div><div class="intel-copy">No advanced route data</div></div>
-      <div class="intel-metric"><div class="intel-label">Circuit</div><div class="intel-value">Armed</div><div class="intel-copy">Base drawdown controls only</div></div>
-    `;
-    alertsEl.innerHTML = '<span class="badge bg-muted">Enhanced telemetry unavailable</span>';
-    return;
-  }
-
-  const health = data.system_health || {};
-  const trading = data.trading_stats || {};
-  const mev = data.mev_stats || {};
-  const circuit = data.circuit_breaker || {};
-  const edgeGuard = data.edge_guard || {};
-  const alerts = Array.isArray(data.active_alerts) ? data.active_alerts : [];
-  const circuitActive = firstBool(circuit, ['active', 'triggered', 'tripped', 'halted']);
-  const circuitLabel = circuitActive === true ? 'Triggered' : circuitActive === false ? 'Armed' : compactValue(firstValue(circuit, ['status', 'state'], 'Armed'));
-  const mevLabel = compactValue(firstValue(mev, ['status', 'strategy', 'mode', 'submission_strategy'], firstBool(mev, ['enabled', 'protection_enabled']) ? 'Protected' : 'Monitoring'));
-  const healthLabel = compactValue(firstValue(health, ['overall_status', 'status', 'summary'], 'Monitoring'));
-  const tradeLabel = compactValue(firstValue(trading, ['total_trades', 'trades_24h', 'executions_24h', 'total_executions'], '—'));
-  const edgeLabel = compactValue(firstValue(edgeGuard, ['action_label', 'status'], 'Normal risk'));
-  const edgeStatus = String(edgeGuard.status || '').toLowerCase();
-
-  statusEl.textContent = `Enhanced systems ${alerts.length ? 'live' : 'stable'}`;
-  summaryEl.textContent = `Observability, risk, and MEV telemetry are online. ${alerts.length ? alerts.length + ' active alert' + (alerts.length === 1 ? '' : 's') + ' need attention.' : 'No active enhanced alerts are currently open.'}`;
-  metricsEl.innerHTML = `
-    <div class="intel-metric"><div class="intel-label">System</div><div class="intel-value">${healthLabel}</div><div class="intel-copy">Health summary</div></div>
-    <div class="intel-metric"><div class="intel-label">Alerts</div><div class="intel-value">${alerts.length}</div><div class="intel-copy">Active alert count</div></div>
-    <div class="intel-metric"><div class="intel-label">MEV Guard</div><div class="intel-value">${mevLabel}</div><div class="intel-copy">Execution protection mode</div></div>
-    <div class="intel-metric"><div class="intel-label">Circuit</div><div class="intel-value">${circuitLabel}</div><div class="intel-copy">Break-glass state</div></div>
-    <div class="intel-metric"><div class="intel-label">Edge Guard</div><div class="intel-value">${edgeLabel}</div><div class="intel-copy">${edgeGuard.reason || 'Report-driven sizing posture'}</div></div>
-  `;
-  alertsEl.innerHTML = alerts.length
-    ? alerts.slice(0, 4).map(a => `<span class="badge ${String(a.severity || '').toLowerCase().includes('high') ? 'bg-red' : 'bg-gold'}">${titleCase(a.severity || 'Alert')}: ${a.title || a.message || 'Unnamed alert'}</span>`).join('')
-    : `<span class="badge bg-blue">Trades tracked ${tradeLabel}</span><span class="badge bg-muted">Health ${healthLabel}</span>${edgeStatus && edgeStatus !== 'normal' ? `<span class="badge ${edgeStatus === 'halted' ? 'bg-red' : edgeStatus === 'defensive' ? 'bg-gold' : 'bg-blue'}">Edge guard ${edgeStatus}</span>` : ''}`;
-}
-async function pollEnhancedDashboard() {
-  try {
-    const data = await fetch('/api/enhanced/dashboard').then(r => r.json()).catch(() => null);
-    _enhancedData = data || null;
-    renderEnhancedDashboard(_enhancedData);
-  } catch (e) {}
-}
-async function refreshNow() {
-  await refresh();
-  if (_activeTab === 'signals') await pollSignals();
-  if (_activeTab === 'whales') await pollWhales();
-  if (_activeTab === 'positions') await pollPositions();
-  if (_activeTab === 'pnl') {
-    const activeRange = document.querySelector('[data-range].sort-pill.active')?.dataset.range || '7';
-    await loadPnl(activeRange);
-  }
-  if (_activeTab === 'quant') await pollQuant();
-  await pollEnhancedDashboard();
-  showToast('Dashboard refreshed');
-}
-function registerKeyboardShortcuts() {
-  document.addEventListener('keydown', event => {
-    const tag = document.activeElement?.tagName || '';
-    const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag);
-    if (event.key === '/' && !typing) {
-      event.preventDefault();
-      const target = _activeTab === 'signals' ? document.getElementById('sig-search') : document.getElementById('scan-search');
-      target?.focus();
-      target?.select?.();
-      return;
-    }
-    if (typing) {
-      if (event.key === 'Escape') document.activeElement?.blur?.();
-      return;
-    }
-    const tabMap = { '1': 'scanner', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl', '7': 'quant' };
-    if (tabMap[event.key]) {
-      event.preventDefault();
-      activateTab(tabMap[event.key]);
-      return;
-    }
-    if (event.key.toLowerCase() === 'r') {
-      event.preventDefault();
-      refreshNow();
-    }
-    if (event.key.toLowerCase() === 's') {
-      event.preventDefault();
-      openSettingsTab();
-    }
-  });
+function ratingBar(score) {
+  const s = Math.max(0, Math.min(100, score || 0));
+  const color = s >= 60 ? 'var(--grn)' : s >= 30 ? 'var(--gold2)' : 'var(--red2)';
+  return `<span class="rating-bar"><span class="rating-fill" style="width:${s}%;background:${color}"></span></span>${s}`;
 }
 
-// ── Sort & render token rows ──────────────────────────────────────────────────
-function setSortCol(col, btn) {
-  sortCol = col;
-  document.querySelectorAll('.sort-pill').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderTokenRows();
+// ── Bot controls ──
+async function startBot() {
+  const r = await fetch('/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>({ok:false}));
+  if (!r.ok) alert(r.msg || 'Could not start bot');
+  refresh();
 }
-
-function getSortedTokens() {
-  const q = (document.getElementById('scan-search')?.value || '').toLowerCase();
-  let tokens = allTokens.filter(t =>
-    !q || (t.name||'').toLowerCase().includes(q) || (t.symbol||'').toLowerCase().includes(q)
-  );
-  return [...tokens].sort((a, b) => {
-    if (sortCol === 'score') return (b.score||0) - (a.score||0);
-    if (sortCol === 'vol')   return (b.vol||0)   - (a.vol||0);
-    if (sortCol === 'chg')   return (b.change||0) - (a.change||0);
-    if (sortCol === 'age')   return (a.age_min||0) - (b.age_min||0);
-    return 0;
-  }).slice(0, 80);
+async function stopBot() {
+  await fetch('/api/stop', {method:'POST'}).then(r=>r.json()).catch(()=>({}));
+  refresh();
 }
-
-function renderTokenRows() {
-  const tokens = getSortedTokens();
-  document.getElementById('token-count').textContent = tokens.length + ' tokens';
-  setText('scanner-token-live', String(tokens.length));
-  const container = document.getElementById('token-rows');
-  if (!tokens.length) {
-    container.innerHTML = '<div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">No tokens yet \u2014 start the bot to begin scanning</div>';
-    return;
-  }
-  container.innerHTML = tokens.map((t, i) => {
-    const chg = t.change || 0;
-    const sc  = t.score  || 0;
-    const col = tokColor(t.name || '?');
-    const sym = (t.symbol || t.name || '?').slice(0, 7);
-    const isSel = t.mint === selectedMint;
-    const nameSafe = (t.name||'').replace(/'/g, '');
-    return `<table style="width:100%;border-collapse:collapse"><tbody>
-      <tr class="dex-row${isSel?' selected':''}" onclick="openWalletTree('${t.mint}','${nameSafe}')">
-        <td style="width:30px;color:var(--t3);font-size:10px;font-family:monospace">${i+1}</td>
-        <td>
-          <div style="display:flex;align-items:center">
-            <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
-            <div>
-              <div class="tok-name">${t.name||sym}${sc>=80?' &#x1f525;':''}</div>
-              <div class="tok-sym">${sym}${t.whale?' &#x1f40b;':''} · ${(t.green_lights||0)}/3 GL · N${t.narrative_score||0}</div>
-            </div>
-          </div>
-        </td>
-        <td><span class="price-val">${fmtPrice(t.price)}</span></td>
-        <td><span class="${chgClass(chg)}">${chgStr(chg)}</span></td>
-        <td><span class="num-val">${fmtK(t.vol)}</span></td>
-        <td><span class="num-val">${fmtK(t.mc)}</span></td>
-        <td><span class="num-val">${fmtK(t.liq)}</span></td>
-        <td><span class="num-val">${fmtAge(t.age_min||0)}</span></td>
-        <td>
-          <div style="display:flex;align-items:center;gap:5px">
-            <div class="score-mini"><div class="score-fill" style="width:${sc}%;background:${scoreColor(sc)}"></div></div>
-            <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
-          </div>
-        </td>
-        <td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy('${t.mint}','${nameSafe}',this)">\u26a1 Buy</button></td>
-      </tr>
-    </tbody></table>`;
-  }).join('');
+async function sellAll() {
+  if (!confirm('Sell all open positions now?')) return;
+  await fetch('/api/cashout', {method:'POST'}).then(r=>r.json()).catch(()=>({}));
+  refresh();
 }
-
-// ── Quick buy ─────────────────────────────────────────────────────────────────
-async function quickBuy(mint, name, btn) {
-  const orig = btn.textContent;
-  btn.textContent = '\u2026'; btn.disabled = true;
-  const res = await fetch('/api/manual-buy', {
+async function sellOne(mint) {
+  await fetch('/api/manual-sell', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mint, name})
-  }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
-  btn.textContent = res.ok ? '\u2705' : '\u274c';
-  showToast(res.ok ? '\u26a1 Buy order sent!' : '\u26a0 ' + (res.msg||'Buy failed'), res.ok);
-  setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
-  if (res.ok) setTimeout(refresh, 2000);
+    body: JSON.stringify({mint})
+  }).then(r=>r.json()).catch(()=>({}));
+  pollTrades();
 }
 
-// ── Wallet Tree ───────────────────────────────────────────────────────────────
-async function openWalletTree(mint, name) {
-  selectedMint = mint;
-  renderTokenRows();
-  const panel = document.getElementById('tree-panel');
-  panel.style.display = '';
-  document.getElementById('tree-tok-name').textContent = name || mint.slice(0,14)+'\u2026';
-  document.getElementById('tree-tok-mint').textContent = mint;
-  document.getElementById('tree-buy-count').textContent  = '\u2026';
-  document.getElementById('tree-sell-count').textContent = '\u2026';
-  const dexLink = document.getElementById('tree-dex-link');
-  if (dexLink) dexLink.href = 'https://dexscreener.com/solana/' + mint;
-  if (!treeCanvas) {
-    treeCanvas = document.getElementById('tree-canvas');
-    treeCtx    = treeCanvas.getContext('2d');
-  }
-  treeCanvas.width  = treeCanvas.parentElement.clientWidth;
-  treeCanvas.height = 360;
-  const loading = document.getElementById('tree-loading');
-  loading.style.display = 'flex';
-  drawTreeBg();
-  try {
-    const data = await fetch('/api/wallet-tree/' + mint).then(r => r.json());
-    loading.style.display = 'none';
-    const buys  = data.nodes.filter(n => n.type === 'buy').length;
-    const sells = data.nodes.filter(n => n.type === 'sell').length;
-    document.getElementById('tree-buy-count').textContent  = buys  + ' buys';
-    document.getElementById('tree-sell-count').textContent = sells + ' sells';
-    drawWalletTree(data.nodes, data.edges, name || mint.slice(0,8));
-    renderTreeList(data.nodes);
-  } catch(e) {
-    loading.style.display = 'none';
-    drawTreeMsg('Failed to load \u2014 token may be too new');
-  }
-  panel.scrollIntoView({behavior:'smooth', block:'nearest'});
-}
-function closeTree() { selectedMint = null; document.getElementById('tree-panel').style.display = 'none'; renderTokenRows(); }
-function drawTreeBg() { if (!treeCanvas) return; treeCtx.fillStyle = '#070d17'; treeCtx.fillRect(0,0,treeCanvas.width,treeCanvas.height); }
-function drawTreeMsg(msg) {
-  const W = treeCanvas.width, H = treeCanvas.height;
-  treeCtx.fillStyle = '#070d17'; treeCtx.fillRect(0,0,W,H);
-  treeCtx.fillStyle = '#4b5563'; treeCtx.font = '13px monospace'; treeCtx.textAlign = 'center';
-  treeCtx.fillText(msg, W/2, H/2);
-}
-function drawWalletTree(nodes, edges, tokenName) {
-  const W = treeCanvas.width, H = treeCanvas.height, ctx = treeCtx;
-  ctx.clearRect(0,0,W,H); ctx.fillStyle = '#070d17'; ctx.fillRect(0,0,W,H);
-  if (!nodes || nodes.length <= 1) { drawTreeMsg('No swap transactions found yet'); return; }
-  const positions = {};
-  const buyGroup  = nodes.find(n => n.id === 'buys');
-  const sellGroup = nodes.find(n => n.id === 'sells');
-  const buyWals   = nodes.filter(n => n.type === 'buy');
-  const sellWals  = nodes.filter(n => n.type === 'sell');
-  positions['root'] = {x: W/2, y: 56};
-  if (buyGroup && sellGroup) { positions['buys']={x:W*0.27,y:140}; positions['sells']={x:W*0.73,y:140}; }
-  else if (buyGroup) positions['buys']={x:W/2,y:140};
-  else if (sellGroup) positions['sells']={x:W/2,y:140};
-  function spreadWallets(wals, gid, yBase) {
-    const gp = positions[gid]; if (!gp || !wals.length) return;
-    const cols = Math.min(wals.length, 5);
-    const colW = Math.min(88, (W * 0.44) / Math.max(cols, 1));
-    wals.forEach((n, i) => { positions[n.id] = {x: gp.x - (cols-1)*colW/2 + (i%cols)*colW, y: yBase + Math.floor(i/cols)*78}; });
-  }
-  spreadWallets(buyWals, 'buys', 230); spreadWallets(sellWals, 'sells', 230);
-  ctx.strokeStyle = '#0f1a28'; ctx.lineWidth = 1;
-  for (let x=0;x<W;x+=60){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
-  for (let y=0;y<H;y+=60){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
-  edges.forEach(e => {
-    const f=positions[e.from],t=positions[e.to]; if(!f||!t) return;
-    const toN=nodes.find(n=>n.id===e.to); const isSell=toN&&(toN.type==='sell'||toN.id==='sells');
-    const grd=ctx.createLinearGradient(f.x,f.y,t.x,t.y);
-    grd.addColorStop(0,isSell?'rgba(242,54,69,.0)':'rgba(20,199,132,.0)');
-    grd.addColorStop(1,isSell?'rgba(242,54,69,.4)':'rgba(20,199,132,.4)');
-    ctx.strokeStyle=grd; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(f.x,f.y);
-    const cy=(f.y+t.y)/2; ctx.bezierCurveTo(f.x,cy,t.x,cy,t.x,t.y); ctx.stroke();
-  });
-  nodes.forEach(n => {
-    const pos=positions[n.id]; if(!pos) return;
-    const isRoot=n.id==='root',isGroup=n.type==='group_buy'||n.type==='group_sell';
-    const isBuy=n.type==='buy'||n.id==='buys',isSell=n.type==='sell'||n.id==='sells';
-    const r=isRoot?26:isGroup?18:15; const color=isRoot?'#f59e0b':isBuy?'#14c784':'#f23645';
-    ctx.shadowBlur=isRoot?22:10; ctx.shadowColor=color;
-    ctx.beginPath(); ctx.arc(pos.x,pos.y,r,0,Math.PI*2);
-    ctx.fillStyle=color+'18'; ctx.fill(); ctx.strokeStyle=color; ctx.lineWidth=isRoot?2.5:1.8; ctx.stroke();
-    ctx.shadowBlur=0; ctx.fillStyle=color; ctx.textAlign='center';
-    ctx.font=isRoot?'bold 9px monospace':isGroup?'bold 8px monospace':'8px monospace';
-    ctx.fillText((isRoot?tokenName:(n.label||'')).slice(0,9),pos.x,pos.y+3);
-    if(n.sol>0){ctx.fillStyle='#94a3b8';ctx.font='7px monospace';ctx.fillText(n.sol.toFixed(3)+'\u25ce',pos.x,pos.y+r+9);}
-  });
-}
-function renderTreeList(nodes) {
-  const all = [...nodes.filter(n=>n.type==='buy').map(n=>({...n,side:'buy'})),...nodes.filter(n=>n.type==='sell').map(n=>({...n,side:'sell'}))];
-  document.getElementById('tree-list').innerHTML = all.map(n => `
-    <div class="tree-wallet-row is-${n.side}" onclick="window.open('https://solscan.io/account/${n.wallet||''}','_blank')" title="${n.wallet||''}">
-      <div class="tree-wallet-dot" style="background:${n.side==='buy'?'#14c784':'#f23645'}"></div>
-      <div class="tree-wallet-addr">${n.label||'?'}</div>
-      <div class="tree-wallet-sol">${(n.sol||0).toFixed(4)}\u25ce</div>
-    </div>`).join('');
-}
-
-// ── Market feed polling ───────────────────────────────────────────────────────
-async function pollFeed() {
-  try {
-    const tokens = await fetch('/api/market-feed?since=' + feedSince).then(r => r.json());
-    if (tokens && tokens.length) {
-      const byMint = new Map(allTokens.map(t => [t.mint, t]));
-      tokens.forEach(t => {
-        const prev = byMint.get(t.mint) || {};
-        byMint.set(t.mint, { ...prev, ...t, intel: { ...(prev.intel||{}), ...(t.intel||{}) } });
-      });
-      allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 100);
-      feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
-      renderTokenRows();
-      updateTicker();
-      setText('scanner-last-market', `Feed ${fmtClock()}`);
-    }
-  } catch(e) {}
-}
-
-function updateTicker() {
-  const items = allTokens.slice(0, 20).map(t => {
-    const chg = t.change || 0;
-    const col = chg >= 0 ? '#14c784' : '#f23645';
-    return `<span class="tick-item">
-      <span class="tick-name">${t.symbol||t.name||'?'}</span>
-      <span style="font-family:monospace;font-size:11px">${fmtPrice(t.price)}</span>
-      <span style="color:${col};font-weight:700">${chgStr(chg)}</span>
-    </span>`;
-  });
-  const html = [...items, ...items].join('');
-  document.getElementById('ticker-inner').innerHTML = html || 'Loading market data\u2026';
-}
-
-// ── CEX Listing alerts ────────────────────────────────────────────────────────
-const seenListings = new Set();
-let listingCatchCount = 0;
-async function pollListings() {
-  try {
-    const alerts = await fetch('/api/listing-alerts').then(r => r.json());
-    if (!alerts || !alerts.length) return;
-    const feed = document.getElementById('listing-feed');
-    let added = false;
-    alerts.forEach(a => {
-      const key = a.exchange + a.symbol;
-      if (seenListings.has(key)) return;
-      seenListings.add(key); listingCatchCount++;
-      const row = document.createElement('div');
-      row.style.cssText = 'padding:7px 10px;border-bottom:1px solid rgba(245,158,11,.12);font-size:11px';
-      row.innerHTML = `<div style="display:flex;justify-content:space-between">
-        <span><b style="color:#f59e0b;font-size:10px">${a.exchange}</b> &nbsp;<b style="color:var(--t1)">${a.symbol}</b></span>
-        <span style="color:var(--t3);font-size:10px">${new Date(a.ts*1000).toLocaleTimeString()}</span>
-      </div>`;
-      if (feed.children[0]?.textContent.includes('Monitoring')) feed.innerHTML = '';
-      feed.insertBefore(row, feed.firstChild);
-      added = true;
-    });
-    if (added) {
-      document.getElementById('listing-stat').textContent = listingCatchCount;
-      document.getElementById('listing-count-badge').textContent = listingCatchCount + ' caught';
-      setText('scanner-listing-live', String(listingCatchCount));
-      setText('scanner-last-listing', `Listings ${fmtClock()}`);
-    }
-  } catch(e) {}
-}
-
-// ── Settings ──────────────────────────────────────────────────────────────────
-const PRESET_SETTINGS = {{PRESET_SETTINGS}};
-const SETTINGS_FIELD_IDS = [
-  's-preset', 's-max-buy', 's-tp1', 's-tp2', 's-sl', 's-trail',
-  's-age', 's-tstop', 's-liq', 's-minmc', 's-maxmc', 's-prio',
-  's-dd', 's-maxpos', 's-minvol', 's-minscore', 's-risk', 's-holders',
-  's-narr', 's-lights', 's-volspike', 's-latemult', 's-nuclear',
-  's-offpeak', 's-hotchg', 's-antirug', 's-checkholders',
-  's-execution-mode', 's-policy-mode', 's-model-threshold', 's-auto-promote',
-  's-auto-window', 's-auto-min-reports', 's-auto-lock',
-];
-const SETTINGS_DEFAULTS = {
-  max_buy_sol: 0.04,
-  tp1_mult: 2.0,
-  tp2_mult: 4.0,
-  stop_loss: 0.70,
-  trail_pct: 0.20,
-  max_age_min: 240,
-  time_stop_min: 30,
-  min_liq: 0,
-  min_mc: 5000,
-  max_mc: 250000,
-  priority_fee: 30000,
-  drawdown_limit_sol: 0.5,
-  max_correlated: 3,
-  min_vol: 3000,
-  min_score: 30,
-  risk_per_trade_pct: 2.0,
-  min_holder_growth_pct: 30,
-  min_narrative_score: 16,
-  min_green_lights: 1,
-  min_volume_spike_mult: 6,
-  late_entry_mult: 5.0,
-  nuclear_narrative_score: 40,
-  offpeak_min_change: 18,
-  max_hot_change: 400,
-  anti_rug: true,
-  check_holders: true,
-  execution_mode: 'live',
-  decision_policy: 'rules',
-  model_threshold: 60,
-  auto_promote: false,
-  auto_promote_window_days: 7,
-  auto_promote_min_reports: 3,
-  auto_promote_lock_minutes: 180,
-};
-const SETTINGS_META = [
-  ['Mode', s => String(s.preset || 'balanced')],
-  ['Execution', s => String(s.execution_mode || 'live')],
-  ['Policy', s => String(s.decision_policy || 'rules').replaceAll('_', ' ')],
-  ['TP1', s => Number(s.tp1_mult || 0).toFixed(2) + 'x'],
-  ['TP2', s => Number(s.tp2_mult || 0).toFixed(2) + 'x'],
-  ['SL', s => Number(s.stop_loss || 0).toFixed(2)],
-  ['Trail', s => (Number(s.trail_pct || 0) * 100).toFixed(0) + '%'],
-  ['MC', s => '$' + Number(s.min_mc || 0).toLocaleString() + ' - $' + Number(s.max_mc || 0).toLocaleString()],
-  ['Age', s => Number(s.max_age_min || 0).toLocaleString() + 'm'],
-  ['Score', s => '>=' + Number(s.min_score || 0)],
-  ['Liquidity', s => Number(s.min_liq || 0) > 0 ? '>=$' + Number(s.min_liq || 0).toLocaleString() : 'off'],
-  ['Green Lights', s => Number(s.min_green_lights || 0)],
-  ['Holder Check', s => s.check_holders ? 'on' : 'off'],
-];
-function setSettingsSaveState(text, pending=false) {
-  const el = document.getElementById('settings-save-state');
-  if (el) {
-    el.textContent = text;
-    el.classList.toggle('pending', pending);
-  }
-  const copy = document.getElementById('settings-save-state-copy');
-  if (copy) copy.textContent = text;
-}
-function readNum(id, fallback=0) {
-  const el = document.getElementById(id);
-  const v = el ? Number(el.value) : NaN;
-  return Number.isFinite(v) ? v : fallback;
-}
-function setPresetChoice(name) {
-  const presetInput = document.getElementById('s-preset');
-  if (presetInput) presetInput.value = name;
-}
-function applySettingsToForm(settings, presetName) {
-  const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
-  const setVal = (id, value) => {
-    const el = document.getElementById(id);
-    if (el) el.value = value;
-  };
-  const setChecked = (id, value) => {
-    const el = document.getElementById(id);
-    if (el) el.checked = !!value;
-  };
-  setPresetChoice(presetName || s.preset || 'balanced');
-  setVal('s-max-buy', s.max_buy_sol ?? SETTINGS_DEFAULTS.max_buy_sol);
-  setVal('s-tp1', s.tp1_mult ?? SETTINGS_DEFAULTS.tp1_mult);
-  setVal('s-tp2', s.tp2_mult ?? SETTINGS_DEFAULTS.tp2_mult);
-  setVal('s-sl', s.stop_loss ?? SETTINGS_DEFAULTS.stop_loss);
-  setVal('s-trail', s.trail_pct ?? SETTINGS_DEFAULTS.trail_pct);
-  setVal('s-age', s.max_age_min ?? SETTINGS_DEFAULTS.max_age_min);
-  setVal('s-tstop', s.time_stop_min ?? SETTINGS_DEFAULTS.time_stop_min);
-  setVal('s-liq', s.min_liq ?? SETTINGS_DEFAULTS.min_liq);
-  setVal('s-minmc', s.min_mc ?? SETTINGS_DEFAULTS.min_mc);
-  setVal('s-maxmc', s.max_mc ?? SETTINGS_DEFAULTS.max_mc);
-  setVal('s-prio', s.priority_fee ?? SETTINGS_DEFAULTS.priority_fee);
-  setVal('s-dd', s.drawdown_limit_sol ?? SETTINGS_DEFAULTS.drawdown_limit_sol);
-  setVal('s-maxpos', s.max_correlated ?? SETTINGS_DEFAULTS.max_correlated);
-  setVal('s-minvol', s.min_vol ?? SETTINGS_DEFAULTS.min_vol);
-  setVal('s-minscore', s.min_score ?? SETTINGS_DEFAULTS.min_score);
-  setVal('s-risk', s.risk_per_trade_pct ?? SETTINGS_DEFAULTS.risk_per_trade_pct);
-  setVal('s-holders', s.min_holder_growth_pct ?? SETTINGS_DEFAULTS.min_holder_growth_pct);
-  setVal('s-narr', s.min_narrative_score ?? SETTINGS_DEFAULTS.min_narrative_score);
-  setVal('s-lights', s.min_green_lights ?? SETTINGS_DEFAULTS.min_green_lights);
-  setVal('s-volspike', s.min_volume_spike_mult ?? SETTINGS_DEFAULTS.min_volume_spike_mult);
-  setVal('s-latemult', s.late_entry_mult ?? SETTINGS_DEFAULTS.late_entry_mult);
-  setVal('s-nuclear', s.nuclear_narrative_score ?? SETTINGS_DEFAULTS.nuclear_narrative_score);
-  setVal('s-offpeak', s.offpeak_min_change ?? SETTINGS_DEFAULTS.offpeak_min_change);
-  setVal('s-hotchg', s.max_hot_change ?? SETTINGS_DEFAULTS.max_hot_change);
-  setVal('s-execution-mode', s.execution_mode ?? SETTINGS_DEFAULTS.execution_mode);
-  setVal('s-policy-mode', s.decision_policy ?? s.policy_mode ?? SETTINGS_DEFAULTS.decision_policy);
-  setVal('s-model-threshold', s.model_threshold ?? SETTINGS_DEFAULTS.model_threshold);
-  setVal('s-auto-window', s.auto_promote_window_days ?? SETTINGS_DEFAULTS.auto_promote_window_days);
-  setVal('s-auto-min-reports', s.auto_promote_min_reports ?? SETTINGS_DEFAULTS.auto_promote_min_reports);
-  setVal('s-auto-lock', s.auto_promote_lock_minutes ?? SETTINGS_DEFAULTS.auto_promote_lock_minutes);
-  setChecked('s-antirug', s.anti_rug ?? SETTINGS_DEFAULTS.anti_rug);
-  setChecked('s-checkholders', s.check_holders ?? SETTINGS_DEFAULTS.check_holders);
-  setChecked('s-auto-promote', s.auto_promote ?? SETTINGS_DEFAULTS.auto_promote);
-  renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
-}
-function getSettingsFromForm() {
-  return {
-    preset: document.getElementById('s-preset')?.value || 'balanced',
-    max_buy_sol: readNum('s-max-buy', SETTINGS_DEFAULTS.max_buy_sol),
-    tp1_mult: readNum('s-tp1', SETTINGS_DEFAULTS.tp1_mult),
-    tp2_mult: readNum('s-tp2', SETTINGS_DEFAULTS.tp2_mult),
-    stop_loss: readNum('s-sl', SETTINGS_DEFAULTS.stop_loss),
-    trail_pct: readNum('s-trail', SETTINGS_DEFAULTS.trail_pct),
-    max_age_min: readNum('s-age', SETTINGS_DEFAULTS.max_age_min),
-    time_stop_min: readNum('s-tstop', SETTINGS_DEFAULTS.time_stop_min),
-    min_liq: readNum('s-liq', SETTINGS_DEFAULTS.min_liq),
-    min_mc: readNum('s-minmc', SETTINGS_DEFAULTS.min_mc),
-    max_mc: readNum('s-maxmc', SETTINGS_DEFAULTS.max_mc),
-    priority_fee: readNum('s-prio', SETTINGS_DEFAULTS.priority_fee),
-    drawdown_limit_sol: readNum('s-dd', SETTINGS_DEFAULTS.drawdown_limit_sol),
-    max_correlated: readNum('s-maxpos', SETTINGS_DEFAULTS.max_correlated),
-    min_vol: readNum('s-minvol', SETTINGS_DEFAULTS.min_vol),
-    min_score: readNum('s-minscore', SETTINGS_DEFAULTS.min_score),
-    risk_per_trade_pct: readNum('s-risk', SETTINGS_DEFAULTS.risk_per_trade_pct),
-    min_holder_growth_pct: readNum('s-holders', SETTINGS_DEFAULTS.min_holder_growth_pct),
-    min_narrative_score: readNum('s-narr', SETTINGS_DEFAULTS.min_narrative_score),
-    min_green_lights: readNum('s-lights', SETTINGS_DEFAULTS.min_green_lights),
-    min_volume_spike_mult: readNum('s-volspike', SETTINGS_DEFAULTS.min_volume_spike_mult),
-    late_entry_mult: readNum('s-latemult', SETTINGS_DEFAULTS.late_entry_mult),
-    nuclear_narrative_score: readNum('s-nuclear', SETTINGS_DEFAULTS.nuclear_narrative_score),
-    offpeak_min_change: readNum('s-offpeak', SETTINGS_DEFAULTS.offpeak_min_change),
-    max_hot_change: readNum('s-hotchg', SETTINGS_DEFAULTS.max_hot_change),
-    anti_rug: !!document.getElementById('s-antirug')?.checked,
-    check_holders: !!document.getElementById('s-checkholders')?.checked,
-    execution_mode: document.getElementById('s-execution-mode')?.value || SETTINGS_DEFAULTS.execution_mode,
-    decision_policy: document.getElementById('s-policy-mode')?.value || SETTINGS_DEFAULTS.decision_policy,
-    model_threshold: readNum('s-model-threshold', SETTINGS_DEFAULTS.model_threshold),
-    auto_promote: !!document.getElementById('s-auto-promote')?.checked,
-    auto_promote_window_days: readNum('s-auto-window', SETTINGS_DEFAULTS.auto_promote_window_days),
-    auto_promote_min_reports: readNum('s-auto-min-reports', SETTINGS_DEFAULTS.auto_promote_min_reports),
-    auto_promote_lock_minutes: readNum('s-auto-lock', SETTINGS_DEFAULTS.auto_promote_lock_minutes),
-  };
-}
-function prettyExecutionPolicy(name) {
-  const key = String(name || 'rules');
-  if (key === 'model_global') return 'Global model';
-  if (key === 'model_regime_auto') return 'Regime model';
-  if (key === 'auto') return 'Auto';
-  return 'Rules';
-}
-function renderExecutionControlSummary(bundle) {
-  const el = document.getElementById('execution-control-summary');
-  if (!el) return;
-  const control = bundle?.control || {};
-  const policyMode = control.policy_mode || control.decision_policy || 'rules';
-  const selected = bundle?.selected_policy || control.active_policy || policyMode || 'rules';
-  const executionMode = bundle?.execution_mode || control.execution_mode || 'live';
-  const badges = [
-    `<span class="badge ${executionMode === 'paper' ? 'bg-gold' : 'bg-blue'}">${executionMode === 'paper' ? 'Paper mode' : 'Live capital'}</span>`,
-    `<span class="badge bg-muted">Policy ${prettyExecutionPolicy(policyMode)}</span>`,
-    `<span class="badge bg-muted">Active ${prettyExecutionPolicy(selected)}</span>`,
-    `<span class="badge bg-muted">Threshold ${Number(bundle?.model_threshold ?? control.model_threshold ?? 60).toFixed(1)}</span>`,
-  ];
-  if (bundle?.selection_source) badges.push(`<span class="badge bg-muted">${bundle.selection_source}</span>`);
-  if (bundle?.lock_until) badges.push(`<span class="badge bg-muted">Locked until ${new Date(bundle.lock_until).toLocaleString()}</span>`);
-  el.innerHTML = badges.join('');
-}
-function renderSettingsSnapshot(settings) {
-  const el = document.getElementById('settings-snapshot');
-  if (!el) return;
-  el.innerHTML = SETTINGS_META.map(([label, getter]) => `<span class="badge bg-muted">${label}: ${getter(settings)}</span>`).join('');
-  const note = document.getElementById('settings-snapshot-note');
-  if (!note) return;
-  note.textContent = Number(settings.min_liq || 0) > 0
-    ? `Liquidity checkpoint is live at $${Number(settings.min_liq).toLocaleString()}. Save again any time you want the path to track different thresholds.`
-    : 'Liquidity checkpoint is off. Keeping the value at 0 means liquidity will never reject a coin in the main path.';
-}
-function renderLaunchSummary(settings) {
-  const el = document.getElementById('launch-summary');
-  if (!el) return;
-  const presetLabel = titleCase(settings.preset || 'balanced');
-  setText('hero-preset-badge', `${presetLabel} preset`);
-  setText('hero-launch-mode', presetLabel);
-  setText('settings-header-preset', `${presetLabel} profile`);
-  el.innerHTML = [
-    `<span class="badge bg-blue">${presetLabel}</span>`,
-    `<span class="badge bg-muted">TP1 ${Number(settings.tp1_mult || 0).toFixed(2)}x</span>`,
-    `<span class="badge bg-muted">TP2 ${Number(settings.tp2_mult || 0).toFixed(2)}x</span>`,
-    `<span class="badge bg-muted">Score >= ${Number(settings.min_score || 0)}</span>`,
-    `<span class="badge bg-muted">GL ${Number(settings.min_green_lights || 0)}</span>`,
-    `<span class="badge bg-muted">Liq ${Number(settings.min_liq || 0) > 0 ? '$' + Number(settings.min_liq || 0).toLocaleString() : 'off'}</span>`,
-    `<span class="badge bg-muted">Holders ${settings.check_holders ? 'on' : 'off'}</span>`,
-  ].join('');
-}
-function renderOperatorMap(settings) {
-  const el = document.getElementById('settings-operator-map');
-  if (!el) return;
-  const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
-  const liqText = Number(s.min_liq || 0) > 0 ? `$${Number(s.min_liq).toLocaleString()}+` : 'off';
-  const sourceFeeds = [
-    ['Dex token-profiles', 'feed'],
-    ['Dex new-pairs', 'feed'],
-    ['Helius sniper', 'feed'],
-    ['Whale tracker', 'feed'],
-    ['Listing scanner', 'feed'],
-  ];
-  const entryStages = [
-    {
-      num: 'Stage 1',
-      title: 'Normalize Signal',
-      value: 'Every feed becomes one token candidate and enters the same evaluator.',
-      meta: 'Whales and snipes do not bypass any later filter. They only surface the coin earlier.',
-    },
-    {
-      num: 'Stage 2',
-      title: 'Basic Filters',
-      value: `MC $${Number(s.min_mc).toLocaleString()}-$${Number(s.max_mc).toLocaleString()} | Liq ${liqText} | Age <= ${Number(s.max_age_min).toLocaleString()}m`,
-      meta: `Change must stay above 0% and under ${Number(s.max_hot_change).toLocaleString()}%. Vol must be >= $${Number(s.min_vol).toLocaleString()} and score >= ${Number(s.min_score).toLocaleString()}.`,
-    },
-    {
-      num: 'Stage 3',
-      title: 'Checklist Gates',
-      value: `${Number(s.min_green_lights).toLocaleString()} green light(s) | holders >= ${Number(s.min_holder_growth_pct).toLocaleString()}% | narrative >= ${Number(s.min_narrative_score).toLocaleString()}`,
-      meta: `Volume spike must be >= ${Number(s.min_volume_spike_mult).toLocaleString()}x. Late entry dies above ${Number(s.late_entry_mult).toLocaleString()}x unless narrative reaches ${Number(s.nuclear_narrative_score).toLocaleString()}.`,
-    },
-    {
-      num: 'Stage 4',
-      title: 'Safety Gates',
-      value: `Authority ${s.anti_rug ? 'on' : 'off'} | holders ${s.check_holders ? 'on' : 'off'} | losing mint block 30m`,
-      meta: 'The buy path can still die here on route failure, dev blacklist, drawdown, balance, or correlated-position limits.',
-    },
-    {
-      num: 'Stage 5',
-      title: 'Execution',
-      value: `Quote -> simulate -> sign -> Helius Sender -> Jito tip -> confirm`,
-      meta: `Priority fee ${Number(s.priority_fee).toLocaleString()} lamports. Max buy ${Number(s.max_buy_sol || 0).toFixed(2)} SOL with risk cap ${Number(s.risk_per_trade_pct || 0).toFixed(1)}%.`,
-    },
-  ];
-  const exitRules = [
-    ['TP1 partial', `${Number(s.tp1_mult || 0).toFixed(2)}x`],
-    ['TP2 full', `${Number(s.tp2_mult || 0).toFixed(2)}x`],
-    ['Stop loss', `${Number(s.stop_loss || 0).toFixed(2)} ratio`],
-    ['Trailing stop', `${Math.round(Number(s.trail_pct || 0) * 100)}% retrace`],
-    ['Time stop', `${Number(s.time_stop_min || 0).toLocaleString()} min`],
-    ['Surge hold', '2.0x inside 10s -> hold until 14% drop from peak'],
-    ['Listing exits', 'listing TP / SL / timeout if source was listing scanner'],
-  ];
-  const guardRules = [
-    ['Session drawdown', `${Number(s.drawdown_limit_sol || 0).toFixed(2)} SOL`],
-    ['Max correlated positions', `${Number(s.max_correlated || 0)} open names`],
-    ['Recent losing mint', 'same mint blocked for 30 minutes after a red close'],
-    ['Holder concentration', s.check_holders ? 'blocking' : 'disabled'],
-  ];
-  el.innerHTML = `
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Signal Sources</div>
-          <div class="operator-lane-note">These feeds are watched in parallel and all route into the same buy engine.</div>
-        </div>
-      </div>
-      <div class="operator-chip-row">
-        ${sourceFeeds.map(([label, cls]) => `<span class="operator-chip ${cls}">${label}</span>`).join('')}
-      </div>
-      <div class="operator-arrow-row">
-        <span class="operator-arrow">all feeds -> broadcast signal -> evaluate_signal()</span>
-      </div>
-    </div>
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Buy Path</div>
-          <div class="operator-lane-note">A coin only reaches quote and buy after it survives every stage below in order.</div>
-        </div>
-        <div class="operator-chip-row">
-          <span class="operator-chip guard">runtime gates stay live after filters</span>
-        </div>
-      </div>
-      <div class="operator-stage-grid">
-        ${entryStages.map(stage => `
-          <div class="operator-stage">
-            <div class="operator-stage-num">${stage.num}</div>
-            <div class="operator-stage-title">${stage.title}</div>
-            <div class="operator-stage-value">${stage.value}</div>
-            <div class="operator-stage-meta">${stage.meta}</div>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Live Guards</div>
-          <div class="operator-lane-note">These rules are monitored even after a token passes the numeric checkpoint map.</div>
-        </div>
-      </div>
-      <div class="operator-rule-list">
-        ${guardRules.map(([label, value]) => `
-          <div class="operator-rule">
-            <span class="operator-rule-label">${label}</span>
-            <span class="operator-rule-value">${value}</span>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Sell + Monitor Path</div>
-          <div class="operator-lane-note">Once bought, every open position is monitored on the same loop until one exit path fires.</div>
-        </div>
-        <div class="operator-chip-row">
-          <span class="operator-chip exit">positions -> check_positions() -> sell()</span>
-        </div>
-      </div>
-      <div class="operator-rule-list">
-        ${exitRules.map(([label, value]) => `
-          <div class="operator-rule">
-            <span class="operator-rule-label">${label}</span>
-            <span class="operator-rule-value">${value}</span>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-  `;
-}
-function renderSettingsVisuals(settings) {
-  const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
-  renderLaunchSummary(s);
-  renderSettingsSnapshot(s);
-  renderOperatorMap(s);
-  const el = document.getElementById('settings-checkpoint-path');
-  if (!el) return;
-  const liqRule = Number(s.min_liq || 0) > 0 ? `Liquidity must be >= $${Number(s.min_liq).toLocaleString()}` : 'Liquidity checkpoint disabled';
-  const cards = [
-    ['1', 'Market Cap', `$${Number(s.min_mc).toLocaleString()} to $${Number(s.max_mc).toLocaleString()}`, 'The token has to land inside the market-cap lane before any later check matters.'],
-    ['2', 'Liquidity', liqRule, 'Set liquidity to 0 to leave this checkpoint open. Any non-zero value makes it a real gate again.'],
-    ['3', 'Token Age', `Age must be <= ${Number(s.max_age_min).toLocaleString()} minutes`, 'Older coins die here before the signal reaches momentum or score.'],
-    ['4', 'Price Change', `Change must be > 0% and <= ${Number(s.max_hot_change).toLocaleString()}%`, 'Negative change and overheated moves both fail on the same checkpoint.'],
-    ['5', 'Volume', `24h volume must be >= $${Number(s.min_vol).toLocaleString()}`, 'This is the first participation proof after the raw price filters.'],
-    ['6', 'AI Score', `Score must be >= ${Number(s.min_score).toLocaleString()}`, 'The score breakdown is computed first, then this floor decides if the coin survives.'],
-    ['7', 'Three-Signal Checklist', `${Number(s.min_green_lights)} green lights | holders >= ${Number(s.min_holder_growth_pct)}% | narrative >= ${Number(s.min_narrative_score)} | volume spike >= ${Number(s.min_volume_spike_mult)}x`, 'These values feed the same checklist and quality gates shown in the Signals tab.'],
-    ['8', 'Late Entry Guard', `Late entry <= ${Number(s.late_entry_mult)}x unless narrative >= ${Number(s.nuclear_narrative_score)}`, 'A coin that is already too extended only survives if narrative timing is strong enough to override the guard.'],
-    ['9', 'Safety Checks', `Authority check ${s.anti_rug ? 'on' : 'off'} | holder concentration ${s.check_holders ? 'on' : 'off'}`, 'These can still kill the trade later, after the numeric path passes.'],
-    ['10', 'Runtime Gates', `Drawdown ${Number(s.drawdown_limit_sol).toFixed(2)} SOL | max positions ${Number(s.max_correlated)} | trade risk ${Number(s.risk_per_trade_pct).toFixed(1)}%`, 'Even after the filter path passes, the bot can still skip on drawdown, position count, balance, or recent losing-mint rules.'],
-  ];
-  el.innerHTML = cards.map(([index, title, value, meta]) => `
-    <div class="checkpoint-card">
-      <div class="checkpoint-step">
-        <div class="checkpoint-index">${index}</div>
-        <div style="min-width:0">
-          <div style="font-size:13px;font-weight:700;color:var(--t1)">${title}</div>
-          <div style="font-size:12px;color:var(--t2);margin-top:4px">${value}</div>
-          <div class="checkpoint-meta">${meta}</div>
-        </div>
-      </div>
-    </div>
-  `).join('');
-}
-function getSettingsFocusIds() {
-  return SETTINGS_FIELD_IDS;
-}
-function selectPreset(name, applyDefaults = true) {
-  setPresetChoice(name);
-  const p = PRESET_SETTINGS[name];
-  if (applyDefaults && name !== 'custom' && p) {
-    applySettingsToForm({ ...SETTINGS_DEFAULTS, ...p, preset: name }, name);
-  } else {
-    renderSettingsVisuals(getSettingsFromForm());
-  }
-  markSettingsDirty();
-}
-async function saveSettings() {
-  const payload = getSettingsFromForm();
-  const res = await fetch('/api/settings', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(payload)
-  }).then(r => r.json()).catch(() => null);
-  if (res && res.ok !== false) {
-    _settingsDirty = false;
-    document._settingsFocused = false;
-    const mergedSettings = {
-      ...(res.settings || payload),
-      ...(res.execution_control?.control || {}),
-      decision_policy: res.execution_control?.control?.policy_mode || payload.decision_policy,
-      execution_mode: res.execution_control?.control?.execution_mode || payload.execution_mode,
-      model_threshold: res.execution_control?.control?.model_threshold || payload.model_threshold,
-    };
-    applySettingsToForm(mergedSettings, res.preset || payload.preset);
-    renderExecutionControlSummary(res.execution_control || { control: mergedSettings });
-    setSettingsSaveState('Saved to bot settings');
-    showToast('\u2713 Settings saved', true);
-    showConfirmModal(
-      'Settings Saved',
-      `Checkpoint path updated for ${String(res.preset || payload.preset)}.`,
-      [
-        `Preset: ${String(res.preset || payload.preset)}`,
-        `Execution: ${String(payload.execution_mode || 'live')}`,
-        `Policy: ${prettyExecutionPolicy(payload.decision_policy || 'rules')}`,
-        `Saved ${res.saved_fields?.length || 0} fields`,
-        `${res.replayed_candidates ?? 0} recent coins rechecked`,
-      ]
-    );
-  } else {
-    setSettingsSaveState('Save failed', true);
-    showToast('\u26a0 Save failed', false);
-  }
-  setTimeout(refresh, 800);
-  return res;
-}
-function openSettingsTab() {
-  activateTab('settings');
-}
-
-async function loadAI() {
-  const r = await fetch('/api/ai-recommendation').then(resp => resp.json()).catch(() => null);
-  if (!r) return;
-  aiSuggestion = r.suggestion || null;
-  const reasonEl = document.getElementById('ai-reason');
-  const logicEl = document.getElementById('ai-logic');
-  if (reasonEl) reasonEl.textContent = aiSuggestion?.reason || 'No recommendation available yet.';
-  if (logicEl) logicEl.textContent = r.logic || 'Uses your last 24h realized trades to map the market to a preset.';
-  const stats = r.stats || {};
-  const statsEl = document.getElementById('ai-stats');
-  if (!statsEl) return;
-  statsEl.innerHTML = `
-    <div class="ai-stat"><div class="ai-stat-value">${stats.total_trades ?? '—'}</div><div class="ai-stat-label">Trades (24h)</div></div>
-    <div class="ai-stat"><div class="ai-stat-value">${stats.win_rate != null ? stats.win_rate + '%' : '—'}</div><div class="ai-stat-label">Win Rate</div></div>
-    <div class="ai-stat"><div class="ai-stat-value">${stats.avg_win_sol != null ? '+' + stats.avg_win_sol : '—'}</div><div class="ai-stat-label">Avg Win (SOL)</div></div>
-    <div class="ai-stat"><div class="ai-stat-value">${stats.avg_loss_sol != null ? stats.avg_loss_sol : '—'}</div><div class="ai-stat-label">Avg Loss (SOL)</div></div>
-  `;
-}
-
-async function applyAISuggestion() {
-  if (!aiSuggestion || !aiSuggestion.preset || !PRESET_SETTINGS[aiSuggestion.preset]) {
-    showToast('AI recommendation unavailable', false);
-    return;
-  }
-  selectPreset(aiSuggestion.preset);
-  await saveSettings();
-}
-
-// ── Bot state refresh ─────────────────────────────────────────────────────────
+// ── Main state refresh ──
 async function refresh() {
-  const d = await fetch('/api/state').then(r => {
-    if (r.status === 401 || r.status === 302) { window.location = '/login'; return null; }
-    return r.json();
-  }).catch(() => null);
-  if (!d) { document.getElementById('stxt').textContent = 'Connection error \u2014 retrying\u2026'; return; }
-  running = d.running;
-  setText('hero-sync-time', fmtClock());
-  setText('scanner-sync-copy', `Synced ${fmtClock()}`);
-  setText('scanner-listing-live', String(listingCatchCount));
-  setText('hero-preset-badge', `${titleCase(d.preset || 'balanced')} preset`);
-  document.getElementById('balance').textContent   = d.balance.toFixed(4);
-  document.getElementById('pos-count').textContent = d.positions.length;
-  setText('scanner-position-live', String(d.positions.length));
-  document.getElementById('wins').textContent      = d.stats.wins;
-  document.getElementById('losses').textContent    = d.stats.losses;
-  const wr = d.stats.win_rate;
-  document.getElementById('win-rate').textContent = wr > 0 ? wr + '%' : '\u2014';
-  const streak = d.stats.streak;
-  const streakEl = document.getElementById('streak');
-  if (streak > 0) { streakEl.textContent = '+' + streak; streakEl.className = 'sval c-grn'; }
-  else if (streak < 0) { streakEl.textContent = streak; streakEl.className = 'sval c-red'; }
-  else { streakEl.textContent = '\u2014'; streakEl.className = 'sval'; }
-  const pnl = d.stats.total_pnl_sol;
-  const pnlEl = document.getElementById('pnl');
-  pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
-  pnlEl.className   = 'sval ' + (pnl>=0?'c-grn':'c-red');
-  const dot = document.getElementById('sdot'), txt = document.getElementById('stxt'), btn = document.getElementById('toggle-btn');
-  if (running) {
-    dot.className='sdot sdot-on'; txt.textContent='Bot Running'; btn.textContent='\u23f8 Stop Bot'; btn.className='btn btn-danger';
-    setText('hero-live-state', 'Execution live');
-  } else {
-    dot.className='sdot sdot-off'; txt.textContent='Bot Stopped'; btn.textContent='\u25b6 Start Bot'; btn.className='btn btn-success';
-    setText('hero-live-state', 'Bot parked');
-  }
-
-  document.getElementById('pos-tbl').innerHTML = d.positions.length
-    ? d.positions.map(p => {
-        const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
-        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
-          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
-          <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
-        </div>`;
-      }).join('')
-    : '<div style="font-size:12px;color:var(--t3)">No open positions</div>';
-
-  const logs = d.log || [];
-  document.getElementById('log-count').textContent = logs.length + ' entries';
-  document.getElementById('log').innerHTML = logs.map(l => {
-    let c = '';
-    if (l.includes('BUY')) c = 'lbuy';
-    else if (l.includes('SELL')||l.includes('CASHOUT')) c = 'lsell';
-    else if (l.includes('WHALE')||l.includes('COPY')) c = 'lsig';
-    else if (l.includes('SNIPE')||l.includes('LISTING')) c = 'lsig';
-    else if (l.includes('SCAN')||l.includes('CHECK')) c = 'lscan';
-    else if (l.includes('Bot ')||l.includes('ERROR')||l.includes('WARN')) c = 'linfo';
-    return `<div class="lline ${c}">${l}</div>`;
-  }).join('');
-  if (d.filter_log) {
-    setText('scanner-filter-live', String(d.filter_log.length || 0));
-    document.getElementById('filter-pipe').innerHTML = d.filter_log.map(f => `
-      <div class="fp-item">
-        <span class="${f.passed?'fp-pass':'fp-fail'}">${f.passed?'\u2713':'\u2717'}</span>
-        <span class="fp-name">${f.name||'?'}</span>
-        <span class="fp-reason">${f.reason||''}</span>
-      </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
-  }
-  if (d.settings && Object.keys(d.settings).length) {
-    const savedSettings = {
-      ...d.settings,
-      ...(d.execution_control?.control || {}),
-      decision_policy: d.execution_control?.control?.policy_mode || d.execution_control?.policy_mode || 'rules',
-      execution_mode: d.execution_control?.control?.execution_mode || d.execution_control?.execution_mode || 'live',
-      preset: d.preset || 'balanced',
-    };
-    if (!document._settingsFocused && !_settingsDirty) {
-      applySettingsToForm(savedSettings, savedSettings.preset);
-      _settingsDirty = false;
-      setSettingsSaveState('Loaded from saved state');
-    } else {
-      renderLaunchSummary(savedSettings);
-      renderSettingsSnapshot(savedSettings);
+  try {
+    const d = await fetch('/api/state').then(r=>r.json());
+    // Status
+    const running = d.running;
+    const dot = document.getElementById('status-dot');
+    const txt = document.getElementById('status-text');
+    dot.className = 'status-dot ' + (running ? 'on' : 'off');
+    txt.textContent = running ? 'Bot Running' : 'Bot Stopped';
+    document.getElementById('btn-start').style.display = running ? 'none' : '';
+    document.getElementById('btn-stop').style.display = running ? '' : 'none';
+    // Stats
+    document.getElementById('balance').textContent = d.balance ? d.balance.toFixed(3) : '0';
+    document.getElementById('pos-count').textContent = (d.positions || []).length;
+    const s = d.stats || {};
+    const total = (s.wins||0) + (s.losses||0);
+    document.getElementById('win-rate').textContent = total > 0 ? Math.round(s.wins/total*100) + '%' : '--';
+    const pnl = s.total_pnl_sol || 0;
+    const pnlEl = document.getElementById('total-pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(3);
+    pnlEl.style.color = pnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+    // Activity log
+    if (d.log && d.log.length) {
+      document.getElementById('activity-log').innerHTML = d.log.slice(0,30).map(l =>
+        `<div style="padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04)">${l}</div>`
+      ).join('');
     }
-    renderExecutionControlSummary(d.execution_control);
-  }
-  const executionMode = d.execution_control?.execution_mode || d.execution_control?.control?.execution_mode || 'live';
-  const selectedPolicy = d.execution_control?.selected_policy || d.execution_control?.control?.active_policy || 'rules';
-  setText('hero-execution-badge', `${executionMode === 'paper' ? 'Paper' : 'Live'} · ${prettyExecutionPolicy(selectedPolicy)}`);
-  if (running) {
-    setText('hero-live-state', executionMode === 'paper' ? 'Paper mode' : 'Execution live');
-  } else if (executionMode === 'paper') {
-    setText('hero-live-state', 'Paper lane armed');
-  }
-  renderTelegramStatus(d.telegram_chat_id || '');
+    // Load settings into form (only if user hasn't edited)
+    if (d.settings && !settingsEdited) {
+      loadSettingsIntoForm(d.settings, d.preset);
+    }
+  } catch(e) { console.error('refresh error', e); }
 }
 
-async function toggleBot() {
-  if (!running && _settingsDirty) { await saveSettings(); }
-  const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>null);
-  if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
-  if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
-  document.getElementById('stxt').style.color = '';
-  setTimeout(refresh, 800);
-}
-async function cashout() {
-  if (!confirm('Sell all open positions at market price?')) return;
-  await fetch('/api/cashout', {method:'POST'});
-  setTimeout(refresh, 1000);
-}
-function showToast(msg, ok=true) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.style.borderColor = ok ? 'var(--grn)' : '#f23645';
-  el.style.color       = ok ? 'var(--grn)' : '#f23645';
-  el.classList.add('show');
-  clearTimeout(el._timer);
-  el._timer = setTimeout(() => el.classList.remove('show'), 3000);
-}
-function showConfirmModal(title, body, meta=[]) {
-  const modal = document.getElementById('confirm-modal');
-  const titleEl = document.getElementById('confirm-title');
-  const bodyEl = document.getElementById('confirm-body');
-  const metaEl = document.getElementById('confirm-meta');
-  if (!modal || !titleEl || !bodyEl || !metaEl) return;
-  titleEl.textContent = title || 'Saved';
-  bodyEl.textContent = body || '';
-  metaEl.innerHTML = (meta || []).map(item => `<span class="badge bg-blue">${item}</span>`).join('');
-  modal.classList.add('show');
-}
-function hideConfirmModal() {
-  document.getElementById('confirm-modal')?.classList.remove('show');
-}
-
-function renderTelegramStatus(chatId) {
-  const input = document.getElementById('telegram-chat-id');
-  const badge = document.getElementById('telegram-status-badge');
-  if (!input || !badge) return;
-  const active = document.activeElement === input;
-  if (!active) input.value = chatId || '';
-  if (chatId) {
-    badge.className = 'badge bg-grn';
-    badge.textContent = `Connected ${chatId}`;
-  } else {
-    badge.className = 'badge bg-muted';
-    badge.textContent = 'Not connected';
-  }
-}
-
-async function saveTelegramChat() {
-  const input = document.getElementById('telegram-chat-id');
-  const raw = (input?.value || '').trim();
-  if (!raw) {
-    showToast('Enter a Telegram chat ID first', false);
-    return;
-  }
-  if (!/^-?[0-9]+$/.test(raw)) {
-    showToast('Chat ID must be numeric', false);
-    return;
-  }
-  const res = await fetch('/api/telegram', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: raw }),
-  }).then(r => r.json()).catch(() => null);
-  if (!res || !res.ok) {
-    showToast('Telegram save failed', false);
-    return;
-  }
-  renderTelegramStatus(raw);
-  showToast('Telegram connected. Check for the confirmation message.');
-  refresh();
-}
-
-async function clearTelegramChat() {
-  const res = await fetch('/api/telegram', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: '' }),
-  }).then(r => r.json()).catch(() => null);
-  if (!res || !res.ok) {
-    showToast('Telegram clear failed', false);
-    return;
-  }
-  renderTelegramStatus('');
-  showToast('Telegram alerts disconnected');
-  refresh();
-}
-
-// ══════════════════════════ SIGNAL EXPLORER ══════════════════════════
-async function pollSignals() {
+// ── Market Watch polling ──
+async function pollWatch() {
   try {
-    const [data, pattern, ops] = await Promise.all([
-      fetch('/api/signal-explorer').then(r => r.json()).catch(() => null),
-      fetch('/api/pattern-lab').then(r => r.json()).catch(() => null),
-      fetch('/api/ops-metrics').then(r => r.json()).catch(() => null),
-    ]);
-    if (!data) return;
-    _sigData = data.recent || [];
-    _patternLab = pattern || { tokens: [], deployers: [], themes: [] };
-    _opsMetrics = ops || { stats: {}, top_whales: [], threat_map: [], liquidity_risks: [], route_mix: [], failure_reasons: [] };
-    document.getElementById('sig-total').textContent = data.stats.total_evaluated;
-    document.getElementById('sig-pass-rate').textContent = data.stats.pass_rate + '%';
-    const topR = data.stats.top_reject_reasons;
-    document.getElementById('sig-top-reject').textContent = topR.length ? topR[0].reason.slice(0,30) : '\u2014';
-    renderSignals();
-    renderPatternLab();
-    renderOpsRadar();
-  } catch(e) {}
-}
-
-function renderSignals() {
-  let items = _sigData;
-  const query = (document.getElementById('sig-search')?.value || '').trim().toLowerCase();
-  if (sigFilter === 'pass') items = items.filter(s => s.passed);
-  if (sigFilter === 'fail') items = items.filter(s => !s.passed);
-  if (query) items = items.filter(s => signalSearchText(s).includes(query));
-  const container = document.getElementById('sig-list');
-  _sigView = items;
-  document.getElementById('sig-visible-count').textContent = `${_sigView.length} rows`;
-  if (!_sigView.length) {
-    container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">No evaluated coins match this filter yet.</div>';
-    return;
-  }
-  if (!_sigSelectedKey || !_sigView.some(s => signalKey(s) === _sigSelectedKey)) {
-    _sigSelected = 0;
-    _sigSelectedKey = signalKey(_sigView[0]);
-  } else {
-    _sigSelected = _sigView.findIndex(s => signalKey(s) === _sigSelectedKey);
-  }
-  container.innerHTML = `
-    <table class="sig-table">
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Result</th>
-          <th>Token</th>
-          <th>Reason</th>
-          <th>3-Point Checklist</th>
-          <th>Score</th>
-          <th>Price</th>
-          <th>1h</th>
-          <th>Age</th>
-          <th>Vol</th>
-          <th>Liq</th>
-          <th>MC</th>
-          <th>Deployer</th>
-          <th>Narrative</th>
-          <th>Whale</th>
-          <th>Threat</th>
-          <th>Vol Spike</th>
-          <th>Holder Growth</th>
-          <th>Smart First 10</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${_sigView.map((s, i) => {
-          const sc = s.score?.total || 0;
-          const col = scoreColor(sc);
-          const intel = s.intel || {};
-          return `<tr class="${_sigSelected===i?'active':''}" onclick="showSignalDetail(${i})">
-            <td><div>${fmtDateTime(s.logged_at || s.ts)}</div><div class="sig-mini-muted">${s.ts || ''}</div></td>
-            <td><span class="sig-badge ${s.passed?'sig-pass':'sig-fail'}">${s.passed?'PASS':'FAIL'}</span></td>
-            <td class="sig-cell-token">
-              <div class="sig-token-name">${s.name||'?'}</div>
-              <div class="sig-token-meta">${(s.mint||'').slice(0,10)}…</div>
-            </td>
-            <td class="sig-reason">${s.reason || '—'}</td>
-            <td><div class="sig-checks">${renderChecklistMini(s)}</div></td>
-            <td>
-              <div class="score-bar" style="margin-bottom:4px"><div class="score-bar-fill" style="width:${sc}%;background:${col}"></div></div>
-              <div style="color:${col};font-weight:800;font-family:monospace">${sc}</div>
-            </td>
-            <td>${fmtPrice(s.price)}</td>
-            <td class="${chgClass(s.change||0)}">${chgStr(s.change||0)}</td>
-            <td>${fmtAge(s.age_min||0)}</td>
-            <td>${fmtK(s.vol)}</td>
-            <td>${fmtK(s.liq)}</td>
-            <td>${fmtK(s.mc)}</td>
-            <td><div style="font-family:monospace">${shortWallet(intel.deployer_wallet)}</div><div class="sig-mini-muted">rep ${intel.deployer_score||0}</div></td>
-            <td><div>${intel.narrative_score||0}</div><div class="sig-mini-muted">${(intel.narrative_tags||[]).slice(0,2).join(' · ') || 'no tags'}</div></td>
-            <td><div>${intel.whale_score||0}</div><div class="sig-mini-muted">act ${intel.whale_action_score||0} · cc ${intel.cluster_confidence||0}</div></td>
-            <td><div>${intel.threat_risk_score||0}</div><div class="sig-mini-muted">${(intel.threat_flags||[]).slice(0,2).join(' · ') || 'clean'}</div></td>
-            <td>${Number(intel.volume_spike_ratio || 0).toFixed(1)}x</td>
-            <td>${Math.round(Number(intel.holder_growth_1h || 0))}%</td>
-            <td>${intel.smart_wallet_first10||0}</td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>
-  `;
-  if (_sigSelected >= 0) showSignalDetail(_sigSelected, true);
-}
-
-function renderPatternLab() {
-  const box = document.getElementById('pattern-lab');
-  if (!box) return;
-  const tokens = _patternLab.tokens || [];
-  const deployers = _patternLab.deployers || [];
-  const themes = _patternLab.themes || [];
-  if (!tokens.length) {
-    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Pattern lab will fill as the scanner tracks deployers and runners.</div>';
-    return;
-  }
-  box.innerHTML = `
-    <div class="sec-label">Pattern Lab</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-      ${themes.map(t => `<span class="badge bg-blue">${t.tag} · ${t.count}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No repeating themes yet</span>'}
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Mapped runners</div>
-    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px">
-      ${tokens.slice(0,5).map(t => `
-        <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px;background:rgba(255,255,255,.02)">
-          <div style="display:flex;justify-content:space-between;gap:8px">
-            <div>
-              <div style="font-size:12px;font-weight:700;color:var(--t1)">${t.name||t.symbol||'?'}</div>
-              <div style="font-size:10px;color:var(--t3)">${(t.narrative_tags||[]).join(' · ') || 'no tags yet'}</div>
-            </div>
-            <div style="text-align:right">
-              <div style="font-size:12px;font-weight:700;color:var(--gold2)">whale ${t.whale_score||0}</div>
-              <div style="font-size:10px;color:var(--t3)">act ${t.whale_action_score||0} · ${(t.max_multiple||1).toFixed(2)}x</div>
-            </div>
-          </div>
-        </div>`).join('')}
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Top deployers</div>
-    <div style="display:flex;flex-direction:column;gap:6px">
-      ${deployers.slice(0,4).map(d => `
-        <div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11px">
-          <span style="color:var(--t2);font-family:monospace">${shortWallet(d.wallet)}</span>
-          <span style="color:var(--t1)">rep ${d.reputation_score} · ${d.best_multiple.toFixed(2)}x best</span>
-        </div>`).join('')}
-    </div>
-  `;
-}
-
-function renderOpsRadar() {
-  const box = document.getElementById('ops-radar');
-  if (!box) return;
-  const stats = _opsMetrics.stats || {};
-  const rpc = _opsMetrics.rpc_health || {};
-  const adaptive = _opsMetrics.adaptive || {};
-  const edgeGuard = _opsMetrics.edge_guard || {};
-  const whales = _opsMetrics.top_whales || [];
-  const threats = _opsMetrics.threat_map || [];
-  const liquidity = _opsMetrics.liquidity_risks || [];
-  const routes = _opsMetrics.route_mix || [];
-  const failures = _opsMetrics.failure_reasons || [];
-  box.innerHTML = `
-    <div class="sec-label">Ops Radar</div>
-    <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px">
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">Quote Success</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.quote_success_rate||0}%</div>
-        <div style="font-size:10px;color:var(--t3)">${stats.avg_quote_ms||0} ms avg</div>
-      </div>
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">Send Success</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.send_success_rate||0}%</div>
-        <div style="font-size:10px;color:var(--t3)">${stats.avg_send_ms||0} ms avg</div>
-      </div>
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">Fill Slippage</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.avg_fill_slippage_bps||0} bps</div>
-        <div style="font-size:10px;color:var(--t3)">${stats.quotes_24h||0} quotes</div>
-      </div>
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">Exit Risks</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">${stats.no_exit_count||0}</div>
-        <div style="font-size:10px;color:var(--t3)">${stats.transfer_hook_count||0} hooks</div>
-      </div>
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">RPC Health</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">${rpc.fail_rate||0}% fail</div>
-        <div style="font-size:10px;color:var(--t3)">p95 ${rpc.p95_ms||0} ms</div>
-      </div>
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">Adaptive Guard</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">L${adaptive.relax_level||0}</div>
-        <div style="font-size:10px;color:var(--t3)">${adaptive.zero_buy_hours||0} zero-buy hrs</div>
-      </div>
-      <div style="padding:8px 10px;border:1px solid var(--b1);border-radius:8px">
-        <div style="font-size:10px;color:var(--t3)">Edge Guard</div>
-        <div style="font-size:15px;font-weight:800;color:var(--t1)">${edgeGuard.action_label||edgeGuard.status||'Normal risk'}</div>
-        <div style="font-size:10px;color:var(--t3)">size ${Math.round((edgeGuard.size_multiplier ?? 1)*100)}%</div>
-      </div>
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Whale Radar</div>
-    <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">
-      ${whales.slice(0,4).map(w => `
-        <div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11px">
-          <span style="color:var(--t1)">${w.name}</span>
-          <span style="color:var(--t2)">w ${w.whale_score} · a ${w.whale_action_score} · cc ${w.cluster_confidence}</span>
-        </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">No whale entities ranked yet</div>'}
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Threat Map</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-      ${threats.slice(0,4).map(t => `<span class="badge bg-red">${t.name} · ${t.threat_risk_score}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No active threat flags</span>'}
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Liquidity Risk</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-      ${liquidity.slice(0,4).map(t => `<span class="badge bg-gold">${t.name} · -${t.liquidity_drop_pct}%</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No liquidity drains detected</span>'}
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Execution Routes</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-      ${routes.slice(0,4).map(r => `<span class="badge bg-blue">${r.route} · ${r.count}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No route data yet</span>'}
-    </div>
-    <div style="font-size:11px;color:var(--t2);font-weight:700;margin-bottom:6px">Top Failures</div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
-      ${failures.slice(0,4).map(f => `<span class="badge bg-muted">${f.reason} · ${f.count}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No recent execution failures</span>'}
-    </div>
-  `;
-}
-
-function showSignalDetail(idx, fromRender=false) {
-  _sigSelected = idx;
-  const s = _sigView[idx];
-  if (!s) return;
-  _sigSelectedKey = signalKey(s);
-  if (!fromRender) renderSignals();
-  const sc = s.score || {};
-  const intel = s.intel || {};
-  const checklist = intel.checklist || [];
-  const links = intel.social_links || [];
-  const tags = intel.narrative_tags || [];
-  const detail = document.getElementById('sig-detail');
-  detail.innerHTML = `
-    <div style="font-weight:700;font-size:14px;margin-bottom:4px">${s.name||'?'}</div>
-    <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:12px">${s.mint||''}</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-      <span class="sig-badge ${s.passed?'sig-pass':'sig-fail'}">${s.passed?'PASS':'FAIL'}</span>
-      <span class="badge bg-muted">${fmtDateTime(s.logged_at || s.ts)}</span>
-      <span class="badge bg-blue">${intel.green_lights||0}/3 green lights</span>
-      <span class="badge bg-gold">Narrative ${intel.narrative_score||0}</span>
-      <span class="badge bg-grn">Deployer ${intel.deployer_score||0}</span>
-    </div>
-    <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap">
-      <div style="font-size:11px"><span style="color:var(--t3)">Price</span> <b>${fmtPrice(s.price)}</b></div>
-      <div style="font-size:11px"><span style="color:var(--t3)">MCap</span> <b>${fmtK(s.mc)}</b></div>
-      <div style="font-size:11px"><span style="color:var(--t3)">Vol</span> <b>${fmtK(s.vol)}</b></div>
-      <div style="font-size:11px"><span style="color:var(--t3)">Liq</span> <b>${fmtK(s.liq)}</b></div>
-      <div style="font-size:11px"><span style="color:var(--t3)">Age</span> <b>${fmtAge(s.age_min||0)}</b></div>
-      <div style="font-size:11px"><span style="color:var(--t3)">Chg</span> <b class="${chgClass(s.change)}">${chgStr(s.change||0)}</b></div>
-    </div>
-    <div class="sec-label">Three-Signal Checklist</div>
-    ${(checklist||[]).map(c => `<div class="filter-step">
-      <div class="filter-dot ${c.passed?'pass':'fail'}"></div>
-      <span style="flex:1">${c.name}</span>
-      <span style="color:var(--t1);font-weight:600;font-size:11px">${c.value||''}</span>
-      <span style="color:var(--t3);font-size:10px">${c.threshold||''}</span>
-    </div>`).join('') || '<div style="font-size:11px;color:var(--t3);margin-bottom:10px">Waiting for deployer and holder intel…</div>'}
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 14px">
-      <span class="badge bg-muted">${(intel.volume_spike_ratio||0).toFixed ? intel.volume_spike_ratio.toFixed(1) : intel.volume_spike_ratio || 0}x vol</span>
-      <span class="badge bg-muted">${intel.holder_growth_1h||0}% holders</span>
-      <span class="badge bg-muted">${intel.first_buyer_count||0} first buyers</span>
-      <span class="badge bg-muted">${intel.smart_wallet_first10||0} smart first 10</span>
-    </div>
-    <div class="sec-label">Whale / Entity Score</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-      <span class="badge bg-blue">Whale ${intel.whale_score||0}/100</span>
-      <span class="badge bg-blue">Action ${intel.whale_action_score||0}/100</span>
-      <span class="badge bg-muted">Cluster ${intel.cluster_confidence||0}</span>
-      <span class="badge bg-muted">Infra penalty ${intel.infra_penalty||0}</span>
-    </div>
-    <div class="sec-label">Threat / Exit Risk</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-      <span class="badge bg-red">Threat ${intel.threat_risk_score||0}/100</span>
-      <span class="badge bg-muted">Program ${(intel.token_program||'').startsWith('Tokenz') ? 'Token-2022' : 'SPL Token'}</span>
-      <span class="badge bg-muted">Exit ${intel.can_exit === false ? 'blocked' : intel.can_exit === true ? 'available' : 'unknown'}</span>
-      <span class="badge bg-muted">Hook ${intel.transfer_hook_enabled ? 'enabled' : 'none'}</span>
-      <span class="badge bg-muted">Liq drain ${Math.round(Number(intel.liquidity_drop_pct||0))}%</span>
-    </div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
-      ${(intel.threat_flags||[]).map(flag => `<span class="badge bg-red">${flag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No threat flags currently detected</span>'}
-    </div>
-    <div class="sec-label">Deployer / Social Intent</div>
-    <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Deployer: <span style="font-family:monospace;color:var(--t1)">${shortWallet(intel.deployer_wallet)}</span></div>
-    <div style="font-size:11px;color:var(--t2);margin-bottom:6px">First buyers: <b style="color:var(--t1)">${intel.first_buyer_count||0}</b> &nbsp; Smart in first 10: <b style="color:var(--t1)">${intel.smart_wallet_first10||0}</b></div>
-    <div style="font-size:11px;color:var(--t2);margin-bottom:6px">Infrastructure labels: <b style="color:var(--t1)">${(intel.infra_labels||[]).join(', ') || 'none'}</b></div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-      ${tags.map(tag => `<span class="badge bg-blue">${tag}</span>`).join('') || '<span style="font-size:11px;color:var(--t3)">No narrative tags yet</span>'}
-    </div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">
-      ${links.slice(0,4).map(link => `<a class="badge bg-muted" href="${link}" target="_blank" rel="noreferrer">${String(link || '').replace('https://','').replace('http://','').slice(0,28)}</a>`).join('') || '<span style="font-size:11px;color:var(--t3)">No socials found</span>'}
-    </div>
-    <div class="sec-label">AI Score Breakdown (${sc.total||0}/100)</div>
-    <canvas id="sig-radar" height="200" style="margin-bottom:14px"></canvas>
-    <div class="sec-label">Filter Pipeline</div>
-    ${(s.filters||[]).map(f => `<div class="filter-step">
-      <div class="filter-dot ${f.passed?'pass':'fail'}"></div>
-      <span style="flex:1">${f.name}</span>
-      <span style="color:var(--t1);font-weight:600;font-size:11px">${f.value}</span>
-      <span style="color:var(--t3);font-size:10px">${f.threshold}</span>
-    </div>`).join('')}
-    <div class="sec-label" style="margin-top:14px">Score Components</div>
-    <div style="display:flex;gap:4px;height:16px;border-radius:4px;overflow:hidden">
-      <div style="flex:${sc.volume||0};background:#3b82f6" title="Volume: ${sc.volume||0}"></div>
-      <div style="flex:${sc.liquidity||0};background:#14c784" title="Liquidity: ${sc.liquidity||0}"></div>
-      <div style="flex:${sc.age||0};background:#a855f7" title="Age: ${sc.age||0}"></div>
-      <div style="flex:${Math.max(0,sc.price_change||0)};background:#f59e0b" title="Change: ${sc.price_change||0}"></div>
-      <div style="flex:${sc.momentum||0};background:#06b6d4" title="Momentum: ${sc.momentum||0}"></div>
-    </div>
-    <div style="display:flex;gap:12px;margin-top:6px;font-size:10px;color:var(--t3);flex-wrap:wrap">
-      <span style="color:#3b82f6">\u25cf Vol ${sc.volume||0}</span>
-      <span style="color:#14c784">\u25cf Liq ${sc.liquidity||0}</span>
-      <span style="color:#a855f7">\u25cf Age ${sc.age||0}</span>
-      <span style="color:#f59e0b">\u25cf Chg ${sc.price_change||0}</span>
-      <span style="color:#06b6d4">\u25cf Mom ${sc.momentum||0}</span>
-    </div>
-  `;
-  // Draw radar chart
-  setTimeout(() => {
-    const canvas = document.getElementById('sig-radar');
-    if (!canvas || !window.Chart) return;
-    if (_charts.sigRadar) _charts.sigRadar.destroy();
-    _charts.sigRadar = new Chart(canvas, {
-      type: 'radar',
-      data: {
-        labels: ['Volume', 'Liquidity', 'Age', 'Change', 'Momentum'],
-        datasets: [{
-          data: [sc.volume||0, sc.liquidity||0, sc.age||0, Math.max(0,sc.price_change||0), sc.momentum||0],
-          backgroundColor: 'rgba(37,99,235,.15)',
-          borderColor: '#3b82f6',
-          borderWidth: 2,
-          pointBackgroundColor: '#3b82f6',
-          pointRadius: 3,
-        }]
-      },
-      options: {
-        scales: { r: { beginAtZero: true, max: 25, ticks: { display: false }, grid: { color: 'rgba(255,255,255,.06)' }, pointLabels: { color: '#94a3b8', font: { size: 10 } } } },
-        plugins: { legend: { display: false } },
-        animation: { duration: 300 },
-      }
-    });
-  }, 50);
-}
-
-// ══════════════════════════ WHALE DASHBOARD ══════════════════════════
-async function pollWhales() {
-  try {
-    const data = await fetch('/api/whale-activity').then(r => r.json());
-    // Render whale stat cards
-    const cardsEl = document.getElementById('whale-cards');
-    cardsEl.innerHTML = (data.whale_stats||[]).map(w => `
-      <div class="whale-card">
-        <div style="font-weight:700;font-size:13px;margin-bottom:4px">&#x1f40b; ${w.label}</div>
-        <div style="font-size:10px;color:var(--t3);font-family:monospace;margin-bottom:8px">${w.address.slice(0,8)}\u2026</div>
-        <div style="display:flex;gap:12px">
-          <div style="font-size:11px"><span style="color:var(--t3)">Buys</span> <b>${w.buys_24h}</b></div>
-          <div style="font-size:11px"><span style="color:var(--t3)">Avg P&L</span> <b class="${w.avg_pnl>=0?'c-grn':'c-red'}">${w.avg_pnl>0?'+':''}${w.avg_pnl}%</b></div>
-        </div>
-      </div>
-    `).join('') || '<div style="color:var(--t3);font-size:12px;padding:12px">No whale wallets configured</div>';
-    // Render whale feed
-    const feed = document.getElementById('whale-feed');
-    const buys = data.recent_buys || [];
-    if (!buys.length) { feed.innerHTML = '<div style="padding:20px;text-align:center;color:var(--t3);font-size:12px">Waiting for whale activity\u2026</div>'; return; }
-    feed.innerHTML = buys.slice(0, 30).map(b => {
-      const pnlStr = b.pnl_pct != null ? `<span class="${b.pnl_pct>=0?'c-grn':'c-red'}" style="font-weight:700">${b.pnl_pct>0?'+':''}${b.pnl_pct}%</span>` : '<span style="color:var(--t3)">-</span>';
-      return `<div class="whale-entry">
-        <div style="width:8px;height:8px;border-radius:50%;background:var(--grn);flex-shrink:0"></div>
-        <div style="flex:1;min-width:0">
-          <div style="font-weight:600;font-size:12px;color:var(--t1)">${b.name||'?'}</div>
-          <div style="font-size:10px;color:var(--t3)">${b.label} \u2022 ${fmtK(b.mc)} MCap</div>
-        </div>
-        <div style="text-align:right">
-          <div style="font-size:11px">${pnlStr}</div>
-          <div style="font-size:10px;color:var(--t3)">${b.ts||''}</div>
-        </div>
-      </div>`;
+    const d = await fetch('/api/market-watch').then(r=>r.json());
+    const coins = d.coins || [];
+    const sum = d.summary || {};
+    document.getElementById('sum-checked').textContent = sum.total_checked || 0;
+    document.getElementById('sum-bought').textContent = sum.total_bought || 0;
+    document.getElementById('sum-skipped').textContent = sum.total_skipped || 0;
+    // Highlight best missed / worst avoided
+    let hl = '';
+    if (sum.best_missed && sum.best_missed.change_pct > 0) {
+      hl += `<span class="summary-chip green">Best one you missed: <strong>${sum.best_missed.name}</strong> (${sum.best_missed.change_pct > 0 ? '+' : ''}${sum.best_missed.change_pct.toFixed(1)}%)</span> `;
+    }
+    if (sum.worst_avoided && sum.worst_avoided.change_pct < 0) {
+      hl += `<span class="summary-chip red">Worst one you dodged: <strong>${sum.worst_avoided.name}</strong> (${sum.worst_avoided.change_pct.toFixed(1)}%)</span>`;
+    }
+    document.getElementById('watch-highlight').innerHTML = hl;
+    // Table
+    if (!coins.length) {
+      document.getElementById('watch-body').innerHTML = '<tr><td colspan="8" class="empty-state">Waiting for bot to start scanning coins...</td></tr>';
+      return;
+    }
+    document.getElementById('watch-body').innerHTML = coins.map(c => {
+      const verdictBadge = c.verdict === 'Bought'
+        ? '<span class="badge-bought">Bought</span>'
+        : '<span class="badge-skipped">Skipped</span>';
+      return `<tr>
+        <td><span class="coin-name">${esc(c.name)}</span></td>
+        <td style="font-size:11px;color:var(--t3)">${esc(c.evaluated_at)}</td>
+        <td>${fmtPrice(c.price_then)}</td>
+        <td>${fmtPrice(c.price_now)}</td>
+        <td>${fmtPct(c.change_pct)}</td>
+        <td>${ratingBar(c.rating)}</td>
+        <td>${verdictBadge}</td>
+        <td><span class="reason-text">${c.verdict === 'Skipped' ? esc(c.skip_reason) : ''}</span></td>
+      </tr>`;
     }).join('');
-  } catch(e) {}
+  } catch(e) { console.error('pollWatch error', e); }
 }
 
-// ══════════════════════════ POSITION ANALYTICS ══════════════════════════
-async function pollPositions() {
+// ── My Trades polling ──
+async function pollTrades() {
   try {
-    const data = await fetch('/api/position-analytics').then(r => r.json());
-    const positions = data.positions || [];
-    const risk = data.risk || {};
-    // Render position cards
-    const container = document.getElementById('pos-cards');
-    if (!positions.length) { container.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:13px;padding:40px">No open positions</div>'; } else {
-      container.innerHTML = positions.map((p, i) => {
-        const pnlCls = p.pnl_pct >= 0 ? 'c-grn' : 'c-red';
-        return `<div class="pos-card">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-            <div>
-              <div style="font-weight:700;font-size:14px">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:6px;font-size:9px">TP1</span>':''}</div>
-              <div style="font-size:10px;color:var(--t3)">${fmtAge(p.age_min)} old \u2022 ${p.entry_sol} SOL</div>
-            </div>
-            <div style="text-align:right">
-              <div class="${pnlCls}" style="font-size:18px;font-weight:700">${p.pnl_pct>0?'+':''}${p.pnl_pct}%</div>
-              <div style="font-size:10px;color:var(--t3)">${fmtPrice(p.current_price)}</div>
-            </div>
+    const d = await fetch('/api/my-trades').then(r=>r.json());
+    // Open trades
+    const open = d.open_trades || [];
+    if (!open.length) {
+      document.getElementById('open-trades').innerHTML = '<div class="empty-state">No open trades right now</div>';
+    } else {
+      document.getElementById('open-trades').innerHTML = open.map(t => {
+        const pctCls = t.profit_pct >= 0 ? 'pct-pos' : 'pct-neg';
+        return `<div class="trade-card">
+          <div class="trade-info">
+            <div class="trade-name">${esc(t.name)}</div>
+            <div class="trade-meta">Bought at ${fmtPrice(t.bought_at_price)} &middot; Now ${fmtPrice(t.current_price)} &middot; Holding ${esc(t.held_for)}</div>
           </div>
-          <div class="pos-chart-mini"><canvas id="pos-chart-${i}" height="70"></canvas></div>
-          <div style="display:flex;gap:8px;margin-top:8px">
-            <div style="flex:1;font-size:10px;color:var(--t3)">Entry: ${fmtPrice(p.entry_price)}</div>
-            <div style="flex:1;font-size:10px;color:var(--t3)">Peak: ${fmtPrice(p.peak_price)}</div>
-            <div style="flex:1;font-size:10px;color:var(--t3)">TP1: ${fmtPrice(p.tp1_price)}</div>
-            <div style="flex:1;font-size:10px;color:var(--t3)">SL: ${fmtPrice(p.sl_price)}</div>
-          </div>
-          ${p.dev_wallet ? '<div style="font-size:10px;color:var(--t3);margin-top:6px">Dev: <span style="font-family:monospace">'+p.dev_wallet.slice(0,12)+'\u2026</span></div>' : ''}
-          <div style="display:flex;gap:6px;margin-top:10px">
-            <button class="btn btn-ghost" style="flex:1;font-size:11px;padding:6px" onclick="fetch('/api/manual-sell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mint:'${p.mint}',pct:0.5})}).then(()=>setTimeout(pollPositions,1500))">Sell 50%</button>
-            <button class="btn btn-danger" style="flex:1;font-size:11px;padding:6px" onclick="fetch('/api/manual-sell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mint:'${p.mint}',pct:1.0})}).then(()=>setTimeout(pollPositions,1500))">Sell 100%</button>
+          <div style="display:flex;align-items:center;gap:12px">
+            <div class="trade-pnl ${pctCls}">${t.profit_pct >= 0 ? '+' : ''}${t.profit_pct.toFixed(1)}%</div>
+            <button class="btn btn-sell" onclick="sellOne('${t.mint}')">Sell Now</button>
           </div>
         </div>`;
       }).join('');
-      // Draw mini charts
-      setTimeout(() => {
-        positions.forEach((p, i) => {
-          const canvas = document.getElementById('pos-chart-' + i);
-          if (!canvas || !p.chart || !p.chart.length || !window.Chart) return;
-          const key = 'posChart' + i;
-          if (_charts[key]) _charts[key].destroy();
-          const prices = p.chart.map(c => c.price);
-          const labels = p.chart.map(c => '');
-          _charts[key] = new Chart(canvas, {
-            type: 'line',
-            data: {
-              labels,
-              datasets: [{
-                data: prices,
-                borderColor: p.pnl_pct >= 0 ? '#14c784' : '#f23645',
-                borderWidth: 1.5,
-                fill: true,
-                backgroundColor: p.pnl_pct >= 0 ? 'rgba(20,199,132,.08)' : 'rgba(248,113,113,.08)',
-                pointRadius: 0, tension: 0.3,
-              }]
-            },
-            options: {
-              scales: { x: { display: false }, y: { display: false } },
-              plugins: { legend: { display: false }, tooltip: { enabled: false } },
-              animation: false,
-              maintainAspectRatio: false,
-            }
-          });
-        });
-      }, 100);
     }
-    // Render risk dashboard
-    const ddPct = risk.drawdown_limit > 0 ? Math.min(100, risk.session_drawdown / risk.drawdown_limit * 100) : 0;
-    const posPct = risk.max_positions > 0 ? Math.min(100, risk.positions_count / risk.max_positions * 100) : 0;
-    document.getElementById('risk-dd-val').textContent = `${risk.session_drawdown} / ${risk.drawdown_limit} SOL`;
-    document.getElementById('risk-dd-bar').style.width = ddPct + '%';
-    document.getElementById('risk-pos-val').textContent = `${risk.positions_count} / ${risk.max_positions}`;
-    document.getElementById('risk-pos-bar').style.width = posPct + '%';
-    document.getElementById('risk-losses').textContent = risk.consecutive_losses;
-    document.getElementById('risk-cooldown').textContent = risk.cooldown_remaining > 0 ? Math.ceil(risk.cooldown_remaining) + 's' : 'Off';
-    document.getElementById('risk-peak').textContent = risk.peak_balance;
-    document.getElementById('risk-now').textContent = risk.current_balance;
-  } catch(e) {}
-}
-
-// ══════════════════════════ P&L CHARTS ══════════════════════════
-async function loadPnl(range) {
-  try {
-    const data = await fetch('/api/pnl-history?days=' + range).then(r => r.json());
-    const s = data.stats || {};
-    const pnlTotalEl = document.getElementById('pnl-total');
-    pnlTotalEl.textContent = (s.total_pnl >= 0 ? '+' : '') + s.total_pnl + ' SOL';
-    pnlTotalEl.className = 'sval ' + (s.total_pnl >= 0 ? 'c-grn' : 'c-red');
-    document.getElementById('pnl-winrate').textContent = s.win_rate + '%';
-    document.getElementById('pnl-best').textContent = '+' + s.best_trade + ' SOL';
-    document.getElementById('pnl-worst').textContent = s.worst_trade + ' SOL';
-    document.getElementById('pnl-dd').textContent = '-' + s.max_drawdown + ' SOL';
-    document.getElementById('pnl-trades').textContent = s.total_trades;
-    // Cumulative P&L chart
-    const cum = data.cumulative || [];
-    if (cum.length && window.Chart) {
-      const labels = cum.map(c => c.ts.split('T')[0] || '');
-      const pnls = cum.map(c => c.pnl);
-      const dds = cum.map(c => -c.drawdown);
-      if (_charts.pnlLine) _charts.pnlLine.destroy();
-      _charts.pnlLine = new Chart(document.getElementById('pnl-chart'), {
-        type: 'line',
-        data: {
-          labels,
-          datasets: [{
-            label: 'Cumulative P&L (SOL)',
-            data: pnls,
-            borderColor: '#14c784',
-            borderWidth: 2,
-            fill: true,
-            backgroundColor: ctx => {
-              const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 220);
-              g.addColorStop(0, 'rgba(20,199,132,.15)');
-              g.addColorStop(1, 'rgba(20,199,132,0)');
-              return g;
-            },
-            pointRadius: 0, tension: 0.3,
-          }]
-        },
-        options: {
-          scales: {
-            x: { display: true, ticks: { color: '#475569', font: { size: 9 }, maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,.03)' } },
-            y: { ticks: { color: '#475569', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.05)' } }
-          },
-          plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
-          interaction: { mode: 'index', intersect: false },
-          animation: { duration: 400 },
-        }
-      });
-      // Drawdown chart
-      if (_charts.ddLine) _charts.ddLine.destroy();
-      _charts.ddLine = new Chart(document.getElementById('dd-chart'), {
-        type: 'line',
-        data: {
-          labels,
-          datasets: [{
-            label: 'Drawdown (SOL)',
-            data: dds,
-            borderColor: '#f23645',
-            borderWidth: 1.5,
-            fill: true,
-            backgroundColor: 'rgba(242,54,69,.1)',
-            pointRadius: 0, tension: 0.3,
-          }]
-        },
-        options: {
-          scales: {
-            x: { display: true, ticks: { color: '#475569', font: { size: 9 }, maxTicksLimit: 8 }, grid: { display: false } },
-            y: { ticks: { color: '#475569', font: { size: 9 } }, grid: { color: 'rgba(255,255,255,.03)' } }
-          },
-          plugins: { legend: { display: false } },
-          animation: { duration: 400 },
-        }
-      });
+    // Recent sells
+    const sells = d.recent_sells || [];
+    if (!sells.length) {
+      document.getElementById('sells-body').innerHTML = '<tr><td colspan="4" class="empty-state">No sells yet</td></tr>';
+    } else {
+      document.getElementById('sells-body').innerHTML = sells.map(s => {
+        const badge = s.result === 'Won'
+          ? '<span class="badge-won">Won</span>'
+          : '<span class="badge-lost">Lost</span>';
+        return `<tr>
+          <td><span class="coin-name">${esc(s.name)}</span></td>
+          <td>${badge}</td>
+          <td style="font-weight:700;${s.profit_sol >= 0 ? 'color:var(--grn)' : 'color:var(--red2)'}">
+            ${s.profit_sol >= 0 ? '+' : ''}${s.profit_sol.toFixed(4)}
+          </td>
+          <td style="font-size:11px;color:var(--t3)">${esc(s.sold_when)}</td>
+        </tr>`;
+      }).join('');
     }
-  } catch(e) {}
-}
-
-// ══════════════════════════ QUANT REPLAY LAB ══════════════════════════
-async function pollQuant() {
-  try {
-    const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
-    const [overview, optimizer, model, comparison, reports, runs] = await Promise.all([
-      fetch('/api/quant/overview').then(r => r.json()).catch(() => null),
-      fetch('/api/quant/optimizer?days=' + days).then(r => r.json()).catch(() => null),
-      fetch('/api/quant/model?days=' + days + '&mode=' + encodeURIComponent(_quantModelMode)).then(r => r.json()).catch(() => null),
-      fetch('/api/quant/comparison?days=' + days).then(r => r.json()).catch(() => null),
-      fetch('/api/quant/reports?days=' + days).then(r => r.json()).catch(() => null),
-      fetch('/api/quant/backtests').then(r => r.json()).catch(() => []),
-    ]);
-    if (overview) _quantOverview = overview;
-    if (optimizer) _quantOptimizer = optimizer;
-    if (model) _quantModel = model;
-    if (comparison) _quantComparison = comparison;
-    if (reports) _quantReports = reports;
-    _quantRuns = Array.isArray(runs) ? runs : [];
-    renderQuantOverview();
-    renderQuantRuns();
-    renderQuantOptimizer();
-    renderQuantModel();
-    renderQuantComparison();
-    renderQuantReports();
-    if (_quantSelectedRunId) {
-      await showQuantRunDetail(_quantSelectedRunId, true);
+    // Update stat strip from trades data
+    if (d.totals) {
+      const t = d.totals;
+      document.getElementById('balance').textContent = t.balance_sol ? t.balance_sol.toFixed(3) : '0';
+      document.getElementById('pos-count').textContent = open.length;
+      document.getElementById('win-rate').textContent = t.win_rate ? t.win_rate + '%' : '--';
+      const pnl = t.total_profit_sol || 0;
+      const pnlEl = document.getElementById('total-pnl');
+      pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(3);
+      pnlEl.style.color = pnl >= 0 ? 'var(--grn)' : 'var(--red2)';
     }
-  } catch (e) {}
+  } catch(e) { console.error('pollTrades error', e); }
 }
 
-function setQuantModelMode(mode) {
-  _quantModelMode = mode || 'auto';
-  pollQuant();
-}
-
-function renderQuantOverview() {
-  const grid = document.getElementById('quant-overview-grid');
-  if (!grid || !_quantOverview) return;
-  const dataset = _quantOverview.dataset || {};
-  const strategies = _quantOverview.strategy_summaries || [];
-  const flow = _quantOverview.flow_regime || {};
-  const opportunity = _quantOverview.opportunity_map || {};
-  const best = strategies[0] || {};
-  grid.innerHTML = `
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">${dataset.tracked_tokens || 0}</div><div class="scanner-summary-copy">Observed in persistent market storage</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Market Events</div><div class="scanner-summary-value">${dataset.market_events || 0}</div><div class="scanner-summary-copy">Append-only event log</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Wallet Flow Events</div><div class="scanner-summary-value">${dataset.wallet_flow_events || 0}</div><div class="scanner-summary-copy">Raw wallet-side swap legs</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Liquidity Deltas</div><div class="scanner-summary-value">${dataset.liquidity_delta_events || 0}</div><div class="scanner-summary-copy">First-class liquidity change records</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Feature Snapshots</div><div class="scanner-summary-value">${dataset.feature_snapshots || 0}</div><div class="scanner-summary-copy">Replay-ready scoring inputs</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Snapshots</div><div class="scanner-summary-value">${dataset.flow_snapshots || 0}</div><div class="scanner-summary-copy">Wallet pressure and liquidity tape</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Shadow Decisions</div><div class="scanner-summary-value">${dataset.shadow_decisions || 0}</div><div class="scanner-summary-copy">Would-buy versus blocked decisions</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Model Decisions</div><div class="scanner-summary-value">${dataset.model_decisions || 0}</div><div class="scanner-summary-copy">Logged global and regime model picks</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Edge Reports</div><div class="scanner-summary-value">${dataset.edge_reports || 0}</div><div class="scanner-summary-copy">Persistent weekly and monthly scorecards</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Regime</div><div class="scanner-summary-value">${flow.regime || '—'}</div><div class="scanner-summary-copy">${flow.sample_size || 0} recent snapshots · ${flow.avg_net_flow_sol > 0 ? '+' : ''}${flow.avg_net_flow_sol || 0} SOL net</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Missed Winners</div><div class="scanner-summary-value">${(opportunity.totals || {}).missed_winners || 0}</div><div class="scanner-summary-copy">Shadow blocks that later ran ${opportunity.winner_threshold_pct || 120}%+</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Open Shadow Positions</div><div class="scanner-summary-value">${dataset.open_shadow_positions || 0}</div><div class="scanner-summary-copy">Currently simulated live book</div></div>
-    <div class="scanner-summary-card"><div class="scanner-summary-label">Best Replay Avg</div><div class="scanner-summary-value">${best.strategy_name ? best.strategy_name + ' ' + (best.avg_pnl_pct > 0 ? '+' : '') + best.avg_pnl_pct + '%' : '—'}</div><div class="scanner-summary-copy">Current top strategy from completed replays</div></div>
-  `;
-  renderQuantFlowRegime();
-  renderQuantOpportunityMap();
-}
-
-function renderQuantFlowRegime() {
-  const box = document.getElementById('quant-flow-regime');
-  if (!box || !_quantOverview) return;
-  const flow = _quantOverview.flow_regime || {};
-  const recent = Array.isArray(_quantOverview.recent_flow) ? _quantOverview.recent_flow : [];
-  const executionTape = Array.isArray(_quantOverview.recent_execution_tape) ? _quantOverview.recent_execution_tape : [];
-  box.innerHTML = `
-    <div class="panel-head" style="margin-bottom:12px">
-      <div>
-        <div class="panel-title">Flow Regime</div>
-        <div class="panel-copy">Recent wallet participation, smart-money presence, and liquidity health across the live capture tape.</div>
-      </div>
-      <span class="badge ${flow.regime === 'accumulation' ? 'bg-grn' : flow.regime === 'defensive' || flow.regime === 'distribution' ? 'bg-red' : 'bg-muted'}">${flow.regime || 'neutral'}</span>
-    </div>
-    <div class="shortcut-row" style="margin-bottom:12px">
-      <span class="badge bg-muted">Buy/Sell ${flow.avg_buy_sell_ratio || 0}</span>
-      <span class="badge bg-muted">Net ${flow.avg_net_flow_sol > 0 ? '+' : ''}${flow.avg_net_flow_sol || 0} SOL</span>
-      <span class="badge bg-muted">Smart ${flow.avg_smart_wallet_buys || 0}</span>
-      <span class="badge bg-muted">Risk ${flow.high_risk_share_pct || 0}%</span>
-    </div>
-    <div class="operator-rule-list" style="margin-bottom:12px">
-      <div class="operator-rule"><div><div class="operator-rule-label">Liquidity Drain Share</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Tokens with 35%+ liquidity loss</div></div><div class="operator-rule-value">${flow.liquidity_drain_share_pct || 0}%</div></div>
-      <div class="operator-rule"><div><div class="operator-rule-label">Exit Blocked Share</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Tokens with no reliable exit route</div></div><div class="operator-rule-value">${flow.exit_blocked_share_pct || 0}%</div></div>
-      <div class="operator-rule"><div><div class="operator-rule-label">Avg Unique Buyers</div><div style="font-size:10px;color:var(--t3);margin-top:3px">Breadth in the recent sample</div></div><div class="operator-rule-value">${flow.avg_unique_buyers || 0}</div></div>
-    </div>
-    <div class="sec-label">Recent Tape</div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      ${recent.slice(0, 5).map(item => `
-        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-            <div style="font-size:11px;font-weight:700;color:var(--t1)">${item.mint ? item.mint.slice(0, 6) + '...' + item.mint.slice(-4) : 'Unknown'}</div>
-            <div style="font-size:11px;font-weight:700;color:${item.net_flow_sol >= 0 ? 'var(--grn)' : 'var(--red2)'}">${item.net_flow_sol >= 0 ? '+' : ''}${(item.net_flow_sol || 0).toFixed(2)} SOL</div>
-          </div>
-          <div class="shortcut-row" style="margin-top:8px">
-            <span class="badge bg-muted">${item.unique_buyer_count || 0} buyers</span>
-            <span class="badge bg-muted">${item.unique_seller_count || 0} sellers</span>
-            <span class="badge bg-muted">Smart ${item.smart_wallet_buys || 0}</span>
-            <span class="badge ${item.can_exit === false ? 'bg-red' : 'bg-muted'}">${item.can_exit === false ? 'Exit risk' : 'Exit ok'}</span>
-          </div>
-        </div>
-      `).join('') || '<div style="font-size:11px;color:var(--t3)">No flow samples captured yet.</div>'}
-    </div>
-    <div class="sec-label" style="margin-top:12px">Latest Wallet Flow</div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      ${executionTape.slice(0, 4).map(item => `
-        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-            <div>
-              <div style="font-size:11px;font-weight:700;color:var(--t1)">${item.mint ? item.mint.slice(0, 6) + '...' + item.mint.slice(-4) : 'Unknown'}</div>
-              <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.side} · ${item.wallet ? item.wallet.slice(0, 6) + '...' + item.wallet.slice(-4) : 'wallet'}</div>
-            </div>
-            <div class="shortcut-row">
-              <span class="badge ${item.side === 'buy' ? 'bg-grn' : 'bg-red'}">${item.side}</span>
-              ${item.smart_wallet ? '<span class="badge bg-gold">Smart</span>' : ''}
-            </div>
-          </div>
-          <div class="shortcut-row" style="margin-top:8px">
-            <span class="badge bg-muted">${(item.sol_amount || 0).toFixed(2)} SOL</span>
-            <span class="badge bg-muted">${(item.token_amount || 0).toFixed(2)} tokens</span>
-            <span class="badge bg-muted">${item.source || 'helius'}</span>
-          </div>
-        </div>
-      `).join('') || '<div style="font-size:11px;color:var(--t3)">Execution tape is still warming up.</div>'}
-    </div>
-  `;
-}
-
-function renderQuantOpportunityMap() {
-  const box = document.getElementById('quant-opportunity-map');
-  if (!box || !_quantOverview) return;
-  const opportunity = _quantOverview.opportunity_map || {};
-  const totals = opportunity.totals || {};
-  const blockers = Array.isArray(opportunity.top_blockers) ? opportunity.top_blockers : [];
-  const samples = opportunity.samples || {};
-  box.innerHTML = `
-    <div class="panel-head" style="margin-bottom:12px">
-      <div>
-        <div class="panel-title">Opportunity Map</div>
-        <div class="panel-copy">Classifies the market tape into winners captured, winners missed, losers avoided, and bad longs that should be filtered harder.</div>
-      </div>
-      <span class="badge bg-muted">Winner threshold ${opportunity.winner_threshold_pct || 120}%</span>
-    </div>
-    <div class="control-action-grid" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:12px">
-      <div class="scanner-summary-card"><div class="scanner-summary-label">Captured Winners</div><div class="scanner-summary-value">${totals.captured_winners || 0}</div><div class="scanner-summary-copy">Passed and later ran</div></div>
-      <div class="scanner-summary-card"><div class="scanner-summary-label">False Positives</div><div class="scanner-summary-value">${totals.false_positives || 0}</div><div class="scanner-summary-copy">Passed and later broke down</div></div>
-      <div class="scanner-summary-card"><div class="scanner-summary-label">Missed Winners</div><div class="scanner-summary-value">${totals.missed_winners || 0}</div><div class="scanner-summary-copy">Blocked before major expansion</div></div>
-      <div class="scanner-summary-card"><div class="scanner-summary-label">Avoided Losers</div><div class="scanner-summary-value">${totals.avoided_losers || 0}</div><div class="scanner-summary-copy">Blocked before collapse</div></div>
-    </div>
-    <div class="sec-label">Top Blockers On Missed Winners</div>
-    <div class="shortcut-row" style="margin-bottom:12px">
-      ${blockers.map(item => `<span class="badge bg-muted">${item.reason.replaceAll('_', ' ')} · ${item.count}</span>`).join('') || '<span class="badge bg-muted">No blocker data yet</span>'}
-    </div>
-    <div class="sec-label">Missed Winners Sample</div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      ${(samples.missed_winners || []).slice(0, 4).map(item => `
-        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-            <div>
-              <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
-              <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.strategy_name} · ${(item.blocker_reasons || []).join(', ') || 'blocked'}</div>
-            </div>
-            <div style="font-size:12px;font-weight:800;color:var(--grn)">+${(item.peak_return_pct || 0).toFixed(1)}%</div>
-          </div>
-        </div>
-      `).join('') || '<div style="font-size:11px;color:var(--t3)">No missed-winner sample yet.</div>'}
-    </div>
-  `;
-}
-
-function renderQuantOptimizer() {
-  const box = document.getElementById('quant-optimizer');
-  if (!box || !_quantOptimizer) return;
-  const dataset = _quantOptimizer.dataset || {};
-  const bestThresholds = Array.isArray(_quantOptimizer.best_thresholds) ? _quantOptimizer.best_thresholds : [];
-  const featureEdges = Array.isArray(_quantOptimizer.feature_edges) ? _quantOptimizer.feature_edges : [];
-  const topOutcomes = Array.isArray(_quantOptimizer.top_outcomes) ? _quantOptimizer.top_outcomes : [];
-  const counts = dataset.label_counts || {};
-  box.innerHTML = `
-    <div class="panel-head" style="margin-bottom:12px">
-      <div>
-        <div class="panel-title">Optimizer Sweep</div>
-        <div class="panel-copy">Uses first captured decision snapshots and realized token paths to rank thresholds that increase winner density while suppressing rugs.</div>
-      </div>
-      <span class="badge bg-muted">${_quantOptimizer.window_days || 7}d window</span>
-    </div>
-    <div class="shortcut-row" style="margin-bottom:12px">
-      <span class="badge bg-muted">${dataset.entry_snapshots || 0} entry snapshots</span>
-      <span class="badge bg-muted">${dataset.labeled_tokens || 0} labeled tokens</span>
-      <span class="badge bg-grn">${counts.winner || 0} winners</span>
-      <span class="badge bg-red">${counts.rug || 0} rugs</span>
-      <span class="badge bg-blue">${counts.volatile_winner || 0} volatile winners</span>
-    </div>
-    <div class="scanner-top-grid">
-      <div>
-        <div class="sec-label">Best Thresholds</div>
-        <div class="operator-rule-list">
-          ${bestThresholds.map(item => `
-            <div class="operator-rule">
-              <div>
-                <div class="operator-rule-label">${item.feature.replaceAll('_', ' ')}</div>
-                <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.selected} tokens · ${item.winner_rate_pct}% winners · ${item.rug_rate_pct}% rugs</div>
-              </div>
-              <div class="operator-rule-value">>= ${Number(item.threshold).toFixed(item.threshold % 1 ? 2 : 0)}</div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Optimizer data not ready yet.</div>'}
-        </div>
-      </div>
-      <div>
-        <div class="sec-label">Feature Edge</div>
-        <div class="shortcut-row" style="margin-bottom:10px">
-          ${featureEdges.map(item => `<span class="badge bg-muted">${item.label} ${item.edge > 0 ? '+' : ''}${item.edge}</span>`).join('') || '<span class="badge bg-muted">No feature edge yet</span>'}
-        </div>
-        <div class="sec-label">Top Outcomes</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          ${topOutcomes.slice(0, 4).map(item => `
-            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-                <div>
-                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
-                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.label.replaceAll('_', ' ')}</div>
-                </div>
-                <div style="font-size:12px;font-weight:800;color:${item.label === 'rug' ? 'var(--red2)' : 'var(--grn)'}">${item.peak_return_pct >= 0 ? '+' : ''}${item.peak_return_pct.toFixed(1)}%</div>
-              </div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Outcome labels are still warming up.</div>'}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function renderQuantModel() {
-  const box = document.getElementById('quant-model');
-  if (!box || !_quantModel) return;
-  const family = _quantModel.model_family || {};
-  const globalModel = family.global || {};
-  const regimeModels = family.regimes || {};
-  const selection = _quantModel.selection || {};
-  const regimeContext = _quantModel.regime_context || {};
-  const ranked = Array.isArray(_quantModel.ranked_candidates) ? _quantModel.ranked_candidates : [];
-  const selectedModel = selection.selected_model || globalModel || {};
-  const weights = Array.isArray(selectedModel.weights) ? selectedModel.weights : [];
-  const selectedKey = selection.selected_key || 'global';
-  const activeRegime = selection.active_regime || regimeContext.regime || 'neutral';
-  const selectedLabel = selectedKey === 'global' ? 'global' : selectedKey;
-  const recentDecisions = Array.isArray(_quantModel.recent_decisions) ? _quantModel.recent_decisions : [];
-  box.innerHTML = `
-    <div class="panel-head" style="margin-bottom:12px">
-      <div>
-        <div class="panel-title">Regime Model Desk</div>
-        <div class="panel-copy">Auto-selects a learned ranking model from the current tape regime and falls back to the global model when a regime-specific sample is too thin.</div>
-      </div>
-      <div class="shortcut-row">
-        <select class="finput" style="max-width:190px;height:36px" onchange="setQuantModelMode(this.value)">
-          <option value="auto" ${_quantModelMode === 'auto' ? 'selected' : ''}>Auto (Recommended)</option>
-          <option value="global" ${_quantModelMode === 'global' ? 'selected' : ''}>Global</option>
-          <option value="accumulation" ${_quantModelMode === 'accumulation' ? 'selected' : ''}>Accumulation</option>
-          <option value="distribution" ${_quantModelMode === 'distribution' ? 'selected' : ''}>Distribution</option>
-          <option value="defensive" ${_quantModelMode === 'defensive' ? 'selected' : ''}>Defensive</option>
-          <option value="neutral" ${_quantModelMode === 'neutral' ? 'selected' : ''}>Neutral</option>
-        </select>
-        <span class="badge ${selectedModel.trained ? 'bg-grn' : 'bg-red'}">${selectedModel.trained ? `${selectedLabel} active` : 'untrained'}</span>
-      </div>
-    </div>
-    <div class="shortcut-row" style="margin-bottom:12px">
-      <span class="badge bg-muted">${_quantModel.window_days || 7}d train window</span>
-      <span class="badge bg-muted">Active regime ${activeRegime}</span>
-      <span class="badge bg-muted">${globalModel.winner_count || 0} global winners</span>
-      <span class="badge bg-muted">${globalModel.rug_count || 0} global rugs</span>
-      <span class="badge bg-blue">${selectedModel.accuracy_pct || 0}% ${selectedLabel} accuracy</span>
-      ${selection.using_global_fallback ? `<span class="badge bg-gold">Fallback ${selection.fallback_reason || ''}</span>` : ''}
-    </div>
-    <div class="scanner-top-grid">
-      <div>
-        <div class="sec-label">Model Family</div>
-        <div class="operator-rule-list" style="margin-bottom:12px">
-          <div class="operator-rule">
-            <div>
-              <div class="operator-rule-label">global</div>
-              <div style="font-size:10px;color:var(--t3);margin-top:3px">${globalModel.token_count || 0} tokens · ${globalModel.winner_count || 0} winners · ${globalModel.rug_count || 0} rugs</div>
-            </div>
-            <div class="operator-rule-value">${globalModel.trained ? (globalModel.accuracy_pct || 0) + '%' : 'warmup'}</div>
-          </div>
-          ${Object.entries(regimeModels).map(([name, row]) => `
-            <div class="operator-rule">
-              <div>
-                <div class="operator-rule-label">${name}</div>
-                <div style="font-size:10px;color:var(--t3);margin-top:3px">${row.token_count || 0} tokens · ${row.winner_count || 0} winners · ${row.rug_count || 0} rugs</div>
-              </div>
-              <div class="operator-rule-value">${row.trained ? (row.accuracy_pct || 0) + '%' : 'warmup'}</div>
-            </div>
-          `).join('')}
-        </div>
-        <div class="sec-label">Selected Model Weights</div>
-        <div class="operator-rule-list">
-          ${weights.slice(0, 6).map(item => `
-            <div class="operator-rule">
-              <div>
-                <div class="operator-rule-label">${item.label}</div>
-                <div style="font-size:10px;color:var(--t3);margin-top:3px">Winner ${item.winner_mean} · Rug ${item.rug_mean}</div>
-              </div>
-              <div class="operator-rule-value">${item.weight > 0 ? '+' : ''}${item.weight}</div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Model weights unavailable.</div>'}
-        </div>
-      </div>
-      <div>
-        <div class="sec-label">Ranked Candidates</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          ${ranked.slice(0, 5).map(item => `
-            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-                <div>
-                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
-                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.mint || ''}</div>
-                </div>
-                <div style="font-size:13px;font-weight:800;color:${item.model_score >= 60 ? 'var(--grn)' : item.model_score >= 45 ? 'var(--gold)' : 'var(--red2)'}">${item.model_score.toFixed(1)}</div>
-              </div>
-              <div class="shortcut-row" style="margin-top:8px">
-                <span class="badge bg-muted">Comp ${item.features?.composite_score ?? 0}</span>
-                <span class="badge bg-muted">Conf ${Math.round((item.features?.confidence || 0) * 100)}%</span>
-                <span class="badge bg-muted">B/S ${item.features?.buy_sell_ratio ?? 0}</span>
-                <span class="badge bg-muted">Net ${item.features?.net_flow_sol ?? 0} SOL</span>
-                <span class="badge bg-muted">${item.model_key || selectedKey}</span>
-              </div>
-              <div class="shortcut-row" style="margin-top:8px">
-                ${(item.top_drivers || []).slice(0, 3).map(driver => `<span class="badge bg-muted">${driver.label} ${driver.contribution > 0 ? '+' : ''}${driver.contribution}</span>`).join('')}
-              </div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Not enough trained candidates yet.</div>'}
-        </div>
-        <div class="sec-label" style="margin-top:12px">Recent Live Model Picks</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          ${recentDecisions.slice(0, 4).map(item => `
-            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-                <div>
-                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
-                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.mode} · ${item.model_key} · ${item.active_regime || 'neutral'}</div>
-                </div>
-                <div style="font-size:12px;font-weight:800;color:${item.model_score >= item.threshold ? 'var(--grn)' : 'var(--red2)'}">${item.model_score.toFixed(1)}</div>
-              </div>
-              <div class="shortcut-row" style="margin-top:8px">
-                <span class="badge ${item.passed ? 'bg-grn' : 'bg-red'}">${item.passed ? 'pass' : 'block'}</span>
-                ${(item.drivers || []).slice(0, 2).map(driver => `<span class="badge bg-muted">${driver.label} ${driver.contribution > 0 ? '+' : ''}${driver.contribution}</span>`).join('')}
-              </div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">No live model picks logged yet.</div>'}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function renderQuantComparison() {
-  const box = document.getElementById('quant-comparison');
-  if (!box || !_quantComparison) return;
-  const summary = _quantComparison.summary || {};
-  const policies = Array.isArray(summary.policies) ? summary.policies : [];
-  const topTrades = Array.isArray(_quantComparison.top_trades) ? _quantComparison.top_trades : [];
-  box.innerHTML = `
-    <div class="panel-head" style="margin-bottom:12px">
-      <div>
-        <div class="panel-title">Rules vs Models</div>
-        <div class="panel-copy">Compares the same captured entry snapshots under the balanced rule set, the global model, and the regime-auto model using identical exit assumptions.</div>
-      </div>
-      <span class="badge bg-muted">${_quantComparison.window_days || 7}d · threshold ${_quantComparison.model_threshold || 60}</span>
-    </div>
-    <div class="control-action-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:12px">
-      ${policies.map(item => `
-        <div class="scanner-summary-card">
-          <div class="scanner-summary-label">${item.policy_name.replaceAll('_', ' ')}</div>
-          <div class="scanner-summary-value">${item.avg_pnl_pct > 0 ? '+' : ''}${item.avg_pnl_pct || 0}%</div>
-          <div class="scanner-summary-copy">${item.closed_trades || 0} trades · ${item.win_rate || 0}% win rate</div>
-        </div>
-      `).join('') || '<div class="scanner-summary-card"><div class="scanner-summary-label">Comparison</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">No comparison data yet</div></div>'}
-    </div>
-    <div class="scanner-top-grid">
-      <div>
-        <div class="sec-label">Policy Summary</div>
-        <div class="operator-rule-list">
-          ${policies.map(item => `
-            <div class="operator-rule">
-              <div>
-                <div class="operator-rule-label">${item.policy_name.replaceAll('_', ' ')}</div>
-                <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.decisions || 0} decisions · ${item.passed || 0} entries · ${item.closed_trades || 0} closed</div>
-              </div>
-              <div class="operator-rule-value">${item.avg_pnl_pct > 0 ? '+' : ''}${item.avg_pnl_pct || 0}%</div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Waiting for comparison data.</div>'}
-        </div>
-      </div>
-      <div>
-        <div class="sec-label">Top Comparison Trades</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          ${topTrades.slice(0, 5).map(item => `
-            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-                <div>
-                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.name || item.mint}</div>
-                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.policy_name.replaceAll('_', ' ')} · ${item.exit_reason || 'exit'}</div>
-                </div>
-                <div style="font-size:12px;font-weight:800;color:${item.realized_pnl_pct >= 0 ? 'var(--grn)' : 'var(--red2)'}">${item.realized_pnl_pct >= 0 ? '+' : ''}${item.realized_pnl_pct.toFixed(1)}%</div>
-              </div>
-              <div class="shortcut-row" style="margin-top:8px">
-                <span class="badge bg-muted">Up ${item.max_upside_pct.toFixed(1)}%</span>
-                <span class="badge bg-muted">DD ${item.max_drawdown_pct.toFixed(1)}%</span>
-              </div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">No comparison trades yet.</div>'}
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function runQuantReport() {
-  const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
-  const res = await fetch('/api/quant/reports', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ days, threshold: _quantComparison?.model_threshold || 60 }),
-  }).then(r => r.json()).catch(() => null);
-  if (!res || !res.ok) {
-    showToast('Edge report generation failed', false);
-    return;
-  }
-  showToast(`Edge report captured for ${days}d window`);
-  await pollQuant();
-}
-
-function renderQuantReports() {
-  const box = document.getElementById('quant-reports');
-  if (!box || !_quantReports) return;
-  const focus = _quantReports.focus_report || {};
-  const focusSummary = focus.summary || {};
-  const guard = _quantReports.guard_state || {};
-  const latestByWindow = Array.isArray(_quantReports.latest_by_window) ? _quantReports.latest_by_window : [];
-  const trendCards = Array.isArray(_quantReports.trend_cards) ? _quantReports.trend_cards : [];
-  const leaderboard = Array.isArray(_quantReports.leaderboard) ? _quantReports.leaderboard : [];
-  const recentReports = Array.isArray(_quantReports.recent_reports) ? _quantReports.recent_reports : [];
-  box.innerHTML = `
-    <div class="panel-head" style="margin-bottom:12px">
-      <div>
-        <div class="panel-title">Edge Reports</div>
-        <div class="panel-copy">Persistent comparison snapshots and automated scorecards so you can see whether rules, the global model, or the regime model are actually improving over time.</div>
-      </div>
-      <div class="panel-actions">
-        <button class="btn btn-ghost" type="button" onclick="runQuantReport()">Generate Report</button>
-      </div>
-    </div>
-    <div class="shortcut-row" style="margin-bottom:12px">
-      <span class="badge bg-muted">${_quantReports.report_count || 0} stored reports</span>
-      <span class="badge bg-muted">Focus ${_quantReports.focus_window_days || 7}d</span>
-      <span class="badge bg-muted">Leader ${prettyPolicyName(focusSummary.leader_policy)}</span>
-      <span class="badge ${guard.status === 'halted' ? 'bg-red' : guard.status === 'defensive' ? 'bg-gold' : guard.status === 'throttled' ? 'bg-blue' : 'bg-muted'}">${guard.action_label || prettyPolicyName(guard.status || 'normal')}</span>
-      <span class="badge bg-muted">Last ${fmtDateTime(focus.generated_at || focusSummary.generated_at)}</span>
-    </div>
-    <div class="operator-rule-list" style="margin-bottom:12px">
-      <div class="operator-rule">
-        <div>
-          <div class="operator-rule-label">Live Safety Gate</div>
-          <div style="font-size:10px;color:var(--t3);margin-top:3px">${guard.reason || 'Using normal report-driven posture.'}</div>
-        </div>
-        <div class="operator-rule-value">${guard.allow_new_entries === false ? 'blocked' : 'size ' + Math.round((guard.size_multiplier ?? 1) * 100) + '%'}</div>
-      </div>
-    </div>
-    <div class="control-action-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-bottom:12px">
-      ${latestByWindow.map(item => `
-        <div class="scanner-summary-card">
-          <div class="scanner-summary-label">${item.window_days}d latest</div>
-          <div class="scanner-summary-value">${item.leader_avg_pnl_pct > 0 ? '+' : ''}${(item.leader_avg_pnl_pct || 0).toFixed(1)}%</div>
-          <div class="scanner-summary-copy">${prettyPolicyName(item.leader_policy)} · edge ${(item.model_edge_pct || 0) > 0 ? '+' : ''}${(item.model_edge_pct || 0).toFixed(1)}%</div>
-        </div>
-      `).join('') || '<div class="scanner-summary-card"><div class="scanner-summary-label">Reports</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">No persistent reports yet</div></div>'}
-    </div>
-    <div class="scanner-top-grid">
-      <div>
-        <div class="sec-label">Trend Deltas</div>
-        <div class="operator-rule-list">
-          ${trendCards.map(item => `
-            <div class="operator-rule">
-              <div>
-                <div class="operator-rule-label">${item.window_days}d · ${prettyPolicyName(item.leader_policy)}</div>
-                <div style="font-size:10px;color:var(--t3);margin-top:3px">
-                  Leader ${(item.delta_leader_avg_pnl_pct ?? 0) >= 0 ? '+' : ''}${item.delta_leader_avg_pnl_pct == null ? 'n/a' : item.delta_leader_avg_pnl_pct + '%'}
-                  · Regime edge ${(item.delta_regime_edge_pct ?? 0) >= 0 ? '+' : ''}${item.delta_regime_edge_pct == null ? 'n/a' : item.delta_regime_edge_pct + '%'}
-                </div>
-              </div>
-              <div class="operator-rule-value">${(item.model_edge_pct || 0) >= 0 ? '+' : ''}${(item.model_edge_pct || 0).toFixed(1)}%</div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Need at least one persisted report before trends appear.</div>'}
-        </div>
-      </div>
-      <div>
-        <div class="sec-label">Policy Leaderboard</div>
-        <div style="display:flex;flex-direction:column;gap:8px">
-          ${leaderboard.slice(0, 5).map(item => `
-            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-              <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-                <div>
-                  <div style="font-size:12px;font-weight:800;color:var(--t1)">${prettyPolicyName(item.policy_name)}</div>
-                  <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.windows || 0} latest-window snapshots</div>
-                </div>
-                <div style="font-size:12px;font-weight:800;color:${item.avg_pnl_pct >= 0 ? 'var(--grn)' : 'var(--red2)'}">${item.avg_pnl_pct >= 0 ? '+' : ''}${item.avg_pnl_pct.toFixed(1)}%</div>
-              </div>
-              <div class="shortcut-row" style="margin-top:8px">
-                <span class="badge bg-muted">Win ${item.avg_win_rate.toFixed(1)}%</span>
-              </div>
-            </div>
-          `).join('') || '<div style="font-size:11px;color:var(--t3)">Leaderboard will populate after reports are generated.</div>'}
-        </div>
-      </div>
-    </div>
-    <div class="sec-label" style="margin-top:12px">Recent Snapshots</div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      ${recentReports.slice(0, 5).map(item => `
-        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-            <div>
-              <div style="font-size:12px;font-weight:800;color:var(--t1)">${item.window_days}d · ${prettyPolicyName(item.summary?.leader_policy)}</div>
-              <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.report_kind} · ${item.active_regime || 'neutral'} · ${fmtDateTime(item.generated_at)}</div>
-            </div>
-            <div style="font-size:12px;font-weight:800;color:${(item.summary?.model_edge_pct || 0) >= 0 ? 'var(--grn)' : 'var(--red2)'}">${(item.summary?.model_edge_pct || 0) >= 0 ? '+' : ''}${(item.summary?.model_edge_pct || 0).toFixed(1)}%</div>
-          </div>
-          <div class="shortcut-row" style="margin-top:8px">
-            <span class="badge bg-muted">Rule ${(item.summary?.rule_avg_pnl_pct || 0).toFixed(1)}%</span>
-            <span class="badge bg-muted">Regime ${(item.summary?.regime_edge_pct || 0) >= 0 ? '+' : ''}${(item.summary?.regime_edge_pct || 0).toFixed(1)}%</span>
-            <span class="badge bg-muted">${(item.policies || []).length} policies</span>
-          </div>
-        </div>
-      `).join('') || '<div style="font-size:11px;color:var(--t3)">No report history stored yet.</div>'}
-    </div>
-  `;
-}
-
-function renderQuantRuns() {
-  const box = document.getElementById('quant-runs');
-  if (!box) return;
-  document.getElementById('quant-run-count').textContent = `${_quantRuns.length} runs`;
-  if (!_quantRuns.length) {
-    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">No backtest runs yet.</div>';
-    return;
-  }
-  box.innerHTML = _quantRuns.map(run => {
-    const active = _quantSelectedRunId === run.id;
-    const strategies = Object.keys((run.summary || {}).strategies || {});
-    const replayMode = run.replay_mode || run.config?.replay_mode || 'snapshot';
-    const dataPoints = replayMode === 'event_tape'
-      ? ((run.summary || {}).events_processed || run.snapshots_processed || 0)
-      : (run.snapshots_processed || 0);
-    return `
-      <div onclick="showQuantRunDetail(${run.id})" style="padding:12px 14px;border:1px solid ${active ? 'rgba(96,165,250,.32)' : 'rgba(255,255,255,.06)'};border-radius:14px;background:${active ? 'rgba(47,107,255,.08)' : 'rgba(255,255,255,.02)'};margin-bottom:10px;cursor:pointer">
-        <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
-          <div>
-            <div style="font-size:13px;font-weight:800;color:var(--t1)">${run.name || ('Run #' + run.id)}</div>
-            <div style="font-size:10px;color:var(--t3);margin-top:3px">${run.days}d · ${replayMode === 'event_tape' ? 'event tape' : 'snapshots'} · ${run.strategy_filter || 'all strategies'} · ${run.created_at ? new Date(run.created_at).toLocaleString() : 'queued'}</div>
-          </div>
-          <div class="shortcut-row">
-            <span class="badge bg-muted">${replayMode === 'event_tape' ? 'Tape' : 'Snapshot'}</span>
-            <span class="badge ${run.status === 'completed' ? 'bg-grn' : run.status === 'failed' ? 'bg-red' : 'bg-gold'}">${run.status}</span>
-          </div>
-        </div>
-        <div class="shortcut-row" style="margin-top:10px">
-          <span class="badge bg-muted">${run.tokens_processed || 0} tokens</span>
-          <span class="badge bg-muted">${dataPoints} ${replayMode === 'event_tape' ? 'events' : 'snapshots'}</span>
-          <span class="badge bg-muted">${run.trades_closed || 0} trades</span>
-          <span class="badge bg-muted">${strategies.length} strategies</span>
-        </div>
-      </div>
-    `;
-  }).join('');
-}
-
-async function runQuantBacktest() {
-  const days = parseInt(document.getElementById('quant-days')?.value || '7', 10);
-  const name = (document.getElementById('quant-run-name')?.value || '').trim();
-  const replayMode = (document.getElementById('quant-replay-mode')?.value || 'snapshot').trim();
-  const res = await fetch('/api/quant/backtests', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      days,
-      name,
-      replay_mode: replayMode,
-      strategies: ['safe', 'balanced', 'aggressive', 'degen'],
-    }),
-  }).then(r => r.json()).catch(() => null);
-  if (!res || !res.ok) {
-    showToast('Backtest launch failed', false);
-    return;
-  }
-  _quantSelectedRunId = res.run_id;
-  showToast(`${replayMode === 'event_tape' ? 'Tape replay' : 'Snapshot replay'} queued (#${res.run_id})`);
-  pollQuant();
-}
-
-async function showQuantRunDetail(runId, silent=false) {
-  _quantSelectedRunId = runId;
-  renderQuantRuns();
-  const box = document.getElementById('quant-run-detail');
-  if (!box) return;
-  if (!silent) {
-    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Loading replay detail…</div>';
-  }
-  const data = await fetch('/api/quant/backtests/' + runId).then(r => r.json()).catch(() => null);
-  if (!data || !data.run) {
-    box.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">Replay detail unavailable.</div>';
-    return;
-  }
-  const run = data.run;
-  const strategies = run.summary?.strategies || {};
-  const replayMode = run.replay_mode || run.config?.replay_mode || 'snapshot';
-  const sourceCounts = run.summary?.source_counts || {};
-  const eventTypeCounts = run.summary?.event_type_counts || {};
-  const topTrades = (data.trades || []).slice(0, 10);
-  box.innerHTML = `
-    <div class="sec-label">Replay Detail</div>
-    <div style="font-size:17px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif;margin-bottom:6px">${run.name || ('Run #' + run.id)}</div>
-    <div style="font-size:11px;color:var(--t2);line-height:1.6;margin-bottom:12px">${run.status} · ${run.days}d window · ${replayMode === 'event_tape' ? 'event tape' : 'snapshot'} replay · ${run.tokens_processed || 0} tokens · ${(replayMode === 'event_tape' ? (run.summary?.events_processed || run.snapshots_processed || 0) : (run.snapshots_processed || 0))} ${replayMode === 'event_tape' ? 'events' : 'snapshots'} · ${run.trades_closed || 0} closed trades</div>
-    ${replayMode === 'event_tape' ? `
-      <div class="shortcut-row" style="margin-bottom:12px">
-        ${Object.entries(eventTypeCounts).slice(0, 4).map(([name, count]) => `<span class="badge bg-muted">${name.replaceAll('_', ' ')} · ${count}</span>`).join('')}
-        ${Object.entries(sourceCounts).slice(0, 3).map(([name, count]) => `<span class="badge bg-muted">${name} · ${count}</span>`).join('')}
-      </div>
-    ` : ''}
-    <div class="operator-rule-list" style="margin-bottom:12px">
-      ${Object.entries(strategies).map(([name, summary]) => `
-        <div class="operator-rule">
-          <div>
-            <div class="operator-rule-label">${name}</div>
-            <div style="font-size:10px;color:var(--t3);margin-top:3px">${summary.closed_trades || 0} trades · ${summary.win_rate || 0}% win rate</div>
-          </div>
-          <div class="operator-rule-value">${(summary.avg_pnl_pct || 0) > 0 ? '+' : ''}${summary.avg_pnl_pct || 0}% avg</div>
-        </div>
-      `).join('') || '<div style="font-size:11px;color:var(--t3)">No strategy summary available yet.</div>'}
-    </div>
-    <div class="sec-label">Top Simulated Trades</div>
-    <div style="display:flex;flex-direction:column;gap:8px">
-      ${topTrades.map(trade => `
-        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
-          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-            <div>
-              <div style="font-size:12px;font-weight:800;color:var(--t1)">${trade.name || trade.mint}</div>
-              <div style="font-size:10px;color:var(--t3);margin-top:3px">${trade.strategy_name} · ${trade.exit_reason || trade.status}</div>
-            </div>
-            <div style="font-size:12px;font-weight:800;color:${trade.realized_pnl_pct >= 0 ? 'var(--grn)' : 'var(--red2)'}">${trade.realized_pnl_pct >= 0 ? '+' : ''}${trade.realized_pnl_pct.toFixed(2)}%</div>
-          </div>
-          <div class="shortcut-row" style="margin-top:8px">
-            <span class="badge bg-muted">Score ${trade.score.toFixed(1)}</span>
-            <span class="badge bg-muted">Conf ${(trade.confidence * 100).toFixed(0)}%</span>
-            <span class="badge bg-muted">Up ${trade.max_upside_pct.toFixed(1)}%</span>
-            <span class="badge bg-muted">DD ${trade.max_drawdown_pct.toFixed(1)}%</span>
-          </div>
-        </div>
-      `).join('') || '<div style="font-size:11px;color:var(--t3)">No trades recorded yet.</div>'}
-    </div>
-  `;
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-(function() {
-  const initialPreset = PRESET_SETTINGS['{{PRESET}}'] ? '{{PRESET}}' : 'balanced';
-  _settingsDirty = false;
-  document._settingsFocused = false;
-  setSettingsSaveState('Loading saved settings…');
-  applySettingsToForm({ ...SETTINGS_DEFAULTS, ...(PRESET_SETTINGS[initialPreset] || {}), preset: initialPreset }, initialPreset);
-  bindSettingsInputs();
-  registerKeyboardShortcuts();
-  renderEnhancedDashboard(null);
-})();
-window.addEventListener('resize', () => {
-  if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
-    treeCanvas.width = treeCanvas.parentElement.clientWidth;
-  }
+// ── Settings ──
+let settingsEdited = false;
+document.querySelectorAll('#tab-settings input, #tab-settings select').forEach(el => {
+  el.addEventListener('change', () => { settingsEdited = true; });
 });
+
+function loadSettingsIntoForm(s, preset) {
+  if (preset) {
+    document.getElementById('s-preset').value = preset;
+  }
+  const map = {
+    's-buy': 'max_buy_sol', 's-tp1': 'tp1_mult', 's-tp2': 'tp2_mult',
+    's-trail': 'trail_pct', 's-sl': 'stop_loss', 's-time': 'time_stop_min',
+    's-maxpos': 'max_correlated', 's-dd': 'drawdown_limit_sol',
+    's-liq': 'min_liq', 's-minmc': 'min_mc', 's-maxmc': 'max_mc',
+    's-minvol': 'min_vol', 's-minscore': 'min_score', 's-maxage': 'max_age_min',
+    's-cool': 'cooldown_min', 's-prio': 'priority_fee'
+  };
+  for (const [elId, key] of Object.entries(map)) {
+    const el = document.getElementById(elId);
+    if (el && s[key] !== undefined) el.value = s[key];
+  }
+}
+
+function loadPresetDefaults() {
+  const p = document.getElementById('s-preset').value;
+  const defs = presetDefaults[p];
+  if (defs) loadSettingsIntoForm(defs, p);
+  settingsEdited = true;
+}
+
+async function saveSettings() {
+  const body = {
+    preset: document.getElementById('s-preset').value,
+    max_buy_sol: parseFloat(document.getElementById('s-buy').value),
+    tp1_mult: parseFloat(document.getElementById('s-tp1').value),
+    tp2_mult: parseFloat(document.getElementById('s-tp2').value),
+    trail_pct: parseFloat(document.getElementById('s-trail').value),
+    stop_loss: parseFloat(document.getElementById('s-sl').value),
+    time_stop_min: parseInt(document.getElementById('s-time').value),
+    max_correlated: parseInt(document.getElementById('s-maxpos').value),
+    drawdown_limit_sol: parseFloat(document.getElementById('s-dd').value),
+    min_liq: parseFloat(document.getElementById('s-liq').value),
+    min_mc: parseFloat(document.getElementById('s-minmc').value),
+    max_mc: parseFloat(document.getElementById('s-maxmc').value),
+    min_vol: parseFloat(document.getElementById('s-minvol').value),
+    min_score: parseInt(document.getElementById('s-minscore').value),
+    max_age_min: parseInt(document.getElementById('s-maxage').value),
+    cooldown_min: parseInt(document.getElementById('s-cool').value),
+    priority_fee: parseInt(document.getElementById('s-prio').value),
+  };
+  const r = await fetch('/api/settings', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  }).then(r=>r.json()).catch(()=>({ok:false}));
+  const status = document.getElementById('settings-status');
+  if (r.ok) {
+    status.textContent = 'Settings saved!';
+    status.style.color = 'var(--grn)';
+    settingsEdited = false;
+  } else {
+    status.textContent = 'Error saving settings';
+    status.style.color = 'var(--red2)';
+  }
+  status.style.display = 'block';
+  setTimeout(() => { status.style.display = 'none'; }, 3000);
+}
+
+// ── Escape HTML ──
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+
+// ── Backtest Results polling ──
+async function pollBacktest() {
+  try {
+    const d = await fetch('/api/backtest-results').then(r=>r.json());
+    // Strategy cards
+    const strats = d.strategies || [];
+    if (!strats.length) {
+      document.getElementById('strategy-cards').innerHTML = '<div class="empty-state">No shadow trading data yet. Start the bot and it will automatically test strategies in the background.</div>';
+    } else {
+      document.getElementById('strategy-cards').innerHTML = strats.map(s => {
+        const pnlColor = s.avg_profit_pct >= 0 ? 'var(--grn)' : 'var(--red2)';
+        const wrColor = s.win_rate >= 50 ? 'var(--grn)' : s.win_rate >= 30 ? 'var(--gold2)' : 'var(--red2)';
+        const settingsJson = JSON.stringify(s.settings).replace(/'/g, "\\'");
+        return `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:18px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+            <div>
+              <div style="font-size:16px;font-weight:700;color:var(--t1)">${esc(s.label)}</div>
+              <div style="font-size:11px;color:var(--t3);margin-top:2px">${s.total_trades} trades tested &middot; ${s.wins} won &middot; ${s.losses} lost</div>
+            </div>
+            <button class="btn btn-save" onclick='applyStrategy(${settingsJson}, "${s.name}")' style="font-size:11px;padding:6px 14px">Use These Settings</button>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Win Rate</div>
+              <div style="font-size:20px;font-weight:700;color:${wrColor}">${s.win_rate}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Avg Profit</div>
+              <div style="font-size:20px;font-weight:700;color:${pnlColor}">${s.avg_profit_pct >= 0 ? '+' : ''}${s.avg_profit_pct}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Best Trade</div>
+              <div style="font-size:20px;font-weight:700;color:var(--grn)">${s.best_trade_pct > 0 ? '+' : ''}${s.best_trade_pct}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em">Worst Trade</div>
+              <div style="font-size:20px;font-weight:700;color:var(--red2)">${s.worst_trade_pct}%</div>
+            </div>
+          </div>
+          <details style="margin-top:12px">
+            <summary style="cursor:pointer;font-size:11px;color:var(--t3)">View settings used</summary>
+            <div style="margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px;font-size:11px;color:var(--t2)">
+              <div>Buy amount: <strong>${s.settings.buy_amount} SOL</strong></div>
+              <div>First sell: <strong>${s.settings.first_sell_target}x</strong></div>
+              <div>Second sell: <strong>${s.settings.second_sell_target}x</strong></div>
+              <div>Cut losses: <strong>${(100 - s.settings.cut_losses_at * 100).toFixed(0)}% loss</strong></div>
+              <div>Time limit: <strong>${s.settings.time_limit_min} min</strong></div>
+              <div>Trailing stop: <strong>${(s.settings.trailing_stop * 100).toFixed(0)}%</strong></div>
+              <div>Max trades: <strong>${s.settings.max_trades}</strong></div>
+              <div>Max loss: <strong>${s.settings.max_loss_sol} SOL</strong></div>
+              <div>Min liquidity: <strong>$${(s.settings.min_liquidity/1000).toFixed(0)}K</strong></div>
+              <div>Min market cap: <strong>$${(s.settings.min_market_cap/1000).toFixed(0)}K</strong></div>
+              <div>Max market cap: <strong>$${(s.settings.max_market_cap/1000).toFixed(0)}K</strong></div>
+              <div>Min volume: <strong>$${(s.settings.min_volume/1000).toFixed(0)}K</strong></div>
+              <div>Min score: <strong>${s.settings.min_score}</strong></div>
+            </div>
+          </details>
+        </div>`;
+      }).join('');
+    }
+
+    // Backtest runs
+    const runs = d.runs || [];
+    if (!runs.length) {
+      document.getElementById('backtest-runs').innerHTML = '<div class="empty-state">No backtests run yet</div>';
+    } else {
+      document.getElementById('backtest-runs').innerHTML = runs.map(r => {
+        const statusColor = r.status === 'completed' ? 'var(--grn)' : r.status === 'running' ? 'var(--gold2)' : 'var(--t3)';
+        const statusLabel = r.status === 'completed' ? 'Done' : r.status === 'running' ? 'Running...' : r.status;
+        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px">
+          <div>
+            <span style="color:var(--t1);font-weight:700">${esc(r.name)}</span>
+            <span style="color:var(--t3);margin-left:8px">${r.days} days &middot; ${r.trades} trades</span>
+          </div>
+          <div>
+            <span style="color:${statusColor};font-weight:600">${statusLabel}</span>
+            <span style="color:var(--t3);margin-left:8px">${esc(r.when)}</span>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    // Recent shadow trades
+    const trades = d.recent_trades || [];
+    if (!trades.length) {
+      document.getElementById('shadow-trades-body').innerHTML = '<tr><td colspan="5" class="empty-state">No shadow trades yet</td></tr>';
+    } else {
+      document.getElementById('shadow-trades-body').innerHTML = trades.map(t => {
+        const pctCls = t.profit_pct >= 0 ? 'pct-pos' : 'pct-neg';
+        return `<tr>
+          <td style="font-size:11px">${esc(t.strategy)}</td>
+          <td><span class="coin-name">${esc(t.coin)}</span></td>
+          <td><span class="${pctCls}">${t.profit_pct >= 0 ? '+' : ''}${t.profit_pct.toFixed(1)}%</span></td>
+          <td style="font-size:11px;color:var(--t3)">${esc(t.exit_reason)}</td>
+          <td>${ratingBar(t.score)}</td>
+        </tr>`;
+      }).join('');
+    }
+  } catch(e) { console.error('pollBacktest error', e); }
+}
+
+// ── Apply strategy settings from backtest results ──
+async function applyStrategy(settings, presetName) {
+  // Fill settings form with the strategy's settings
+  document.getElementById('s-preset').value = presetName;
+  document.getElementById('s-buy').value = settings.buy_amount;
+  document.getElementById('s-tp1').value = settings.first_sell_target;
+  document.getElementById('s-tp2').value = settings.second_sell_target;
+  document.getElementById('s-sl').value = settings.cut_losses_at;
+  document.getElementById('s-time').value = settings.time_limit_min;
+  document.getElementById('s-trail').value = settings.trailing_stop;
+  document.getElementById('s-maxpos').value = settings.max_trades;
+  document.getElementById('s-dd').value = settings.max_loss_sol;
+  document.getElementById('s-liq').value = settings.min_liquidity;
+  document.getElementById('s-minmc').value = settings.min_market_cap;
+  document.getElementById('s-maxmc').value = settings.max_market_cap;
+  document.getElementById('s-minvol').value = settings.min_volume;
+  document.getElementById('s-minscore').value = settings.min_score;
+  settingsEdited = true;
+  // Auto-save
+  await saveSettings();
+  // Visual feedback
+  switchTab('settings');
+}
+
+// ── Init ──
 refresh();
 setInterval(refresh, 5000);
-pollFeed(); setInterval(pollFeed, 4000);
-pollListings(); setInterval(pollListings, 6000);
-pollEnhancedDashboard(); setInterval(pollEnhancedDashboard, 15000);
+pollWatch(); setInterval(pollWatch, 6000);
+pollTrades(); setInterval(pollTrades, 5000);
+pollBacktest(); setInterval(pollBacktest, 15000);
+if (initialPreset) {
+  document.getElementById('s-preset').value = initialPreset;
+}
 </script>
 """
+
+
 
 
 # ── Admin Page ─────────────────────────────────────────────────────────────────
