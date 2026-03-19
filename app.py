@@ -7354,6 +7354,61 @@ def _acquire_background_worker_lock():
         return False
 
 
+# ── Auto-prune DB to prevent disk exhaustion ──────────────────────────────────
+_DB_PRUNE_INTERVAL = 1800  # every 30 minutes
+_DB_ROW_LIMITS = {
+    # table: (max_rows, id_column)
+    "shadow_decisions": (8000, "id"),
+    "wallet_flow_events": (8000, "id"),
+    "model_decisions": (5000, "id"),
+    "signal_explorer_log": (5000, "id"),
+    "market_events": (5000, "id"),
+    "token_feature_snapshots": (8000, "id"),
+    "token_flow_snapshots": (5000, "id"),
+    "filter_log": (3000, "id"),
+    "liquidity_delta_events": (3000, "id"),
+}
+
+
+def _auto_prune_db():
+    """Background worker: periodically prune large tables to keep DB under control."""
+    while True:
+        time.sleep(_DB_PRUNE_INTERVAL)
+        try:
+            conn = db()
+            try:
+                cur = conn.cursor()
+                total_deleted = 0
+                for table, (limit, id_col) in _DB_ROW_LIMITS.items():
+                    try:
+                        cur.execute(f"SELECT COUNT(*) as c FROM {table}")
+                        count = cur.fetchone()["c"]
+                        if count > limit:
+                            cur.execute(
+                                f"DELETE FROM {table} WHERE {id_col} NOT IN "
+                                f"(SELECT {id_col} FROM {table} ORDER BY {id_col} DESC LIMIT %s)",
+                                (limit,)
+                            )
+                            deleted = cur.rowcount
+                            total_deleted += deleted
+                            if deleted > 0:
+                                print(f"[DB-PRUNE] {table}: {count} -> {limit} ({deleted} rows pruned)", flush=True)
+                    except Exception as te:
+                        conn.rollback()
+                        print(f"[DB-PRUNE] {table}: error {te}", flush=True)
+                if total_deleted > 0:
+                    conn.commit()
+                    # VACUUM in autocommit
+                    conn.autocommit = True
+                    cur.execute("VACUUM")
+                    conn.autocommit = False
+                    print(f"[DB-PRUNE] Done: {total_deleted} total rows pruned + VACUUM", flush=True)
+            finally:
+                db_return(conn)
+        except Exception as e:
+            print(f"[DB-PRUNE] Error: {e}", flush=True)
+
+
 def ensure_background_workers_started():
     global _background_workers_started
     if _background_workers_started:
@@ -7379,6 +7434,7 @@ def ensure_background_workers_started():
             execution_tape_monitor,
             quant_edge_report_monitor,
             _prune_seen_tokens,
+            _auto_prune_db,
         ]
         for target in worker_targets:
             threading.Thread(target=target, daemon=True).start()
