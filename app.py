@@ -31,6 +31,13 @@ import stripe
 from dotenv import load_dotenv
 from backtest_engine import simulate_backtest, simulate_event_tape_backtest, simulate_policy_comparison
 from edge_reporting import build_edge_report, derive_edge_guard_state, summarize_edge_report_history
+from execution_controls import (
+    DEFAULT_EXECUTION_CONTROL,
+    determine_execution_policy,
+    normalize_execution_control,
+    normalize_execution_mode,
+    normalize_policy_mode,
+)
 from learning_engine import (
     score_feature_snapshot_with_family,
     score_recent_candidates_for_regime,
@@ -505,6 +512,126 @@ def load_user_effective_settings(user_id):
     return preset_name, strip_auto_relax_state(settings)
 
 
+def _serialize_execution_control(control):
+    normalized = normalize_execution_control(control)
+    for key in ("active_policy_updated_at", "auto_promote_locked_until"):
+        value = normalized.get(key)
+        if hasattr(value, "isoformat"):
+            normalized[key] = value.isoformat()
+    return normalized
+
+
+def load_user_execution_control(user_id):
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT execution_mode, decision_policy, model_threshold, auto_promote,
+                   auto_promote_window_days, auto_promote_min_reports, auto_promote_lock_minutes,
+                   active_policy, active_policy_source, active_policy_report_id,
+                   active_policy_updated_at, auto_promote_locked_until
+            FROM bot_settings
+            WHERE user_id=%s
+        """, (user_id,))
+        row = cur.fetchone() or {}
+    finally:
+        db_return(conn)
+    return _serialize_execution_control(row)
+
+
+def persist_user_execution_control(user_id, control, only_updates=False):
+    merged = normalize_execution_control(control)
+    conn = db()
+    try:
+        cur = conn.cursor()
+        if only_updates:
+            cur.execute("""
+                INSERT INTO bot_settings (
+                    user_id, execution_mode, decision_policy, model_threshold, auto_promote,
+                    auto_promote_window_days, auto_promote_min_reports, auto_promote_lock_minutes,
+                    active_policy, active_policy_source, active_policy_report_id,
+                    active_policy_updated_at, auto_promote_locked_until
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    active_policy = EXCLUDED.active_policy,
+                    active_policy_source = EXCLUDED.active_policy_source,
+                    active_policy_report_id = EXCLUDED.active_policy_report_id,
+                    active_policy_updated_at = EXCLUDED.active_policy_updated_at,
+                    auto_promote_locked_until = EXCLUDED.auto_promote_locked_until
+            """, (
+                user_id,
+                merged["execution_mode"],
+                merged["policy_mode"],
+                merged["model_threshold"],
+                1 if merged["auto_promote"] else 0,
+                merged["auto_promote_window_days"],
+                merged["auto_promote_min_reports"],
+                merged["auto_promote_lock_minutes"],
+                merged["active_policy"],
+                merged["active_policy_source"],
+                merged.get("active_policy_report_id"),
+                merged.get("active_policy_updated_at"),
+                merged.get("auto_promote_locked_until"),
+            ))
+        else:
+            cur.execute("""
+                INSERT INTO bot_settings (
+                    user_id, execution_mode, decision_policy, model_threshold, auto_promote,
+                    auto_promote_window_days, auto_promote_min_reports, auto_promote_lock_minutes,
+                    active_policy, active_policy_source, active_policy_report_id,
+                    active_policy_updated_at, auto_promote_locked_until
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    execution_mode = EXCLUDED.execution_mode,
+                    decision_policy = EXCLUDED.decision_policy,
+                    model_threshold = EXCLUDED.model_threshold,
+                    auto_promote = EXCLUDED.auto_promote,
+                    auto_promote_window_days = EXCLUDED.auto_promote_window_days,
+                    auto_promote_min_reports = EXCLUDED.auto_promote_min_reports,
+                    auto_promote_lock_minutes = EXCLUDED.auto_promote_lock_minutes,
+                    active_policy = EXCLUDED.active_policy,
+                    active_policy_source = EXCLUDED.active_policy_source,
+                    active_policy_report_id = EXCLUDED.active_policy_report_id,
+                    active_policy_updated_at = EXCLUDED.active_policy_updated_at,
+                    auto_promote_locked_until = EXCLUDED.auto_promote_locked_until
+            """, (
+                user_id,
+                merged["execution_mode"],
+                merged["policy_mode"],
+                merged["model_threshold"],
+                1 if merged["auto_promote"] else 0,
+                merged["auto_promote_window_days"],
+                merged["auto_promote_min_reports"],
+                merged["auto_promote_lock_minutes"],
+                merged["active_policy"],
+                merged["active_policy_source"],
+                merged.get("active_policy_report_id"),
+                merged.get("active_policy_updated_at"),
+                merged.get("auto_promote_locked_until"),
+            ))
+        conn.commit()
+    finally:
+        db_return(conn)
+    return _serialize_execution_control(merged)
+
+
+def resolve_user_execution_control(user_id, guard_state=None):
+    control = load_user_execution_control(user_id)
+    focus_window_days = int(control.get("auto_promote_window_days") or DEFAULT_EXECUTION_CONTROL["auto_promote_window_days"])
+    rows = load_quant_edge_reports(limit=36)
+    history = summarize_edge_report_history(rows, focus_window_days=focus_window_days)
+    state = guard_state or derive_edge_guard_state(history)
+    selection = determine_execution_policy(history, state, control)
+    if selection.get("db_update"):
+        control = {**control, **selection["db_update"]}
+        control = persist_user_execution_control(user_id, control, only_updates=True)
+        selection = determine_execution_policy(history, state, control)
+    return {
+        **selection,
+        "control": _serialize_execution_control(selection.get("control") or control),
+    }
+
+
 def replay_recent_market_feed(bot, limit=40):
     """Re-evaluate the latest unique scanner candidates with current bot settings."""
     if not bot:
@@ -603,7 +730,19 @@ def init_db():
             profit_target_sol REAL DEFAULT 0,
             is_running INTEGER DEFAULT 0,
             drawdown_limit_sol REAL DEFAULT 0.5,
-            max_correlated INTEGER DEFAULT 3
+            max_correlated INTEGER DEFAULT 3,
+            execution_mode TEXT DEFAULT 'live',
+            decision_policy TEXT DEFAULT 'rules',
+            model_threshold REAL DEFAULT 60,
+            auto_promote INTEGER DEFAULT 0,
+            auto_promote_window_days INTEGER DEFAULT 7,
+            auto_promote_min_reports INTEGER DEFAULT 3,
+            auto_promote_lock_minutes INTEGER DEFAULT 180,
+            active_policy TEXT DEFAULT 'rules',
+            active_policy_source TEXT DEFAULT 'manual',
+            active_policy_report_id INTEGER,
+            active_policy_updated_at TIMESTAMP,
+            auto_promote_locked_until TIMESTAMP
         )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS open_positions (
@@ -1054,6 +1193,18 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS is_running INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS execution_mode TEXT DEFAULT 'live'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS decision_policy TEXT DEFAULT 'rules'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS model_threshold REAL DEFAULT 60",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_promote INTEGER DEFAULT 0",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_promote_window_days INTEGER DEFAULT 7",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_promote_min_reports INTEGER DEFAULT 3",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_promote_lock_minutes INTEGER DEFAULT 180",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_policy TEXT DEFAULT 'rules'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_policy_source TEXT DEFAULT 'manual'",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_policy_report_id INTEGER",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS active_policy_updated_at TIMESTAMP",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS auto_promote_locked_until TIMESTAMP",
             "ALTER TABLE perf_fees ADD COLUMN IF NOT EXISTS session_id TEXT",
             "ALTER TABLE filter_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
             "ALTER TABLE signal_explorer_log ADD COLUMN IF NOT EXISTS user_id INTEGER",
@@ -1744,12 +1895,21 @@ def send_sol(keypair, to_address, amount_sol):
         return None
 
 class BotInstance:
-    def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol, preset_name="balanced"):
+    def __init__(self, user_id, keypair, settings, run_mode, run_duration_min, profit_target_sol, preset_name="balanced", execution_control=None):
         self.user_id          = user_id
         self.keypair          = keypair
         self.wallet           = str(keypair.pubkey())
         self.settings         = strip_auto_relax_state(dict(settings))
         self.preset_name      = normalize_preset_name(preset_name)
+        self.execution_control = normalize_execution_control(execution_control or {})
+        self.execution_selection = {
+            "selected_policy": self.execution_control.get("active_policy") or self.execution_control.get("policy_mode") or "rules",
+            "selected_policy_label": "Rules",
+            "execution_mode": self.execution_control.get("execution_mode") or "live",
+            "selection_source": "manual",
+            "candidate_reason": "startup",
+            "model_threshold": float(self.execution_control.get("model_threshold") or MODEL_DECISION_THRESHOLD),
+        }
         self.positions        = {}
         self.log              = []
         self.running          = True
@@ -1779,6 +1939,8 @@ class BotInstance:
         self.edge_guard_state   = None
         self.edge_guard_key     = ""
         self.edge_guard_checked_at = 0.0
+        self.execution_control_checked_at = 0.0
+        self.execution_control_key = ""
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
         self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
@@ -1814,6 +1976,41 @@ class BotInstance:
             self.profit_target,
             self.settings,
         )
+
+    def _execution_signature(self, selection):
+        if not selection:
+            return ""
+        return "|".join([
+            str(selection.get("execution_mode") or ""),
+            str(selection.get("selected_policy") or ""),
+            str(selection.get("selection_source") or ""),
+            str(selection.get("candidate_reason") or ""),
+            str(selection.get("lock_until") or ""),
+        ])
+
+    def _notify_execution_selection_change(self, selection):
+        if not selection:
+            return
+        mode = str(selection.get("execution_mode") or "live").upper()
+        policy = selection.get("selected_policy_label") or selection.get("selected_policy") or "Rules"
+        source = selection.get("selection_source") or "manual"
+        reason = selection.get("candidate_reason") or "updated"
+        msg = f"🧭 Execution {mode} — {policy} ({source}). Reason: {reason.replace('_', ' ')}"
+        self.log_msg(msg)
+        try:
+            chat_id = get_user_telegram_chat_id(self.user_id)
+            if chat_id and selection.get("promotion_applied"):
+                send_telegram(
+                    chat_id,
+                    (
+                        f"🧭 <b>Execution policy updated</b>\n"
+                        f"Mode: {mode}\n"
+                        f"Policy: {policy}\n"
+                        f"Reason: {reason.replace('_', ' ')}"
+                    ),
+                )
+        except Exception as _e:
+            print(f"[ERROR] execution policy telegram failed: {_e}", flush=True)
 
     def _edge_guard_signature(self, state):
         if not state:
@@ -1876,6 +2073,73 @@ class BotInstance:
         else:
             self.edge_guard_state = state
         return self.edge_guard_state
+
+    def refresh_execution_control(self, force=False):
+        now = time.time()
+        if not force and self.execution_selection and now - self.execution_control_checked_at < EDGE_GUARD_REFRESH_SEC:
+            return self.execution_selection
+        guard_state = self.refresh_edge_guard(force=force)
+        selection_bundle = resolve_user_execution_control(self.user_id, guard_state=guard_state)
+        self.execution_control_checked_at = now
+        self.execution_control = normalize_execution_control(selection_bundle.get("control") or self.execution_control)
+        selection = {
+            key: value
+            for key, value in selection_bundle.items()
+            if key != "control"
+        }
+        signature = self._execution_signature(selection)
+        if signature != self.execution_control_key:
+            self.execution_control_key = signature
+            self.execution_selection = selection
+            self._notify_execution_selection_change(selection)
+        else:
+            self.execution_selection = selection
+        return self.execution_selection
+
+    def resolve_live_execution_decision(self, mint, name, snapshot, flow_snapshot):
+        selection = self.refresh_execution_control()
+        selected_policy = normalize_policy_mode(selection.get("selected_policy"))
+        threshold = max(40.0, min(float(selection.get("model_threshold") or MODEL_DECISION_THRESHOLD), 90.0))
+        active_regime = (_current_regime_context(include_flow_snapshot=flow_snapshot, limit=20) or {}).get("regime") or "neutral"
+        trained = False
+        model_score = None
+        driver_rows = []
+        fallback_reason = ""
+        effective_policy = selected_policy
+        allow_trade = True
+
+        if selected_policy in {"model_global", "model_regime_auto"}:
+            bundle = get_cached_quant_model_bundle(days=MODEL_TRAIN_DAYS)
+            family = bundle.get("family") or {}
+            mode = "global" if selected_policy == "model_global" else "auto"
+            scored = score_feature_snapshot_with_family(snapshot, family, active_regime, mode=mode)
+            trained = bool(scored.get("trained"))
+            model_score = float(scored.get("model_score") or 0)
+            driver_rows = scored.get("top_drivers") or []
+            fallback_reason = ((scored.get("selection") or {}).get("fallback_reason") or "")
+            if trained:
+                allow_trade = model_score >= threshold
+            else:
+                effective_policy = "rules"
+                allow_trade = True
+                fallback_reason = fallback_reason or "model_untrained_fallback_to_rules"
+
+        return {
+            "execution_mode": normalize_execution_mode(selection.get("execution_mode")),
+            "policy_mode": selection.get("policy_mode") or "rules",
+            "selected_policy": selected_policy,
+            "effective_policy": effective_policy,
+            "selected_policy_label": selection.get("selected_policy_label") or selected_policy.replace("_", " "),
+            "active_regime": active_regime,
+            "model_threshold": threshold,
+            "model_score": model_score,
+            "trained": trained,
+            "top_drivers": driver_rows,
+            "fallback_reason": fallback_reason,
+            "allow_trade": allow_trade,
+            "selection_source": selection.get("selection_source") or "manual",
+            "candidate_reason": selection.get("candidate_reason") or "manual_selection",
+        }
 
     def entry_settings(self):
         guard_state = self.refresh_edge_guard()
@@ -2607,7 +2871,7 @@ class BotInstance:
             "checks": checks,
         }
 
-    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0):
+    def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, decision_context=None):
         s = self.entry_settings()
         edge_guard = s.get("_edge_guard") or {}
         if not edge_guard.get("allow_new_entries", True):
@@ -2787,8 +3051,13 @@ class BotInstance:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
             self.consecutive_losses  = 0   # reset on successful buy
-            self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps", score=0)
-            self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps | solscan.io/tx/{sig}")
+            policy_note = ""
+            if decision_context:
+                policy_note = f" | policy={decision_context.get('effective_policy') or decision_context.get('selected_policy')}"
+                if decision_context.get("model_score") is not None:
+                    policy_note += f" score={float(decision_context.get('model_score') or 0):.1f}"
+            self.log_filter(name, mint, True, f"BUY @ ${real_price:.8f} | slip={slippage}bps{policy_note}", score=0)
+            self.log_msg(f"BUY {name} @ ${real_price:.8f} | size={trade_sol:.4f} SOL | slip={slippage}bps{policy_note} | solscan.io/tx/{sig}")
             self.refresh_balance()
             try:
                 conn = db()
@@ -3294,12 +3563,60 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
+        snapshot_info = {
+            "mint": mint,
+            "name": name,
+            "price": price,
+            "mc": mc,
+            "vol": vol,
+            "liq": liq,
+            "age_min": age_min,
+            "change": change,
+            "score": score_total,
+            "momentum": _sinfo.get("momentum"),
+            "green_lights": checklist["green_lights"],
+            "narrative_score": intel.get("narrative_score"),
+            "deployer_score": intel.get("deployer_score"),
+        }
+        feature_snapshot = build_feature_snapshot(snapshot_info, intel)
+        flow_snapshot = build_flow_snapshot(snapshot_info, intel)
+        execution_decision = self.resolve_live_execution_decision(mint, name, feature_snapshot, flow_snapshot)
+        if not execution_decision.get("allow_trade", True):
+            score_text = execution_decision.get("model_score")
+            if score_text is None:
+                score_text = 0.0
+            sig_entry["reason"] = (
+                f"{execution_decision.get('selected_policy_label') or 'Model'} "
+                f"blocked entry ({float(score_text):.1f} < {float(execution_decision.get('model_threshold') or MODEL_DECISION_THRESHOLD):.1f})"
+            )
+            self.log_signal_entry(sig_entry)
+            self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"SKIP {name} — {sig_entry['reason']}")
+            return
         sig_entry["passed"] = True
-        sig_entry["reason"] = "Passed all filters"
+        sig_entry["execution"] = execution_decision
+        execution_prefix = "Paper" if execution_decision.get("execution_mode") == "paper" else "Live"
+        policy_label = execution_decision.get("selected_policy_label") or "Rules"
+        sig_entry["reason"] = f"Passed all filters · {execution_prefix} · {policy_label}"
         self.log_signal_entry(sig_entry)
         self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, "Signal passed all filters")
-        self.buy(mint, name, price, liq=liq, dev_wallet=intel.get("deployer_wallet"), age_min=age_min)
+        if execution_decision.get("execution_mode") == "paper":
+            detail = f"{policy_label} accepted"
+            if execution_decision.get("model_score") is not None:
+                detail += f" @ {float(execution_decision.get('model_score') or 0):.1f}"
+            self.log_msg(f"PAPER BUY {name} — {detail}")
+            self.log_filter(name, mint, True, f"PAPER {detail}")
+            return
+        self.buy(
+            mint,
+            name,
+            price,
+            liq=liq,
+            dev_wallet=intel.get("deployer_wallet"),
+            age_min=age_min,
+            decision_context=execution_decision,
+        )
 
     def cashout_all(self):
         self.log_msg("CASHOUT ALL — selling all positions")
@@ -3320,6 +3637,7 @@ class BotInstance:
         while self.running:
             try:
                 self.refresh_edge_guard()
+                self.refresh_execution_control()
                 self.maybe_relax_guards()
                 if self.should_stop():
                     self.cashout_all()
@@ -6054,6 +6372,10 @@ def auto_restart_bots():
             cur.execute("""
                 SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
                        bs.max_correlated, bs.drawdown_limit_sol, bs.custom_settings,
+                       bs.execution_mode, bs.decision_policy, bs.model_threshold, bs.auto_promote,
+                       bs.auto_promote_window_days, bs.auto_promote_min_reports, bs.auto_promote_lock_minutes,
+                       bs.active_policy, bs.active_policy_source, bs.active_policy_report_id,
+                       bs.active_policy_updated_at, bs.auto_promote_locked_until,
                        w.encrypted_key, u.plan, u.email
                 FROM bot_settings bs
                 JOIN wallets w ON w.user_id = bs.user_id
@@ -6087,7 +6409,8 @@ def auto_restart_bots():
                     run_mode=row["run_mode"],
                     run_duration_min=row["run_duration_min"],
                     profit_target_sol=row["profit_target_sol"],
-                    preset_name=preset_name)
+                    preset_name=preset_name,
+                    execution_control=row)
                 with user_bots_lock:
                     user_bots[uid] = bot
                 # Reload open positions from DB so they survive Railway restarts
@@ -6878,6 +7201,18 @@ def api_state():
     except Exception:
         db_settings = strip_auto_relax_state(bot.settings) if bot else {}
     telegram_chat_id = get_user_telegram_chat_id(uid)
+    try:
+        execution_bundle = bot.refresh_execution_control() if bot else resolve_user_execution_control(uid)
+    except Exception:
+        execution_bundle = {
+            "selected_policy": "rules",
+            "selected_policy_label": "Rules",
+            "execution_mode": "live",
+            "selection_source": "manual",
+            "candidate_reason": "unavailable",
+            "model_threshold": MODEL_DECISION_THRESHOLD,
+            "control": load_user_execution_control(uid),
+        }
     
     return jsonify({
         "running":    bot.running if bot else False,
@@ -6893,6 +7228,7 @@ def api_state():
             "zero_buy_hours": 0,
             "offpeak_min_change": float(db_settings.get("offpeak_min_change") or 0),
         },
+        "execution_control": execution_bundle,
         "telegram_chat_id": telegram_chat_id,
         "telegram_connected": bool(telegram_chat_id),
     })
@@ -6951,6 +7287,7 @@ def api_start():
         run_duration_min  = bs["run_duration_min"] if bs else 0,
         profit_target_sol = bs["profit_target_sol"] if bs else 0,
         preset_name       = preset,
+        execution_control = bs or {},
     )
     with user_bots_lock:
         user_bots[uid] = bot
@@ -7020,6 +7357,28 @@ def api_settings():
     run_mode = data.get("run_mode","indefinite")
     duration = int(data.get("run_duration_min",0) or 0)
     profit   = float(data.get("profit_target_sol",0) or 0)
+    current_execution_control = load_user_execution_control(uid)
+    execution_control = normalize_execution_control({
+        **current_execution_control,
+        "execution_mode": data.get("execution_mode", current_execution_control.get("execution_mode")),
+        "policy_mode": data.get("decision_policy", data.get("policy_mode", current_execution_control.get("policy_mode"))),
+        "model_threshold": data.get("model_threshold", current_execution_control.get("model_threshold")),
+        "auto_promote": data.get("auto_promote", current_execution_control.get("auto_promote")),
+        "auto_promote_window_days": data.get("auto_promote_window_days", current_execution_control.get("auto_promote_window_days")),
+        "auto_promote_min_reports": data.get("auto_promote_min_reports", current_execution_control.get("auto_promote_min_reports")),
+        "auto_promote_lock_minutes": data.get("auto_promote_lock_minutes", current_execution_control.get("auto_promote_lock_minutes")),
+        "active_policy": data.get("active_policy", current_execution_control.get("active_policy")),
+        "active_policy_source": current_execution_control.get("active_policy_source"),
+        "active_policy_report_id": current_execution_control.get("active_policy_report_id"),
+        "active_policy_updated_at": current_execution_control.get("active_policy_updated_at"),
+        "auto_promote_locked_until": current_execution_control.get("auto_promote_locked_until"),
+    })
+    if execution_control["policy_mode"] != "auto":
+        execution_control["active_policy"] = execution_control["policy_mode"]
+        execution_control["active_policy_source"] = "manual"
+        execution_control["active_policy_report_id"] = None
+        execution_control["active_policy_updated_at"] = datetime.utcnow().isoformat()
+        execution_control["auto_promote_locked_until"] = None
     overrides = build_bot_overrides(data)
     if preset == "custom":
         _, base_settings = load_user_effective_settings(uid)
@@ -7029,6 +7388,7 @@ def api_settings():
         base_settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
     base_settings.update(overrides)
     persist_bot_settings(uid, preset, run_mode, duration, profit, base_settings)
+    persist_user_execution_control(uid, execution_control)
     bot = user_bots.get(uid)
     replayed = 0
     if bot:
@@ -7037,6 +7397,10 @@ def api_settings():
         bot.run_mode         = run_mode
         bot.run_duration_min = duration
         bot.profit_target    = profit
+        bot.execution_control = execution_control
+        bot.execution_control_checked_at = 0.0
+        bot.execution_control_key = ""
+        bot.refresh_execution_control(force=True)
         replayed = replay_recent_market_feed(bot)
         bot.log_msg(f"Settings updated — mode {preset}. Re-evaluated {replayed} recent scanner candidates.")
     return jsonify({
@@ -7049,6 +7413,7 @@ def api_settings():
         "run_mode": run_mode,
         "run_duration_min": duration,
         "profit_target_sol": profit,
+        "execution_control": bot.execution_selection if bot else resolve_user_execution_control(uid),
     })
 
 @app.route("/api/chart/<mint>")
@@ -7838,6 +8203,7 @@ def api_enhanced_dashboard():
             "mev_stats": bot.mev_system.get_health_report(),
             "circuit_breaker": bot.risk_engine.get_circuit_breaker_state(uid),
             "edge_guard": bot.refresh_edge_guard(),
+            "execution_control": bot.refresh_execution_control(),
         }
         return jsonify(data)
     except Exception as e:
@@ -9377,6 +9743,7 @@ DASHBOARD_HTML = _CSS + """
         <span class="badge bg-blue" id="hero-preset-badge">Preset loading…</span>
         <span class="badge bg-muted">{{PLAN_LABEL}}</span>
         <span class="badge bg-muted" id="hero-live-state">Connecting…</span>
+        <span class="badge bg-muted" id="hero-execution-badge">Execution lane loading…</span>
         <span class="badge bg-muted">Operator {{EMAIL}}</span>
       </div>
       <div class="hero-actions">
@@ -9676,6 +10043,77 @@ DASHBOARD_HTML = _CSS + """
               <option value="custom">Custom</option>
             </select>
             <div class="setting-unit">preset</div>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="settings-section-title">Execution Desk</div>
+          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">Control whether the app spends capital or only learns, and decide whether entries follow rules, a model, or auto-promoted report winners.</div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Execution Mode</div>
+              <div class="setting-desc">`Paper` keeps the scanner and models learning without broadcasting live buys.</div>
+            </div>
+            <select class="setting-input" id="s-execution-mode">
+              <option value="live">Live</option>
+              <option value="paper">Paper</option>
+            </select>
+            <div class="setting-unit">capital</div>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Decision Policy</div>
+              <div class="setting-desc">`Auto` follows report leadership with guardrails. Manual modes stay fixed until you change them.</div>
+            </div>
+            <select class="setting-input" id="s-policy-mode">
+              <option value="rules">Rules</option>
+              <option value="auto">Auto</option>
+              <option value="model_global">Global model</option>
+              <option value="model_regime_auto">Regime model</option>
+            </select>
+            <div class="setting-unit">policy</div>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Model Threshold</div>
+              <div class="setting-desc">Score floor used when the live lane is model-driven.</div>
+            </div>
+            <input class="setting-input" id="s-model-threshold" type="number" min="40" max="90" step="0.5">
+            <div class="setting-unit">score</div>
+          </div>
+          <div class="setting-toggle-row">
+            <div>
+              <div class="setting-label">Auto Promote Leader</div>
+              <div class="setting-desc">When `Auto` is selected, persist the leading policy and lock it for a cooldown window instead of flipping every refresh.</div>
+            </div>
+            <label class="toggle-wrap"><input id="s-auto-promote" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Promotion Window</div>
+              <div class="setting-desc">Report window used for auto policy leadership checks.</div>
+            </div>
+            <input class="setting-input" id="s-auto-window" type="number" min="3" max="30" step="1">
+            <div class="setting-unit">days</div>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Min Reports</div>
+              <div class="setting-desc">Required report count before auto mode trusts the leaderboard.</div>
+            </div>
+            <input class="setting-input" id="s-auto-min-reports" type="number" min="2" max="12" step="1">
+            <div class="setting-unit">reports</div>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Promotion Lock</div>
+              <div class="setting-desc">Cooldown after a promotion before auto mode can switch again.</div>
+            </div>
+            <input class="setting-input" id="s-auto-lock" type="number" min="30" max="10080" step="30">
+            <div class="setting-unit">min</div>
+          </div>
+          <div id="execution-control-summary" class="settings-echo" style="margin-top:12px">
+            <span class="badge bg-muted">Execution lane loading…</span>
           </div>
         </div>
 
@@ -10678,6 +11116,8 @@ const SETTINGS_FIELD_IDS = [
   's-dd', 's-maxpos', 's-minvol', 's-minscore', 's-risk', 's-holders',
   's-narr', 's-lights', 's-volspike', 's-latemult', 's-nuclear',
   's-offpeak', 's-hotchg', 's-antirug', 's-checkholders',
+  's-execution-mode', 's-policy-mode', 's-model-threshold', 's-auto-promote',
+  's-auto-window', 's-auto-min-reports', 's-auto-lock',
 ];
 const SETTINGS_DEFAULTS = {
   max_buy_sol: 0.04,
@@ -10706,9 +11146,18 @@ const SETTINGS_DEFAULTS = {
   max_hot_change: 400,
   anti_rug: true,
   check_holders: true,
+  execution_mode: 'live',
+  decision_policy: 'rules',
+  model_threshold: 60,
+  auto_promote: false,
+  auto_promote_window_days: 7,
+  auto_promote_min_reports: 3,
+  auto_promote_lock_minutes: 180,
 };
 const SETTINGS_META = [
   ['Mode', s => String(s.preset || 'balanced')],
+  ['Execution', s => String(s.execution_mode || 'live')],
+  ['Policy', s => String(s.decision_policy || 'rules').replaceAll('_', ' ')],
   ['TP1', s => Number(s.tp1_mult || 0).toFixed(2) + 'x'],
   ['TP2', s => Number(s.tp2_mult || 0).toFixed(2) + 'x'],
   ['SL', s => Number(s.stop_loss || 0).toFixed(2)],
@@ -10773,8 +11222,15 @@ function applySettingsToForm(settings, presetName) {
   setVal('s-nuclear', s.nuclear_narrative_score ?? SETTINGS_DEFAULTS.nuclear_narrative_score);
   setVal('s-offpeak', s.offpeak_min_change ?? SETTINGS_DEFAULTS.offpeak_min_change);
   setVal('s-hotchg', s.max_hot_change ?? SETTINGS_DEFAULTS.max_hot_change);
+  setVal('s-execution-mode', s.execution_mode ?? SETTINGS_DEFAULTS.execution_mode);
+  setVal('s-policy-mode', s.decision_policy ?? s.policy_mode ?? SETTINGS_DEFAULTS.decision_policy);
+  setVal('s-model-threshold', s.model_threshold ?? SETTINGS_DEFAULTS.model_threshold);
+  setVal('s-auto-window', s.auto_promote_window_days ?? SETTINGS_DEFAULTS.auto_promote_window_days);
+  setVal('s-auto-min-reports', s.auto_promote_min_reports ?? SETTINGS_DEFAULTS.auto_promote_min_reports);
+  setVal('s-auto-lock', s.auto_promote_lock_minutes ?? SETTINGS_DEFAULTS.auto_promote_lock_minutes);
   setChecked('s-antirug', s.anti_rug ?? SETTINGS_DEFAULTS.anti_rug);
   setChecked('s-checkholders', s.check_holders ?? SETTINGS_DEFAULTS.check_holders);
+  setChecked('s-auto-promote', s.auto_promote ?? SETTINGS_DEFAULTS.auto_promote);
   renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
 }
 function getSettingsFromForm() {
@@ -10806,7 +11262,38 @@ function getSettingsFromForm() {
     max_hot_change: readNum('s-hotchg', SETTINGS_DEFAULTS.max_hot_change),
     anti_rug: !!document.getElementById('s-antirug')?.checked,
     check_holders: !!document.getElementById('s-checkholders')?.checked,
+    execution_mode: document.getElementById('s-execution-mode')?.value || SETTINGS_DEFAULTS.execution_mode,
+    decision_policy: document.getElementById('s-policy-mode')?.value || SETTINGS_DEFAULTS.decision_policy,
+    model_threshold: readNum('s-model-threshold', SETTINGS_DEFAULTS.model_threshold),
+    auto_promote: !!document.getElementById('s-auto-promote')?.checked,
+    auto_promote_window_days: readNum('s-auto-window', SETTINGS_DEFAULTS.auto_promote_window_days),
+    auto_promote_min_reports: readNum('s-auto-min-reports', SETTINGS_DEFAULTS.auto_promote_min_reports),
+    auto_promote_lock_minutes: readNum('s-auto-lock', SETTINGS_DEFAULTS.auto_promote_lock_minutes),
   };
+}
+function prettyExecutionPolicy(name) {
+  const key = String(name || 'rules');
+  if (key === 'model_global') return 'Global model';
+  if (key === 'model_regime_auto') return 'Regime model';
+  if (key === 'auto') return 'Auto';
+  return 'Rules';
+}
+function renderExecutionControlSummary(bundle) {
+  const el = document.getElementById('execution-control-summary');
+  if (!el) return;
+  const control = bundle?.control || {};
+  const policyMode = control.policy_mode || control.decision_policy || 'rules';
+  const selected = bundle?.selected_policy || control.active_policy || policyMode || 'rules';
+  const executionMode = bundle?.execution_mode || control.execution_mode || 'live';
+  const badges = [
+    `<span class="badge ${executionMode === 'paper' ? 'bg-gold' : 'bg-blue'}">${executionMode === 'paper' ? 'Paper mode' : 'Live capital'}</span>`,
+    `<span class="badge bg-muted">Policy ${prettyExecutionPolicy(policyMode)}</span>`,
+    `<span class="badge bg-muted">Active ${prettyExecutionPolicy(selected)}</span>`,
+    `<span class="badge bg-muted">Threshold ${Number(bundle?.model_threshold ?? control.model_threshold ?? 60).toFixed(1)}</span>`,
+  ];
+  if (bundle?.selection_source) badges.push(`<span class="badge bg-muted">${bundle.selection_source}</span>`);
+  if (bundle?.lock_until) badges.push(`<span class="badge bg-muted">Locked until ${new Date(bundle.lock_until).toLocaleString()}</span>`);
+  el.innerHTML = badges.join('');
 }
 function renderSettingsSnapshot(settings) {
   const el = document.getElementById('settings-snapshot');
@@ -11022,7 +11509,15 @@ async function saveSettings() {
   if (res && res.ok !== false) {
     _settingsDirty = false;
     document._settingsFocused = false;
-    applySettingsToForm(res.settings || payload, res.preset || payload.preset);
+    const mergedSettings = {
+      ...(res.settings || payload),
+      ...(res.execution_control?.control || {}),
+      decision_policy: res.execution_control?.control?.policy_mode || payload.decision_policy,
+      execution_mode: res.execution_control?.control?.execution_mode || payload.execution_mode,
+      model_threshold: res.execution_control?.control?.model_threshold || payload.model_threshold,
+    };
+    applySettingsToForm(mergedSettings, res.preset || payload.preset);
+    renderExecutionControlSummary(res.execution_control || { control: mergedSettings });
     setSettingsSaveState('Saved to bot settings');
     showToast('\u2713 Settings saved', true);
     showConfirmModal(
@@ -11030,6 +11525,8 @@ async function saveSettings() {
       `Checkpoint path updated for ${String(res.preset || payload.preset)}.`,
       [
         `Preset: ${String(res.preset || payload.preset)}`,
+        `Execution: ${String(payload.execution_mode || 'live')}`,
+        `Policy: ${prettyExecutionPolicy(payload.decision_policy || 'rules')}`,
         `Saved ${res.saved_fields?.length || 0} fields`,
         `${res.replayed_candidates ?? 0} recent coins rechecked`,
       ]
@@ -11142,7 +11639,13 @@ async function refresh() {
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
   }
   if (d.settings && Object.keys(d.settings).length) {
-    const savedSettings = { ...d.settings, preset: d.preset || 'balanced' };
+    const savedSettings = {
+      ...d.settings,
+      ...(d.execution_control?.control || {}),
+      decision_policy: d.execution_control?.control?.policy_mode || d.execution_control?.policy_mode || 'rules',
+      execution_mode: d.execution_control?.control?.execution_mode || d.execution_control?.execution_mode || 'live',
+      preset: d.preset || 'balanced',
+    };
     if (!document._settingsFocused && !_settingsDirty) {
       applySettingsToForm(savedSettings, savedSettings.preset);
       _settingsDirty = false;
@@ -11151,6 +11654,15 @@ async function refresh() {
       renderLaunchSummary(savedSettings);
       renderSettingsSnapshot(savedSettings);
     }
+    renderExecutionControlSummary(d.execution_control);
+  }
+  const executionMode = d.execution_control?.execution_mode || d.execution_control?.control?.execution_mode || 'live';
+  const selectedPolicy = d.execution_control?.selected_policy || d.execution_control?.control?.active_policy || 'rules';
+  setText('hero-execution-badge', `${executionMode === 'paper' ? 'Paper' : 'Live'} · ${prettyExecutionPolicy(selectedPolicy)}`);
+  if (running) {
+    setText('hero-live-state', executionMode === 'paper' ? 'Paper mode' : 'Execution live');
+  } else if (executionMode === 'paper') {
+    setText('hero-live-state', 'Paper lane armed');
   }
   renderTelegramStatus(d.telegram_chat_id || '');
 }
