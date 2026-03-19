@@ -57,8 +57,17 @@ def _to_snapshot(row):
     snapshot["mint"] = row.get("mint")
     snapshot["name"] = row.get("name")
     if "composite_score" not in snapshot or "confidence" not in snapshot:
+        # Rebuild features from whatever data exists in the snapshot.
+        # Use snapshot as both info and intel so all stored fields are considered.
         rebuilt = build_feature_snapshot(snapshot, snapshot)
-        snapshot = {**rebuilt, **snapshot}
+        # IMPORTANT: rebuilt goes SECOND so its computed values (composite_score,
+        # confidence, quality scores) are NOT overwritten by zero-valued raw fields.
+        # Only keep non-zero raw values over rebuilt defaults.
+        merged = dict(rebuilt)
+        for key, val in snapshot.items():
+            if val not in (None, "", 0, 0.0, False) or key in ("mint", "name", "price"):
+                merged[key] = val
+        snapshot = merged
     return snapshot
 
 
@@ -137,6 +146,7 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
             "blocked": 0,
             "trades_opened": 0,
             "trades_closed": 0,
+            "blocker_counts": {},  # track WHY entries are blocked
         }
 
     for row in snapshot_rows:
@@ -208,6 +218,13 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
                 }
             else:
                 tracker["blocked"] += 1
+                for reason in (decision.blocker_reasons or []):
+                    tracker["blocker_counts"][reason] = tracker["blocker_counts"].get(reason, 0) + 1
+                if not decision.blocker_reasons:
+                    if decision.score < 40:
+                        tracker["blocker_counts"]["score_below_threshold"] = tracker["blocker_counts"].get("score_below_threshold", 0) + 1
+                    elif decision.confidence < 0.35:
+                        tracker["blocker_counts"]["confidence_below_threshold"] = tracker["blocker_counts"].get("confidence_below_threshold", 0) + 1
 
     if snapshot_rows:
         final_ts = snapshot_rows[-1].get("created_at")
@@ -292,6 +309,7 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
             "blocked": 0,
             "trades_opened": 0,
             "trades_closed": 0,
+            "blocker_counts": {},
         }
 
     for row in event_rows:
@@ -368,6 +386,13 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
                 }
             else:
                 tracker["blocked"] += 1
+                for reason in (decision.blocker_reasons or []):
+                    tracker["blocker_counts"][reason] = tracker["blocker_counts"].get(reason, 0) + 1
+                if not decision.blocker_reasons:
+                    if decision.score < 40:
+                        tracker["blocker_counts"]["score_below_threshold"] = tracker["blocker_counts"].get("score_below_threshold", 0) + 1
+                    elif decision.confidence < 0.35:
+                        tracker["blocker_counts"]["confidence_below_threshold"] = tracker["blocker_counts"].get("confidence_below_threshold", 0) + 1
 
     if event_rows:
         final_ts = event_rows[-1].get("created_at")
