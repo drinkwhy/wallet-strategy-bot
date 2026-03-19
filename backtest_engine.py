@@ -62,7 +62,7 @@ def _to_snapshot(row):
     return snapshot
 
 
-def _to_event_snapshot(row):
+def _event_payload_info(row):
     payload = row.get("payload_json") or "{}"
     try:
         info = json.loads(payload)
@@ -70,8 +70,35 @@ def _to_event_snapshot(row):
         info = {}
     if not isinstance(info, dict):
         info = {}
+    return info
+
+
+def _to_event_snapshot(row, previous_snapshot=None):
+    info = _event_payload_info(row)
+    event_type = row.get("event_type") or "market_tick"
+    previous_snapshot = dict(previous_snapshot or {})
     intel = info.get("intel") or {}
+    if previous_snapshot:
+        intel = {**previous_snapshot, **intel}
+    if event_type == "wallet_buy":
+        intel["unique_buyer_count"] = int(intel.get("unique_buyer_count") or 0) + 1
+        intel["total_buy_sol"] = float(intel.get("total_buy_sol") or 0) + float(info.get("sol") or 0)
+        intel["smart_wallet_buys"] = int(intel.get("smart_wallet_buys") or 0) + (1 if info.get("smart_wallet") else 0)
+    elif event_type == "wallet_sell":
+        intel["unique_seller_count"] = int(intel.get("unique_seller_count") or 0) + 1
+        intel["total_sell_sol"] = float(intel.get("total_sell_sol") or 0) + float(info.get("sol") or 0)
+    elif event_type in {"liquidity_add", "liquidity_drop"}:
+        intel["liquidity_drop_pct"] = float(row.get("change_pct") or info.get("delta_pct") or intel.get("liquidity_drop_pct") or 0)
+
+    total_buy_sol = float(intel.get("total_buy_sol") or 0)
+    total_sell_sol = float(intel.get("total_sell_sol") or 0)
+    intel["net_flow_sol"] = round(total_buy_sol - total_sell_sol, 4)
+    unique_buyers = int(intel.get("unique_buyer_count") or 0)
+    unique_sellers = int(intel.get("unique_seller_count") or 0)
+    intel["buy_sell_ratio"] = round(unique_buyers / max(unique_sellers, 1), 2) if unique_buyers else float(intel.get("buy_sell_ratio") or 0)
+
     enriched = {
+        **previous_snapshot,
         **info,
         "price": row.get("price") or info.get("price") or 0,
         "mc": row.get("mc") or info.get("mc") or 0,
@@ -82,11 +109,14 @@ def _to_event_snapshot(row):
         "mint": row.get("mint") or info.get("mint"),
         "name": row.get("name") or info.get("name"),
     }
+    for field in ("price", "mc", "liq", "vol", "age_min", "change", "score", "green_lights", "narrative_score"):
+        if enriched.get(field) in (None, "", 0):
+            enriched[field] = previous_snapshot.get(field, enriched.get(field))
     snapshot = build_feature_snapshot(enriched, intel)
     snapshot["price"] = float(enriched.get("price") or snapshot.get("price") or 0)
     snapshot["mint"] = enriched.get("mint")
     snapshot["name"] = enriched.get("name") or "Unknown"
-    snapshot["event_type"] = row.get("event_type") or "market_tick"
+    snapshot["event_type"] = event_type
     snapshot["source"] = row.get("source") or info.get("source") or "scanner"
     return snapshot
 
@@ -246,6 +276,7 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
 def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
     open_positions = {}
     completed = []
+    last_snapshots = {}
     metrics = {
         "events_processed": 0,
         "tokens_processed": len({row.get("mint") for row in event_rows if row.get("mint")}),
@@ -268,7 +299,8 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
         created_at = row.get("created_at")
         if not mint or not created_at:
             continue
-        snapshot = _to_event_snapshot(row)
+        snapshot = _to_event_snapshot(row, previous_snapshot=last_snapshots.get(mint))
+        last_snapshots[mint] = dict(snapshot)
         name = snapshot.get("name") or row.get("name") or "Unknown"
         metrics["events_processed"] += 1
         event_type = snapshot.get("event_type") or "market_tick"

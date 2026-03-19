@@ -5249,7 +5249,7 @@ def persist_liquidity_delta_event(mint, previous_row, info, event_type):
         db_return(conn)
 
 
-def _record_market_intelligence(info):
+def _record_market_intelligence(info, include_strategy_decisions=True, include_model_decisions=True):
     intel = info.get("intel") or {}
     snapshot = build_feature_snapshot(info, intel)
     flow_snapshot = build_flow_snapshot(info, intel)
@@ -5338,54 +5338,56 @@ def _record_market_intelligence(info):
         ))
 
         opened_positions = 0
-        for strategy_name, settings in strategies.items():
-            decision = evaluate_shadow_strategy(strategy_name, settings, snapshot)
-            decision_json = json.dumps(decision.as_dict())
-            cur.execute("""
-                INSERT INTO shadow_decisions (
-                    strategy_name, mint, name, source, passed, score, confidence, price,
-                    pass_reasons_json, blocker_reasons_json, feature_json, decision_json
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                strategy_name, info.get("mint"), info.get("name"), info.get("source") or "scanner",
-                1 if decision.passed else 0, decision.score, decision.confidence, info.get("price"),
-                json.dumps(decision.pass_reasons), json.dumps(decision.blocker_reasons),
-                json.dumps(snapshot), decision_json,
-            ))
-            if not decision.passed:
-                continue
-            cur.execute("""
-                SELECT id
-                FROM shadow_positions
-                WHERE strategy_name=%s AND mint=%s AND status='open'
-                LIMIT 1
-            """, (strategy_name, info.get("mint")))
-            if cur.fetchone():
-                continue
-            cur.execute("""
-                SELECT id
-                FROM shadow_positions
-                WHERE strategy_name=%s AND mint=%s
-                LIMIT 1
-            """, (strategy_name, info.get("mint")))
-            if cur.fetchone():
-                continue
-            cur.execute("""
-                INSERT INTO shadow_positions (
-                    strategy_name, mint, name, source, status, entry_price, current_price,
-                    peak_price, trough_price, take_profit_mult, stop_loss_ratio, time_stop_min,
-                    score, confidence, feature_json, decision_json
-                ) VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                strategy_name, info.get("mint"), info.get("name"), info.get("source") or "scanner",
-                info.get("price"), info.get("price"), info.get("price"), info.get("price"),
-                decision.metrics.get("take_profit_mult"), decision.metrics.get("stop_loss_ratio"),
-                decision.metrics.get("time_stop_min"), decision.score, decision.confidence,
-                json.dumps(snapshot), decision_json,
-            ))
-            opened_positions += 1
+        if include_strategy_decisions:
+            for strategy_name, settings in strategies.items():
+                decision = evaluate_shadow_strategy(strategy_name, settings, snapshot)
+                decision_json = json.dumps(decision.as_dict())
+                cur.execute("""
+                    INSERT INTO shadow_decisions (
+                        strategy_name, mint, name, source, passed, score, confidence, price,
+                        pass_reasons_json, blocker_reasons_json, feature_json, decision_json
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    strategy_name, info.get("mint"), info.get("name"), info.get("source") or "scanner",
+                    1 if decision.passed else 0, decision.score, decision.confidence, info.get("price"),
+                    json.dumps(decision.pass_reasons), json.dumps(decision.blocker_reasons),
+                    json.dumps(snapshot), decision_json,
+                ))
+                if not decision.passed:
+                    continue
+                cur.execute("""
+                    SELECT id
+                    FROM shadow_positions
+                    WHERE strategy_name=%s AND mint=%s AND status='open'
+                    LIMIT 1
+                """, (strategy_name, info.get("mint")))
+                if cur.fetchone():
+                    continue
+                cur.execute("""
+                    SELECT id
+                    FROM shadow_positions
+                    WHERE strategy_name=%s AND mint=%s
+                    LIMIT 1
+                """, (strategy_name, info.get("mint")))
+                if cur.fetchone():
+                    continue
+                cur.execute("""
+                    INSERT INTO shadow_positions (
+                        strategy_name, mint, name, source, status, entry_price, current_price,
+                        peak_price, trough_price, take_profit_mult, stop_loss_ratio, time_stop_min,
+                        score, confidence, feature_json, decision_json
+                    ) VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (
+                    strategy_name, info.get("mint"), info.get("name"), info.get("source") or "scanner",
+                    info.get("price"), info.get("price"), info.get("price"), info.get("price"),
+                    decision.metrics.get("take_profit_mult"), decision.metrics.get("stop_loss_ratio"),
+                    decision.metrics.get("time_stop_min"), decision.score, decision.confidence,
+                    json.dumps(snapshot), decision_json,
+                ))
+                opened_positions += 1
         conn.commit()
-        _log_model_decisions(info, snapshot, flow_snapshot)
+        if include_model_decisions:
+            _log_model_decisions(info, snapshot, flow_snapshot)
         if opened_positions:
             print(f"[SIM] opened {opened_positions} shadow position(s) for {info.get('name')}", flush=True)
     except Exception as e:
@@ -5503,7 +5505,7 @@ def execution_tape_monitor():
             finally:
                 db_return(conn)
             for row in rows:
-                refresh_token_intel(row.get("mint"), base_info={
+                intel = refresh_token_intel(row.get("mint"), base_info={
                     "mint": row.get("mint"),
                     "name": row.get("name"),
                     "symbol": row.get("symbol"),
@@ -5513,6 +5515,41 @@ def execution_tape_monitor():
                     "vol": float(row.get("last_vol") or 0),
                     "age_min": float(row.get("age_min") or 0),
                 }, force=True)
+                first_price = float((intel or {}).get("first_price") or 0)
+                current_price = float(row.get("last_price") or 0)
+                change_pct = 0.0
+                if first_price > 0 and current_price > 0:
+                    change_pct = round(((current_price / first_price) - 1.0) * 100.0, 2)
+                tape_info = {
+                    "mint": row.get("mint"),
+                    "name": row.get("name"),
+                    "symbol": row.get("symbol"),
+                    "price": current_price,
+                    "mc": float(row.get("last_mc") or 0),
+                    "liq": float(row.get("last_liq") or 0),
+                    "vol": float(row.get("last_vol") or 0),
+                    "age_min": float(row.get("age_min") or 0),
+                    "change": change_pct,
+                    "source": "execution_tape",
+                    "momentum": volume_velocity(row.get("mint"), float(row.get("last_vol") or 0)),
+                    "score": ai_score_detailed({
+                        "vol": float(row.get("last_vol") or 0),
+                        "liq": float(row.get("last_liq") or 0),
+                        "mc": float(row.get("last_mc") or 0),
+                        "age_min": float(row.get("age_min") or 0),
+                        "change": change_pct,
+                        "momentum": volume_velocity(row.get("mint"), float(row.get("last_vol") or 0)),
+                    }).get("total", 0),
+                    "intel": intel or {},
+                    "green_lights": int((intel or {}).get("green_lights") or 0),
+                    "deployer_score": int((intel or {}).get("deployer_score") or 0),
+                    "narrative_score": int((intel or {}).get("narrative_score") or 0),
+                }
+                _record_market_intelligence(
+                    tape_info,
+                    include_strategy_decisions=False,
+                    include_model_decisions=False,
+                )
                 time.sleep(2)
         except Exception as e:
             print(f"[TAPE] monitor error: {e}", flush=True)
@@ -5550,11 +5587,47 @@ def _load_backtest_event_tape(days=7, limit=80000):
         cur.execute("""
             SELECT mint, event_type, source, name, symbol, price, mc, liq, vol,
                    change_pct, age_min, payload_json, created_at
-            FROM market_events
-            WHERE created_at >= NOW() - INTERVAL %s
+            FROM (
+                SELECT mint, event_type, source, name, symbol, price, mc, liq, vol,
+                       change_pct, age_min, payload_json, created_at
+                FROM market_events
+                WHERE created_at >= NOW() - INTERVAL %s
+                UNION ALL
+                SELECT mint,
+                       CASE WHEN side='buy' THEN 'wallet_buy' ELSE 'wallet_sell' END AS event_type,
+                       source,
+                       NULL::TEXT AS name,
+                       NULL::TEXT AS symbol,
+                       NULL::REAL AS price,
+                       NULL::REAL AS mc,
+                       NULL::REAL AS liq,
+                       NULL::REAL AS vol,
+                       NULL::REAL AS change_pct,
+                       NULL::REAL AS age_min,
+                       payload_json,
+                       COALESCE(observed_at, created_at) AS created_at
+                FROM wallet_flow_events
+                WHERE COALESCE(observed_at, created_at) >= NOW() - INTERVAL %s
+                UNION ALL
+                SELECT mint,
+                       event_type,
+                       source,
+                       NULL::TEXT AS name,
+                       NULL::TEXT AS symbol,
+                       current_price AS price,
+                       NULL::REAL AS mc,
+                       current_liq AS liq,
+                       NULL::REAL AS vol,
+                       delta_pct AS change_pct,
+                       NULL::REAL AS age_min,
+                       payload_json,
+                       COALESCE(observed_at, created_at) AS created_at
+                FROM liquidity_delta_events
+                WHERE COALESCE(observed_at, created_at) >= NOW() - INTERVAL %s
+            ) tape
             ORDER BY created_at ASC
             LIMIT %s
-        """, (f"{cutoff} days", limit))
+        """, (f"{cutoff} days", f"{cutoff} days", f"{cutoff} days", limit))
         return cur.fetchall()
     finally:
         db_return(conn)

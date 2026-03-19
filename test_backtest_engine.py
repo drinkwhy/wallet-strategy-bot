@@ -119,6 +119,42 @@ class BacktestEngineTests(unittest.TestCase):
             },
             {
                 "mint": "mint-evt",
+                "name": None,
+                "price": None,
+                "mc": None,
+                "liq": None,
+                "vol": None,
+                "age_min": None,
+                "event_type": "wallet_buy",
+                "source": "helius",
+                "created_at": now + timedelta(minutes=1),
+                "payload_json": json.dumps({
+                    "wallet": "buyer-1",
+                    "sol": 2.4,
+                    "token": 1200,
+                    "smart_wallet": True,
+                }),
+            },
+            {
+                "mint": "mint-evt",
+                "name": None,
+                "price": 1.35,
+                "mc": None,
+                "liq": 16500,
+                "vol": None,
+                "age_min": None,
+                "event_type": "liquidity_add",
+                "source": "execution_tape",
+                "created_at": now + timedelta(minutes=2),
+                "payload_json": json.dumps({
+                    "delta_liq": 2500,
+                    "delta_pct": 17.8,
+                    "current_liq": 16500,
+                    "current_price": 1.35,
+                }),
+            },
+            {
+                "mint": "mint-evt",
                 "name": "TapeRunner",
                 "price": 2.15,
                 "mc": 145000,
@@ -177,8 +213,10 @@ class BacktestEngineTests(unittest.TestCase):
         }
         result = simulate_event_tape_backtest(2, rows, settings)
         self.assertEqual(result["summary"]["replay_mode"], "event_tape")
-        self.assertEqual(result["summary"]["events_processed"], 2)
+        self.assertEqual(result["summary"]["events_processed"], 4)
         self.assertEqual(result["summary"]["event_type_counts"]["price_breakout"], 1)
+        self.assertEqual(result["summary"]["event_type_counts"]["wallet_buy"], 1)
+        self.assertEqual(result["summary"]["event_type_counts"]["liquidity_add"], 1)
         self.assertEqual(result["summary"]["trades_closed"], 1)
         self.assertGreater(result["trades"][0].realized_pnl_pct, 100)
 
