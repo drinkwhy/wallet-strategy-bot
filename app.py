@@ -6227,15 +6227,248 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
         print(f"[BACKTEST] run {run_id} failed: {e}", flush=True)
 
 
+# ── Optimization: sweep filter thresholds to find best settings ─────────────
+
+# The loosest possible values for each entry filter
+_SWEEP_FLOOR = {
+    "min_score": 5, "min_liq": 500, "min_mc": 500, "max_mc": 2000000,
+    "min_vol": 100, "min_holder_growth_pct": 0, "min_narrative_score": 0,
+    "min_green_lights": 0, "min_volume_spike_mult": 0, "max_age_min": 1440,
+    "min_composite_score": 15, "min_confidence": 0.15,
+}
+_SWEEP_LEVEL_LABELS = ["Current", "Slightly Looser", "Medium Loose", "Very Loose", "Maximum Loose"]
+
+
+def _generate_sweep_levels(base_preset, num_levels=5):
+    """Generate progressively looser filter variations of a preset.
+    Level 0 = current settings, Level N-1 = loosest possible."""
+    levels = []
+    for i in range(num_levels):
+        pct = i / max(num_levels - 1, 1)  # 0.0 → 1.0
+        variant = dict(base_preset)
+        for key, loose_val in _SWEEP_FLOOR.items():
+            current = float(base_preset.get(key, loose_val))
+            if key in ("max_mc", "max_age_min"):
+                # These INCREASE when loosened
+                variant[key] = current + (loose_val - current) * pct
+            else:
+                # These DECREASE when loosened
+                variant[key] = current - (current - loose_val) * pct
+        # Round neatly
+        for k in ("min_score", "min_liq", "min_mc", "max_mc", "min_vol",
+                   "min_holder_growth_pct", "min_narrative_score", "min_green_lights",
+                   "min_volume_spike_mult", "max_age_min", "min_composite_score"):
+            if k in variant:
+                variant[k] = round(float(variant[k]), 1)
+        if "min_confidence" in variant:
+            variant["min_confidence"] = round(float(variant["min_confidence"]), 3)
+        levels.append(variant)
+    return levels
+
+
+def _score_sweep_result(summary, strategy_name):
+    """Score a backtest result for ranking sweep levels.
+    Higher = better. Balances win rate, profit, and trade count."""
+    strat = (summary.get("strategies") or {}).get(strategy_name, {})
+    closed = strat.get("trades_closed", 0)
+    if closed == 0:
+        return -999.0
+    wins = strat.get("wins", 0)
+    win_rate = (wins / closed) if closed else 0
+    avg_pnl = strat.get("avg_pnl_pct", 0) or 0
+    # Normalize trade count (more trades = more confidence, up to ~50)
+    trade_norm = min(closed / 50.0, 1.0)
+    return (win_rate * 40) + (avg_pnl * 0.4) + (trade_norm * 20)
+
+
+def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
+    """Run a sweep backtest: for each strategy, test 5 looseness levels and find the best."""
+    _set_backtest_job(run_id, {"status": "running", "started_at": time.time()})
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE backtest_runs SET status='running', started_at=NOW() WHERE id=%s", (run_id,))
+        conn.commit()
+    finally:
+        db_return(conn)
+
+    try:
+        strategy_names = strategy_names or list(CANONICAL_STRATEGIES)
+        # Load snapshots ONCE — reuse for all 20 runs
+        rows = _load_backtest_snapshots(days=days)
+        print(f"[OPTIMIZE] run {run_id}: loaded {len(rows)} snapshots over {days}d", flush=True)
+
+        if not rows:
+            raise RuntimeError(f"No snapshots found for the last {days} day(s). Start the bot to collect data first.")
+
+        all_trades = []
+        per_strategy = {}
+        total_snapshots = 0
+        total_tokens = 0
+
+        for strat_name in strategy_names:
+            if strat_name not in PRESETS:
+                continue
+            base = dict(PRESETS[strat_name])
+            levels = _generate_sweep_levels(base, num_levels=5)
+            level_results = []
+
+            for level_idx, variant_settings in enumerate(levels):
+                label = _SWEEP_LEVEL_LABELS[level_idx] if level_idx < len(_SWEEP_LEVEL_LABELS) else f"Level {level_idx}"
+                # Run simulation with this single strategy at this looseness
+                strat_dict = {strat_name: variant_settings}
+                result = simulate_backtest(run_id, rows, strat_dict)
+                summary = result["summary"]
+                strat_summary = (summary.get("strategies") or {}).get(strat_name, {})
+
+                if level_idx == 0:
+                    total_snapshots = max(total_snapshots, summary.get("snapshots_processed", 0))
+                    total_tokens = max(total_tokens, summary.get("tokens_processed", 0))
+
+                closed = strat_summary.get("trades_closed", 0)
+                wins = strat_summary.get("wins", 0)
+                losses = closed - wins
+                avg_pnl = strat_summary.get("avg_pnl_pct", 0) or 0
+                win_rate = round((wins / closed * 100) if closed else 0, 1)
+                score = _score_sweep_result(summary, strat_name)
+
+                # Extract key filter values for display
+                filter_summary = {
+                    "min_score": variant_settings.get("min_score"),
+                    "min_liq": variant_settings.get("min_liq"),
+                    "min_mc": variant_settings.get("min_mc"),
+                    "max_mc": variant_settings.get("max_mc"),
+                    "min_vol": variant_settings.get("min_vol"),
+                    "min_holder_growth_pct": variant_settings.get("min_holder_growth_pct"),
+                    "min_narrative_score": variant_settings.get("min_narrative_score"),
+                    "min_volume_spike_mult": variant_settings.get("min_volume_spike_mult"),
+                    "min_composite_score": variant_settings.get("min_composite_score", 40),
+                    "min_confidence": variant_settings.get("min_confidence", 0.35),
+                }
+
+                level_results.append({
+                    "level": level_idx,
+                    "label": label,
+                    "trades": closed,
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": win_rate,
+                    "avg_pnl": round(avg_pnl, 2),
+                    "score": round(score, 2),
+                    "decisions": strat_summary.get("decisions", 0),
+                    "passed": strat_summary.get("passed", 0),
+                    "blocked": strat_summary.get("blocked", 0),
+                    "blocker_counts": strat_summary.get("blocker_counts", {}),
+                    "filter_summary": filter_summary,
+                    "settings": variant_settings,
+                })
+                print(f"[OPTIMIZE]   {strat_name} level {level_idx} ({label}): {closed} trades, {wins} wins, avg {avg_pnl:+.1f}%, score={score:.1f}", flush=True)
+
+                # Collect trades from the best-scoring level
+                if result["trades"]:
+                    for t in result["trades"]:
+                        all_trades.append(t)
+
+            # Pick best level
+            best = max(level_results, key=lambda l: l["score"])
+            per_strategy[strat_name] = {
+                "levels": level_results,
+                "best_level": best["level"],
+                "best_label": best["label"],
+                "best_settings": best["settings"],
+                "best_score": best["score"],
+                "best_trades": best["trades"],
+                "best_win_rate": best["win_rate"],
+                "best_avg_pnl": best["avg_pnl"],
+            }
+            print(f"[OPTIMIZE] {strat_name} best: level {best['level']} ({best['label']}), {best['trades']} trades, {best['win_rate']}% win rate, {best['avg_pnl']:+.1f}% avg", flush=True)
+
+        # Build summary
+        opt_summary = {
+            "mode": "optimize",
+            "snapshots_processed": total_snapshots,
+            "tokens_processed": total_tokens,
+            "trades_closed": sum(ps["best_trades"] for ps in per_strategy.values()),
+            "per_strategy": per_strategy,
+            "strategies": {},  # Compat with normal backtest format
+        }
+        # Also populate the standard strategies format for backward compat
+        for sname, sdata in per_strategy.items():
+            best_lvl = next((l for l in sdata["levels"] if l["level"] == sdata["best_level"]), {})
+            opt_summary["strategies"][sname] = {
+                "decisions": best_lvl.get("decisions", 0),
+                "passed": best_lvl.get("passed", 0),
+                "blocked": best_lvl.get("blocked", 0),
+                "trades_opened": best_lvl.get("trades", 0),
+                "trades_closed": best_lvl.get("trades", 0),
+                "closed": best_lvl.get("trades", 0),
+                "wins": best_lvl.get("wins", 0),
+                "win_rate": best_lvl.get("win_rate", 0),
+                "avg_pnl_pct": best_lvl.get("avg_pnl", 0),
+                "blocker_counts": best_lvl.get("blocker_counts", {}),
+            }
+
+        # Save to DB
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM backtest_trades WHERE run_id=%s", (run_id,))
+            if all_trades:
+                psycopg2.extras.execute_batch(cur, """
+                    INSERT INTO backtest_trades (
+                        run_id, strategy_name, mint, name, opened_at, closed_at,
+                        entry_price, exit_price, status, score, confidence,
+                        max_upside_pct, max_drawdown_pct, realized_pnl_pct,
+                        exit_reason, feature_json, decision_json
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, [t.as_insert_tuple() for t in all_trades], page_size=200)
+            cur.execute("""
+                UPDATE backtest_runs
+                SET status='completed', completed_at=NOW(),
+                    snapshots_processed=%s, tokens_processed=%s, trades_closed=%s,
+                    summary_json=%s, error_text=NULL
+                WHERE id=%s
+            """, (
+                total_snapshots, total_tokens,
+                opt_summary["trades_closed"],
+                json.dumps(opt_summary),
+                run_id,
+            ))
+            conn.commit()
+        finally:
+            db_return(conn)
+
+        _set_backtest_job(run_id, {
+            "status": "completed", "completed_at": time.time(),
+            "summary": opt_summary, "requested_by": requested_by, "name": name,
+            "replay_mode": "optimize",
+        })
+        print(f"[OPTIMIZE] run {run_id} complete: {opt_summary['trades_closed']} total trades from best levels", flush=True)
+
+    except Exception as e:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE backtest_runs SET status='failed', completed_at=NOW(), error_text=%s WHERE id=%s", (str(e), run_id))
+            conn.commit()
+        finally:
+            db_return(conn)
+        _set_backtest_job(run_id, {"status": "failed", "error": str(e), "completed_at": time.time()})
+        print(f"[OPTIMIZE] run {run_id} failed: {e}", flush=True)
+
+
 def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="snapshot"):
     strategy_names = [s for s in (strategy_names or list(CANONICAL_STRATEGIES)) if s in PRESETS]
     if not strategy_names:
         strategy_names = ["balanced"]
-    normalized_mode = "event_tape" if str(replay_mode).strip().lower() in {"event_tape", "tape", "events"} else "snapshot"
+    is_optimize = str(replay_mode).strip().lower() in {"optimize", "find_best", "sweep"}
+    normalized_mode = "optimize" if is_optimize else (
+        "event_tape" if str(replay_mode).strip().lower() in {"event_tape", "tape", "events"} else "snapshot"
+    )
     config = {
         "days": max(1, int(days)),
         "strategy_names": strategy_names,
-        "name": (name or f"{max(1, int(days))}d replay").strip()[:80],
+        "name": (name or (f"Find Best Settings ({max(1, int(days))}d)" if is_optimize else f"{max(1, int(days))}d replay")).strip()[:80],
         "replay_mode": normalized_mode,
     }
     conn = db()
@@ -6259,11 +6492,18 @@ def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", repl
         db_return(conn)
 
     _set_backtest_job(run_id, {"status": "queued", "created_at": time.time(), **config})
-    threading.Thread(
-        target=_execute_backtest_run,
-        args=(run_id, requested_by, config["days"], strategy_names, config["name"], normalized_mode),
-        daemon=True,
-    ).start()
+    if is_optimize:
+        threading.Thread(
+            target=_execute_optimization_run,
+            args=(run_id, requested_by, config["days"], strategy_names, config["name"]),
+            daemon=True,
+        ).start()
+    else:
+        threading.Thread(
+            target=_execute_backtest_run,
+            args=(run_id, requested_by, config["days"], strategy_names, config["name"], normalized_mode),
+            daemon=True,
+        ).start()
     return run_id, config
 
 
@@ -11204,6 +11444,13 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
           </select>
         </div>
         <div>
+          <div style="font-size:11px;color:var(--t3);margin-bottom:4px">Mode</div>
+          <select class="setting-input" id="bt-mode" style="width:190px;text-align:left">
+            <option value="optimize">Find best settings ★</option>
+            <option value="snapshot">Test current settings</option>
+          </select>
+        </div>
+        <div>
           <div style="font-size:11px;color:var(--t3);margin-bottom:4px">Name (optional)</div>
           <input class="setting-input" id="bt-name" type="text" placeholder="e.g. Weekly test" style="width:160px;text-align:left">
         </div>
@@ -11807,24 +12054,30 @@ async function runBacktest() {
   const days = parseInt(document.getElementById('bt-days').value);
   const stratVal = document.getElementById('bt-strategies').value;
   const name = document.getElementById('bt-name').value.trim();
+  const mode = document.getElementById('bt-mode').value;
   const strategies = stratVal === 'all' ? ['safe','balanced','aggressive','degen'] : [stratVal];
+  const isOptimize = mode === 'optimize';
 
   btn.disabled = true;
-  btn.textContent = 'Starting...';
+  btn.textContent = isOptimize ? 'Optimizing...' : 'Starting...';
   status.style.display = 'block';
   status.style.color = 'var(--gold2)';
-  status.textContent = 'Launching backtest simulation...';
+  status.textContent = isOptimize
+    ? 'Finding best settings — testing 4 strategies × 5 looseness levels...'
+    : 'Launching backtest simulation...';
 
   try {
     const r = await fetch('/api/quant/backtests', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({days, strategies, name: name || `${days}d test`, replay_mode: 'snapshot'})
+      body: JSON.stringify({days, strategies, name: name || (isOptimize ? `Find Best (${days}d)` : `${days}d test`), replay_mode: mode})
     }).then(r => r.json());
 
     if (r.ok) {
       status.style.color = 'var(--grn)';
-      status.textContent = `Backtest started! Run #${r.run_id} is processing ${days} days of data. Results will appear below when done.`;
+      status.textContent = isOptimize
+        ? `Optimization started! Run #${r.run_id} — testing all looseness levels across ${days} days of data...`
+        : `Backtest started! Run #${r.run_id} is processing ${days} days of data. Results will appear below when done.`;
       // Start polling for completion
       pollBacktestUntilDone(r.run_id);
     } else {
@@ -11894,8 +12147,87 @@ async function loadBtDetail(runId) {
     document.getElementById('bt-detail-meta').textContent =
       `${r.days} days | ${r.trades_closed} trades | ${r.tokens_processed} tokens | ${r.snapshots_processed} snapshots | Status: ${r.status}`;
 
-    // Summary by strategy from the summary JSON
+    // ── Optimization results (sweep mode) ──
     const summary = r.summary || {};
+    if (summary.mode === 'optimize' && summary.per_strategy) {
+      let optHtml = '<div style="font-size:16px;font-weight:700;color:var(--t1);margin-bottom:8px">Optimization Results</div>';
+      optHtml += '<div style="font-size:12px;color:var(--t3);margin-bottom:14px">Each strategy was tested at 5 looseness levels. The best level is highlighted.</div>';
+      const sLabels = {safe:'Careful',balanced:'Balanced',aggressive:'Aggressive',degen:'Full Send'};
+      for (const [sname, sdata] of Object.entries(summary.per_strategy)) {
+        const bestLvl = sdata.best_level;
+        const levels = sdata.levels || [];
+        optHtml += `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:12px;padding:16px;margin-bottom:14px">`;
+        optHtml += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px">`;
+        optHtml += `<div><span style="font-size:15px;font-weight:700;color:var(--t1)">${sLabels[sname]||sname}</span>`;
+        optHtml += ` <span style="font-size:11px;color:var(--grn);margin-left:8px">Best: ${sdata.best_label} — ${sdata.best_trades} trades, ${sdata.best_win_rate}% wins, ${sdata.best_avg_pnl >= 0 ? '+' : ''}${sdata.best_avg_pnl}% avg</span></div>`;
+        const bestJson = JSON.stringify(sdata.best_settings || {}).replace(/'/g, "\\'");
+        optHtml += `<button class="btn btn-save" onclick='applyStrategy(${bestJson}, "${sname}")' style="font-size:11px;padding:5px 12px">Use Best Settings</button>`;
+        optHtml += `</div>`;
+        // Level comparison table
+        optHtml += `<table class="clean" style="font-size:11px"><thead><tr>
+          <th>Level</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Avg Profit</th><th>Passed</th><th>Blocked</th>
+        </tr></thead><tbody>`;
+        for (const lv of levels) {
+          const isBest = lv.level === bestLvl;
+          const rowStyle = isBest ? 'background:rgba(0,255,136,.08);' : '';
+          const badge = isBest ? ' <span style="color:var(--grn);font-weight:700">★ BEST</span>' : '';
+          const wrC = lv.win_rate >= 50 ? 'var(--grn)' : lv.win_rate >= 30 ? 'var(--gold2)' : 'var(--red2)';
+          const pnlC = lv.avg_pnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+          optHtml += `<tr style="${rowStyle}">
+            <td style="font-weight:${isBest?700:400}">${esc(lv.label)}${badge}</td>
+            <td>${lv.trades}</td>
+            <td style="color:var(--grn)">${lv.wins}</td>
+            <td style="color:var(--red2)">${lv.losses}</td>
+            <td style="color:${wrC};font-weight:700">${lv.win_rate}%</td>
+            <td style="color:${pnlC};font-weight:700">${lv.avg_pnl >= 0 ? '+' : ''}${lv.avg_pnl}%</td>
+            <td>${lv.passed}</td>
+            <td>${lv.blocked}</td>
+          </tr>`;
+        }
+        optHtml += '</tbody></table>';
+        // Show key filter differences for best level
+        const bestFilters = (levels.find(l => l.level === bestLvl) || {}).filter_summary || {};
+        const origFilters = (levels.find(l => l.level === 0) || {}).filter_summary || {};
+        let filterChanges = [];
+        for (const [fk, fv] of Object.entries(bestFilters)) {
+          const ov = origFilters[fk];
+          if (ov !== undefined && Math.abs(fv - ov) > 0.01) {
+            const label = fk.replace(/_/g, ' ').replace(/min |max /g, m => m.toUpperCase());
+            filterChanges.push(`${label}: ${typeof ov === 'number' && ov > 100 ? Math.round(ov).toLocaleString() : ov} → <strong style="color:var(--grn)">${typeof fv === 'number' && fv > 100 ? Math.round(fv).toLocaleString() : (typeof fv === 'number' ? fv.toFixed(fk === 'min_confidence' ? 2 : 0) : fv)}</strong>`);
+          }
+        }
+        if (filterChanges.length) {
+          optHtml += '<div style="margin-top:10px;font-size:11px;color:var(--t2)"><div style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Settings changes from current → best</div>';
+          optHtml += filterChanges.map(c => `<div style="padding:1px 0">${c}</div>`).join('');
+          optHtml += '</div>';
+        }
+        optHtml += '</div>';
+      }
+      document.getElementById('bt-detail-summary').innerHTML = optHtml;
+      // Still show trades table below
+      const trades = d.trades || [];
+      if (!trades.length) {
+        document.getElementById('bt-detail-trades').innerHTML = '<tr><td colspan="7" class="empty-state">Trades from the best levels shown above</td></tr>';
+      } else {
+        document.getElementById('bt-detail-trades').innerHTML = trades.map(t => {
+          const pct = parseFloat(t.realized_pnl_pct || 0);
+          const pctCls = pct >= 0 ? 'pct-pos' : 'pct-neg';
+          return `<tr>
+            <td style="font-size:11px">${esc(stratLabels[t.strategy_name] || t.strategy_name)}</td>
+            <td><span class="coin-name">${esc(t.name)}</span></td>
+            <td>${fmtPrice(t.entry_price)}</td>
+            <td>${fmtPrice(t.exit_price)}</td>
+            <td><span class="${pctCls}">${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%</span></td>
+            <td style="font-size:11px;color:var(--t3)">${esc(exitLabels[t.exit_reason] || (t.exit_reason||'').replace(/_/g, ' '))}</td>
+            <td>${ratingBar(t.score)}</td>
+          </tr>`;
+        }).join('');
+      }
+      panel.scrollIntoView({behavior: 'smooth', block: 'start'});
+      return;
+    }
+
+    // ── Normal backtest results (non-optimize) ──
     const blockerLabels = {
       missing_price: 'Missing price data',
       liquidity_below_threshold: 'Not enough liquidity',
