@@ -6152,6 +6152,77 @@ def _set_backtest_job(run_id, payload):
         _backtest_jobs[run_id] = payload
 
 
+def _auto_tune_from_results(requested_by, summary, run_id):
+    """After a backtest/optimization completes, automatically apply the best strategy settings."""
+    strategies = summary.get("strategies") or {}
+    per_strategy = summary.get("per_strategy") or {}
+    if not strategies and not per_strategy:
+        return
+
+    # Score each strategy: weighted combo of win_rate and avg_pnl
+    scored = []
+    for strat_name, data in strategies.items():
+        closed = data.get("trades_closed", data.get("closed", 0)) or 0
+        if closed < 3:
+            continue  # need minimum trades to be meaningful
+        win_rate = float(data.get("win_rate", 0))
+        avg_pnl = float(data.get("avg_pnl_pct", 0))
+        # Score: prioritize win rate but reward profitability
+        score = (win_rate * 0.6) + (max(avg_pnl, -50) * 0.4)
+        best_settings = None
+        if per_strategy.get(strat_name, {}).get("best_settings"):
+            best_settings = per_strategy[strat_name]["best_settings"]
+        scored.append((strat_name, score, win_rate, avg_pnl, closed, best_settings))
+
+    if not scored:
+        print(f"[AUTO-TUNE] run {run_id}: no strategies with >= 3 trades, skipping", flush=True)
+        return
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_name, best_score, best_wr, best_pnl, best_trades, best_settings = scored[0]
+    print(f"[AUTO-TUNE] run {run_id}: best strategy = {best_name} "
+          f"(score={best_score:.1f}, win_rate={best_wr:.1f}%, avg_pnl={best_pnl:+.1f}%, trades={best_trades})", flush=True)
+
+    # Build the settings to apply: start from preset, overlay optimization results
+    apply_settings = dict(PRESETS.get(best_name, PRESETS["balanced"]))
+    if best_settings and isinstance(best_settings, dict):
+        # Optimization found better filter values — apply them
+        for key in BOT_OVERRIDE_FIELDS:
+            field_name = key[0] if isinstance(key, tuple) else key
+            if field_name in best_settings:
+                apply_settings[field_name] = best_settings[field_name]
+        print(f"[AUTO-TUNE] applying optimized filter values from sweep", flush=True)
+
+    # Save to DB
+    try:
+        persist_bot_settings(
+            user_id=requested_by,
+            preset=best_name,
+            run_mode="indefinite",
+            duration=0,
+            profit=0,
+            settings=apply_settings,
+        )
+        print(f"[AUTO-TUNE] saved preset={best_name} to bot_settings for user {requested_by}", flush=True)
+    except Exception as e:
+        print(f"[AUTO-TUNE] failed to save settings: {e}", flush=True)
+        return
+
+    # Hot-reload into running bot if one exists
+    with user_bots_lock:
+        bots = user_bots.get(requested_by, {})
+        for bot in bots.values():
+            if bot.running:
+                bot.settings.update(apply_settings)
+                bot.preset_name = best_name
+                print(f"[AUTO-TUNE] hot-reloaded {best_name} settings into running bot", flush=True)
+
+    # Log summary for all strategies
+    for strat_name, score, wr, pnl, trades, _ in scored:
+        tag = " ← APPLIED" if strat_name == best_name else ""
+        print(f"[AUTO-TUNE]   {strat_name}: score={score:.1f}, wr={wr:.1f}%, pnl={pnl:+.1f}%, trades={trades}{tag}", flush=True)
+
+
 def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, replay_mode="snapshot"):
     _set_backtest_job(run_id, {"status": "running", "started_at": time.time()})
     conn = db()
@@ -6252,6 +6323,11 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
             "name": name,
             "replay_mode": normalized_mode,
         })
+        # Auto-tune: apply the best strategy from this backtest to live settings
+        try:
+            _auto_tune_from_results(requested_by, summary, run_id)
+        except Exception as tune_err:
+            print(f"[AUTO-TUNE] error after backtest {run_id}: {tune_err}", flush=True)
     except Exception as e:
         conn = db()
         try:
@@ -6487,6 +6563,12 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
             "replay_mode": "optimize",
         })
         print(f"[OPTIMIZE] run {run_id} complete: {len(all_best_trades)} trades saved (best levels only)", flush=True)
+
+        # Auto-tune: apply the best strategy from this optimization to live settings
+        try:
+            _auto_tune_from_results(requested_by, opt_summary, run_id)
+        except Exception as tune_err:
+            print(f"[AUTO-TUNE] error after optimization {run_id}: {tune_err}", flush=True)
 
     except Exception as e:
         conn = db()
