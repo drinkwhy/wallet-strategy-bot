@@ -240,15 +240,19 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     _liq_min = _safe_float(settings.get("min_liq", 0))
     if _liq_min > 0 and _liq_val > 0 and _liq_val < _liq_min:
         blocker_reasons.append("liquidity_below_threshold")
-    if snapshot["mc"] < _safe_float(settings.get("min_mc", 0)):
+    _mc_val = _safe_float(snapshot.get("mc"))
+    _mc_min = _safe_float(settings.get("min_mc", 0))
+    if _mc_min > 0 and _mc_val > 0 and _mc_val < _mc_min:
         blocker_reasons.append("market_cap_below_floor")
-    if _safe_float(settings.get("max_mc", 0)) > 0 and snapshot["mc"] > _safe_float(settings.get("max_mc", 0)):
+    if _safe_float(settings.get("max_mc", 0)) > 0 and _mc_val > 0 and _mc_val > _safe_float(settings.get("max_mc", 0)):
         blocker_reasons.append("market_cap_above_ceiling")
     _vol_val = _safe_float(snapshot.get("vol"))
     _vol_min = _safe_float(settings.get("min_vol", 0))
     if _vol_min > 0 and _vol_val > 0 and _vol_val < _vol_min:
         blocker_reasons.append("volume_below_threshold")
-    if snapshot["score"] < _safe_float(settings.get("min_score", 0)):
+    _score_val = _safe_float(snapshot.get("score"))
+    _score_min = _safe_float(settings.get("min_score", 0))
+    if _score_min > 0 and _score_val > 0 and _score_val < _score_min:
         blocker_reasons.append("ai_score_below_threshold")
     _age_val = _safe_float(snapshot.get("age_min"))
     _age_max = _safe_float(settings.get("max_age_min", 9999))
@@ -285,7 +289,7 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         pass_reasons.append("liquidity_ok")
     if _vol_val >= _vol_min or _vol_val == 0:
         pass_reasons.append("volume_ok")
-    if snapshot["score"] >= _safe_float(settings.get("min_score", 0)):
+    if _score_val >= _score_min or _score_val == 0:
         pass_reasons.append("ai_score_ok")
     if _gl_val >= _gl_min or _gl_val == 0:
         pass_reasons.append("green_lights_ok")
