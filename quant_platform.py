@@ -236,26 +236,36 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
 
     if snapshot["price"] <= 0:
         blocker_reasons.append("missing_price")
-    if settings.get("min_liq", 0) > 0 and snapshot["liq"] < _safe_float(settings.get("min_liq")):
+    _liq_val = _safe_float(snapshot.get("liq"))
+    _liq_min = _safe_float(settings.get("min_liq", 0))
+    if _liq_min > 0 and _liq_val > 0 and _liq_val < _liq_min:
         blocker_reasons.append("liquidity_below_threshold")
     if snapshot["mc"] < _safe_float(settings.get("min_mc", 0)):
         blocker_reasons.append("market_cap_below_floor")
     if _safe_float(settings.get("max_mc", 0)) > 0 and snapshot["mc"] > _safe_float(settings.get("max_mc", 0)):
         blocker_reasons.append("market_cap_above_ceiling")
-    if snapshot["vol"] < _safe_float(settings.get("min_vol", 0)):
+    _vol_val = _safe_float(snapshot.get("vol"))
+    _vol_min = _safe_float(settings.get("min_vol", 0))
+    if _vol_min > 0 and _vol_val > 0 and _vol_val < _vol_min:
         blocker_reasons.append("volume_below_threshold")
     if snapshot["score"] < _safe_float(settings.get("min_score", 0)):
         blocker_reasons.append("ai_score_below_threshold")
-    if snapshot["age_min"] > _safe_float(settings.get("max_age_min", 9999)):
+    _age_val = _safe_float(snapshot.get("age_min"))
+    _age_max = _safe_float(settings.get("max_age_min", 9999))
+    if _age_val > 0 and _age_val < 9999 and _age_val > _age_max:
         blocker_reasons.append("token_too_old")
-    if snapshot["green_lights"] < _safe_int(settings.get("min_green_lights", 0)):
+    # Green lights, narrative, holder growth, and volume spike are enrichment
+    # fields that may not exist in historical snapshots.  Treat them as blockers
+    # ONLY when data is actually present (non-zero) but below the threshold —
+    # if data is missing (0), skip the blocker so backtests don't produce zero trades.
+    _gl_val = _safe_int(snapshot.get("green_lights"))
+    _gl_min = _safe_int(settings.get("min_green_lights", 0))
+    if _gl_min > 0 and _gl_val > 0 and _gl_val < _gl_min:
         blocker_reasons.append("green_lights_below_threshold")
-    if snapshot["narrative_score"] < _safe_int(settings.get("min_narrative_score", 0)):
+    _narr_val = _safe_int(snapshot.get("narrative_score"))
+    _narr_min = _safe_int(settings.get("min_narrative_score", 0))
+    if _narr_min > 0 and _narr_val > 0 and _narr_val < _narr_min:
         blocker_reasons.append("narrative_below_threshold")
-    # Holder growth and volume spike are enrichment fields that may not exist in
-    # historical snapshots.  Treat them as blockers ONLY when data is actually
-    # present (non-zero) but still below the threshold — if data is missing (0),
-    # skip the blocker so backtests don't silently produce zero trades.
     _holder_growth_val = _safe_float(snapshot.get("holder_growth_1h"))
     _holder_growth_min = _safe_float(settings.get("min_holder_growth_pct", 0))
     if _holder_growth_min > 0 and _holder_growth_val > 0 and _holder_growth_val < _holder_growth_min:
@@ -271,15 +281,15 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     if _safe_int(snapshot.get("threat_risk_score")) >= 70:
         blocker_reasons.append("threat_risk_too_high")
 
-    if snapshot["liq"] >= _safe_float(settings.get("min_liq", 0)):
+    if _liq_val >= _liq_min or _liq_val == 0:
         pass_reasons.append("liquidity_ok")
-    if snapshot["vol"] >= _safe_float(settings.get("min_vol", 0)):
+    if _vol_val >= _vol_min or _vol_val == 0:
         pass_reasons.append("volume_ok")
     if snapshot["score"] >= _safe_float(settings.get("min_score", 0)):
         pass_reasons.append("ai_score_ok")
-    if snapshot["green_lights"] >= _safe_int(settings.get("min_green_lights", 0)):
+    if _gl_val >= _gl_min or _gl_val == 0:
         pass_reasons.append("green_lights_ok")
-    if snapshot["narrative_score"] >= _safe_int(settings.get("min_narrative_score", 0)):
+    if _narr_val >= _narr_min or _narr_val == 0:
         pass_reasons.append("narrative_ok")
     if _holder_growth_val >= _holder_growth_min or _holder_growth_val == 0:
         pass_reasons.append("holder_growth_ok")
