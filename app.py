@@ -8837,11 +8837,12 @@ def api_market_watch():
     uid = session["user_id"]
     bot = user_bots.get(uid)
 
-    # Gather evaluations from in-memory log first, DB fallback
+    # Gather evaluations from in-memory log first, then DB fallbacks
     entries = []
     if bot and bot.signal_explorer_log:
         entries = list(bot.signal_explorer_log)
     if not entries:
+        # Fallback 1: signal_explorer_log table (user-specific)
         conn = db()
         try:
             cur = conn.cursor()
@@ -8857,6 +8858,38 @@ def api_market_watch():
                         entries.append(p)
                 except Exception:
                     pass
+        finally:
+            db_return(conn)
+    if not entries:
+        # Fallback 2: shadow_decisions table (global — all strategy evaluations)
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT ON (mint)
+                       strategy_name, mint, name, passed, score, confidence, price,
+                       blocker_reasons_json, created_at
+                FROM shadow_decisions
+                ORDER BY mint, created_at DESC
+                LIMIT 200
+            """)
+            for row in cur.fetchall():
+                blockers = []
+                try:
+                    blockers = json.loads(row.get("blocker_reasons_json") or "[]")
+                except Exception:
+                    pass
+                reason = blockers[0] if blockers else ""
+                entries.append({
+                    "mint": row.get("mint"),
+                    "name": row.get("name") or "Unknown",
+                    "passed": bool(row.get("passed")),
+                    "score": float(row.get("score") or 0),
+                    "price": float(row.get("price") or 0),
+                    "reason": reason,
+                    "timestamp": row["created_at"].timestamp() if row.get("created_at") and hasattr(row["created_at"], "timestamp") else 0,
+                    "filters": [],
+                })
         finally:
             db_return(conn)
 
@@ -9047,12 +9080,15 @@ def api_my_trades():
 @app.route("/api/backtest-results")
 @login_required
 def api_backtest_results():
-    """Simplified backtest results: strategy performance + settings for each."""
+    """Simplified backtest results: strategy performance + settings for each.
+    Pulls from ALL data sources: shadow_positions, backtest_trades, backtest_runs.
+    """
     uid = session["user_id"]
     conn = db()
     try:
         cur = conn.cursor()
-        # Shadow performance by strategy
+
+        # ── 1. Strategy performance from SHADOW positions (live shadow trading) ──
         cur.execute("""
             SELECT strategy_name,
                    COUNT(*) AS closed_trades,
@@ -9067,27 +9103,71 @@ def api_backtest_results():
             GROUP BY strategy_name
             ORDER BY avg_pnl DESC NULLS LAST
         """)
-        perf_rows = cur.fetchall()
-        # Recent backtest runs
+        shadow_perf_rows = cur.fetchall()
+
+        # ── 2. Strategy performance from BACKTEST trades (from backtest runs) ──
         cur.execute("""
-            SELECT id, name, status, days, strategy_filter, trades_closed, summary_json,
-                   config_json, created_at
-            FROM backtest_runs
-            WHERE requested_by=%s
-            ORDER BY created_at DESC
-            LIMIT 10
-        """, (uid,))
-        run_rows = cur.fetchall()
-        # Recent shadow trades (most recent 30)
-        cur.execute("""
-            SELECT strategy_name, mint, name, entry_price, exit_price, realized_pnl_pct,
-                   exit_reason, opened_at, closed_at, score
-            FROM shadow_positions
-            WHERE status='closed'
-            ORDER BY closed_at DESC NULLS LAST
-            LIMIT 30
+            SELECT bt.strategy_name,
+                   COUNT(*) AS closed_trades,
+                   SUM(CASE WHEN bt.realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(bt.realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND(MAX(bt.realized_pnl_pct)::numeric, 2) AS best_trade,
+                   ROUND(MIN(bt.realized_pnl_pct)::numeric, 2) AS worst_trade,
+                   ROUND(AVG(bt.max_upside_pct)::numeric, 2) AS avg_upside,
+                   ROUND(AVG(bt.max_drawdown_pct)::numeric, 2) AS avg_drawdown
+            FROM backtest_trades bt
+            JOIN backtest_runs br ON br.id = bt.run_id
+            WHERE bt.status='closed' AND br.status='completed'
+            GROUP BY bt.strategy_name
+            ORDER BY avg_pnl DESC NULLS LAST
         """)
-        trade_rows = cur.fetchall()
+        bt_perf_rows = cur.fetchall()
+
+        # ── 3. All backtest runs (no user filter — global data) ──
+        cur.execute("""
+            SELECT id, name, status, days, replay_mode, strategy_filter, trades_closed,
+                   summary_json, config_json, created_at, snapshots_processed, tokens_processed
+            FROM backtest_runs
+            ORDER BY created_at DESC
+            LIMIT 15
+        """)
+        run_rows = cur.fetchall()
+
+        # ── 4. Recent trades from BOTH sources combined ──
+        # Shadow trades
+        cur.execute("""
+            SELECT 'shadow' AS source, strategy_name, mint, name, entry_price, exit_price,
+                   realized_pnl_pct, exit_reason, closed_at, score
+            FROM shadow_positions
+            WHERE status='closed' AND realized_pnl_pct IS NOT NULL
+            ORDER BY closed_at DESC NULLS LAST
+            LIMIT 20
+        """)
+        shadow_trade_rows = cur.fetchall()
+
+        # Backtest trades
+        cur.execute("""
+            SELECT 'backtest' AS source, bt.strategy_name, bt.mint, bt.name, bt.entry_price,
+                   bt.exit_price, bt.realized_pnl_pct, bt.exit_reason, bt.closed_at, bt.score
+            FROM backtest_trades bt
+            JOIN backtest_runs br ON br.id = bt.run_id
+            WHERE bt.status='closed' AND br.status='completed' AND bt.realized_pnl_pct IS NOT NULL
+            ORDER BY bt.closed_at DESC NULLS LAST
+            LIMIT 20
+        """)
+        bt_trade_rows = cur.fetchall()
+
+        # ── 5. Open shadow positions (still tracking) ──
+        cur.execute("""
+            SELECT strategy_name, mint, name, entry_price, current_price, score,
+                   max_upside_pct, max_drawdown_pct, opened_at, observations
+            FROM shadow_positions
+            WHERE status='open'
+            ORDER BY opened_at DESC NULLS LAST
+            LIMIT 20
+        """)
+        open_shadow_rows = cur.fetchall()
+
     finally:
         db_return(conn)
 
@@ -9098,31 +9178,61 @@ def api_backtest_results():
         "aggressive": "Aggressive (Higher Risk)",
         "degen": "Full Send (Max Risk)",
     }
-    # Plain-English exit reasons
     exit_labels = {
         "take_profit": "Hit profit target",
         "stop_loss": "Hit loss limit",
         "time_stop": "Ran out of time",
     }
 
-    strategies = []
-    for row in perf_rows:
+    # ── Merge strategy performance from both sources ──
+    perf_map = {}
+    for row in shadow_perf_rows:
         name = row.get("strategy_name", "")
-        trades = int(row.get("closed_trades") or 0)
-        wins = int(row.get("wins") or 0)
+        perf_map[name] = {
+            "closed_trades": int(row.get("closed_trades") or 0),
+            "wins": int(row.get("wins") or 0),
+            "avg_pnl": float(row.get("avg_pnl") or 0),
+            "best_trade": float(row.get("best_trade") or 0),
+            "worst_trade": float(row.get("worst_trade") or 0),
+            "avg_upside": float(row.get("avg_upside") or 0),
+            "avg_drawdown": float(row.get("avg_drawdown") or 0),
+            "source": "shadow",
+        }
+    # Backtest results override shadow if they have more trades
+    for row in bt_perf_rows:
+        name = row.get("strategy_name", "")
+        bt_trades = int(row.get("closed_trades") or 0)
+        existing = perf_map.get(name)
+        if not existing or bt_trades > existing["closed_trades"]:
+            perf_map[name] = {
+                "closed_trades": bt_trades,
+                "wins": int(row.get("wins") or 0),
+                "avg_pnl": float(row.get("avg_pnl") or 0),
+                "best_trade": float(row.get("best_trade") or 0),
+                "worst_trade": float(row.get("worst_trade") or 0),
+                "avg_upside": float(row.get("avg_upside") or 0),
+                "avg_drawdown": float(row.get("avg_drawdown") or 0),
+                "source": "backtest",
+            }
+
+    strategies = []
+    for name, p in sorted(perf_map.items(), key=lambda x: -x[1]["avg_pnl"]):
+        trades = p["closed_trades"]
+        wins = p["wins"]
         preset = PRESETS.get(name, {})
         strategies.append({
             "name": name,
             "label": strategy_labels.get(name, name.title()),
+            "data_source": "Backtest Simulation" if p["source"] == "backtest" else "Live Shadow Trading",
             "total_trades": trades,
             "wins": wins,
             "losses": trades - wins,
             "win_rate": round(wins / trades * 100) if trades else 0,
-            "avg_profit_pct": float(row.get("avg_pnl") or 0),
-            "best_trade_pct": float(row.get("best_trade") or 0),
-            "worst_trade_pct": float(row.get("worst_trade") or 0),
-            "avg_best_gain_pct": float(row.get("avg_upside") or 0),
-            "avg_worst_drop_pct": float(row.get("avg_drawdown") or 0),
+            "avg_profit_pct": p["avg_pnl"],
+            "best_trade_pct": p["best_trade"],
+            "worst_trade_pct": p["worst_trade"],
+            "avg_best_gain_pct": p["avg_upside"],
+            "avg_worst_drop_pct": p["avg_drawdown"],
             "settings": {
                 "buy_amount": preset.get("max_buy_sol", 0),
                 "first_sell_target": preset.get("tp1_mult", 0),
@@ -9140,6 +9250,35 @@ def api_backtest_results():
             },
         })
 
+    # If no closed trades yet but strategies exist in PRESETS, show them anyway
+    if not strategies:
+        for name in ["safe", "balanced", "aggressive", "degen"]:
+            preset = PRESETS.get(name, {})
+            strategies.append({
+                "name": name,
+                "label": strategy_labels.get(name, name.title()),
+                "data_source": "No data yet",
+                "total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0,
+                "avg_profit_pct": 0, "best_trade_pct": 0, "worst_trade_pct": 0,
+                "avg_best_gain_pct": 0, "avg_worst_drop_pct": 0,
+                "settings": {
+                    "buy_amount": preset.get("max_buy_sol", 0),
+                    "first_sell_target": preset.get("tp1_mult", 0),
+                    "second_sell_target": preset.get("tp2_mult", 0),
+                    "cut_losses_at": preset.get("stop_loss", 0),
+                    "time_limit_min": preset.get("time_stop_min", 0),
+                    "trailing_stop": preset.get("trail_pct", 0),
+                    "max_trades": preset.get("max_correlated", 0),
+                    "max_loss_sol": preset.get("drawdown_limit_sol", 0),
+                    "min_liquidity": preset.get("min_liq", 0),
+                    "min_market_cap": preset.get("min_mc", 0),
+                    "max_market_cap": preset.get("max_mc", 0),
+                    "min_volume": preset.get("min_vol", 0),
+                    "min_score": preset.get("min_score", 0),
+                },
+            })
+
+    # ── Runs ──
     runs = []
     for row in run_rows:
         try:
@@ -9150,21 +9289,43 @@ def api_backtest_results():
             config = json.loads(row.get("config_json") or "{}")
         except Exception:
             config = {}
+        # Pull per-strategy results from summary if available
+        strat_results = []
+        if isinstance(summary, dict):
+            for sname, sdata in summary.items():
+                if isinstance(sdata, dict) and "closed" in sdata:
+                    strat_results.append({
+                        "strategy": strategy_labels.get(sname, sname.title()),
+                        "trades": int(sdata.get("closed") or 0),
+                        "wins": int(sdata.get("wins") or 0),
+                        "avg_pnl": round(float(sdata.get("avg_pnl_pct") or 0), 1),
+                        "win_rate": round(float(sdata.get("win_rate") or 0), 0),
+                    })
         runs.append({
             "id": int(row.get("id") or 0),
             "name": row.get("name") or f"Run #{row.get('id')}",
             "status": row.get("status"),
             "days": int(row.get("days") or 0),
+            "mode": row.get("replay_mode") or "snapshot",
             "trades": int(row.get("trades_closed") or 0),
+            "snapshots": int(row.get("snapshots_processed") or 0),
+            "tokens": int(row.get("tokens_processed") or 0),
             "strategies": row.get("strategy_filter") or "all",
-            "summary": summary,
+            "strategy_results": strat_results,
             "when": row.get("created_at").strftime("%b %d, %I:%M %p") if row.get("created_at") and hasattr(row["created_at"], "strftime") else str(row.get("created_at") or ""),
         })
 
+    # ── Merge recent trades from both sources ──
+    all_trade_rows = list(shadow_trade_rows) + list(bt_trade_rows)
+    # Sort by closed_at desc
+    all_trade_rows.sort(key=lambda r: r.get("closed_at") or datetime.min, reverse=True)
+
     recent_trades = []
-    for row in trade_rows:
+    for row in all_trade_rows[:30]:
         exit_r = row.get("exit_reason") or ""
+        src = row.get("source", "")
         recent_trades.append({
+            "source": "Backtest" if src == "backtest" else "Shadow",
             "strategy": strategy_labels.get(row.get("strategy_name", ""), row.get("strategy_name", "")),
             "coin": row.get("name") or "Unknown",
             "profit_pct": float(row.get("realized_pnl_pct") or 0),
@@ -9174,10 +9335,28 @@ def api_backtest_results():
             "exit_price": float(row.get("exit_price") or 0),
         })
 
+    # ── Open shadow positions ──
+    open_positions = []
+    for row in open_shadow_rows:
+        entry = float(row.get("entry_price") or 0)
+        current = float(row.get("current_price") or 0)
+        pnl_pct = round(((current / entry) - 1) * 100, 1) if entry > 0 and current > 0 else 0
+        open_positions.append({
+            "strategy": strategy_labels.get(row.get("strategy_name", ""), row.get("strategy_name", "")),
+            "coin": row.get("name") or "Unknown",
+            "entry_price": entry,
+            "current_price": current,
+            "pnl_pct": pnl_pct,
+            "best_gain_pct": float(row.get("max_upside_pct") or 0),
+            "worst_drop_pct": float(row.get("max_drawdown_pct") or 0),
+            "checks": int(row.get("observations") or 0),
+        })
+
     return jsonify({
         "strategies": strategies,
         "runs": runs,
         "recent_trades": recent_trades,
+        "open_positions": open_positions,
     })
 
 
@@ -10829,11 +11008,19 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
       </div>
     </div>
     <div class="glass">
-      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Recent Shadow Trades</div>
-      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Simulated trades the bot would have made</div>
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Currently Tracking (Open Positions)</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Coins the bot is watching with fake money right now</div>
+      <div id="open-shadow-positions">
+        <div class="empty-state">No open shadow positions</div>
+      </div>
+    </div>
+    <div class="glass">
+      <div style="font-size:18px;font-weight:700;color:var(--t1);margin-bottom:4px">Completed Simulated Trades</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:14px">Trades the bot would have made (shadow + backtest)</div>
       <table class="clean">
         <thead>
           <tr>
+            <th>Source</th>
             <th>Strategy</th>
             <th>Coin</th>
             <th>Profit</th>
@@ -10842,7 +11029,7 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
           </tr>
         </thead>
         <tbody id="shadow-trades-body">
-          <tr><td colspan="5" class="empty-state">No shadow trades yet</td></tr>
+          <tr><td colspan="6" class="empty-state">No simulated trades yet</td></tr>
         </tbody>
       </table>
     </div>
@@ -11148,7 +11335,7 @@ async function pollBacktest() {
           <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:12px">
             <div>
               <div style="font-size:16px;font-weight:700;color:var(--t1)">${esc(s.label)}</div>
-              <div style="font-size:11px;color:var(--t3);margin-top:2px">${s.total_trades} trades tested &middot; ${s.wins} won &middot; ${s.losses} lost</div>
+              <div style="font-size:11px;color:var(--t3);margin-top:2px">${s.total_trades} trades tested &middot; ${s.wins} won &middot; ${s.losses} lost &middot; <em>${esc(s.data_source)}</em></div>
             </div>
             <button class="btn btn-save" onclick='applyStrategy(${settingsJson}, "${s.name}")' style="font-size:11px;padding:6px 14px">Use These Settings</button>
           </div>
@@ -11195,32 +11382,75 @@ async function pollBacktest() {
     // Backtest runs
     const runs = d.runs || [];
     if (!runs.length) {
-      document.getElementById('backtest-runs').innerHTML = '<div class="empty-state">No backtests run yet</div>';
+      document.getElementById('backtest-runs').innerHTML = '<div class="empty-state">No backtests run yet. The bot runs simulations automatically when active.</div>';
     } else {
       document.getElementById('backtest-runs').innerHTML = runs.map(r => {
-        const statusColor = r.status === 'completed' ? 'var(--grn)' : r.status === 'running' ? 'var(--gold2)' : 'var(--t3)';
-        const statusLabel = r.status === 'completed' ? 'Done' : r.status === 'running' ? 'Running...' : r.status;
-        return `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px">
-          <div>
-            <span style="color:var(--t1);font-weight:700">${esc(r.name)}</span>
-            <span style="color:var(--t3);margin-left:8px">${r.days} days &middot; ${r.trades} trades</span>
+        const statusColor = r.status === 'completed' ? 'var(--grn)' : r.status === 'running' ? 'var(--gold2)' : r.status === 'failed' ? 'var(--red2)' : 'var(--t3)';
+        const statusLabel = r.status === 'completed' ? 'Done' : r.status === 'running' ? 'Running...' : r.status === 'failed' ? 'Failed' : r.status || 'Unknown';
+        let stratHtml = '';
+        if (r.strategy_results && r.strategy_results.length) {
+          stratHtml = '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">' + r.strategy_results.map(sr => {
+            const c = sr.avg_pnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+            return `<span style="font-size:10px;padding:3px 8px;border-radius:6px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)">
+              ${esc(sr.strategy)}: <strong style="color:${c}">${sr.avg_pnl >= 0 ? '+' : ''}${sr.avg_pnl}%</strong> avg, ${sr.win_rate}% wins (${sr.trades} trades)
+            </span>`;
+          }).join('') + '</div>';
+        }
+        return `<div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,.04)">
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+            <div>
+              <span style="color:var(--t1);font-weight:700">${esc(r.name)}</span>
+              <span style="color:var(--t3);margin-left:8px">${r.days} days &middot; ${r.trades} trades &middot; ${r.tokens} tokens &middot; ${r.snapshots} snapshots</span>
+            </div>
+            <div>
+              <span style="color:${statusColor};font-weight:600">${statusLabel}</span>
+              <span style="color:var(--t3);margin-left:8px">${esc(r.when)}</span>
+            </div>
           </div>
-          <div>
-            <span style="color:${statusColor};font-weight:600">${statusLabel}</span>
-            <span style="color:var(--t3);margin-left:8px">${esc(r.when)}</span>
+          ${stratHtml}
+        </div>`;
+      }).join('');
+    }
+
+    // Open shadow positions
+    const openPos = d.open_positions || [];
+    if (!openPos.length) {
+      document.getElementById('open-shadow-positions').innerHTML = '<div class="empty-state">No open shadow positions being tracked right now</div>';
+    } else {
+      document.getElementById('open-shadow-positions').innerHTML = openPos.map(p => {
+        const pctCls = p.pnl_pct >= 0 ? 'pct-pos' : 'pct-neg';
+        return `<div class="trade-card">
+          <div class="trade-info">
+            <div class="trade-name">${esc(p.coin)}</div>
+            <div class="trade-meta">${esc(p.strategy)} &middot; Entry ${fmtPrice(p.entry_price)} &middot; Now ${fmtPrice(p.current_price)} &middot; ${p.checks} price checks</div>
+          </div>
+          <div style="display:flex;gap:16px;align-items:center">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3)">Current</div>
+              <div class="trade-pnl ${pctCls}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3)">Best</div>
+              <div style="font-size:14px;font-weight:700;color:var(--grn)">${p.best_gain_pct > 0 ? '+' : ''}${p.best_gain_pct.toFixed(1)}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:var(--t3)">Worst</div>
+              <div style="font-size:14px;font-weight:700;color:var(--red2)">${p.worst_drop_pct.toFixed(1)}%</div>
+            </div>
           </div>
         </div>`;
       }).join('');
     }
 
-    // Recent shadow trades
+    // Recent completed trades (shadow + backtest)
     const trades = d.recent_trades || [];
     if (!trades.length) {
-      document.getElementById('shadow-trades-body').innerHTML = '<tr><td colspan="5" class="empty-state">No shadow trades yet</td></tr>';
+      document.getElementById('shadow-trades-body').innerHTML = '<tr><td colspan="6" class="empty-state">No simulated trades yet</td></tr>';
     } else {
       document.getElementById('shadow-trades-body').innerHTML = trades.map(t => {
         const pctCls = t.profit_pct >= 0 ? 'pct-pos' : 'pct-neg';
         return `<tr>
+          <td style="font-size:10px;color:var(--t3)">${esc(t.source)}</td>
           <td style="font-size:11px">${esc(t.strategy)}</td>
           <td><span class="coin-name">${esc(t.coin)}</span></td>
           <td><span class="${pctCls}">${t.profit_pct >= 0 ? '+' : ''}${t.profit_pct.toFixed(1)}%</span></td>
