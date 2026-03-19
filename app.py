@@ -7533,6 +7533,83 @@ def _auto_prune_db():
             print(f"[DB-PRUNE] Error: {e}", flush=True)
 
 
+_SHADOW_TUNE_INTERVAL = 3600  # auto-tune from shadow results every 1 hour
+_last_shadow_tune_at = 0
+
+
+def _shadow_auto_tune():
+    """Background worker: periodically evaluate closed shadow positions and auto-tune bot settings."""
+    global _last_shadow_tune_at
+    time.sleep(300)  # wait 5 min after startup for data to accumulate
+    while True:
+        try:
+            conn = db()
+            try:
+                cur = conn.cursor()
+                # Get performance stats per strategy from recent closed shadow positions (last 48h)
+                cur.execute("""
+                    SELECT strategy_name,
+                           COUNT(*) AS closed_trades,
+                           SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                           ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                           ROUND(AVG(max_upside_pct)::numeric, 2) AS avg_upside,
+                           ROUND(AVG(max_drawdown_pct)::numeric, 2) AS avg_drawdown
+                    FROM shadow_positions
+                    WHERE status='closed'
+                      AND closed_at >= NOW() - INTERVAL '48 hours'
+                    GROUP BY strategy_name
+                    ORDER BY avg_pnl DESC NULLS LAST
+                """)
+                rows = cur.fetchall()
+            finally:
+                db_return(conn)
+
+            if not rows:
+                print(f"[SHADOW-TUNE] no closed shadow trades in last 48h, skipping", flush=True)
+                time.sleep(_SHADOW_TUNE_INTERVAL)
+                continue
+
+            # Build a summary dict matching the format _auto_tune_from_results expects
+            strategies = {}
+            for row in rows:
+                sname = row.get("strategy_name")
+                closed = int(row.get("closed_trades") or 0)
+                wins = int(row.get("wins") or 0)
+                strategies[sname] = {
+                    "trades_closed": closed,
+                    "closed": closed,
+                    "wins": wins,
+                    "win_rate": round((wins / closed * 100) if closed else 0, 1),
+                    "avg_pnl_pct": float(row.get("avg_pnl") or 0),
+                    "avg_upside_pct": float(row.get("avg_upside") or 0),
+                    "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
+                }
+
+            summary = {"strategies": strategies}
+
+            # Find a user_id to attribute the tune to (pick first user with bot_settings)
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT user_id FROM bot_settings ORDER BY user_id LIMIT 1")
+                user_row = cur.fetchone()
+            finally:
+                db_return(conn)
+
+            user_id = (user_row or {}).get("user_id", 1)
+            print(f"[SHADOW-TUNE] evaluating {len(rows)} strategies from live shadow data (48h window)", flush=True)
+            for sname, data in strategies.items():
+                print(f"[SHADOW-TUNE]   {sname}: {data['trades_closed']} trades, "
+                      f"{data['win_rate']}% win, {data['avg_pnl_pct']:+.1f}% avg pnl", flush=True)
+
+            _auto_tune_from_results(user_id, summary, f"shadow-live-{int(time.time())}")
+            _last_shadow_tune_at = time.time()
+
+        except Exception as e:
+            print(f"[SHADOW-TUNE] error: {e}", flush=True)
+        time.sleep(_SHADOW_TUNE_INTERVAL)
+
+
 def ensure_background_workers_started():
     global _background_workers_started
     if _background_workers_started:
@@ -7559,6 +7636,7 @@ def ensure_background_workers_started():
             quant_edge_report_monitor,
             _prune_seen_tokens,
             _auto_prune_db,
+            _shadow_auto_tune,
         ]
         for target in worker_targets:
             threading.Thread(target=target, daemon=True).start()
@@ -8850,6 +8928,44 @@ def api_quant_shadow_equity():
             "cumulative_pnl": round(running[strat], 2),
         })
     return jsonify(equity)
+
+
+@app.route("/api/quant/auto-tune-status")
+@login_required
+def api_quant_auto_tune_status():
+    """Show current auto-tune state: what strategy is active, last tune time, shadow stats."""
+    user_id = session.get("user_id", 1)
+    preset_name, settings = load_user_effective_settings(user_id)
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Recent shadow performance per strategy (48h)
+        cur.execute("""
+            SELECT strategy_name,
+                   COUNT(*) AS closed,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl
+            FROM shadow_positions
+            WHERE status='closed' AND closed_at >= NOW() - INTERVAL '48 hours'
+            GROUP BY strategy_name ORDER BY avg_pnl DESC NULLS LAST
+        """)
+        shadow_stats = [{
+            "strategy": r["strategy_name"],
+            "closed": int(r["closed"] or 0),
+            "wins": int(r["wins"] or 0),
+            "win_rate": round((int(r["wins"] or 0) / int(r["closed"] or 1)) * 100, 1),
+            "avg_pnl": float(r["avg_pnl"] or 0),
+        } for r in cur.fetchall()]
+    finally:
+        db_return(conn)
+
+    return jsonify({
+        "active_preset": preset_name,
+        "last_shadow_tune_at": _last_shadow_tune_at or None,
+        "tune_interval_sec": _SHADOW_TUNE_INTERVAL,
+        "shadow_48h_stats": shadow_stats,
+    })
 
 
 @app.route("/api/quant/shadow-decisions")
