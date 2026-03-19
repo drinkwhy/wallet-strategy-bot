@@ -9230,6 +9230,59 @@ def api_backtest_results():
                 data_health[f"backtest_runs_{row2['status']}"] = int(row2.get("n", 0))
         except Exception:
             pass
+        # Per-strategy shadow_decisions breakdown (the ALL 4 strategies data)
+        decision_breakdown = []
+        try:
+            cur.execute("""
+                SELECT strategy_name,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN passed THEN 1 ELSE 0 END) AS passed,
+                       SUM(CASE WHEN NOT passed THEN 1 ELSE 0 END) AS blocked,
+                       ROUND(AVG(score)::numeric, 1) AS avg_score,
+                       ROUND(AVG(confidence)::numeric, 2) AS avg_confidence,
+                       MIN(created_at) AS first_eval,
+                       MAX(created_at) AS last_eval
+                FROM shadow_decisions
+                GROUP BY strategy_name
+                ORDER BY strategy_name
+            """)
+            for row2 in cur.fetchall():
+                first_eval = row2.get("first_eval")
+                last_eval = row2.get("last_eval")
+                decision_breakdown.append({
+                    "strategy": row2.get("strategy_name", ""),
+                    "total": int(row2.get("total") or 0),
+                    "passed": int(row2.get("passed") or 0),
+                    "blocked": int(row2.get("blocked") or 0),
+                    "avg_score": float(row2.get("avg_score") or 0),
+                    "avg_confidence": float(row2.get("avg_confidence") or 0),
+                    "first_eval": first_eval.strftime("%b %d, %I:%M %p") if first_eval and hasattr(first_eval, "strftime") else "",
+                    "last_eval": last_eval.strftime("%b %d, %I:%M %p") if last_eval and hasattr(last_eval, "strftime") else "",
+                })
+        except Exception:
+            pass
+        # Top blocker reasons across ALL strategies
+        top_blockers = []
+        try:
+            cur.execute("""
+                SELECT blocker_reasons_json
+                FROM shadow_decisions
+                WHERE NOT passed
+                ORDER BY created_at DESC
+                LIMIT 500
+            """)
+            blocker_counter = {}
+            for row2 in cur.fetchall():
+                try:
+                    reasons = json.loads(row2.get("blocker_reasons_json") or "[]")
+                    for r in reasons:
+                        blocker_counter[r] = blocker_counter.get(r, 0) + 1
+                except Exception:
+                    pass
+            for reason, count in sorted(blocker_counter.items(), key=lambda x: -x[1])[:10]:
+                top_blockers.append({"reason": reason, "count": count})
+        except Exception:
+            pass
 
     finally:
         db_return(conn)
@@ -9472,6 +9525,8 @@ def api_backtest_results():
         "recent_trades": recent_trades,
         "open_positions": open_positions,
         "data_health": data_health,
+        "decision_breakdown": decision_breakdown,
+        "top_blockers": top_blockers,
     })
 
 
@@ -11115,6 +11170,7 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
         </div>
       </div>
       <div id="data-health" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px"></div>
+      <div id="shadow-activity" style="margin-bottom:16px"></div>
       <div id="strategy-cards">
         <div class="empty-state">Loading backtest results...</div>
       </div>
@@ -11520,6 +11576,53 @@ async function pollBacktest() {
       if (dh.backtest_runs !== undefined) chips.push(`<span class="summary-chip">${dh.backtest_runs} backtest runs</span>`);
       healthEl.innerHTML = chips.join('');
     }
+    // Shadow trading activity breakdown
+    const db2 = d.decision_breakdown || [];
+    const tb = d.top_blockers || [];
+    const actEl = document.getElementById('shadow-activity');
+    if (actEl && db2.length) {
+      const stratNames = {safe:'Careful',balanced:'Balanced',aggressive:'Aggressive',degen:'Full Send'};
+      const blockerNames = {
+        missing_price:'Missing price',liquidity_below_threshold:'Low liquidity',market_cap_below_floor:'Market cap too low',
+        market_cap_above_ceiling:'Market cap too high',volume_below_threshold:'Volume too low',ai_score_below_threshold:'AI score too low',
+        token_too_old:'Token too old',green_lights_below_threshold:'Not enough green lights',narrative_below_threshold:'Low narrative',
+        holder_growth_below_threshold:'Not enough new holders',volume_spike_below_threshold:'No volume spike',
+        cannot_exit:'Cannot exit',transfer_hook_enabled:'Transfer hook',threat_risk_too_high:'High scam risk',
+        score_below_minimum:'Score below 40',confidence_below_minimum:'Confidence below 35%'
+      };
+      let html = '<div style="font-size:14px;font-weight:700;color:var(--t1);margin-bottom:8px">Shadow Trading Activity (All 4 Strategies)</div>';
+      html += '<div style="font-size:11px;color:var(--t3);margin-bottom:12px">Every coin the bot saw was tested against all 4 strategies. Here\'s what happened:</div>';
+      html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:14px">';
+      for (const s of db2) {
+        const passRate = s.total > 0 ? ((s.passed / s.total) * 100).toFixed(1) : '0';
+        const passColor = s.passed > 0 ? 'var(--grn)' : 'var(--red2)';
+        html += `<div style="background:rgba(7,14,23,.5);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:14px">
+          <div style="font-size:13px;font-weight:700;color:var(--t1);margin-bottom:6px">${stratNames[s.strategy]||s.strategy}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:12px">
+            <div style="color:var(--t3)">Coins checked:</div><div style="font-weight:600;color:var(--t1)">${s.total}</div>
+            <div style="color:var(--t3)">Would buy:</div><div style="font-weight:600;color:${passColor}">${s.passed} (${passRate}%)</div>
+            <div style="color:var(--t3)">Blocked:</div><div style="font-weight:600;color:var(--red2)">${s.blocked}</div>
+            <div style="color:var(--t3)">Avg score:</div><div style="font-weight:600">${s.avg_score}</div>
+            <div style="color:var(--t3)">Avg confidence:</div><div style="font-weight:600">${(s.avg_confidence * 100).toFixed(0)}%</div>
+          </div>
+          ${s.first_eval ? '<div style="font-size:10px;color:var(--t3);margin-top:6px">First: ' + esc(s.first_eval) + ' &middot; Last: ' + esc(s.last_eval) + '</div>' : ''}
+        </div>`;
+      }
+      html += '</div>';
+      // Top blockers
+      if (tb.length) {
+        html += '<div style="font-size:12px;font-weight:700;color:var(--t1);margin-bottom:6px">Top Reasons Coins Were Blocked</div>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">';
+        for (const b of tb) {
+          html += `<span style="font-size:11px;padding:4px 10px;border-radius:6px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)">${blockerNames[b.reason]||b.reason.replace(/_/g,' ')} <strong style="color:var(--red2)">${b.count}</strong></span>`;
+        }
+        html += '</div>';
+      }
+      actEl.innerHTML = html;
+    } else if (actEl) {
+      actEl.innerHTML = '';
+    }
+
     // Strategy cards
     const strats = d.strategies || [];
     if (!strats.length) {
