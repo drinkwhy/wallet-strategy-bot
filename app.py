@@ -782,6 +782,39 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_flow_events (
+            id SERIAL PRIMARY KEY,
+            event_key TEXT UNIQUE,
+            mint TEXT NOT NULL,
+            signature TEXT,
+            wallet TEXT NOT NULL,
+            side TEXT NOT NULL,
+            sol_amount REAL DEFAULT 0,
+            token_amount REAL DEFAULT 0,
+            smart_wallet INTEGER DEFAULT 0,
+            source TEXT,
+            observed_at TIMESTAMP,
+            payload_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS liquidity_delta_events (
+            id SERIAL PRIMARY KEY,
+            event_key TEXT UNIQUE,
+            mint TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            source TEXT,
+            previous_liq REAL DEFAULT 0,
+            current_liq REAL DEFAULT 0,
+            delta_liq REAL DEFAULT 0,
+            delta_pct REAL DEFAULT 0,
+            previous_price REAL DEFAULT 0,
+            current_price REAL DEFAULT 0,
+            observed_at TIMESTAMP,
+            payload_json TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS token_feature_snapshots (
             id SERIAL PRIMARY KEY,
             mint TEXT NOT NULL,
@@ -933,6 +966,9 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_market_events_mint_created_at ON market_events (mint, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_market_events_created_at ON market_events (created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_market_tokens_last_seen ON market_tokens (last_seen_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_wallet_flow_events_mint_observed_at ON wallet_flow_events (mint, observed_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_wallet_flow_events_wallet_observed_at ON wallet_flow_events (wallet, observed_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_liquidity_delta_events_mint_observed_at ON liquidity_delta_events (mint, observed_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_token_feature_snapshots_mint_created_at ON token_feature_snapshots (mint, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_mint_created_at ON token_flow_snapshots (mint, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_created_at ON token_flow_snapshots (created_at DESC)",
@@ -1150,6 +1186,35 @@ def migrate_db():
                 age_min REAL,
                 payload_json TEXT,
                 created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS wallet_flow_events (
+                id SERIAL PRIMARY KEY,
+                event_key TEXT UNIQUE,
+                mint TEXT NOT NULL,
+                signature TEXT,
+                wallet TEXT NOT NULL,
+                side TEXT NOT NULL,
+                sol_amount REAL DEFAULT 0,
+                token_amount REAL DEFAULT 0,
+                smart_wallet INTEGER DEFAULT 0,
+                source TEXT,
+                observed_at TIMESTAMP,
+                payload_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS liquidity_delta_events (
+                id SERIAL PRIMARY KEY,
+                event_key TEXT UNIQUE,
+                mint TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                source TEXT,
+                previous_liq REAL DEFAULT 0,
+                current_liq REAL DEFAULT 0,
+                delta_liq REAL DEFAULT 0,
+                delta_pct REAL DEFAULT 0,
+                previous_price REAL DEFAULT 0,
+                current_price REAL DEFAULT 0,
+                observed_at TIMESTAMP,
+                payload_json TEXT,
+                created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS token_feature_snapshots (
                 id SERIAL PRIMARY KEY,
                 mint TEXT NOT NULL,
@@ -1280,6 +1345,9 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_market_events_mint_created_at ON market_events (mint, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_market_events_created_at ON market_events (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_market_tokens_last_seen ON market_tokens (last_seen_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_flow_events_mint_observed_at ON wallet_flow_events (mint, observed_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_flow_events_wallet_observed_at ON wallet_flow_events (wallet, observed_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_liquidity_delta_events_mint_observed_at ON liquidity_delta_events (mint, observed_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_feature_snapshots_mint_created_at ON token_feature_snapshots (mint, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_mint_created_at ON token_flow_snapshots (mint, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_token_flow_snapshots_created_at ON token_flow_snapshots (created_at DESC)")
@@ -3504,6 +3572,8 @@ def extract_wallet_flow_from_swaps(txns, mint):
     ordered = sorted((tx for tx in txns if isinstance(tx, dict)), key=lambda tx: tx.get("timestamp") or 0)
     for tx in ordered:
         fee_payer = tx.get("feePayer", "")
+        signature = tx.get("signature") or ""
+        timestamp = int(tx.get("timestamp") or 0)
         swap = (tx.get("events") or {}).get("swap") or {}
         if not fee_payer or not swap:
             continue
@@ -3511,19 +3581,25 @@ def extract_wallet_flow_from_swaps(txns, mint):
         token_inputs = swap.get("tokenInputs") or []
         native_input = swap.get("nativeInput") or {}
         native_output = swap.get("nativeOutput") or {}
-        if any(t.get("mint") == mint for t in token_outputs):
+        output_leg = next((t for t in token_outputs if t.get("mint") == mint), None)
+        input_leg = next((t for t in token_inputs if t.get("mint") == mint), None)
+        if output_leg:
             buyers.append({
                 "wallet": fee_payer,
-                "timestamp": tx.get("timestamp") or 0,
+                "signature": signature,
+                "timestamp": timestamp,
                 "sol": round(float(native_input.get("amount") or 0) / 1e9, 4),
+                "token_amount": round(float(output_leg.get("tokenAmount") or output_leg.get("rawTokenAmount", {}).get("tokenAmount") or 0), 4),
             })
             if fee_payer not in unique_buyers:
                 unique_buyers.append(fee_payer)
-        elif any(t.get("mint") == mint for t in token_inputs):
+        elif input_leg:
             sellers.append({
                 "wallet": fee_payer,
-                "timestamp": tx.get("timestamp") or 0,
+                "signature": signature,
+                "timestamp": timestamp,
                 "sol": round(float(native_output.get("amount") or 0) / 1e9, 4),
+                "token_amount": round(float(input_leg.get("tokenAmount") or input_leg.get("rawTokenAmount", {}).get("tokenAmount") or 0), 4),
             })
             if fee_payer not in unique_sellers:
                 unique_sellers.append(fee_payer)
@@ -4227,6 +4303,7 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
     seeded = prime_token_intel(base_info, pair=pair, source="refresh")
     txns = helius_address_transactions(mint, limit=60, timeout=8)
     flow = extract_wallet_flow_from_swaps(txns, mint)
+    persist_wallet_flow_events(mint, flow, source="helius")
     deployer_wallet = seeded.get("deployer_wallet") or resolve_deployer_wallet(mint, txns)
     if deployer_wallet and deployer_wallet != seeded.get("deployer_wallet"):
         deployer_stats = register_deployer_launch(deployer_wallet, mint)
@@ -4570,6 +4647,123 @@ def _classify_market_event(previous_row, info):
     return "market_tick"
 
 
+def _event_timestamp_to_datetime(ts):
+    try:
+        ts = int(ts or 0)
+        return datetime.utcfromtimestamp(ts) if ts > 0 else _now_utc()
+    except Exception:
+        return _now_utc()
+
+
+def persist_wallet_flow_events(mint, flow, source="helius"):
+    if not mint:
+        return 0
+    rows = []
+    for side, items in (("buy", flow.get("buyers") or []), ("sell", flow.get("sellers") or [])):
+        for item in items:
+            wallet = item.get("wallet")
+            if not wallet:
+                continue
+            signature = item.get("signature") or ""
+            timestamp = int(item.get("timestamp") or 0)
+            observed_at = _event_timestamp_to_datetime(timestamp)
+            event_key = f"{mint}:{signature or timestamp}:{side}:{wallet}"
+            payload = {
+                "wallet": wallet,
+                "signature": signature,
+                "side": side,
+                "sol": float(item.get("sol") or 0),
+                "token_amount": float(item.get("token_amount") or 0),
+                "timestamp": timestamp,
+            }
+            rows.append((
+                event_key,
+                mint,
+                signature or None,
+                wallet,
+                side,
+                float(item.get("sol") or 0),
+                float(item.get("token_amount") or 0),
+                1 if wallet in WHALE_WALLETS else 0,
+                source,
+                observed_at,
+                json.dumps(payload),
+            ))
+    if not rows:
+        return 0
+    conn = db()
+    try:
+        cur = conn.cursor()
+        psycopg2.extras.execute_batch(cur, """
+            INSERT INTO wallet_flow_events (
+                event_key, mint, signature, wallet, side, sol_amount, token_amount,
+                smart_wallet, source, observed_at, payload_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (event_key) DO NOTHING
+        """, rows, page_size=100)
+        inserted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+        return inserted
+    except Exception as e:
+        conn.rollback()
+        print(f"[TAPE] wallet flow persist error for {mint}: {e}", flush=True)
+        return 0
+    finally:
+        db_return(conn)
+
+
+def persist_liquidity_delta_event(mint, previous_row, info, event_type):
+    previous_liq = float((previous_row or {}).get("last_liq") or 0)
+    current_liq = float(info.get("liq") or 0)
+    if previous_liq <= 0 or current_liq <= 0:
+        return
+    delta_liq = current_liq - previous_liq
+    delta_pct = (delta_liq / previous_liq) * 100.0 if previous_liq else 0.0
+    if abs(delta_pct) < 3:
+        return
+    observed_at = _event_timestamp_to_datetime(info.get("ts") or int(time.time()))
+    event_key = f"{mint}:{event_type}:{int(observed_at.timestamp())}:{round(current_liq, 2)}"
+    payload = {
+        "mint": mint,
+        "event_type": event_type,
+        "previous_liq": previous_liq,
+        "current_liq": current_liq,
+        "delta_liq": round(delta_liq, 2),
+        "delta_pct": round(delta_pct, 2),
+        "previous_price": float((previous_row or {}).get("last_price") or 0),
+        "current_price": float(info.get("price") or 0),
+    }
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO liquidity_delta_events (
+                event_key, mint, event_type, source, previous_liq, current_liq, delta_liq,
+                delta_pct, previous_price, current_price, observed_at, payload_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (event_key) DO NOTHING
+        """, (
+            event_key,
+            mint,
+            event_type,
+            info.get("source") or "scanner",
+            previous_liq,
+            current_liq,
+            round(delta_liq, 2),
+            round(delta_pct, 2),
+            float((previous_row or {}).get("last_price") or 0),
+            float(info.get("price") or 0),
+            observed_at,
+            json.dumps(payload),
+        ))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[TAPE] liquidity delta persist error for {mint}: {e}", flush=True)
+    finally:
+        db_return(conn)
+
+
 def _record_market_intelligence(info):
     intel = info.get("intel") or {}
     snapshot = build_feature_snapshot(info, intel)
@@ -4622,6 +4816,7 @@ def _record_market_intelligence(info):
             info.get("name"), info.get("symbol"), info.get("price"), info.get("mc"),
             info.get("liq"), info.get("vol"), info.get("change"), info.get("age_min"), payload_json,
         ))
+        persist_liquidity_delta_event(info.get("mint"), previous_row, info, event_type)
         cur.execute("""
             INSERT INTO token_feature_snapshots (
                 mint, source, price, composite_score, confidence, ai_score, green_lights,
@@ -4798,6 +4993,44 @@ def shadow_position_monitor():
         except Exception as e:
             print(f"[SIM] monitor error: {e}", flush=True)
         time.sleep(45)
+
+
+def execution_tape_monitor():
+    time.sleep(35)
+    while True:
+        try:
+            if not get_helius_api_key():
+                time.sleep(180)
+                continue
+            conn = db()
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT mint, name, symbol, last_price, last_mc, last_liq, last_vol,
+                           EXTRACT(EPOCH FROM (NOW() - first_seen_at)) / 60.0 AS age_min
+                    FROM market_tokens
+                    WHERE last_seen_at >= NOW() - INTERVAL '24 hours'
+                    ORDER BY last_seen_at DESC
+                    LIMIT 6
+                """)
+                rows = cur.fetchall()
+            finally:
+                db_return(conn)
+            for row in rows:
+                refresh_token_intel(row.get("mint"), base_info={
+                    "mint": row.get("mint"),
+                    "name": row.get("name"),
+                    "symbol": row.get("symbol"),
+                    "price": float(row.get("last_price") or 0),
+                    "mc": float(row.get("last_mc") or 0),
+                    "liq": float(row.get("last_liq") or 0),
+                    "vol": float(row.get("last_vol") or 0),
+                    "age_min": float(row.get("age_min") or 0),
+                }, force=True)
+                time.sleep(2)
+        except Exception as e:
+            print(f"[TAPE] monitor error: {e}", flush=True)
+        time.sleep(90)
 
 
 def _load_backtest_snapshots(days=7, strategies=None, limit=50000):
@@ -5650,6 +5883,7 @@ def ensure_background_workers_started():
             listing_scanner,
             process_listing_alerts,
             shadow_position_monitor,
+            execution_tape_monitor,
             _prune_seen_tokens,
         ]
         for target in worker_targets:
@@ -6485,6 +6719,10 @@ def api_quant_overview():
         token_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM market_events")
         event_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM wallet_flow_events")
+        wallet_flow_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM liquidity_delta_events")
+        liquidity_delta_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM token_feature_snapshots")
         snapshot_count = int((cur.fetchone() or {}).get("n") or 0)
         cur.execute("SELECT COUNT(*) AS n FROM token_flow_snapshots")
@@ -6525,6 +6763,13 @@ def api_quant_overview():
             LIMIT 20
         """)
         recent_flow_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint, wallet, side, sol_amount, token_amount, smart_wallet, source, observed_at
+            FROM wallet_flow_events
+            ORDER BY observed_at DESC NULLS LAST, created_at DESC
+            LIMIT 12
+        """)
+        recent_execution_rows = cur.fetchall()
         cur.execute("""
             SELECT DISTINCT ON (sd.strategy_name, sd.mint)
                    sd.strategy_name,
@@ -6567,6 +6812,8 @@ def api_quant_overview():
         "dataset": {
             "tracked_tokens": token_count,
             "market_events": event_count,
+            "wallet_flow_events": wallet_flow_count,
+            "liquidity_delta_events": liquidity_delta_count,
             "feature_snapshots": snapshot_count,
             "flow_snapshots": flow_snapshot_count,
             "shadow_decisions": decision_count,
@@ -6587,6 +6834,16 @@ def api_quant_overview():
             "can_exit": None if row.get("can_exit") is None else bool(row.get("can_exit")),
             "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
         } for row in recent_flow_rows[:8]],
+        "recent_execution_tape": [{
+            "mint": row.get("mint"),
+            "wallet": row.get("wallet"),
+            "side": row.get("side"),
+            "sol_amount": float(row.get("sol_amount") or 0),
+            "token_amount": float(row.get("token_amount") or 0),
+            "smart_wallet": bool(row.get("smart_wallet")),
+            "source": row.get("source"),
+            "observed_at": row.get("observed_at").isoformat() if row.get("observed_at") else None,
+        } for row in recent_execution_rows[:8]],
         "opportunity_map": opportunity_map,
         "strategy_summaries": summaries,
         "recent_positions": [{
@@ -10759,6 +11016,8 @@ function renderQuantOverview() {
   grid.innerHTML = `
     <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">${dataset.tracked_tokens || 0}</div><div class="scanner-summary-copy">Observed in persistent market storage</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Market Events</div><div class="scanner-summary-value">${dataset.market_events || 0}</div><div class="scanner-summary-copy">Append-only event log</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Wallet Flow Events</div><div class="scanner-summary-value">${dataset.wallet_flow_events || 0}</div><div class="scanner-summary-copy">Raw wallet-side swap legs</div></div>
+    <div class="scanner-summary-card"><div class="scanner-summary-label">Liquidity Deltas</div><div class="scanner-summary-value">${dataset.liquidity_delta_events || 0}</div><div class="scanner-summary-copy">First-class liquidity change records</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Feature Snapshots</div><div class="scanner-summary-value">${dataset.feature_snapshots || 0}</div><div class="scanner-summary-copy">Replay-ready scoring inputs</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Flow Snapshots</div><div class="scanner-summary-value">${dataset.flow_snapshots || 0}</div><div class="scanner-summary-copy">Wallet pressure and liquidity tape</div></div>
     <div class="scanner-summary-card"><div class="scanner-summary-label">Shadow Decisions</div><div class="scanner-summary-value">${dataset.shadow_decisions || 0}</div><div class="scanner-summary-copy">Would-buy versus blocked decisions</div></div>
@@ -10776,6 +11035,7 @@ function renderQuantFlowRegime() {
   if (!box || !_quantOverview) return;
   const flow = _quantOverview.flow_regime || {};
   const recent = Array.isArray(_quantOverview.recent_flow) ? _quantOverview.recent_flow : [];
+  const executionTape = Array.isArray(_quantOverview.recent_execution_tape) ? _quantOverview.recent_execution_tape : [];
   box.innerHTML = `
     <div class="panel-head" style="margin-bottom:12px">
       <div>
@@ -10811,6 +11071,28 @@ function renderQuantFlowRegime() {
           </div>
         </div>
       `).join('') || '<div style="font-size:11px;color:var(--t3)">No flow samples captured yet.</div>'}
+    </div>
+    <div class="sec-label" style="margin-top:12px">Latest Wallet Flow</div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      ${executionTape.slice(0, 4).map(item => `
+        <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02)">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+            <div>
+              <div style="font-size:11px;font-weight:700;color:var(--t1)">${item.mint ? item.mint.slice(0, 6) + '...' + item.mint.slice(-4) : 'Unknown'}</div>
+              <div style="font-size:10px;color:var(--t3);margin-top:3px">${item.side} · ${item.wallet ? item.wallet.slice(0, 6) + '...' + item.wallet.slice(-4) : 'wallet'}</div>
+            </div>
+            <div class="shortcut-row">
+              <span class="badge ${item.side === 'buy' ? 'bg-grn' : 'bg-red'}">${item.side}</span>
+              ${item.smart_wallet ? '<span class="badge bg-gold">Smart</span>' : ''}
+            </div>
+          </div>
+          <div class="shortcut-row" style="margin-top:8px">
+            <span class="badge bg-muted">${(item.sol_amount || 0).toFixed(2)} SOL</span>
+            <span class="badge bg-muted">${(item.token_amount || 0).toFixed(2)} tokens</span>
+            <span class="badge bg-muted">${item.source || 'helius'}</span>
+          </div>
+        </div>
+      `).join('') || '<div style="font-size:11px;color:var(--t3)">Execution tape is still warming up.</div>'}
     </div>
   `;
 }
