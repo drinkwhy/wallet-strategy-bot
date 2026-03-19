@@ -11513,7 +11513,7 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
           <div style="font-size:18px;font-weight:700;color:var(--t1)">Run a New Backtest</div>
           <div style="font-size:12px;color:var(--t3);margin-top:2px">Test strategies against recent market data to see what would have worked</div>
         </div>
-        <button class="btn btn-ghost" onclick="cleanupDB()" id="btn-cleanup" style="font-size:11px;padding:5px 12px">🗑 Free Up Space</button>
+        <button class="btn btn-ghost" onclick="cleanupDB()" id="btn-cleanup" style="font-size:11px;padding:5px 12px">Free Up Space</button>
       </div>
       <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
         <div>
@@ -12473,13 +12473,13 @@ async function cleanupDB() {
     const r = await fetch('/api/db-cleanup', {method:'POST'}).then(r => r.json());
     if (r.ok) {
       const f = r.freed;
-      alert(`Space freed!\\n• ${f.backtest_trades_deleted||0} old backtest trades deleted\\n• ${f.backtest_runs_deleted||0} old runs deleted\\n• ${f.shadow_decisions_deleted||0} old decisions cleaned\\n• ${f.snapshots_deleted||0} old snapshots removed\\n\\nYou can now run backtests again.`);
+      alert('Space freed! Deleted ' + (f.backtest_trades_deleted||0) + ' old trades, ' + (f.backtest_runs_deleted||0) + ' old runs, ' + (f.shadow_decisions_deleted||0) + ' old decisions, ' + (f.snapshots_deleted||0) + ' old snapshots. You can now run backtests again.');
     } else {
       alert('Cleanup error: ' + (r.msg || 'Unknown'));
     }
   } catch(e) { alert('Cleanup failed: ' + e); }
   btn.disabled = false;
-  btn.textContent = '🗑 Free Up Space';
+  btn.textContent = 'Free Up Space';
 }
 
 // ── Init ──
