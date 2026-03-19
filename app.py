@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from zoneinfo import ZoneInfo
 from flask import Flask, request, redirect, url_for, session, jsonify, Response
+from flask import send_file
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from cryptography.fernet import Fernet
@@ -676,6 +677,13 @@ _db_pool = psycopg2.pool.ThreadedConnectionPool(
 def db():
     conn = _db_pool.getconn()
     conn.autocommit = False
+    if getattr(conn, "closed", 0):
+        try:
+            _db_pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = _db_pool.getconn()
+        conn.autocommit = False
     return conn
 
 def db_return(conn):
@@ -685,6 +693,27 @@ def db_return(conn):
     except Exception:
         pass
     _db_pool.putconn(conn)
+
+
+def db_health_check(retries=2):
+    last_error = None
+    for _ in range(max(1, int(retries))):
+        conn = None
+        try:
+            conn = db()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            db_return(conn)
+            return True, None
+        except Exception as exc:
+            last_error = exc
+            if conn is not None:
+                try:
+                    _db_pool.putconn(conn, close=True)
+                except Exception:
+                    pass
+    return False, str(last_error or "unknown database error")
 
 def init_db():
     conn = db()
@@ -6859,15 +6888,15 @@ def _apply_security_headers(resp):
 @app.route("/health")
 def health_check():
     """Health check endpoint for Railway / load balancers."""
-    try:
-        conn = db()
-        try:
-            conn.cursor().execute("SELECT 1")
-        finally:
-            db_return(conn)
+    ok, error = db_health_check(retries=2)
+    if ok:
         return jsonify({"status": "ok", "db": "ok"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "db": str(e)}), 503
+    return jsonify({"status": "error", "db": error}), 503
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return send_file("static/icon-48.png", mimetype="image/png", max_age=86400)
 
 def login_required(f):
     @wraps(f)
