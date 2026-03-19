@@ -5486,18 +5486,12 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                 ))
                 if not decision.passed:
                     continue
-                cur.execute("""
-                    SELECT id
-                    FROM shadow_positions
-                    WHERE strategy_name=%s AND mint=%s AND status='open'
-                    LIMIT 1
-                """, (strategy_name, info.get("mint")))
-                if cur.fetchone():
-                    continue
+                # Allow re-entry after 60-min cooldown (not lifetime ban)
                 cur.execute("""
                     SELECT id
                     FROM shadow_positions
                     WHERE strategy_name=%s AND mint=%s
+                      AND (status='open' OR closed_at > NOW() - INTERVAL '60 minutes')
                     LIMIT 1
                 """, (strategy_name, info.get("mint")))
                 if cur.fetchone():
@@ -5516,6 +5510,52 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                     json.dumps(snapshot), decision_json,
                 ))
                 opened_positions += 1
+
+        # ── Inline position updates: update all open positions for this mint ──
+        price = float(info.get("price") or 0)
+        mint = info.get("mint")
+        if price > 0 and mint:
+            cur.execute("""
+                UPDATE shadow_positions
+                SET current_price = %s,
+                    peak_price = GREATEST(peak_price, %s),
+                    trough_price = LEAST(trough_price, %s),
+                    max_upside_pct = GREATEST(COALESCE(max_upside_pct, 0),
+                        ((%s - entry_price) / NULLIF(entry_price, 0)) * 100),
+                    max_drawdown_pct = GREATEST(COALESCE(max_drawdown_pct, 0),
+                        ((entry_price - %s) / NULLIF(entry_price, 0)) * 100),
+                    observations = COALESCE(observations, 0) + 1,
+                    last_seen_at = NOW()
+                WHERE mint = %s AND status = 'open'
+            """, (price, price, price, price, price, mint))
+
+            # Check TP/SL/time-stop exits inline
+            cur.execute("SELECT * FROM shadow_positions WHERE mint=%s AND status='open'", (mint,))
+            open_rows = cur.fetchall()
+            closed_inline = 0
+            for row in open_rows:
+                settings = PRESETS.get(row.get("strategy_name") or "balanced", PRESETS["balanced"])
+                opened_at = row.get("opened_at")
+                age_min = ((time.time() - opened_at.timestamp()) / 60.0) if opened_at else 0.0
+                update = shadow_position_update(row, price, settings, age_min)
+                if update["status"] == "closed":
+                    cur.execute("""
+                        UPDATE shadow_positions
+                        SET status='closed', closed_at=NOW(), exit_price=%s,
+                            exit_reason=%s, realized_pnl_pct=%s,
+                            peak_price=%s, trough_price=%s,
+                            max_upside_pct=%s, max_drawdown_pct=%s
+                        WHERE id=%s
+                    """, (
+                        update["current_price"], update["exit_reason"], update["realized_pnl_pct"],
+                        update["peak_price"], update["trough_price"],
+                        update["max_upside_pct"], update["max_drawdown_pct"],
+                        row["id"],
+                    ))
+                    closed_inline += 1
+            if closed_inline:
+                print(f"[SIM] inline-closed {closed_inline} position(s) for {info.get('name')}", flush=True)
+
         conn.commit()
         if include_model_decisions:
             _log_model_decisions(info, snapshot, flow_snapshot)
@@ -5536,6 +5576,7 @@ def reconcile_shadow_positions(limit=40):
             SELECT *
             FROM shadow_positions
             WHERE status='open'
+              AND (last_seen_at IS NULL OR last_seen_at < NOW() - INTERVAL '60 seconds')
             ORDER BY opened_at ASC
             LIMIT %s
         """, (limit,))
@@ -7367,6 +7408,7 @@ _DB_ROW_LIMITS = {
     "token_flow_snapshots": (5000, "id"),
     "filter_log": (3000, "id"),
     "liquidity_delta_events": (3000, "id"),
+    "shadow_positions": (15000, "id"),
 }
 
 
@@ -8687,6 +8729,47 @@ def api_quant_shadow_performance():
     } for row in rows])
 
 
+@app.route("/api/quant/shadow-equity")
+@login_required
+def api_quant_shadow_equity():
+    """Cumulative PnL over time per strategy — for equity curve charts."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT strategy_name,
+                   DATE_TRUNC('hour', closed_at) AS hour,
+                   COUNT(*) AS trades,
+                   ROUND(SUM(realized_pnl_pct)::numeric, 2) AS pnl_sum,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins
+            FROM shadow_positions
+            WHERE status='closed' AND closed_at IS NOT NULL
+            GROUP BY strategy_name, DATE_TRUNC('hour', closed_at)
+            ORDER BY hour
+        """)
+        rows = cur.fetchall()
+    finally:
+        db_return(conn)
+
+    # Build cumulative equity per strategy
+    equity = {}  # strategy -> [(hour, cum_pnl, trades, wins)]
+    running = {}  # strategy -> cumulative pnl
+    for row in rows:
+        strat = row.get("strategy_name") or "unknown"
+        pnl = float(row.get("pnl_sum") or 0)
+        running[strat] = running.get(strat, 0) + pnl
+        if strat not in equity:
+            equity[strat] = []
+        equity[strat].append({
+            "hour": row["hour"].isoformat() if row.get("hour") else None,
+            "trades": int(row.get("trades") or 0),
+            "wins": int(row.get("wins") or 0),
+            "period_pnl": pnl,
+            "cumulative_pnl": round(running[strat], 2),
+        })
+    return jsonify(equity)
+
+
 @app.route("/api/quant/shadow-decisions")
 @login_required
 def api_quant_shadow_decisions():
@@ -8933,7 +9016,7 @@ def api_db_cleanup():
         freed["shadow_decisions_deleted"] = cur.rowcount
 
         # 4. Trim shadow_positions older than 7 days that are closed
-        cur.execute("DELETE FROM shadow_positions WHERE status='closed' AND closed_at < NOW() - INTERVAL '7 days'")
+        cur.execute("DELETE FROM shadow_positions WHERE status='closed' AND closed_at < NOW() - INTERVAL '90 days'")
         freed["shadow_positions_deleted"] = cur.rowcount
 
         # 5. Trim token_feature_snapshots older than 14 days
