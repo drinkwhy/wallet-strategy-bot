@@ -6301,7 +6301,7 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
         if not rows:
             raise RuntimeError(f"No snapshots found for the last {days} day(s). Start the bot to collect data first.")
 
-        all_trades = []
+        best_trades_by_strat = {}   # only store trades from the winning level
         per_strategy = {}
         total_snapshots = 0
         total_tokens = 0
@@ -6312,6 +6312,7 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
             base = dict(PRESETS[strat_name])
             levels = _generate_sweep_levels(base, num_levels=5)
             level_results = []
+            level_trades = {}  # level_idx -> trades list (kept temporarily)
 
             for level_idx, variant_settings in enumerate(levels):
                 label = _SWEEP_LEVEL_LABELS[level_idx] if level_idx < len(_SWEEP_LEVEL_LABELS) else f"Level {level_idx}"
@@ -6332,7 +6333,7 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                 win_rate = round((wins / closed * 100) if closed else 0, 1)
                 score = _score_sweep_result(summary, strat_name)
 
-                # Extract key filter values for display
+                # Extract key filter values for display (compact — no full settings blob)
                 filter_summary = {
                     "min_score": variant_settings.get("min_score"),
                     "min_liq": variant_settings.get("min_liq"),
@@ -6362,15 +6363,13 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                     "filter_summary": filter_summary,
                     "settings": variant_settings,
                 })
+                # Keep trades temporarily to pick the best later
+                level_trades[level_idx] = result["trades"] or []
                 print(f"[OPTIMIZE]   {strat_name} level {level_idx} ({label}): {closed} trades, {wins} wins, avg {avg_pnl:+.1f}%, score={score:.1f}", flush=True)
 
-                # Collect trades from the best-scoring level
-                if result["trades"]:
-                    for t in result["trades"]:
-                        all_trades.append(t)
-
-            # Pick best level
+            # Pick best level — ONLY keep trades from the winning level
             best = max(level_results, key=lambda l: l["score"])
+            best_trades_by_strat[strat_name] = level_trades.get(best["level"], [])
             per_strategy[strat_name] = {
                 "levels": level_results,
                 "best_level": best["level"],
@@ -6408,12 +6407,15 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                 "blocker_counts": best_lvl.get("blocker_counts", {}),
             }
 
-        # Save to DB
+        # Save to DB — only trades from the BEST level per strategy (not all 20 levels)
+        all_best_trades = []
+        for strat_trades in best_trades_by_strat.values():
+            all_best_trades.extend(strat_trades)
         conn = db()
         try:
             cur = conn.cursor()
             cur.execute("DELETE FROM backtest_trades WHERE run_id=%s", (run_id,))
-            if all_trades:
+            if all_best_trades:
                 psycopg2.extras.execute_batch(cur, """
                     INSERT INTO backtest_trades (
                         run_id, strategy_name, mint, name, opened_at, closed_at,
@@ -6421,7 +6423,7 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
                         exit_reason, feature_json, decision_json
                     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """, [t.as_insert_tuple() for t in all_trades], page_size=200)
+                """, [t.as_insert_tuple() for t in all_best_trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
                 SET status='completed', completed_at=NOW(),
@@ -6443,7 +6445,7 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
             "summary": opt_summary, "requested_by": requested_by, "name": name,
             "replay_mode": "optimize",
         })
-        print(f"[OPTIMIZE] run {run_id} complete: {opt_summary['trades_closed']} total trades from best levels", flush=True)
+        print(f"[OPTIMIZE] run {run_id} complete: {len(all_best_trades)} trades saved (best levels only)", flush=True)
 
     except Exception as e:
         conn = db()
@@ -8840,6 +8842,69 @@ def api_quant_backtest_detail(run_id):
             "exit_reason": row.get("exit_reason"),
         } for row in trade_rows],
     })
+
+
+# ── Database cleanup (free space) ──────────────────────────────────────────────
+
+@app.route("/api/db-cleanup", methods=["POST"])
+@login_required
+def api_db_cleanup():
+    """Delete old data to free up Postgres disk space."""
+    conn = db()
+    freed = {}
+    try:
+        cur = conn.cursor()
+        # 1. Delete old backtest trades (keep last 3 runs)
+        cur.execute("""
+            DELETE FROM backtest_trades
+            WHERE run_id NOT IN (
+                SELECT id FROM backtest_runs ORDER BY created_at DESC LIMIT 3
+            )
+        """)
+        freed["backtest_trades_deleted"] = cur.rowcount
+
+        # 2. Delete old backtest runs (keep last 5)
+        cur.execute("""
+            DELETE FROM backtest_runs
+            WHERE id NOT IN (
+                SELECT id FROM backtest_runs ORDER BY created_at DESC LIMIT 5
+            )
+        """)
+        freed["backtest_runs_deleted"] = cur.rowcount
+
+        # 3. Trim shadow_decisions older than 7 days
+        cur.execute("DELETE FROM shadow_decisions WHERE created_at < NOW() - INTERVAL '7 days'")
+        freed["shadow_decisions_deleted"] = cur.rowcount
+
+        # 4. Trim shadow_positions older than 7 days that are closed
+        cur.execute("DELETE FROM shadow_positions WHERE status='closed' AND closed_at < NOW() - INTERVAL '7 days'")
+        freed["shadow_positions_deleted"] = cur.rowcount
+
+        # 5. Trim token_feature_snapshots older than 14 days
+        cur.execute("DELETE FROM token_feature_snapshots WHERE created_at < NOW() - INTERVAL '14 days'")
+        freed["snapshots_deleted"] = cur.rowcount
+
+        # 6. Trim signal_explorer_log older than 7 days
+        try:
+            cur.execute("DELETE FROM signal_explorer_log WHERE created_at < NOW() - INTERVAL '7 days'")
+            freed["signal_log_deleted"] = cur.rowcount
+        except Exception:
+            conn.rollback()
+            freed["signal_log_deleted"] = 0
+
+        # 7. VACUUM to reclaim disk space
+        conn.commit()
+        conn.autocommit = True
+        cur.execute("VACUUM")
+        conn.autocommit = False
+        freed["vacuumed"] = True
+
+        return jsonify({"ok": True, "freed": freed})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"ok": False, "msg": str(e), "freed": freed}), 500
+    finally:
+        db_return(conn)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -11421,6 +11486,7 @@ select.setting-input{width:160px;text-align:left;cursor:pointer}
           <div style="font-size:18px;font-weight:700;color:var(--t1)">Run a New Backtest</div>
           <div style="font-size:12px;color:var(--t3);margin-top:2px">Test strategies against recent market data to see what would have worked</div>
         </div>
+        <button class="btn btn-ghost" onclick="cleanupDB()" id="btn-cleanup" style="font-size:11px;padding:5px 12px">🗑 Free Up Space</button>
       </div>
       <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
         <div>
@@ -12347,28 +12413,46 @@ function closeBtDetail() {
   document.getElementById('bt-detail-panel').style.display = 'none';
 }
 
-// ── Apply strategy settings from backtest results ──
+// ── Apply strategy settings from backtest/optimization results ──
 async function applyStrategy(settings, presetName) {
-  // Fill settings form with the strategy's settings
-  document.getElementById('s-preset').value = presetName;
-  document.getElementById('s-buy').value = settings.buy_amount;
-  document.getElementById('s-tp1').value = settings.first_sell_target;
-  document.getElementById('s-tp2').value = settings.second_sell_target;
-  document.getElementById('s-sl').value = settings.cut_losses_at;
-  document.getElementById('s-time').value = settings.time_limit_min;
-  document.getElementById('s-trail').value = settings.trailing_stop;
-  document.getElementById('s-maxpos').value = settings.max_trades;
-  document.getElementById('s-dd').value = settings.max_loss_sol;
-  document.getElementById('s-liq').value = settings.min_liquidity;
-  document.getElementById('s-minmc').value = settings.min_market_cap;
-  document.getElementById('s-maxmc').value = settings.max_market_cap;
-  document.getElementById('s-minvol').value = settings.min_volume;
-  document.getElementById('s-minscore').value = settings.min_score;
+  // Handle both raw preset keys (from optimizer) and display keys (from normal backtest)
+  const s = settings;
+  document.getElementById('s-preset').value = presetName || 'custom';
+  document.getElementById('s-buy').value = s.max_buy_sol || s.buy_amount || 0.04;
+  document.getElementById('s-tp1').value = s.tp1_mult || s.first_sell_target || 2.0;
+  document.getElementById('s-tp2').value = s.tp2_mult || s.second_sell_target || 4.0;
+  document.getElementById('s-sl').value = s.stop_loss || s.cut_losses_at || 0.7;
+  document.getElementById('s-time').value = s.time_stop_min || s.time_limit_min || 30;
+  document.getElementById('s-trail').value = s.trail_pct || s.trailing_stop || 0.2;
+  document.getElementById('s-maxpos').value = s.max_correlated || s.max_trades || 3;
+  document.getElementById('s-dd').value = s.drawdown_limit_sol || s.max_loss_sol || 0.5;
+  document.getElementById('s-liq').value = s.min_liq || s.min_liquidity || 5000;
+  document.getElementById('s-minmc').value = s.min_mc || s.min_market_cap || 5000;
+  document.getElementById('s-maxmc').value = s.max_mc || s.max_market_cap || 250000;
+  document.getElementById('s-minvol').value = s.min_vol || s.min_volume || 3000;
+  document.getElementById('s-minscore').value = s.min_score || 30;
   settingsEdited = true;
-  // Auto-save
   await saveSettings();
-  // Visual feedback
   switchTab('settings');
+}
+
+// ── Database cleanup ──
+async function cleanupDB() {
+  const btn = document.getElementById('btn-cleanup');
+  if (!confirm('This will delete old backtest data and snapshots to free disk space. Continue?')) return;
+  btn.disabled = true;
+  btn.textContent = 'Cleaning...';
+  try {
+    const r = await fetch('/api/db-cleanup', {method:'POST'}).then(r => r.json());
+    if (r.ok) {
+      const f = r.freed;
+      alert(`Space freed!\\n• ${f.backtest_trades_deleted||0} old backtest trades deleted\\n• ${f.backtest_runs_deleted||0} old runs deleted\\n• ${f.shadow_decisions_deleted||0} old decisions cleaned\\n• ${f.snapshots_deleted||0} old snapshots removed\\n\\nYou can now run backtests again.`);
+    } else {
+      alert('Cleanup error: ' + (r.msg || 'Unknown'));
+    }
+  } catch(e) { alert('Cleanup failed: ' + e); }
+  btn.disabled = false;
+  btn.textContent = '🗑 Free Up Space';
 }
 
 // ── Init ──
