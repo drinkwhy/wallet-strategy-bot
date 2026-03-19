@@ -669,7 +669,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
 _db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=2, maxconn=20,
+    minconn=5, maxconn=35,
     dsn=DATABASE_URL,
     cursor_factory=psycopg2.extras.RealDictCursor,
 )
@@ -3328,6 +3328,8 @@ class BotInstance:
         s = self.settings
         mints = list(self.positions.keys())
         prices = self._batch_token_prices(mints)
+        # Collect peak updates for a single batch DB write
+        _peak_updates = []
         for mint in mints:
             pos = self.positions.get(mint)
             if not pos:
@@ -3337,15 +3339,7 @@ class BotInstance:
                 continue
             if cur > pos["peak_price"]:
                 self.positions[mint]["peak_price"] = cur
-                try:
-                    _conn = db()
-                    try:
-                        _conn.cursor().execute("UPDATE open_positions SET peak_price=%s WHERE user_id=%s AND mint=%s", (cur, self.user_id, mint))
-                        _conn.commit()
-                    finally:
-                        db_return(_conn)
-                except Exception as _e:
-                    print(f"[ERROR] {_e}", flush=True)
+                _peak_updates.append((cur, self.user_id, mint))
             ratio      = cur / pos["entry_price"]
             peak_ratio = pos["peak_price"] / pos["entry_price"]
             age_sec    = time.time() - pos["timestamp"]
@@ -3412,6 +3406,22 @@ class BotInstance:
                 self.sell(mint, 1.0, f"TP2 {ratio:.2f}x")
             elif (pos["tp1_hit"] or peak_ratio >= 1.3) and cur < trail_line:
                 self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
+        # Batch-write all peak_price updates in one DB round-trip
+        if _peak_updates:
+            try:
+                _conn = db()
+                try:
+                    _cur = _conn.cursor()
+                    psycopg2.extras.execute_batch(
+                        _cur,
+                        "UPDATE open_positions SET peak_price=%s WHERE user_id=%s AND mint=%s",
+                        _peak_updates,
+                    )
+                    _conn.commit()
+                finally:
+                    db_return(_conn)
+            except Exception as _e:
+                print(f"[ERROR] batch peak update: {_e}", flush=True)
 
     def evaluate_signal(self, mint, name, price, mc, vol, liq, age_min, change, source=None):
         if mint in self.positions:
@@ -3628,7 +3638,7 @@ class BotInstance:
         policy_label = execution_decision.get("selected_policy_label") or "Rules"
         sig_entry["reason"] = f"Passed all filters · {execution_prefix} · {policy_label}"
         self.log_signal_entry(sig_entry)
-        self.log_msg(f"SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
+        self.log_msg(f"🟢 SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, "Signal passed all filters")
         if execution_decision.get("execution_mode") == "paper":
             detail = f"{policy_label} accepted"
@@ -3658,27 +3668,67 @@ class BotInstance:
             self.refresh_balance()
             if self.sol_balance > 0:
                 break
-            self.log_msg(f"[WARN] Balance read 0.0 SOL, retrying ({attempt+1}/5)...")
+            self.log_msg(f"⏳ Balance read 0.0 SOL, retrying ({attempt+1}/5)...")
             time.sleep(2)
         self.start_balance = self.sol_balance
         self.peak_balance  = self.sol_balance
-        self.log_msg(f"Bot started | Wallet: {self.wallet} | Balance: {self.sol_balance:.4f} SOL")
+        self.log_msg(f"✅ Bot started | Wallet: {self.wallet[:8]}...{self.wallet[-4:]} | Balance: {self.sol_balance:.4f} SOL")
+        self.log_msg(f"📋 Preset: {self.preset_name} | Mode: {self.run_mode} | Max positions: {self.settings.get('max_correlated', 3)}")
+        consecutive_errors = 0
+        last_health_check = 0
+        last_balance_refresh = time.time()
         while self.running:
             try:
+                now = time.time()
                 self.refresh_edge_guard()
                 self.refresh_execution_control()
                 self.maybe_relax_guards()
                 if self.should_stop():
+                    self.log_msg("🛑 Stop condition met — closing all positions")
                     self.cashout_all()
                     self.running = False
                     self.record_perf_fee()
                     break
                 if self.positions:
                     self.check_positions()
+                # Periodic health check every 5 minutes
+                if now - last_health_check > 300:
+                    last_health_check = now
+                    alert = self.execution_health_alert()
+                    if alert:
+                        self.log_msg(f"⚠️ HEALTH: {alert}")
+                    uptime_min = (now - self.started_at) / 60
+                    pnl = self.stats["total_pnl_sol"]
+                    wins = self.stats["wins"]
+                    losses = self.stats["losses"]
+                    total = wins + losses
+                    wr = round(wins / total * 100, 1) if total else 0
+                    pos_count = len(self.positions)
+                    self.log_msg(
+                        f"📊 Status: {uptime_min:.0f}m uptime | {pos_count} positions | "
+                        f"{total} trades ({wr}% WR) | PnL: {pnl:+.4f} SOL"
+                    )
+                # Refresh balance periodically (every 2 min) even without trades
+                if now - last_balance_refresh > 120:
+                    last_balance_refresh = now
+                    self.refresh_balance()
+                consecutive_errors = 0  # reset on success
                 time.sleep(3)
             except Exception as e:
-                self.log_msg(f"Loop error: {e}")
-                time.sleep(3)
+                consecutive_errors += 1
+                self.log_msg(f"⚠️ Loop error ({consecutive_errors}): {e}")
+                if consecutive_errors >= 10:
+                    self.log_msg("🔴 Too many consecutive errors — pausing 60s for self-healing")
+                    time.sleep(60)
+                    consecutive_errors = 0
+                    # Try to recover: refresh balance and reconnect
+                    try:
+                        self.refresh_balance()
+                        self.log_msg(f"🔄 Self-heal complete — balance: {self.sol_balance:.4f} SOL")
+                    except Exception:
+                        pass
+                else:
+                    time.sleep(3)
 
     def record_perf_fee(self):
         if self.perf_fee_recorded:
@@ -3734,21 +3784,52 @@ class BotInstance:
 # ── Shared DexScreener scanner ─────────────────────────────────────────────────
 # ── Momentum tracking ──────────────────────────────────────────────────────────
 # Stores recent volume snapshots per token to detect momentum spikes
-_volume_history = {}   # mint -> [(timestamp, vol), ...]
+_volume_history = {}   # mint -> deque([(timestamp, vol), ...], maxlen=60)
+_volume_history_lock = threading.Lock()
+_VOLUME_HISTORY_MAX_MINTS = 500      # hard cap on tracked mints
+_VOLUME_HISTORY_MAX_SAMPLES = 60     # per-mint sample limit
+_VOLUME_HISTORY_TTL_SEC = 300        # drop datapoints older than 5 min
+_volume_history_last_prune = 0.0
+
+def _prune_volume_history():
+    """Evict stale mints from _volume_history. Called automatically."""
+    global _volume_history_last_prune
+    now = time.time()
+    if now - _volume_history_last_prune < 120:
+        return
+    _volume_history_last_prune = now
+    stale = [m for m, hist in _volume_history.items()
+             if not hist or now - hist[-1][0] > _VOLUME_HISTORY_TTL_SEC]
+    for m in stale:
+        _volume_history.pop(m, None)
+    # If still over cap, drop oldest-last-seen
+    if len(_volume_history) > _VOLUME_HISTORY_MAX_MINTS:
+        by_age = sorted(_volume_history.items(), key=lambda kv: kv[1][-1][0] if kv[1] else 0)
+        for m, _ in by_age[:len(_volume_history) - _VOLUME_HISTORY_MAX_MINTS]:
+            _volume_history.pop(m, None)
 
 def volume_velocity(mint, current_vol):
     """Returns volume acceleration score 0-100. Measures rate of volume growth."""
     now = time.time()
-    hist = _volume_history.get(mint, [])
-    hist = [(t, v) for t, v in hist if now - t < 300]
-    hist.append((now, current_vol))
-    _volume_history[mint] = hist
-    if len(hist) < 3: return 0
+    with _volume_history_lock:
+        _prune_volume_history()
+        hist = _volume_history.get(mint)
+        if hist is None:
+            hist = deque(maxlen=_VOLUME_HISTORY_MAX_SAMPLES)
+            _volume_history[mint] = hist
+        # drop stale
+        while hist and now - hist[0][0] > _VOLUME_HISTORY_TTL_SEC:
+            hist.popleft()
+        hist.append((now, current_vol))
+        samples = list(hist)
+    if len(samples) < 3:
+        return 0
     # compare last third vs first third
-    third = max(1, len(hist)//3)
-    early_avg = sum(v for _,v in hist[:third]) / third
-    late_avg  = sum(v for _,v in hist[-third:]) / third
-    if early_avg <= 0: return 0
+    third = max(1, len(samples) // 3)
+    early_avg = sum(v for _, v in samples[:third]) / third
+    late_avg  = sum(v for _, v in samples[-third:]) / third
+    if early_avg <= 0:
+        return 0
     accel = (late_avg - early_avg) / early_avg * 100
     return min(int(accel), 100)
 
@@ -3772,6 +3853,7 @@ WHALE_LABELS = {
 _whale_seen  = set()
 _whale_mints = {}   # mint -> last_seen timestamp (dedup per token)
 _whale_buys  = deque(maxlen=200)  # recent whale buys for dashboard
+_whale_lock  = threading.Lock()   # protects _whale_seen, _whale_mints, _whale_buys
 
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -4896,14 +4978,41 @@ def refresh_token_intel(mint, base_info=None, pair=None, force=False):
     return token_intel_payload(intel)
 
 
+# ── Background intel refresh pool (non-blocking) ─────────────────────────────
+_intel_refresh_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="intel-bg")
+_intel_refresh_pending = set()  # mints currently being refreshed in background
+_intel_refresh_pending_lock = threading.Lock()
+
+def _bg_refresh_token_intel(mint, base_info, pair, force):
+    """Run refresh_token_intel in background thread, update cache when done."""
+    try:
+        refresh_token_intel(mint, base_info=base_info, pair=pair, force=force)
+    except Exception as e:
+        print(f"[INTEL-BG] refresh failed for {mint}: {e}", flush=True)
+    finally:
+        with _intel_refresh_pending_lock:
+            _intel_refresh_pending.discard(mint)
+
 def ensure_token_intel(mint, base_info=None, pair=None, force=False):
     if not mint:
         return {}
-    cached = token_intel_payload(_token_intel_cache.get(mint) or {})
+    with _token_intel_lock:
+        cached = token_intel_payload(_token_intel_cache.get(mint) or {})
     if cached and not force:
         last_updated = _from_iso(cached.get("last_updated"))
         if last_updated and (_now_utc() - last_updated).total_seconds() < INTEL_REFRESH_SEC:
             return cached
+    # If we have stale cached data, return it immediately and refresh in background
+    if cached and not force:
+        with _intel_refresh_pending_lock:
+            if mint not in _intel_refresh_pending:
+                _intel_refresh_pending.add(mint)
+                try:
+                    _intel_refresh_pool.submit(_bg_refresh_token_intel, mint, base_info, pair, force)
+                except Exception:
+                    _intel_refresh_pending.discard(mint)
+        return cached
+    # No cached data at all — must block to get initial intel
     try:
         return refresh_token_intel(mint, base_info=base_info, pair=pair, force=force)
     except Exception as e:
@@ -4937,8 +5046,141 @@ def token_pattern_monitor():
             print(f"[INTEL] monitor error: {e}", flush=True)
         time.sleep(45)
 
+def _whale_is_sig_seen(sig):
+    """Thread-safe check + add for whale signature dedup."""
+    with _whale_lock:
+        if sig in _whale_seen:
+            return True
+        _whale_seen.add(sig)
+        # Cap the set so it doesn't grow forever
+        if len(_whale_seen) > 20_000:
+            _whale_seen.clear()
+        return False
+
+def _whale_is_mint_recent(mint, cooldown_sec=300):
+    """Thread-safe dedup: returns True if mint was seen within cooldown."""
+    now = time.time()
+    with _whale_lock:
+        if now - _whale_mints.get(mint, 0) < cooldown_sec:
+            return True
+        _whale_mints[mint] = now
+        # Prune stale mints
+        if len(_whale_mints) > 2000:
+            stale = [m for m, ts in _whale_mints.items() if now - ts > 3600]
+            for m in stale:
+                _whale_mints.pop(m, None)
+        return False
+
+def _whale_record_buy(wallet, mint, name, price, mc, vol, liq):
+    """Thread-safe append to whale_buys dashboard feed."""
+    now = time.time()
+    with _whale_lock:
+        _whale_buys.appendleft({
+            "wallet": wallet, "label": WHALE_LABELS.get(wallet, wallet[:8] + "..."),
+            "mint": mint, "name": name, "price": price,
+            "mc": mc, "vol": vol, "liq": liq,
+            "timestamp": now, "ts": time.strftime("%H:%M:%S"),
+        })
+
+def _whale_process_dex_pair(wallet, mint, p):
+    """Validate a DexScreener pair for whale-copy eligibility and broadcast to bots."""
+    price = float(p.get("priceUsd") or 0)
+    if not price:
+        return
+    mc = p.get("marketCap", 0) or 0
+    vol = (p.get("volume") or {}).get("h24", 0) or 0
+    liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+    name = p.get("baseToken", {}).get("name", "Unknown")
+    created_at = p.get("pairCreatedAt")
+    age_min = (time.time() * 1000 - created_at) / 60000 if created_at else 9999
+    if age_min > 60 or mc > 500_000 or liq < 3000:
+        return
+    if _whale_is_mint_recent(mint):
+        return
+    _whale_record_buy(wallet, mint, name, price, mc, vol, liq)
+    change = (p.get("priceChange") or {}).get("h1", 0) or 0
+    with user_bots_lock:
+        running_bots = [b for b in user_bots.values() if b.running]
+    for bot in running_bots:
+        if mint not in bot.positions:
+            bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
+            try:
+                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, change)
+            except Exception as _e:
+                print(f"[WHALE] eval error: {_e}", flush=True)
+
+def _poll_single_whale(wallet):
+    """Fetch + process one whale wallet's recent transactions. Run inside ThreadPoolExecutor."""
+    try:
+        enhanced_txs = helius_address_transactions(wallet, limit=8, timeout=8)
+        used_enhanced = False
+        for tx in enhanced_txs:
+            sig = tx.get("signature")
+            if not sig or _whale_is_sig_seen(sig):
+                continue
+            transfers = tx.get("tokenTransfers") or []
+            if not isinstance(transfers, list):
+                continue
+            used_enhanced = True
+            for transfer in transfers:
+                mint = transfer.get("mint") or ""
+                to_user = transfer.get("toUserAccount") or ""
+                amount = float(transfer.get("tokenAmount") or 0)
+                if not mint or mint == SOL_MINT or to_user != wallet or amount <= 0:
+                    continue
+                try:
+                    _wr = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+                    if _wr.status_code != 200:
+                        continue
+                    pairs = safe_json_response(_wr, {}).get("pairs") or []
+                    if pairs:
+                        _whale_process_dex_pair(wallet, mint, pairs[0])
+                except Exception as _e:
+                    print(f"[WHALE] dex lookup error: {_e}", flush=True)
+        if used_enhanced:
+            return
+        # Fallback: raw RPC signatures
+        r = requests.post(HELIUS_RPC, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [wallet, {"limit": 5}]
+        }, timeout=8)
+        sigs = r.json().get("result", [])
+        for sig_info in sigs:
+            sig = sig_info.get("signature")
+            if not sig or _whale_is_sig_seen(sig):
+                continue
+            tx_r = requests.post(HELIUS_RPC, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            }, timeout=8)
+            tx = tx_r.json().get("result")
+            if not tx:
+                continue
+            pre = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances", [])}
+            post = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("postTokenBalances", [])}
+            for idx, pb in post.items():
+                mint = pb.get("mint")
+                if not mint or mint == SOL_MINT:
+                    continue
+                pre_amt = float((pre.get(idx) or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
+                post_amt = float(pb.get("uiTokenAmount", {}).get("uiAmount") or 0)
+                if post_amt > pre_amt * 1.5 and post_amt > 0:
+                    try:
+                        _wr = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+                        if _wr.status_code != 200:
+                            continue
+                        pairs = safe_json_response(_wr, {}).get("pairs") or []
+                        if pairs:
+                            _whale_process_dex_pair(wallet, mint, pairs[0])
+                    except Exception as _e:
+                        print(f"[WHALE] dex fallback error: {_e}", flush=True)
+    except Exception as _e:
+        print(f"[WHALE] wallet {wallet[:8]}... error: {_e}", flush=True)
+
 def check_whale_wallets():
-    """Poll recent transactions of whale wallets and copy their buys."""
+    """Poll recent transactions of whale wallets in parallel and copy their buys."""
     time.sleep(15)  # let app fully start first
     while True:
         try:
@@ -4947,152 +5189,12 @@ def check_whale_wallets():
             if not active_bots:
                 time.sleep(30)
                 continue
-            for wallet in WHALE_WALLETS:
-                try:
-                    enhanced_txs = helius_address_transactions(wallet, limit=8, timeout=8)
-                    used_enhanced = False
-                    for tx in enhanced_txs:
-                        sig = tx.get("signature")
-                        if not sig or sig in _whale_seen:
-                            continue
-                        _whale_seen.add(sig)
-                        transfers = tx.get("tokenTransfers") or []
-                        if not isinstance(transfers, list):
-                            continue
-                        used_enhanced = True
-                        for transfer in transfers:
-                            mint = transfer.get("mint") or ""
-                            to_user = transfer.get("toUserAccount") or ""
-                            amount = float(transfer.get("tokenAmount") or 0)
-                            if not mint or mint == SOL_MINT or to_user != wallet or amount <= 0:
-                                continue
-                            try:
-                                _wr = dex_get(
-                                    f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                    timeout=5
-                                )
-                                if _wr.status_code != 200:
-                                    continue
-                                pairs = safe_json_response(_wr, {}).get("pairs") or []
-                                if not pairs:
-                                    continue
-                                p = pairs[0]
-                                price  = float(p.get("priceUsd") or 0)
-                                mc     = p.get("marketCap", 0) or 0
-                                vol    = (p.get("volume") or {}).get("h24", 0) or 0
-                                liq    = (p.get("liquidity") or {}).get("usd", 0) or 0
-                                name   = p.get("baseToken", {}).get("name", "Unknown")
-                                created_at = p.get("pairCreatedAt")
-                                age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
-                                if not price:
-                                    continue
-                                if age_min > 60:
-                                    continue
-                                if mc > 500_000:
-                                    continue
-                                if liq < 3000:
-                                    continue
-                                now = time.time()
-                                if now - _whale_mints.get(mint, 0) < 300:
-                                    continue
-                                _whale_mints[mint] = now
-                                _whale_buys.appendleft({
-                                    "wallet": wallet, "label": WHALE_LABELS.get(wallet, wallet[:8]+"..."),
-                                    "mint": mint, "name": name, "price": price,
-                                    "mc": mc, "vol": vol, "liq": liq,
-                                    "timestamp": now, "ts": time.strftime("%H:%M:%S"),
-                                })
-                                for bot in list(user_bots.values()):
-                                    if bot.running and mint not in bot.positions:
-                                        bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
-                                        try:
-                                            change = (p.get("priceChange") or {}).get("h1", 0) or 0
-                                            bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, change)
-                                        except Exception as _e:
-                                            print(f"[ERROR] {_e}", flush=True)
-                            except Exception as _e:
-                                print(f"[ERROR] {_e}", flush=True)
-                    if used_enhanced:
-                        continue
-                    r = requests.post(HELIUS_RPC, json={
-                        "jsonrpc": "2.0", "id": 1,
-                        "method": "getSignaturesForAddress",
-                        "params": [wallet, {"limit": 5}]
-                    }, timeout=8)
-                    sigs = r.json().get("result", [])
-                    for sig_info in sigs:
-                        sig = sig_info.get("signature")
-                        if not sig or sig in _whale_seen:
-                            continue
-                        _whale_seen.add(sig)
-                        tx_r = requests.post(HELIUS_RPC, json={
-                            "jsonrpc": "2.0", "id": 1,
-                            "method": "getTransaction",
-                            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-                        }, timeout=8)
-                        tx = tx_r.json().get("result")
-                        if not tx:
-                            continue
-                        pre  = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances",  [])}
-                        post = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("postTokenBalances", [])}
-                        for idx, pb in post.items():
-                            mint = pb.get("mint")
-                            if not mint or mint == SOL_MINT:
-                                continue
-                            pre_amt  = float((pre.get(idx)  or {}).get("uiTokenAmount", {}).get("uiAmount") or 0)
-                            post_amt = float(pb.get("uiTokenAmount", {}).get("uiAmount") or 0)
-                            if post_amt > pre_amt * 1.5 and post_amt > 0:
-                                try:
-                                    _wr = dex_get(
-                                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                                        timeout=5
-                                    )
-                                    if _wr.status_code != 200:
-                                        continue
-                                    pairs = safe_json_response(_wr, {}).get("pairs") or []
-                                    if not pairs:
-                                        continue
-                                    p = pairs[0]
-                                    price  = float(p.get("priceUsd") or 0)
-                                    mc     = p.get("marketCap", 0) or 0
-                                    vol    = (p.get("volume") or {}).get("h24", 0) or 0
-                                    liq    = (p.get("liquidity") or {}).get("usd", 0) or 0
-                                    name   = p.get("baseToken", {}).get("name", "Unknown")
-                                    created_at = p.get("pairCreatedAt")
-                                    age_min = (time.time()*1000 - created_at)/60000 if created_at else 9999
-                                    if not price:
-                                        continue
-                                    if age_min > 60:
-                                        continue
-                                    if mc > 500_000:
-                                        continue
-                                    if liq < 3000:
-                                        continue
-                                    now = time.time()
-                                    if now - _whale_mints.get(mint, 0) < 300:
-                                        continue
-                                    _whale_mints[mint] = now
-                                    _whale_buys.appendleft({
-                                        "wallet": wallet, "label": WHALE_LABELS.get(wallet, wallet[:8]+"..."),
-                                        "mint": mint, "name": name, "price": price,
-                                        "mc": mc, "vol": vol, "liq": liq,
-                                        "timestamp": now, "ts": time.strftime("%H:%M:%S"),
-                                    })
-                                    for bot in list(user_bots.values()):
-                                        if bot.running and mint not in bot.positions:
-                                            bot.log_msg(f"🐋 WHALE COPY: {name} ({wallet[:8]}...)")
-                                            try:
-                                                change = (p.get("priceChange") or {}).get("h1", 0) or 0
-                                                bot.evaluate_signal(mint, name, price, mc, vol, liq, age_min, change)
-                                            except Exception as _e:
-                                                print(f"[ERROR] {_e}", flush=True)
-                                except Exception as _e:
-                                    print(f"[ERROR] {_e}", flush=True)
-                except Exception as _e:
-                    print(f"[ERROR] {_e}", flush=True)
+            # Process all wallets in parallel (cuts 32s serial down to ~8s)
+            with ThreadPoolExecutor(max_workers=min(len(WHALE_WALLETS), 4)) as pool:
+                pool.map(_poll_single_whale, WHALE_WALLETS)
             time.sleep(20)
         except Exception as e:
-            print(f"Whale tracker error: {e}")
+            print(f"[WHALE] tracker error: {e}", flush=True)
             time.sleep(30)
 
 def _process_dex_pair(p):
@@ -6032,12 +6134,27 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
         normalized_mode = "event_tape" if str(replay_mode).strip().lower() in {"event_tape", "tape", "events"} else "snapshot"
         if normalized_mode == "event_tape":
             rows = _load_backtest_event_tape(days=days)
+            print(f"[BACKTEST] run {run_id}: loaded {len(rows)} events over {days}d for {len(strategies)} strategies", flush=True)
+            if not rows:
+                print(f"[BACKTEST] ⚠️ run {run_id}: ZERO events found in market_events / wallet_flow_events / liquidity_delta_events for the last {days} day(s). "
+                      f"The bot must be running and scanning tokens to populate this data.", flush=True)
             result = simulate_event_tape_backtest(run_id, rows, strategies)
         else:
             rows = _load_backtest_snapshots(days=days, strategies=strategies)
+            print(f"[BACKTEST] run {run_id}: loaded {len(rows)} snapshots over {days}d for {len(strategies)} strategies", flush=True)
+            if not rows:
+                print(f"[BACKTEST] ⚠️ run {run_id}: ZERO snapshots found in token_feature_snapshots for the last {days} day(s). "
+                      f"The bot must be running and scanning tokens to populate this data.", flush=True)
             result = simulate_backtest(run_id, rows, strategies)
         trades = result["trades"]
         summary = result["summary"]
+        # Diagnostic: log why trades may be zero
+        print(f"[BACKTEST] run {run_id} complete: {len(trades)} trades from {summary.get('snapshots_processed', summary.get('events_processed', 0))} snapshots/events", flush=True)
+        for strat_name, strat_summary in (summary.get("strategies") or {}).items():
+            decisions = strat_summary.get("decisions", 0)
+            passed = strat_summary.get("passed", 0)
+            blocked = strat_summary.get("blocked", 0)
+            print(f"[BACKTEST]   {strat_name}: {decisions} evaluated, {passed} passed, {blocked} blocked", flush=True)
 
         conn = db()
         try:
@@ -6072,6 +6189,20 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
             conn.commit()
         finally:
             db_return(conn)
+        # Add diagnostic hints when no trades are generated
+        if not trades:
+            data_count = len(rows)
+            diag_hints = []
+            if data_count == 0:
+                diag_hints.append(f"No market data found for the last {days} day(s). The bot's scanners must be running to record data.")
+                diag_hints.append("Start the bot, let it scan for at least a few hours, then re-run the backtest.")
+            else:
+                diag_hints.append(f"{data_count} data points were loaded but all signals were blocked by entry filters.")
+                for strat_name, strat_summary in (summary.get("strategies") or {}).items():
+                    if strat_summary.get("blocked", 0) > 0 and strat_summary.get("passed", 0) == 0:
+                        diag_hints.append(f"Strategy '{strat_name}': {strat_summary['blocked']} blocked, 0 passed. Entry thresholds may be too strict for historical data.")
+                diag_hints.append("Try running a longer backtest window (14-30 days) to capture more varied market conditions.")
+            summary["diagnostic_hints"] = diag_hints
         _set_backtest_job(run_id, {
             "status": "completed",
             "completed_at": time.time(),
@@ -6156,6 +6287,12 @@ def _broadcast_signal(info):
         })
     record_price(mint, info["price"])
     _record_market_intelligence(info)
+    # Feed momentum sniper tracker so it can detect surges across scans
+    _momentum_track(
+        mint, info.get("price", 0), info.get("vol", 0), info.get("mc", 0),
+        info.get("liq", 0), info.get("name", ""), info.get("age_min", 9999),
+        info.get("source", "scanner"),
+    )
     with user_bots_lock:
         running_bots = [b for b in user_bots.values() if b.running]
     print(f"[SCAN] {info['name']} | MC:${info['mc']:,.0f} Liq:${info['liq']:,.0f} Age:{info['age_min']:.0f}m Chg:{info['change']:+.0f}% | bots={len(running_bots)}", flush=True)
@@ -6172,6 +6309,145 @@ def _broadcast_signal(info):
             )
         except Exception as _be:
             print(f"[SCAN] evaluate_signal error: {_be}", flush=True)
+
+# ── Momentum Sniper ──────────────────────────────────────────────────────────
+# Detects coins soaring fast (price velocity) and auto-buys while still rising.
+# Uses a rolling price window per token; triggers when price accelerates >X% in
+# a short window with rising volume — the classic "it's pumping NOW" signal.
+_momentum_price_history = {}  # mint -> deque([(ts, price, vol, mc), ...])
+_momentum_price_lock = threading.Lock()
+_MOMENTUM_MAX_TRACKED = 400
+_MOMENTUM_WINDOW_SEC = 180       # 3-min window
+_MOMENTUM_MIN_SURGE_PCT = 25     # must gain >25% in the window
+_MOMENTUM_MIN_VOL_USD = 8000     # needs real volume, not just one trade
+_MOMENTUM_MIN_LIQ_USD = 3000     # needs real pool
+_MOMENTUM_MAX_MC = 800_000       # still small-cap
+_MOMENTUM_MIN_MC = 2000          # not zero
+_MOMENTUM_COOLDOWN = {}          # mint -> last_buy_ts (prevent repeat buys)
+_MOMENTUM_COOLDOWN_SEC = 300     # 5 min cooldown per mint
+
+def _momentum_track(mint, price, vol, mc, liq, name, age_min, source):
+    """Record a price tick for momentum tracking. Returns surge info dict or None."""
+    if not mint or not price or mc > _MOMENTUM_MAX_MC or mc < _MOMENTUM_MIN_MC:
+        return None
+    if liq < _MOMENTUM_MIN_LIQ_USD or vol < _MOMENTUM_MIN_VOL_USD:
+        return None
+    now = time.time()
+    with _momentum_price_lock:
+        hist = _momentum_price_history.get(mint)
+        if hist is None:
+            hist = deque(maxlen=60)
+            _momentum_price_history[mint] = hist
+        # Prune old ticks
+        while hist and now - hist[0][0] > _MOMENTUM_WINDOW_SEC:
+            hist.popleft()
+        hist.append((now, price, vol, mc))
+        samples = list(hist)
+        # Prune entire dict if too large
+        if len(_momentum_price_history) > _MOMENTUM_MAX_TRACKED:
+            oldest_mints = sorted(
+                _momentum_price_history.items(),
+                key=lambda kv: kv[1][-1][0] if kv[1] else 0,
+            )[:len(_momentum_price_history) - _MOMENTUM_MAX_TRACKED]
+            for m, _ in oldest_mints:
+                _momentum_price_history.pop(m, None)
+    if len(samples) < 3:
+        return None
+    earliest_price = samples[0][1]
+    if earliest_price <= 0:
+        return None
+    surge_pct = ((price - earliest_price) / earliest_price) * 100
+    if surge_pct < _MOMENTUM_MIN_SURGE_PCT:
+        return None
+    # Volume should be increasing across the window too
+    first_half_vol = sum(s[2] for s in samples[:len(samples) // 2]) / max(1, len(samples) // 2)
+    second_half_vol = sum(s[2] for s in samples[len(samples) // 2:]) / max(1, len(samples) - len(samples) // 2)
+    vol_rising = second_half_vol >= first_half_vol * 0.8  # allow slight dip
+    if not vol_rising:
+        return None
+    # Check cooldown
+    if now - _MOMENTUM_COOLDOWN.get(mint, 0) < _MOMENTUM_COOLDOWN_SEC:
+        return None
+    _MOMENTUM_COOLDOWN[mint] = now
+    # Clean up old cooldowns
+    if len(_MOMENTUM_COOLDOWN) > 1000:
+        stale = [m for m, ts in _MOMENTUM_COOLDOWN.items() if now - ts > 600]
+        for m in stale:
+            _MOMENTUM_COOLDOWN.pop(m, None)
+    window_sec = now - samples[0][0]
+    return {
+        "surge_pct": round(surge_pct, 1),
+        "window_sec": round(window_sec, 0),
+        "earliest_price": earliest_price,
+        "current_price": price,
+        "vol_rising": vol_rising,
+        "samples": len(samples),
+    }
+
+def momentum_sniper():
+    """
+    Dedicated scanner: re-checks recent market_feed tokens every 8s for rapid surges.
+    If a token has gained >25% in the last 3 minutes with rising volume, it broadcasts
+    a high-priority BUY signal to all active bots immediately.
+    """
+    time.sleep(12)
+    print("[MomentumSniper] 🚀 Started — watching for fast-soaring tokens", flush=True)
+    while True:
+        try:
+            # Pull the most recent tokens from market_feed
+            feed = list(market_feed)[:50]
+            with user_bots_lock:
+                active_bots = [b for b in user_bots.values() if b.running]
+            if not active_bots or not feed:
+                time.sleep(10)
+                continue
+            surges_found = 0
+            for item in feed:
+                mint = item.get("mint")
+                if not mint:
+                    continue
+                price = float(item.get("price") or 0)
+                vol = float(item.get("vol") or 0)
+                mc = float(item.get("mc") or 0)
+                liq = float(item.get("liq") or 0)
+                name = item.get("name") or "Unknown"
+                age_min = float(item.get("age_min") or 9999)
+                # Also check for fresh price data from DexScreener if the feed entry is stale
+                feed_age = time.time() - float(item.get("timestamp") or time.time())
+                if feed_age > 120:
+                    continue  # skip tokens not seen in the last 2 min
+                surge = _momentum_track(mint, price, vol, mc, liq, name, age_min, "momentum-sniper")
+                if not surge:
+                    continue
+                surges_found += 1
+                surge_pct = surge["surge_pct"]
+                window_sec = surge["window_sec"]
+                print(
+                    f"[MomentumSniper] 🔥 SURGE DETECTED: {name} +{surge_pct:.0f}% in {window_sec:.0f}s | "
+                    f"MC:${mc:,.0f} Vol:${vol:,.0f} Liq:${liq:,.0f}",
+                    flush=True,
+                )
+                # Broadcast to all running bots with boosted change signal
+                change = max(float(item.get("change") or 0), surge_pct)
+                for bot in active_bots:
+                    if mint in bot.positions:
+                        continue
+                    bot.log_msg(
+                        f"🔥 SURGE: {name} +{surge_pct:.0f}% in {window_sec:.0f}s — buying on momentum"
+                    )
+                    try:
+                        bot.evaluate_signal(
+                            mint, name, price, mc, vol, liq, age_min, change,
+                            source="momentum-sniper",
+                        )
+                    except Exception as _e:
+                        print(f"[MomentumSniper] eval error: {_e}", flush=True)
+            if surges_found:
+                print(f"[MomentumSniper] Cycle complete — {surges_found} surge(s) fired", flush=True)
+            time.sleep(8)
+        except Exception as e:
+            print(f"[MomentumSniper] error: {e}", flush=True)
+            time.sleep(10)
 
 def global_scanner():
     """Primary scanner: DexScreener latest token profiles (established flow)."""
@@ -6364,7 +6640,7 @@ def helius_pool_sniper():
 
             def on_open(ws):
                 for idx, (program_id, label) in enumerate(tracked_programs, start=1):
-                    ws.send(_json.dumps({
+                    ws.send(json.dumps({
                         "jsonrpc": "2.0",
                         "id": idx,
                         "method": "logsSubscribe",
@@ -6378,7 +6654,7 @@ def helius_pool_sniper():
             def on_message(ws, message):
                 try:
                     timeout_state["streak"] = 0
-                    data = _json.loads(message)
+                    data = json.loads(message)
                     value = (((data or {}).get("params") or {}).get("result") or {}).get("value") or {}
                     logs = value.get("logs") or []
                     sig = value.get("signature") or ""
@@ -6464,9 +6740,68 @@ def helius_pool_sniper():
             _run_rpc_poll_sniper(tracked_programs, seen_signatures)
             return
 
+def _start_bot_from_row(row):
+    """Create a BotInstance from a DB row and start its thread. Returns (uid, bot) or raises."""
+    uid = row["user_id"]
+    kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
+    preset_name = normalize_preset_name(row["preset"])
+    settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
+    if row.get("max_correlated") is not None:
+        settings["max_correlated"] = row["max_correlated"]
+    if row.get("drawdown_limit_sol") is not None:
+        settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
+    if row.get("custom_settings"):
+        try:
+            custom = json.loads(row["custom_settings"])
+            if isinstance(custom, dict):
+                settings.update(custom)
+        except Exception:
+            pass
+    max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email", "")), PLAN_LIMITS["basic"])["max_buy_sol"]
+    settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
+    bot = BotInstance(uid, kp, settings,
+        run_mode=row["run_mode"],
+        run_duration_min=row["run_duration_min"],
+        profit_target_sol=row["profit_target_sol"],
+        preset_name=preset_name,
+        execution_control=row)
+    with user_bots_lock:
+        user_bots[uid] = bot
+    # Reload open positions from DB so they survive Railway restarts
+    try:
+        _conn = db()
+        try:
+            _c = _conn.cursor()
+            _c.execute("SELECT * FROM open_positions WHERE user_id=%s", (uid,))
+            saved_pos = _c.fetchall()
+        finally:
+            db_return(_conn)
+        for p in saved_pos:
+            opened_ts = p["opened_at"].timestamp() if p.get("opened_at") else time.time()
+            bot.positions[p["mint"]] = {
+                "name":       p["name"],
+                "entry_price": p["entry_price"],
+                "peak_price":  p["peak_price"],
+                "timestamp":   opened_ts,
+                "tp1_hit":     bool(p["tp1_hit"]),
+                "entry_sol":   p["entry_sol"],
+                "dev_wallet":  p["dev_wallet"],
+                "surge_hold_active": False,
+                "surge_peak_price": p["peak_price"] or p["entry_price"],
+            }
+        if saved_pos:
+            print(f"[AutoRestart] ✅ U{uid}: restored {len(saved_pos)} position(s)", flush=True)
+    except Exception as _e:
+        print(f"[AutoRestart] ⚠️ U{uid}: could not reload positions: {_e}", flush=True)
+    t = threading.Thread(target=bot.run, daemon=True)
+    t.start()
+    bot.thread = t
+    return uid, bot
+
 def auto_restart_bots():
-    """Restart bots that were running before a server restart."""
+    """Restart bots that were running before a server restart, then monitor for dead threads."""
     time.sleep(5)  # wait for app to fully initialize
+    # Phase 1: Initial restart from DB
     try:
         conn = db()
         try:
@@ -6487,73 +6822,53 @@ def auto_restart_bots():
             rows = cur.fetchall()
         finally:
             db_return(conn)
+        restarted = 0
         for row in rows:
             uid = row["user_id"]
             try:
-                kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
-                preset_name = normalize_preset_name(row["preset"])
-                settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
-                if row.get("max_correlated") is not None:
-                    settings["max_correlated"] = row["max_correlated"]
-                if row.get("drawdown_limit_sol") is not None:
-                    settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
-                if row.get("custom_settings"):
-                    try:
-                        import json as _json
-                        custom = _json.loads(row["custom_settings"])
-                        if isinstance(custom, dict):
-                            settings.update(custom)
-                    except Exception:
-                        pass
-                max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email","")), PLAN_LIMITS["basic"])["max_buy_sol"]
-                settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
-                bot = BotInstance(uid, kp, settings,
-                    run_mode=row["run_mode"],
-                    run_duration_min=row["run_duration_min"],
-                    profit_target_sol=row["profit_target_sol"],
-                    preset_name=preset_name,
-                    execution_control=row)
-                with user_bots_lock:
-                    user_bots[uid] = bot
-                # Reload open positions from DB so they survive Railway restarts
+                _start_bot_from_row(row)
+                restarted += 1
+                print(f"[AutoRestart] ✅ U{uid} restarted ({row['preset']})", flush=True)
+            except Exception as e:
+                print(f"[AutoRestart] ❌ U{uid} failed: {e}", flush=True)
                 try:
                     _conn = db()
                     try:
-                        _c = _conn.cursor()
-                        _c.execute("SELECT * FROM open_positions WHERE user_id=%s", (uid,))
-                        saved_pos = _c.fetchall()
+                        _conn.cursor().execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
+                        _conn.commit()
                     finally:
                         db_return(_conn)
-                    for p in saved_pos:
-                        opened_ts = p["opened_at"].timestamp() if p.get("opened_at") else time.time()
-                        bot.positions[p["mint"]] = {
-                            "name":       p["name"],
-                            "entry_price": p["entry_price"],
-                            "peak_price":  p["peak_price"],
-                            "timestamp":   opened_ts,
-                            "tp1_hit":     bool(p["tp1_hit"]),
-                            "entry_sol":   p["entry_sol"],
-                            "dev_wallet":  p["dev_wallet"],
-                            "surge_hold_active": False,
-                            "surge_peak_price": p["peak_price"] or p["entry_price"],
-                        }
-                    if saved_pos:
-                        print(f"[U{uid}] Restored {len(saved_pos)} open position(s) from DB")
-                except Exception as _e:
-                    print(f"[WARN] Could not reload positions for user {uid}: {_e}")
-                t = threading.Thread(target=bot.run, daemon=True)
-                t.start()
-                bot.thread = t
-            except Exception as e:
-                conn = db()
-                try:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
-                    conn.commit()
-                finally:
-                    db_return(conn)
-    except Exception:
-        pass
+                except Exception:
+                    pass
+        if restarted:
+            print(f"[AutoRestart] 🔄 Restarted {restarted}/{len(rows)} bot(s)", flush=True)
+    except Exception as e:
+        print(f"[AutoRestart] startup error: {e}", flush=True)
+
+    # Phase 2: Dead-thread watchdog — check every 60s for crashed bot threads
+    while True:
+        try:
+            time.sleep(60)
+            with user_bots_lock:
+                bots_snapshot = list(user_bots.items())
+            for uid, bot in bots_snapshot:
+                if not bot.running:
+                    continue
+                if bot.thread and not bot.thread.is_alive():
+                    print(f"[Watchdog] 🔴 U{uid} thread died — attempting auto-restart", flush=True)
+                    bot.log_msg("🔄 Bot thread crashed — auto-restarting...")
+                    try:
+                        t = threading.Thread(target=bot.run, daemon=True)
+                        t.start()
+                        bot.thread = t
+                        bot.log_msg("✅ Auto-restart successful")
+                    except Exception as _e:
+                        bot.running = False
+                        bot.log_msg(f"❌ Auto-restart failed: {_e}")
+                        print(f"[Watchdog] ❌ U{uid} auto-restart failed: {_e}", flush=True)
+        except Exception as e:
+            print(f"[Watchdog] error: {e}", flush=True)
+            time.sleep(30)
 
 def warm_sender_connections():
     """Ping Helius Sender regional nodes every 30s to reduce cold-start latency."""
@@ -6786,7 +7101,7 @@ def _acquire_background_worker_lock():
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(%s)", (BACKGROUND_WORKER_LOCK_ID,))
-            locked = cur.fetchone()[0]
+            locked = (cur.fetchone() or [False])[0]
         if not locked:
             conn.close()
             return False
@@ -6813,6 +7128,7 @@ def ensure_background_workers_started():
             new_pairs_scanner,
             helius_pool_sniper,
             token_pattern_monitor,
+            momentum_sniper,
             auto_restart_bots,
             warm_sender_connections,
             listing_scanner,
@@ -6853,17 +7169,21 @@ def handle_500(e):
 
 def _graceful_shutdown(signum, frame):
     """Stop all running bots and persist positions on SIGTERM/SIGINT."""
-    print(f"[SHUTDOWN] Signal {signum} received — stopping all bots...", flush=True)
+    print(f"[SHUTDOWN] 🛑 Signal {signum} received — stopping all bots...", flush=True)
     with user_bots_lock:
         bots = list(user_bots.values())
+    stopped = 0
     for bot in bots:
         try:
-            bot.running = False
+            if bot.running:
+                bot.running = False
+                bot.log_msg("🛑 Server shutting down — positions preserved in DB")
+                stopped += 1
         except Exception:
             pass
     # Give bots a moment to finish current sell cycles
     time.sleep(2)
-    print("[SHUTDOWN] All bots stopped. Exiting.", flush=True)
+    print(f"[SHUTDOWN] ✅ {stopped} bot(s) stopped. Positions persisted. Exiting.", flush=True)
     _release_background_lock()
     raise SystemExit(0)
 
@@ -8476,7 +8796,7 @@ def api_signal_explorer():
             payload = {}
         if isinstance(payload, dict) and payload:
             if row.get("ts") and not payload.get("logged_at"):
-                payload["logged_at"] = row["ts"].isoformat()
+                payload["logged_at"] = row["ts"].isoformat() if hasattr(row["ts"], "isoformat") else str(row["ts"])
             recent.append(payload)
     total = len(recent)
     passed = sum(1 for s in recent if s.get("passed"))
@@ -8905,7 +9225,7 @@ def api_referral():
         cur.execute("SELECT referral_code, referral_earnings_sol FROM users WHERE id=%s", (uid,))
         u = cur.fetchone()
         cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=%s", (uid,))
-        count = cur.fetchone()["c"]
+        count = (cur.fetchone() or {}).get("c", 0)
     finally:
         db_return(conn)
     code = u["referral_code"] or ""

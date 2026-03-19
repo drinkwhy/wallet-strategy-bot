@@ -252,9 +252,17 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         blocker_reasons.append("green_lights_below_threshold")
     if snapshot["narrative_score"] < _safe_int(settings.get("min_narrative_score", 0)):
         blocker_reasons.append("narrative_below_threshold")
-    if _safe_float(settings.get("min_holder_growth_pct", 0)) > 0 and snapshot["holder_growth_1h"] < _safe_float(settings.get("min_holder_growth_pct", 0)):
+    # Holder growth and volume spike are enrichment fields that may not exist in
+    # historical snapshots.  Treat them as blockers ONLY when data is actually
+    # present (non-zero) but still below the threshold — if data is missing (0),
+    # skip the blocker so backtests don't silently produce zero trades.
+    _holder_growth_val = _safe_float(snapshot.get("holder_growth_1h"))
+    _holder_growth_min = _safe_float(settings.get("min_holder_growth_pct", 0))
+    if _holder_growth_min > 0 and _holder_growth_val > 0 and _holder_growth_val < _holder_growth_min:
         blocker_reasons.append("holder_growth_below_threshold")
-    if _safe_float(settings.get("min_volume_spike_mult", 0)) > 0 and snapshot["volume_spike_ratio"] < _safe_float(settings.get("min_volume_spike_mult", 0)):
+    _vol_spike_val = _safe_float(snapshot.get("volume_spike_ratio"))
+    _vol_spike_min = _safe_float(settings.get("min_volume_spike_mult", 0))
+    if _vol_spike_min > 0 and _vol_spike_val > 0 and _vol_spike_val < _vol_spike_min:
         blocker_reasons.append("volume_spike_below_threshold")
     if settings.get("anti_rug") and snapshot.get("can_exit") is False:
         blocker_reasons.append("cannot_exit")
@@ -273,9 +281,9 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         pass_reasons.append("green_lights_ok")
     if snapshot["narrative_score"] >= _safe_int(settings.get("min_narrative_score", 0)):
         pass_reasons.append("narrative_ok")
-    if snapshot["holder_growth_1h"] >= _safe_float(settings.get("min_holder_growth_pct", 0)):
+    if _holder_growth_val >= _holder_growth_min or _holder_growth_val == 0:
         pass_reasons.append("holder_growth_ok")
-    if snapshot["volume_spike_ratio"] >= _safe_float(settings.get("min_volume_spike_mult", 0)):
+    if _vol_spike_val >= _vol_spike_min or _vol_spike_val == 0:
         pass_reasons.append("volume_spike_ok")
     if _safe_int(snapshot.get("threat_risk_score")) < 45:
         pass_reasons.append("threat_risk_ok")
@@ -285,11 +293,11 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     score += _normalize(snapshot["vol"], 0, max(_safe_float(settings.get("min_vol", 0)) * 2, 1.0)) * 5
     score += _normalize(snapshot["green_lights"], 0, 3) * 8
     score += _normalize(snapshot["narrative_score"], 0, max(_safe_float(settings.get("min_narrative_score", 0)) + 30, 30)) * 6
-    score -= len(blocker_reasons) * 8
+    score -= len(blocker_reasons) * 5
     score = max(0.0, min(100.0, score))
 
-    confidence = _clamp(snapshot["confidence"] + (len(pass_reasons) * 0.035) - (len(blocker_reasons) * 0.08))
-    passed = not blocker_reasons and score >= 45 and confidence >= 0.4
+    confidence = _clamp(snapshot["confidence"] + (len(pass_reasons) * 0.04) - (len(blocker_reasons) * 0.06))
+    passed = not blocker_reasons and score >= 40 and confidence >= 0.35
 
     metrics = {
         "entry_price": snapshot["price"],
