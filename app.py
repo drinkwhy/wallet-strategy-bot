@@ -11624,120 +11624,73 @@ DASHBOARD_HTML = _CSS + """
     <div class="stat"><div class="slabel">Streak</div><div class="sval" id="streak">—</div></div>
   </div>
 
-  <!-- ═══════════ LIVE SHADOW PERFORMANCE BANNER (VIRAL) ═══════════ -->
+  <!-- ═══════════ LIVE SHADOW PERFORMANCE BANNER ═══════════ -->
   <style>
-  @keyframes livePulse{0%,100%{box-shadow:0 0 8px rgba(20,199,132,.5),0 0 20px rgba(20,199,132,.2)}50%{box-shadow:0 0 24px rgba(20,199,132,.9),0 0 48px rgba(20,199,132,.3)}}
-  @keyframes fadeSlideIn{from{opacity:0;transform:translateY(-12px) scale(.95)}to{opacity:1;transform:translateY(0) scale(1)}}
-  @keyframes countUp{from{opacity:.4;transform:scale(.85) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
-  @keyframes flashGreen{0%{background:rgba(20,199,132,.45)}100%{background:rgba(20,199,132,.06)}}
-  @keyframes flashRed{0%{background:rgba(239,68,68,.45)}100%{background:rgba(239,68,68,.06)}}
+  @keyframes livePulse{0%,100%{box-shadow:0 0 6px rgba(20,199,132,.4)}50%{box-shadow:0 0 18px rgba(20,199,132,.8)}}
+  @keyframes fadeSlideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes countUp{from{opacity:.5;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+  @keyframes flashGreen{0%{background:rgba(20,199,132,.35)}100%{background:rgba(20,199,132,.06)}}
+  @keyframes flashRed{0%{background:rgba(239,68,68,.35)}100%{background:rgba(239,68,68,.06)}}
   @keyframes gradientShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-  @keyframes borderGlow{0%{border-color:rgba(20,199,132,.3)}25%{border-color:rgba(59,130,246,.4)}50%{border-color:rgba(168,85,247,.4)}75%{border-color:rgba(20,199,132,.5)}100%{border-color:rgba(20,199,132,.3)}}
-  @keyframes shimmer{0%{left:-100%}100%{left:200%}}
-  @keyframes heroGlow{0%,100%{text-shadow:0 0 20px rgba(20,199,132,.4),0 0 40px rgba(20,199,132,.15)}50%{text-shadow:0 0 30px rgba(20,199,132,.7),0 0 60px rgba(20,199,132,.25)}}
-  @keyframes tickerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
-  @keyframes fireFlicker{0%,100%{transform:scale(1)}25%{transform:scale(1.15) rotate(-3deg)}50%{transform:scale(1.05) rotate(2deg)}75%{transform:scale(1.2) rotate(-2deg)}}
-  @keyframes sparkFloat{0%{transform:translateY(0) scale(1);opacity:1}100%{transform:translateY(-40px) scale(0);opacity:0}}
-  @keyframes dropIn{from{opacity:0;transform:translateY(-30px) scale(.7)}to{opacity:1;transform:translateY(0) scale(1)}}
-  @keyframes slotRoll{0%{transform:translateY(100%);opacity:0}60%{transform:translateY(-8%);opacity:1}80%{transform:translateY(3%)}100%{transform:translateY(0)}}
   .live-banner{
     position:relative;overflow:hidden;
-    background:linear-gradient(135deg,rgba(8,16,32,.97),rgba(12,24,48,.95),rgba(6,14,28,.97));
-    background-size:300% 300%;animation:gradientShift 6s ease infinite;
-    border:2px solid rgba(20,199,132,.3);border-radius:24px;padding:0;margin-bottom:16px;
-    animation:gradientShift 6s ease infinite,borderGlow 4s ease infinite;
+    background:linear-gradient(135deg,rgba(10,22,40,.95),rgba(14,28,50,.92),rgba(8,18,34,.95));
+    background-size:200% 200%;animation:gradientShift 8s ease infinite;
+    border:1px solid rgba(20,199,132,.2);border-radius:20px;padding:16px 20px;margin-bottom:16px;
+    display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:center;
   }
-  .live-banner::before{content:"";position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(ellipse at 30% 20%,rgba(20,199,132,.08),transparent 50%),radial-gradient(ellipse at 70% 80%,rgba(59,130,246,.08),transparent 50%),radial-gradient(ellipse at 50% 50%,rgba(168,85,247,.04),transparent 40%);pointer-events:none;z-index:0}
-  .live-banner::after{content:"";position:absolute;top:0;left:-100%;width:60%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.03),transparent);animation:shimmer 4s ease-in-out infinite;pointer-events:none;z-index:1}
-  .live-banner-top{position:relative;z-index:2;display:flex;align-items:center;justify-content:space-between;padding:14px 20px 10px;border-bottom:1px solid rgba(255,255,255,.04)}
-  .live-dot-wrap{display:flex;align-items:center;gap:10px}
-  .live-dot{width:12px;height:12px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite;flex-shrink:0}
-  .live-label{font-size:12px;font-weight:900;letter-spacing:.18em;text-transform:uppercase;color:#14c784;text-shadow:0 0 12px rgba(20,199,132,.4)}
-  .live-subtitle{font-size:10px;color:var(--t3);margin-top:2px;letter-spacing:.04em}
-  .live-badges{display:flex;gap:6px;align-items:center}
-  .shadow-auto-tag{display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:4px 10px;border-radius:8px;background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:var(--blue2);backdrop-filter:blur(8px)}
-  .shadow-fire-tag{display:inline-flex;align-items:center;gap:3px;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:4px 10px;border-radius:8px;background:rgba(251,146,60,.12);border:1px solid rgba(251,146,60,.3);color:#fb923c;backdrop-filter:blur(8px)}
-  .shadow-fire-tag .fire-icon{display:inline-block;animation:fireFlicker .6s ease infinite}
-  .live-banner-hero{position:relative;z-index:2;display:flex;align-items:center;justify-content:center;gap:24px;padding:16px 20px 12px}
-  .hero-profit{text-align:center;position:relative}
-  .hero-profit-label{font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:var(--t3);margin-bottom:4px}
-  .hero-profit-val{font-family:'Space Grotesk','Manrope',monospace;font-size:48px;font-weight:900;letter-spacing:-1.5px;color:#14c784;animation:heroGlow 3s ease infinite;line-height:1;overflow:hidden}
-  .hero-profit-val.neg{color:#ef4444;text-shadow:0 0 20px rgba(239,68,68,.4),0 0 40px rgba(239,68,68,.15)}
-  .hero-profit-val .digit{display:inline-block;transition:transform .4s cubic-bezier(.23,1,.32,1),opacity .3s}
-  .hero-profit-val .digit.rolling{animation:slotRoll .5s cubic-bezier(.23,1,.32,1)}
-  .hero-sparkline-wrap{flex-shrink:0;position:relative}
-  .hero-sparkline-label{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--t3);text-align:center;margin-bottom:4px}
-  #hero-sparkline{border-radius:12px;display:block}
-  .live-banner-stats{position:relative;z-index:2;display:flex;gap:0;padding:0 20px 14px;justify-content:center}
-  .live-stat{display:flex;flex-direction:column;align-items:center;min-width:90px;padding:8px 16px;position:relative}
-  .live-stat:not(:last-child)::after{content:"";position:absolute;right:0;top:20%;height:60%;width:1px;background:rgba(255,255,255,.06)}
-  .live-stat-val{font-family:'Space Grotesk','Manrope',sans-serif;font-size:24px;font-weight:900;letter-spacing:-.5px;transition:all .3s}
-  .live-stat-val.updating{animation:countUp .5s cubic-bezier(.23,1,.32,1)}
-  .live-stat-lbl{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--t3);margin-top:3px}
+  .live-banner::before{content:"";position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at 20% 50%,rgba(20,199,132,.06),transparent 50%),radial-gradient(circle at 80% 50%,rgba(59,130,246,.06),transparent 50%);pointer-events:none}
+  .live-dot-wrap{display:flex;align-items:center;gap:8px}
+  .live-dot{width:10px;height:10px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite}
+  .live-label{font-size:11px;font-weight:800;letter-spacing:.15em;text-transform:uppercase;color:#14c784}
+  .live-stats{display:flex;gap:20px;flex-wrap:wrap;align-items:center}
+  .live-stat{display:flex;flex-direction:column;align-items:center;min-width:80px}
+  .live-stat-val{font-family:'Space Grotesk','Manrope',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;transition:all .3s}
+  .live-stat-val.updating{animation:countUp .4s ease}
+  .live-stat-lbl{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--t3);margin-top:2px}
   .live-stat-val.pos{color:#14c784}.live-stat-val.neg{color:#ef4444}.live-stat-val.neu{color:var(--blue2)}
-  .live-ticker-wrap{position:relative;z-index:2;overflow:hidden;border-top:1px solid rgba(255,255,255,.04);background:rgba(0,0,0,.2);border-radius:0 0 22px 22px;height:36px;display:flex;align-items:center}
-  .live-ticker-label{flex-shrink:0;padding:0 12px;font-size:9px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#14c784;border-right:1px solid rgba(255,255,255,.06);height:100%;display:flex;align-items:center;background:rgba(20,199,132,.05)}
-  .live-ticker-track{display:flex;align-items:center;gap:24px;white-space:nowrap;animation:tickerScroll 30s linear infinite;padding:0 12px}
-  .live-ticker-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;white-space:nowrap}
-  .live-ticker-item.win{color:#14c784}
-  .live-ticker-item.loss{color:#ef4444}
-  .live-ticker-item .tk-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-  .live-ticker-item.win .tk-dot{background:#14c784;box-shadow:0 0 6px rgba(20,199,132,.5)}
-  .live-ticker-item.loss .tk-dot{background:#ef4444;box-shadow:0 0 6px rgba(239,68,68,.5)}
-  .live-ticker-item .tk-name{max-width:90px;overflow:hidden;text-overflow:ellipsis}
-  .live-ticker-item .tk-pnl{font-weight:900}
-  .live-ticker-item .tk-time{font-size:10px;color:var(--t3);font-weight:400}
-  #confetti-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:3}
+  .live-divider{width:1px;height:32px;background:rgba(255,255,255,.08)}
+  .live-feed{display:flex;flex-direction:column;gap:4px;max-height:64px;overflow:hidden}
+  .live-feed-item{font-size:11px;padding:4px 10px;border-radius:8px;display:flex;align-items:center;gap:6px;animation:fadeSlideIn .4s ease}
+  .live-feed-item.win{background:rgba(20,199,132,.06);border:1px solid rgba(20,199,132,.15);color:#14c784}
+  .live-feed-item.loss{background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);color:#ef4444}
+  .live-feed-icon{font-size:13px}.live-feed-name{font-weight:700;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .live-feed-pnl{font-weight:800;margin-left:auto}
+  .shadow-auto-tag{display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;border-radius:6px;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.25);color:var(--blue2);margin-left:8px}
   </style>
 
   <div class="live-banner" id="live-banner">
-    <canvas id="confetti-canvas"></canvas>
-    <div class="live-banner-top">
-      <div class="live-dot-wrap">
-        <div class="live-dot"></div>
-        <div>
-          <div class="live-label">Shadow Trading Live</div>
-          <div class="live-subtitle">AI auto-tuning in real time</div>
-        </div>
-      </div>
-      <div class="live-badges">
-        <span class="shadow-fire-tag" id="lv-streak-tag" style="display:none"><span class="fire-icon">*</span> <span id="lv-streak-count">0</span> Win Streak</span>
-        <span class="shadow-auto-tag" id="lv-auto-tune-tag">Auto-Tune Active</span>
+    <div class="live-dot-wrap">
+      <div class="live-dot"></div>
+      <div>
+        <div class="live-label">Shadow Trading Live</div>
+        <div style="font-size:10px;color:var(--t3);margin-top:2px">AI auto-tuning filters in real time</div>
       </div>
     </div>
-    <div class="live-banner-hero">
-      <div class="hero-profit">
-        <div class="hero-profit-label">Total Shadow Profit</div>
-        <div class="hero-profit-val pos" id="lv-hero-profit">+0.0%</div>
-      </div>
-      <div class="hero-sparkline-wrap">
-        <div class="hero-sparkline-label">Equity Curve</div>
-        <canvas id="hero-sparkline" width="180" height="56"></canvas>
-      </div>
-    </div>
-    <div class="live-banner-stats">
+    <div class="live-stats">
       <div class="live-stat">
         <div class="live-stat-val neu" id="lv-shadow-trades">0</div>
-        <div class="live-stat-lbl">Trades</div>
+        <div class="live-stat-lbl">Shadow Trades</div>
       </div>
+      <div class="live-divider"></div>
       <div class="live-stat">
-        <div class="live-stat-val neu" id="lv-shadow-wr">--</div>
+        <div class="live-stat-val neu" id="lv-shadow-wr">—</div>
         <div class="live-stat-lbl">Win Rate</div>
       </div>
+      <div class="live-divider"></div>
       <div class="live-stat">
         <div class="live-stat-val neu" id="lv-shadow-pnl">0%</div>
         <div class="live-stat-lbl">Avg P&L</div>
       </div>
+      <div class="live-divider"></div>
       <div class="live-stat">
-        <div class="live-stat-val neu" id="lv-shadow-best">--</div>
+        <div class="live-stat-val neu" id="lv-shadow-best">—</div>
         <div class="live-stat-lbl">Best Strategy</div>
       </div>
+      <span class="shadow-auto-tag" id="lv-auto-tune-tag">Auto-Tune Active</span>
     </div>
-    <div class="live-ticker-wrap">
-      <div class="live-ticker-label">LIVE</div>
-      <div id="live-ticker-track" class="live-ticker-track">
-        <span class="live-ticker-item win"><span class="tk-dot"></span><span class="tk-name">Waiting for trades...</span></span>
-      </div>
+    <div class="live-feed" id="live-feed">
+      <div class="live-feed-item win"><span class="live-feed-icon">+</span><span style="color:var(--t3)">Waiting for trades...</span></div>
     </div>
   </div>
   <!-- ═══════════ END LIVE BANNER ═══════════ -->
@@ -14885,138 +14838,8 @@ pollFeed(); setInterval(pollFeed, 4000);
 pollListings(); setInterval(pollListings, 6000);
 pollEnhancedDashboard(); setInterval(pollEnhancedDashboard, 15000);
 
-// ═══════════ LIVE SHADOW BANNER (VIRAL) ═══════════
-let _shadowPrevProfit = null, _shadowEquityHistory = [], _confettiParticles = [];
-const _confettiCanvas = document.getElementById('confetti-canvas');
-const _confettiCtx = _confettiCanvas ? _confettiCanvas.getContext('2d') : null;
-function _resizeConfetti() {
-  if (!_confettiCanvas) return;
-  const b = _confettiCanvas.parentElement.getBoundingClientRect();
-  _confettiCanvas.width = b.width; _confettiCanvas.height = b.height;
-}
-_resizeConfetti(); window.addEventListener('resize', _resizeConfetti);
-
-// Confetti burst on wins
-function _fireConfetti(count) {
-  if (!_confettiCtx) return;
-  const w = _confettiCanvas.width, h = _confettiCanvas.height;
-  const colors = ['#14c784','#10b981','#34d399','#6ee7b7','#a7f3d0','#fbbf24','#f59e0b','#60a5fa','#a78bfa'];
-  for (let i = 0; i < count; i++) {
-    _confettiParticles.push({
-      x: w * 0.3 + Math.random() * w * 0.4,
-      y: h * 0.5,
-      vx: (Math.random() - 0.5) * 8,
-      vy: -(Math.random() * 6 + 3),
-      size: Math.random() * 5 + 2,
-      color: colors[Math.floor(Math.random() * colors.length)],
-      life: 1,
-      decay: 0.01 + Math.random() * 0.015,
-      rotation: Math.random() * 360,
-      rotSpeed: (Math.random() - 0.5) * 12,
-      shape: Math.random() > 0.5 ? 'rect' : 'circle'
-    });
-  }
-}
-function _animateConfetti() {
-  if (!_confettiCtx) { requestAnimationFrame(_animateConfetti); return; }
-  _confettiCtx.clearRect(0, 0, _confettiCanvas.width, _confettiCanvas.height);
-  _confettiParticles = _confettiParticles.filter(p => p.life > 0);
-  _confettiParticles.forEach(p => {
-    p.x += p.vx; p.y += p.vy; p.vy += 0.15; p.life -= p.decay; p.rotation += p.rotSpeed;
-    _confettiCtx.save();
-    _confettiCtx.translate(p.x, p.y);
-    _confettiCtx.rotate(p.rotation * Math.PI / 180);
-    _confettiCtx.globalAlpha = Math.max(0, p.life);
-    _confettiCtx.fillStyle = p.color;
-    if (p.shape === 'rect') { _confettiCtx.fillRect(-p.size/2, -p.size/2, p.size, p.size * 1.5); }
-    else { _confettiCtx.beginPath(); _confettiCtx.arc(0, 0, p.size/2, 0, Math.PI*2); _confettiCtx.fill(); }
-    _confettiCtx.restore();
-  });
-  requestAnimationFrame(_animateConfetti);
-}
-_animateConfetti();
-
-// Slot-machine digit roll for hero profit
-function _setHeroProfit(val) {
-  const el = document.getElementById('lv-hero-profit');
-  if (!el) return;
-  const str = (val >= 0 ? '+' : '') + val.toFixed(1) + '%';
-  el.className = 'hero-profit-val ' + (val >= 0 ? 'pos' : 'neg');
-  const oldText = el.textContent || '';
-  if (oldText === str) return;
-  let html = '';
-  for (let i = 0; i < str.length; i++) {
-    const ch = str[i];
-    const changed = i >= oldText.length || oldText[i] !== ch;
-    html += '<span class="digit' + (changed ? ' rolling' : '') + '">' + ch + '</span>';
-  }
-  el.innerHTML = html;
-  // Remove rolling class after animation
-  setTimeout(() => { el.querySelectorAll('.rolling').forEach(d => d.classList.remove('rolling')); }, 550);
-}
-
-// Sparkline equity chart
-function _drawSparkline(points) {
-  const canvas = document.getElementById('hero-sparkline');
-  if (!canvas || points.length < 2) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
-  const vals = points.map(p => p.v);
-  const mn = Math.min(...vals), mx = Math.max(...vals);
-  const range = mx - mn || 1;
-  const pts = vals.map((v, i) => ({ x: (i / (vals.length - 1)) * w, y: h - ((v - mn) / range) * (h - 8) - 4 }));
-  // Gradient fill
-  const lastVal = vals[vals.length - 1];
-  const isPos = lastVal >= 0;
-  const grad = ctx.createLinearGradient(0, 0, 0, h);
-  if (isPos) { grad.addColorStop(0, 'rgba(20,199,132,.25)'); grad.addColorStop(1, 'rgba(20,199,132,0)'); }
-  else { grad.addColorStop(0, 'rgba(239,68,68,.25)'); grad.addColorStop(1, 'rgba(239,68,68,0)'); }
-  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < pts.length; i++) {
-    const cx = (pts[i-1].x + pts[i].x) / 2;
-    ctx.bezierCurveTo(cx, pts[i-1].y, cx, pts[i].y, pts[i].x, pts[i].y);
-  }
-  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
-  ctx.fillStyle = grad; ctx.fill();
-  // Line
-  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < pts.length; i++) {
-    const cx = (pts[i-1].x + pts[i].x) / 2;
-    ctx.bezierCurveTo(cx, pts[i-1].y, cx, pts[i].y, pts[i].x, pts[i].y);
-  }
-  ctx.strokeStyle = isPos ? '#14c784' : '#ef4444';
-  ctx.lineWidth = 2.5; ctx.shadowColor = isPos ? 'rgba(20,199,132,.5)' : 'rgba(239,68,68,.5)';
-  ctx.shadowBlur = 8; ctx.stroke(); ctx.shadowBlur = 0;
-  // Glow dot at end
-  const last = pts[pts.length - 1];
-  ctx.beginPath(); ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
-  ctx.fillStyle = isPos ? '#14c784' : '#ef4444'; ctx.fill();
-  ctx.beginPath(); ctx.arc(last.x, last.y, 7, 0, Math.PI * 2);
-  ctx.fillStyle = isPos ? 'rgba(20,199,132,.25)' : 'rgba(239,68,68,.25)'; ctx.fill();
-}
-
-let _tickerItems = [];
-function _buildTicker(items) {
-  const track = document.getElementById('live-ticker-track');
-  if (!track || items.length === 0) return;
-  // Duplicate items for seamless loop
-  const html = items.concat(items).map(it => {
-    const cls = it.win ? 'win' : 'loss';
-    const pnl = it.pnl > 0 ? '+' + it.pnl.toFixed(1) + '%' : it.pnl.toFixed(1) + '%';
-    return '<span class="live-ticker-item ' + cls + '">' +
-      '<span class="tk-dot"></span>' +
-      '<span class="tk-name">' + it.name + '</span>' +
-      '<span class="tk-pnl">' + pnl + '</span>' +
-      '<span class="tk-time">' + (it.time || '') + '</span>' +
-    '</span>';
-  }).join('');
-  track.innerHTML = html;
-  // Adjust speed based on content width
-  const speed = Math.max(15, items.length * 5);
-  track.style.animationDuration = speed + 's';
-}
-
+// ═══════════ LIVE SHADOW BANNER ═══════════
+let _shadowFeedItems = [];
 async function pollShadowBanner() {
   try {
     const [perf, equity] = await Promise.all([
@@ -15025,7 +14848,6 @@ async function pollShadowBanner() {
     ]);
     if (!Array.isArray(perf) || perf.length === 0) return;
     let totalTrades = 0, totalWins = 0, totalPnl = 0, bestStrat = '', bestScore = -999;
-    let winStreak = 0;
     perf.forEach(s => {
       const t = s.closed_trades || 0;
       totalTrades += t;
@@ -15034,20 +14856,10 @@ async function pollShadowBanner() {
       const score = (s.win_rate || 0) * 0.6 + (s.avg_pnl_pct || 0) * 0.4;
       if (score > bestScore) { bestScore = score; bestStrat = s.strategy_name; }
     });
-    const wr = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(1) : '--';
+    const wr = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(1) : '—';
     const avgPnl = totalTrades > 0 ? (totalPnl / totalTrades).toFixed(1) : '0';
-    const totalPnlVal = totalTrades > 0 ? totalPnl / totalTrades : 0;
 
-    // Hero profit with slot-machine animation
-    _setHeroProfit(parseFloat(avgPnl));
-
-    // Confetti on profit increase
-    if (_shadowPrevProfit !== null && parseFloat(avgPnl) > _shadowPrevProfit && parseFloat(avgPnl) > 0) {
-      _fireConfetti(35);
-    }
-    _shadowPrevProfit = parseFloat(avgPnl);
-
-    // Animate stat values
+    // Animate value changes
     _animateShadowVal('lv-shadow-trades', totalTrades.toString());
     _animateShadowVal('lv-shadow-wr', wr + '%');
     const pnlEl = document.getElementById('lv-shadow-pnl');
@@ -15055,7 +14867,7 @@ async function pollShadowBanner() {
       pnlEl.textContent = (avgPnl > 0 ? '+' : '') + avgPnl + '%';
       pnlEl.className = 'live-stat-val ' + (avgPnl > 0 ? 'pos' : avgPnl < 0 ? 'neg' : 'neu');
       pnlEl.classList.add('updating');
-      setTimeout(() => pnlEl.classList.remove('updating'), 500);
+      setTimeout(() => pnlEl.classList.remove('updating'), 400);
     }
     const bestEl = document.getElementById('lv-shadow-best');
     if (bestEl && bestStrat) {
@@ -15063,59 +14875,25 @@ async function pollShadowBanner() {
       bestEl.className = 'live-stat-val pos';
     }
 
-    // Build equity sparkline
+    // Build trade feed from equity data
     const allPoints = [];
     Object.entries(equity).forEach(([strat, points]) => {
       if (Array.isArray(points)) {
         points.forEach(p => allPoints.push({...p, strategy: strat}));
       }
     });
-    allPoints.sort((a,b) => (a.hour||'').localeCompare(b.hour||''));
-    // Aggregate cumulative P&L per hour across all strategies
-    const hourMap = {};
-    allPoints.forEach(p => {
-      const h = p.hour || '';
-      if (!hourMap[h]) hourMap[h] = 0;
-      hourMap[h] += (p.cumulative_pnl || p.period_pnl || 0);
-    });
-    const sparkPoints = Object.entries(hourMap).sort((a,b) => a[0].localeCompare(b[0])).map(([h,v]) => ({h, v}));
-    if (sparkPoints.length >= 2) _drawSparkline(sparkPoints);
-
-    // Build ticker feed from equity data (most recent first)
-    const tickerPoints = [];
-    Object.entries(equity).forEach(([strat, points]) => {
-      if (Array.isArray(points)) {
-        points.forEach(p => tickerPoints.push({...p, strategy: strat}));
-      }
-    });
-    tickerPoints.sort((a,b) => (b.hour||'').localeCompare(a.hour||''));
-
-    // Count win streak from most recent trades
-    winStreak = 0;
-    for (const tp of tickerPoints) {
-      if ((tp.period_pnl || 0) >= 0) winStreak++;
-      else break;
-    }
-    const streakTag = document.getElementById('lv-streak-tag');
-    const streakCount = document.getElementById('lv-streak-count');
-    if (streakTag && streakCount) {
-      if (winStreak >= 3) {
-        streakTag.style.display = 'inline-flex';
-        streakCount.textContent = winStreak;
-      } else {
-        streakTag.style.display = 'none';
-      }
-    }
-
-    if (tickerPoints.length > 0) {
-      const items = tickerPoints.slice(0, 12).map(p => {
+    allPoints.sort((a,b) => (b.hour||'').localeCompare(a.hour||''));
+    const feedEl = document.getElementById('live-feed');
+    if (feedEl && allPoints.length > 0) {
+      const items = allPoints.slice(0, 3).map(p => {
         const isWin = (p.period_pnl || 0) >= 0;
-        const name = (p.strategy || 'unknown');
-        const pnl = p.period_pnl || 0;
-        const hr = p.hour ? new Date(p.hour).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
-        return { win: isWin, name: name.charAt(0).toUpperCase() + name.slice(1), pnl, time: hr };
+        const cls = isWin ? 'win' : 'loss';
+        const icon = isWin ? '+' : '-';
+        const pnl = (p.period_pnl || 0) > 0 ? '+' + p.period_pnl + '%' : p.period_pnl + '%';
+        const name = p.strategy || 'unknown';
+        return '<div class="live-feed-item ' + cls + '"><span class="live-feed-icon">' + icon + '</span><span class="live-feed-name">' + name + '</span><span style="color:var(--t3)">' + (p.trades||0) + ' trades</span><span class="live-feed-pnl">' + pnl + '</span></div>';
       });
-      _buildTicker(items);
+      feedEl.innerHTML = items.join('');
     }
   } catch(e) {}
 }
@@ -15125,7 +14903,7 @@ function _animateShadowVal(id, newVal) {
   if (el.textContent !== newVal) {
     el.textContent = newVal;
     el.classList.add('updating');
-    setTimeout(() => el.classList.remove('updating'), 500);
+    setTimeout(() => el.classList.remove('updating'), 400);
   }
 }
 pollShadowBanner(); setInterval(pollShadowBanner, 8000);
