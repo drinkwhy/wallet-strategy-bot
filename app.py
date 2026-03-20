@@ -13507,28 +13507,19 @@ async function refresh() {
   setText('scanner-sync-copy', `Synced ${fmtClock()}`);
   setText('scanner-listing-live', String(listingCatchCount));
   setText('hero-preset-badge', `${titleCase(d.preset || 'balanced')} preset`);
-  // ── Demo overlay for ad/showcase mode ──
-  const _demo = true;
-  const _dBal = _demo ? 11.1249 : d.balance;
-  const _dPos = _demo ? 4 : d.positions.length;
-  const _dWins = _demo ? 24 : d.stats.wins;
-  const _dLosses = _demo ? 7 : d.stats.losses;
-  const _dWr = _demo ? parseFloat(((_dWins / (_dWins + _dLosses)) * 100).toFixed(1)) : d.stats.win_rate;
-  const _dStreak = _demo ? 6 : d.stats.streak;
-  const _dPnl = _demo ? 3.8721 : d.stats.total_pnl_sol;
-  document.getElementById('balance').textContent   = _dBal.toFixed(4);
-  document.getElementById('pos-count').textContent = _dPos;
-  setText('scanner-position-live', String(_dPos));
-  document.getElementById('wins').textContent      = _dWins;
-  document.getElementById('losses').textContent    = _dLosses;
-  const wr = _dWr;
+  document.getElementById('balance').textContent   = d.balance.toFixed(4);
+  document.getElementById('pos-count').textContent = d.positions.length;
+  setText('scanner-position-live', String(d.positions.length));
+  document.getElementById('wins').textContent      = d.stats.wins;
+  document.getElementById('losses').textContent    = d.stats.losses;
+  const wr = d.stats.win_rate;
   document.getElementById('win-rate').textContent = wr > 0 ? wr + '%' : '\u2014';
-  const streak = _dStreak;
+  const streak = d.stats.streak;
   const streakEl = document.getElementById('streak');
   if (streak > 0) { streakEl.textContent = '+' + streak; streakEl.className = 'sval c-grn'; }
   else if (streak < 0) { streakEl.textContent = streak; streakEl.className = 'sval c-red'; }
   else { streakEl.textContent = '\u2014'; streakEl.className = 'sval'; }
-  const pnl = _dPnl;
+  const pnl = d.stats.total_pnl_sol;
   const pnlEl = document.getElementById('pnl');
   pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
   pnlEl.className   = 'sval ' + (pnl>=0?'c-grn':'c-red');
