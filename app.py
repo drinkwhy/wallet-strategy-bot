@@ -15114,12 +15114,12 @@ function _demoTick() {
 // Demo: inject snipe entries into activity log with pulse animation
 let _demoSnipeInjected = {};
 const _demoSnipes = [
-  { at:3,  line:'[{T}] \u{1f3af} SNIPE BUY MOONCAT | MC:$48,200 Liq:$12.4k Age:2m Score:92 | 0.15 SOL', coin:'MOONCAT' },
-  { at:7,  line:'[{T}] \u{1f3af} SNIPE BUY SOLAPE | MC:$125,800 Liq:$31.2k Age:5m Score:88 | 0.20 SOL', coin:'SOLAPE' },
-  { at:14, line:'[{T}] \u26a0\ufe0f SELL RUGPULL | TP miss, SL hit -1.04% | -0.011 SOL', coin:'RUGPULL', isSell:true },
-  { at:18, line:'[{T}] \u{1f3af} SNIPE BUY BONKINU | MC:$67,500 Liq:$18.9k Age:3m Score:95 | 0.18 SOL', coin:'BONKINU' },
-  { at:22, line:'[{T}] \u{1f4b0} SELL SUNSHINE | TP1 hit +12.4% | +0.249 SOL', coin:'SUNSHINE', isSell:true, isWin:true },
-  { at:26, line:'[{T}] \u{1f3af} SNIPE BUY CATGOLD | MC:$89,100 Liq:$22.7k Age:1m Score:97 | 0.25 SOL', coin:'CATGOLD' },
+  { at:3,  line:'[{T}] >> SNIPE BUY MOONCAT | MC:$48,200 Liq:$12.4k Age:2m Score:92 | 0.15 SOL', coin:'MOONCAT' },
+  { at:7,  line:'[{T}] >> SNIPE BUY SOLAPE | MC:$125,800 Liq:$31.2k Age:5m Score:88 | 0.20 SOL', coin:'SOLAPE' },
+  { at:14, line:'[{T}] !! SELL RUGPULL | TP miss, SL hit -1.04% | -0.011 SOL', coin:'RUGPULL', isSell:true },
+  { at:18, line:'[{T}] >> SNIPE BUY BONKINU | MC:$67,500 Liq:$18.9k Age:3m Score:95 | 0.18 SOL', coin:'BONKINU' },
+  { at:22, line:'[{T}] $$ SELL SUNSHINE | TP1 hit +12.4% | +0.249 SOL', coin:'SUNSHINE', isSell:true, isWin:true },
+  { at:26, line:'[{T}] >> SNIPE BUY CATGOLD | MC:$89,100 Liq:$22.7k Age:1m Score:97 | 0.25 SOL', coin:'CATGOLD' },
 ];
 function _demoInjectSnipe(ev) {
   if (_demoSnipeInjected[ev.at]) return;
