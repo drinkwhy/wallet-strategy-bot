@@ -11666,8 +11666,6 @@ DASHBOARD_HTML = _CSS + """
   @keyframes tickerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
   @keyframes fireFlicker{0%,100%{transform:scale(1)}25%{transform:scale(1.15) rotate(-3deg)}50%{transform:scale(1.05) rotate(2deg)}75%{transform:scale(1.2) rotate(-2deg)}}
   @keyframes sparkFloat{0%{transform:translateY(0) scale(1);opacity:1}100%{transform:translateY(-40px) scale(0);opacity:0}}
-  @keyframes snipePulse{0%{transform:scale(1.15) translateX(-8px);background:rgba(74,222,128,.25);box-shadow:0 0 24px rgba(74,222,128,.4)}40%{transform:scale(1.08);background:rgba(74,222,128,.15)}100%{transform:scale(1) translateX(0);background:rgba(74,222,128,.06);box-shadow:none}}
-  .demo-snipe-pulse{border-radius:6px!important;margin:2px 8px!important;padding:6px 12px!important}
   @keyframes dropIn{from{opacity:0;transform:translateY(-30px) scale(.7)}to{opacity:1;transform:translateY(0) scale(1)}}
   @keyframes slotRoll{0%{transform:translateY(100%);opacity:0}60%{transform:translateY(-8%);opacity:1}80%{transform:translateY(3%)}100%{transform:translateY(0)}}
   .live-banner{
@@ -13509,27 +13507,31 @@ async function refresh() {
   setText('scanner-sync-copy', `Synced ${fmtClock()}`);
   setText('scanner-listing-live', String(listingCatchCount));
   setText('hero-preset-badge', `${titleCase(d.preset || 'balanced')} preset`);
-  // ── Demo animation loop handles stat updates when _demoMode is on ──
-  if (typeof _demoMode !== 'undefined' && _demoMode) {
-    // Skip real data — demo loop handles all stat display
-  } else {
-    document.getElementById('balance').textContent   = d.balance.toFixed(4);
-    document.getElementById('pos-count').textContent = d.positions.length;
-    setText('scanner-position-live', String(d.positions.length));
-    document.getElementById('wins').textContent      = d.stats.wins;
-    document.getElementById('losses').textContent    = d.stats.losses;
-    const wr = d.stats.win_rate;
-    document.getElementById('win-rate').textContent = wr > 0 ? wr + '%' : '\u2014';
-    const streak = d.stats.streak;
-    const streakEl = document.getElementById('streak');
-    if (streak > 0) { streakEl.textContent = '+' + streak; streakEl.className = 'sval c-grn'; }
-    else if (streak < 0) { streakEl.textContent = streak; streakEl.className = 'sval c-red'; }
-    else { streakEl.textContent = '\u2014'; streakEl.className = 'sval'; }
-    const pnl = d.stats.total_pnl_sol;
-    const pnlEl = document.getElementById('pnl');
-    pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
-    pnlEl.className   = 'sval ' + (pnl>=0?'c-grn':'c-red');
-  }
+  // ── Demo overlay for ad/showcase mode ──
+  const _demo = true;
+  const _dBal = _demo ? 11.1249 : d.balance;
+  const _dPos = _demo ? 4 : d.positions.length;
+  const _dWins = _demo ? 24 : d.stats.wins;
+  const _dLosses = _demo ? 7 : d.stats.losses;
+  const _dWr = _demo ? parseFloat(((_dWins / (_dWins + _dLosses)) * 100).toFixed(1)) : d.stats.win_rate;
+  const _dStreak = _demo ? 6 : d.stats.streak;
+  const _dPnl = _demo ? 3.8721 : d.stats.total_pnl_sol;
+  document.getElementById('balance').textContent   = _dBal.toFixed(4);
+  document.getElementById('pos-count').textContent = _dPos;
+  setText('scanner-position-live', String(_dPos));
+  document.getElementById('wins').textContent      = _dWins;
+  document.getElementById('losses').textContent    = _dLosses;
+  const wr = _dWr;
+  document.getElementById('win-rate').textContent = wr > 0 ? wr + '%' : '\u2014';
+  const streak = _dStreak;
+  const streakEl = document.getElementById('streak');
+  if (streak > 0) { streakEl.textContent = '+' + streak; streakEl.className = 'sval c-grn'; }
+  else if (streak < 0) { streakEl.textContent = streak; streakEl.className = 'sval c-red'; }
+  else { streakEl.textContent = '\u2014'; streakEl.className = 'sval'; }
+  const pnl = _dPnl;
+  const pnlEl = document.getElementById('pnl');
+  pnlEl.textContent = (pnl>=0?'+':'') + pnl.toFixed(4);
+  pnlEl.className   = 'sval ' + (pnl>=0?'c-grn':'c-red');
   const dot = document.getElementById('sdot'), txt = document.getElementById('stxt'), btn = document.getElementById('toggle-btn');
   if (running) {
     dot.className='sdot sdot-on'; txt.textContent='Bot Running'; btn.textContent='\u23f8 Stop Bot'; btn.className='btn btn-danger';
@@ -14990,164 +14992,45 @@ function _setHeroProfit(val) {
   setTimeout(() => { el.querySelectorAll('.rolling').forEach(d => d.classList.remove('rolling')); }, 550);
 }
 
-// Sparkline equity chart (animated progressive draw)
-let _sparkAnimId = null, _sparkProgress = 0;
+// Sparkline equity chart
 function _drawSparkline(points) {
   const canvas = document.getElementById('hero-sparkline');
   if (!canvas || points.length < 2) return;
-  // Only use real data sparkline if demo mode is off
-  if (typeof _demoMode !== 'undefined' && _demoMode) return;
-  _drawSparklineFrame(canvas, points.map(p => p.v), 1.0);
-}
-function _drawSparklineFrame(canvas, vals, progress) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   ctx.clearRect(0, 0, w, h);
+  const vals = points.map(p => p.v);
   const mn = Math.min(...vals), mx = Math.max(...vals);
   const range = mx - mn || 1;
   const pts = vals.map((v, i) => ({ x: (i / (vals.length - 1)) * w, y: h - ((v - mn) / range) * (h - 8) - 4 }));
-  // How many points to draw based on progress
-  const drawCount = Math.max(2, Math.ceil(pts.length * Math.min(1, progress)));
-  const drawPts = pts.slice(0, drawCount);
-  const lastVal = vals[drawCount - 1];
-  const isPos = lastVal >= (vals[0] || 0);
   // Gradient fill
+  const lastVal = vals[vals.length - 1];
+  const isPos = lastVal >= 0;
   const grad = ctx.createLinearGradient(0, 0, 0, h);
   if (isPos) { grad.addColorStop(0, 'rgba(20,199,132,.25)'); grad.addColorStop(1, 'rgba(20,199,132,0)'); }
   else { grad.addColorStop(0, 'rgba(239,68,68,.25)'); grad.addColorStop(1, 'rgba(239,68,68,0)'); }
-  ctx.beginPath(); ctx.moveTo(drawPts[0].x, drawPts[0].y);
-  for (let i = 1; i < drawPts.length; i++) {
-    const cx = (drawPts[i-1].x + drawPts[i].x) / 2;
-    ctx.bezierCurveTo(cx, drawPts[i-1].y, cx, drawPts[i].y, drawPts[i].x, drawPts[i].y);
+  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) {
+    const cx = (pts[i-1].x + pts[i].x) / 2;
+    ctx.bezierCurveTo(cx, pts[i-1].y, cx, pts[i].y, pts[i].x, pts[i].y);
   }
-  const lastPt = drawPts[drawPts.length - 1];
-  ctx.lineTo(lastPt.x, h); ctx.lineTo(drawPts[0].x, h); ctx.closePath();
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
   ctx.fillStyle = grad; ctx.fill();
   // Line
-  ctx.beginPath(); ctx.moveTo(drawPts[0].x, drawPts[0].y);
-  for (let i = 1; i < drawPts.length; i++) {
-    const cx = (drawPts[i-1].x + drawPts[i].x) / 2;
-    ctx.bezierCurveTo(cx, drawPts[i-1].y, cx, drawPts[i].y, drawPts[i].x, drawPts[i].y);
+  ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) {
+    const cx = (pts[i-1].x + pts[i].x) / 2;
+    ctx.bezierCurveTo(cx, pts[i-1].y, cx, pts[i].y, pts[i].x, pts[i].y);
   }
   ctx.strokeStyle = isPos ? '#14c784' : '#ef4444';
   ctx.lineWidth = 2.5; ctx.shadowColor = isPos ? 'rgba(20,199,132,.5)' : 'rgba(239,68,68,.5)';
   ctx.shadowBlur = 8; ctx.stroke(); ctx.shadowBlur = 0;
-  // Glow dot at tip
-  ctx.beginPath(); ctx.arc(lastPt.x, lastPt.y, 4, 0, Math.PI * 2);
+  // Glow dot at end
+  const last = pts[pts.length - 1];
+  ctx.beginPath(); ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
   ctx.fillStyle = isPos ? '#14c784' : '#ef4444'; ctx.fill();
-  ctx.beginPath(); ctx.arc(lastPt.x, lastPt.y, 7, 0, Math.PI * 2);
+  ctx.beginPath(); ctx.arc(last.x, last.y, 7, 0, Math.PI * 2);
   ctx.fillStyle = isPos ? 'rgba(20,199,132,.25)' : 'rgba(239,68,68,.25)'; ctx.fill();
-}
-
-// ═══════════ DEMO ANIMATION LOOP ═══════════
-const _demoMode = true;
-const _demoCurve = [0, 1.2, 2.8, 2.1, 3.5, 5.0, 4.2, 6.1, 7.8, 6.9, 8.5, 10.2, 9.4, 11.0, 13.1, 12.3, 14.8, 16.5, 15.7, 17.9, 20.1, 19.2, 21.5, 23.8, 22.6, 25.0, 27.4, 26.1, 28.9, 31.2, 30.0, 33.5, 35.8, 34.2, 37.1, 39.5, 41.8, 40.3, 43.2, 45.6, 44.1, 47.8, 50.2, 52.5, 51.0, 54.3, 56.8, 58.2, 60.5, 62.1, 64.8, 63.2, 66.1, 68.1];
-const _demoEvents = [
-  { at:0,  wins:24, losses:7, pos:4, bal:11.1249, streak:6, pnl:3.8721, heroProfit:68.1, shadow:598 },
-  { at:4,  wins:25, losses:7, pos:4, bal:11.2784, streak:7, pnl:4.0256, heroProfit:69.4, shadow:599, confetti:true, coin:'MOONCAT' },
-  { at:8,  wins:26, losses:7, pos:5, bal:11.4901, streak:8, pnl:4.2373, heroProfit:71.2, shadow:600, confetti:true, coin:'SOLAPE' },
-  { at:12, wins:26, losses:7, pos:5, bal:11.4901, streak:8, pnl:4.2373, heroProfit:71.2, shadow:600 },
-  { at:15, wins:26, losses:8, pos:4, bal:11.3856, streak:-1, pnl:4.1328, heroProfit:69.8, shadow:601, loss:true, coin:'RUGPULL' },
-  { at:19, wins:27, losses:8, pos:4, bal:11.5612, streak:1, pnl:4.3084, heroProfit:72.5, shadow:602, confetti:true, coin:'BONKINU' },
-  { at:23, wins:28, losses:8, pos:3, bal:11.8103, streak:2, pnl:4.5575, heroProfit:74.8, shadow:603, confetti:true, coin:'SUNSHINE' },
-  { at:27, wins:29, losses:8, pos:4, bal:12.0247, streak:3, pnl:4.7719, heroProfit:76.3, shadow:604, confetti:true, coin:'CATGOLD' },
-];
-const _demoCycleLen = 30; // seconds per loop
-let _demoStart = performance.now();
-
-function _demoTick() {
-  if (!_demoMode) return;
-  const elapsed = ((performance.now() - _demoStart) / 1000) % _demoCycleLen;
-
-  // Find current event
-  let ev = _demoEvents[0];
-  for (let i = _demoEvents.length - 1; i >= 0; i--) {
-    if (elapsed >= _demoEvents[i].at) { ev = _demoEvents[i]; break; }
-  }
-
-  // Check if this is a NEW event transition (fire confetti only once)
-  const evIdx = _demoEvents.indexOf(ev);
-  if (typeof _demoLastEvIdx === 'undefined') _demoLastEvIdx = -1;
-  if (evIdx !== _demoLastEvIdx) {
-    if (ev.confetti) _fireConfetti(40);
-    if (ev.loss) _fireConfetti(12); // smaller burst for loss
-    _demoLastEvIdx = evIdx;
-  }
-
-  // Update overview stats
-  _animateShadowVal('balance', ev.bal.toFixed(4));
-  _animateShadowVal('pos-count', ev.pos.toString());
-  _animateShadowVal('wins', ev.wins.toString());
-  _animateShadowVal('losses', ev.losses.toString());
-  const wr = ((ev.wins / (ev.wins + ev.losses)) * 100).toFixed(1);
-  _animateShadowVal('win-rate', wr + '%');
-  const streakEl = document.getElementById('streak');
-  if (streakEl) {
-    if (ev.streak > 0) { streakEl.textContent = '+' + ev.streak; streakEl.className = 'sval c-grn'; }
-    else if (ev.streak < 0) { streakEl.textContent = ev.streak; streakEl.className = 'sval c-red'; }
-    else { streakEl.textContent = '0'; streakEl.className = 'sval'; }
-  }
-  const pnlEl = document.getElementById('pnl');
-  if (pnlEl) {
-    pnlEl.textContent = (ev.pnl >= 0 ? '+' : '') + ev.pnl.toFixed(4);
-    pnlEl.className = 'sval ' + (ev.pnl >= 0 ? 'c-grn' : 'c-red');
-  }
-
-  // Update shadow banner hero
-  _setHeroProfit(ev.heroProfit);
-  _animateShadowVal('lv-shadow-trades', ev.shadow.toString());
-  _animateShadowVal('lv-shadow-wr', wr + '%');
-  _animateShadowVal('lv-shadow-pnl', '+' + ev.heroProfit.toFixed(1) + '%');
-
-  // Animated sparkline: progressively draw curve
-  const curveProgress = elapsed / _demoCycleLen;
-  const canvas = document.getElementById('hero-sparkline');
-  if (canvas) _drawSparklineFrame(canvas, _demoCurve, curveProgress);
-
-  // Inject demo snipe entries into activity log
-  _demoSnipes.forEach(s => {
-    if (elapsed >= s.at && !_demoSnipeInjected[s.at]) _demoInjectSnipe(s);
-  });
-
-  requestAnimationFrame(_demoTick);
-}
-// Demo: inject snipe entries into activity log with pulse animation
-let _demoSnipeInjected = {};
-const _demoSnipes = [
-  { at:3,  line:'[{T}] \u{1f3af} SNIPE BUY MOONCAT | MC:$48,200 Liq:$12.4k Age:2m Score:92 | 0.15 SOL', coin:'MOONCAT' },
-  { at:7,  line:'[{T}] \u{1f3af} SNIPE BUY SOLAPE | MC:$125,800 Liq:$31.2k Age:5m Score:88 | 0.20 SOL', coin:'SOLAPE' },
-  { at:14, line:'[{T}] \u26a0\ufe0f SELL RUGPULL | TP miss, SL hit -1.04% | -0.011 SOL', coin:'RUGPULL', isSell:true },
-  { at:18, line:'[{T}] \u{1f3af} SNIPE BUY BONKINU | MC:$67,500 Liq:$18.9k Age:3m Score:95 | 0.18 SOL', coin:'BONKINU' },
-  { at:22, line:'[{T}] \u{1f4b0} SELL SUNSHINE | TP1 hit +12.4% | +0.249 SOL', coin:'SUNSHINE', isSell:true, isWin:true },
-  { at:26, line:'[{T}] \u{1f3af} SNIPE BUY CATGOLD | MC:$89,100 Liq:$22.7k Age:1m Score:97 | 0.25 SOL', coin:'CATGOLD' },
-];
-function _demoInjectSnipe(ev) {
-  if (_demoSnipeInjected[ev.at]) return;
-  _demoSnipeInjected[ev.at] = true;
-  const log = document.getElementById('log');
-  if (!log) return;
-  const now = new Date();
-  const timeStr = now.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',hour12:false});
-  const text = ev.line.replace('{T}', timeStr);
-  const div = document.createElement('div');
-  div.className = 'lline ' + (ev.isSell ? (ev.isWin ? 'lsell' : 'lsell') : 'lbuy') + ' demo-snipe-pulse';
-  div.textContent = text;
-  div.style.cssText = 'animation:snipePulse 1.2s cubic-bezier(.23,1,.32,1);transform-origin:left center;position:relative;z-index:2;';
-  // Insert at top (activity-log is column-reverse so prepend = bottom visually, append = top visually)
-  log.insertBefore(div, log.firstChild);
-  // Keep highlighted
-  setTimeout(() => {
-    div.style.animation = 'none';
-    div.style.background = ev.isSell ? (ev.isWin ? 'rgba(20,199,132,.08)' : 'rgba(239,68,68,.08)') : 'rgba(74,222,128,.08)';
-    div.style.borderLeft = ev.isSell ? (ev.isWin ? '3px solid #14c784' : '3px solid #ef4444') : '3px solid #4ade80';
-    div.style.fontWeight = '700';
-    div.style.fontSize = '13px';
-  }, 1200);
-}
-if (_demoMode) {
-  // Reset snipe tracking on each loop
-  setInterval(() => { _demoSnipeInjected = {}; }, _demoCycleLen * 1000);
-  requestAnimationFrame(_demoTick);
 }
 
 let _tickerItems = [];
