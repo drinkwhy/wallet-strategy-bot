@@ -8968,34 +8968,6 @@ def api_quant_auto_tune_status():
     })
 
 
-@app.route("/api/quant/shadow-recent-trades")
-@login_required
-def api_quant_shadow_recent_trades():
-    """Recent closed shadow positions with token names for the live ticker."""
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT name, strategy_name, realized_pnl_pct, exit_reason, closed_at
-            FROM shadow_positions
-            WHERE status='closed' AND closed_at IS NOT NULL
-            ORDER BY closed_at DESC LIMIT 20
-        """)
-        rows = cur.fetchall()
-    finally:
-        db_return(conn)
-    trades = []
-    for r in rows:
-        trades.append({
-            "name": r["name"] or "Unknown",
-            "strategy": r["strategy_name"] or "degen",
-            "pnl": float(r["realized_pnl_pct"] or 0),
-            "exit_reason": r["exit_reason"] or "",
-            "closed_at": r["closed_at"].isoformat() if r["closed_at"] else "",
-        })
-    return jsonify(trades)
-
-
 @app.route("/api/quant/shadow-decisions")
 @login_required
 def api_quant_shadow_decisions():
@@ -15047,10 +15019,9 @@ function _buildTicker(items) {
 
 async function pollShadowBanner() {
   try {
-    const [perf, equity, recentTrades] = await Promise.all([
+    const [perf, equity] = await Promise.all([
       fetch('/api/quant/shadow-performance').then(r=>r.json()).catch(()=>[]),
       fetch('/api/quant/shadow-equity').then(r=>r.json()).catch(()=>({})),
-      fetch('/api/quant/shadow-recent-trades').then(r=>r.json()).catch(()=>[]),
     ]);
     if (!Array.isArray(perf) || perf.length === 0) return;
     let totalTrades = 0, totalWins = 0, totalPnl = 0, bestStrat = '', bestScore = -999;
@@ -15110,14 +15081,20 @@ async function pollShadowBanner() {
     const sparkPoints = Object.entries(hourMap).sort((a,b) => a[0].localeCompare(b[0])).map(([h,v]) => ({h, v}));
     if (sparkPoints.length >= 2) _drawSparkline(sparkPoints);
 
-    // Build ticker feed from recent closed trades (actual token names)
+    // Build ticker feed from equity data (most recent first)
+    const tickerPoints = [];
+    Object.entries(equity).forEach(([strat, points]) => {
+      if (Array.isArray(points)) {
+        points.forEach(p => tickerPoints.push({...p, strategy: strat}));
+      }
+    });
+    tickerPoints.sort((a,b) => (b.hour||'').localeCompare(a.hour||''));
+
     // Count win streak from most recent trades
     winStreak = 0;
-    if (Array.isArray(recentTrades) && recentTrades.length > 0) {
-      for (const t of recentTrades) {
-        if ((t.pnl || 0) >= 0) winStreak++;
-        else break;
-      }
+    for (const tp of tickerPoints) {
+      if ((tp.period_pnl || 0) >= 0) winStreak++;
+      else break;
     }
     const streakTag = document.getElementById('lv-streak-tag');
     const streakCount = document.getElementById('lv-streak-count');
@@ -15130,13 +15107,13 @@ async function pollShadowBanner() {
       }
     }
 
-    if (Array.isArray(recentTrades) && recentTrades.length > 0) {
-      const items = recentTrades.slice(0, 12).map(t => {
-        const isWin = (t.pnl || 0) >= 0;
-        const name = t.name || 'Unknown';
-        const pnl = t.pnl || 0;
-        const hr = t.closed_at ? new Date(t.closed_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
-        return { win: isWin, name: name, pnl, time: hr };
+    if (tickerPoints.length > 0) {
+      const items = tickerPoints.slice(0, 12).map(p => {
+        const isWin = (p.period_pnl || 0) >= 0;
+        const name = (p.strategy || 'unknown');
+        const pnl = p.period_pnl || 0;
+        const hr = p.hour ? new Date(p.hour).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+        return { win: isWin, name: name.charAt(0).toUpperCase() + name.slice(1), pnl, time: hr };
       });
       _buildTicker(items);
     }
