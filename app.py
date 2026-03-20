@@ -2129,7 +2129,7 @@ class BotInstance:
         selection = self.refresh_execution_control()
         selected_policy = normalize_policy_mode(selection.get("selected_policy"))
         threshold = max(40.0, min(float(selection.get("model_threshold") or MODEL_DECISION_THRESHOLD), 90.0))
-        active_regime = (_current_regime_context(include_flow_snapshot=flow_snapshot, limit=20) or {}).get("regime") or "neutral"
+        active_regime = (_current_regime_context(include_flow_snapshot=flow_snapshot, window_hours=48) or {}).get("regime") or "neutral"
         trained = False
         model_score = None
         driver_rows = []
@@ -3344,7 +3344,26 @@ class BotInstance:
             peak_ratio = pos["peak_price"] / pos["entry_price"]
             age_sec    = time.time() - pos["timestamp"]
             age_min    = (time.time() - pos["timestamp"]) / 60
-            trail_line = pos["peak_price"] * (1 - s["trail_pct"])
+
+            # ── Progressive trailing stop — tightens as gains increase ──
+            base_trail = s["trail_pct"]
+            if s.get("peak_plateau_mode"):
+                # Moonshot mode: progressive trailing that tightens at higher multiples
+                if peak_ratio >= 50:
+                    effective_trail = min(base_trail, 0.10)   # 10% trail above 50x — lock in mega gains
+                elif peak_ratio >= 20:
+                    effective_trail = min(base_trail, 0.12)   # 12% trail above 20x
+                elif peak_ratio >= 10:
+                    effective_trail = min(base_trail, 0.15)   # 15% trail above 10x
+                elif peak_ratio >= 5:
+                    effective_trail = min(base_trail, 0.20)   # 20% trail above 5x
+                elif peak_ratio >= 3:
+                    effective_trail = min(base_trail, 0.25)   # 25% trail above 3x
+                else:
+                    effective_trail = base_trail               # Default wide trail early
+            else:
+                effective_trail = base_trail
+            trail_line = pos["peak_price"] * (1 - effective_trail)
 
             # ── Enhanced position monitoring (whale + rug detection) ─────────
             if self.enhanced_enabled:
@@ -3400,12 +3419,23 @@ class BotInstance:
                 self.sell(mint, 1.0, f"SL {ratio:.2f}x")
             elif age_min >= s["time_stop_min"] and ratio < 1.10:
                 self.sell(mint, 1.0, f"TIME {age_min:.0f}m")
-            elif not pos["tp1_hit"] and ratio >= s["tp1_mult"]:
-                self.sell(mint, 0.5, f"TP1 {ratio:.2f}x")
-            elif pos["tp1_hit"] and ratio >= s["tp2_mult"]:
-                self.sell(mint, 1.0, f"TP2 {ratio:.2f}x")
-            elif (pos["tp1_hit"] or peak_ratio >= 1.3) and cur < trail_line:
-                self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
+            elif s.get("peak_plateau_mode"):
+                # ── Peak Plateau Mode: ride to the top, let trailing stop decide ──
+                tp1_sell_pct = s.get("tp1_sell_pct", 0.25)
+                if not pos["tp1_hit"] and ratio >= s["tp1_mult"]:
+                    # Skim a small portion at TP1 to secure some profit
+                    self.sell(mint, tp1_sell_pct, f"SKIM {ratio:.2f}x ({int(tp1_sell_pct*100)}%)")
+                elif (pos["tp1_hit"] or peak_ratio >= 1.5) and cur < trail_line:
+                    # Progressive trailing stop is the primary exit — rides to peak plateau
+                    self.sell(mint, 1.0, f"PEAK EXIT {ratio:.2f}x (peak {peak_ratio:.1f}x, trail {effective_trail*100:.0f}%)")
+            else:
+                # ── Standard TP mode ──
+                if not pos["tp1_hit"] and ratio >= s["tp1_mult"]:
+                    self.sell(mint, 0.5, f"TP1 {ratio:.2f}x")
+                elif pos["tp1_hit"] and ratio >= s["tp2_mult"]:
+                    self.sell(mint, 1.0, f"TP2 {ratio:.2f}x")
+                elif (pos["tp1_hit"] or peak_ratio >= 1.3) and cur < trail_line:
+                    self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
         # Batch-write all peak_price updates in one DB round-trip
         if _peak_updates:
             try:
@@ -5719,8 +5749,8 @@ def execution_tape_monitor():
                 }
                 _record_market_intelligence(
                     tape_info,
-                    include_strategy_decisions=False,
-                    include_model_decisions=False,
+                    include_strategy_decisions=True,
+                    include_model_decisions=True,
                 )
                 time.sleep(2)
         except Exception as e:
@@ -5899,7 +5929,16 @@ def get_cached_quant_model_bundle(days=MODEL_TRAIN_DAYS, refresh_sec=MODEL_CACHE
     return built
 
 
-def _current_regime_context(include_flow_snapshot=None, limit=20):
+def _current_regime_context(include_flow_snapshot=None, limit=None, window_hours=48):
+    """Determine active market regime from recent flow snapshots.
+
+    Args:
+        include_flow_snapshot: Optional live snapshot to prepend to the dataset.
+        limit: Max rows to return (safety cap, default 5000).
+        window_hours: Time window in hours to look back (default 48 = 2 days).
+    """
+    if limit is None:
+        limit = 5000
     conn = db()
     try:
         cur = conn.cursor()
@@ -5907,9 +5946,10 @@ def _current_regime_context(include_flow_snapshot=None, limit=20):
             SELECT mint, buy_sell_ratio, net_flow_sol, smart_wallet_buys, unique_buyer_count,
                    threat_risk_score, can_exit, liquidity_drop_pct, created_at
             FROM token_flow_snapshots
+            WHERE created_at >= NOW() - INTERVAL '%s hours'
             ORDER BY created_at DESC
             LIMIT %s
-        """, (max(1, int(limit)),))
+        """, (max(1, int(window_hours)), max(1, int(limit)),))
         rows = cur.fetchall()
     finally:
         db_return(conn)
@@ -5922,7 +5962,7 @@ def _log_model_decisions(info, snapshot, flow_snapshot):
     try:
         bundle = get_cached_quant_model_bundle(days=MODEL_TRAIN_DAYS)
         family = bundle.get("family") or {}
-        regime_context = _current_regime_context(include_flow_snapshot=flow_snapshot, limit=20)
+        regime_context = _current_regime_context(include_flow_snapshot=flow_snapshot, window_hours=48)
         active_regime = regime_context.get("regime") or "neutral"
         variants = [("global", "global"), ("regime_auto", "auto")]
         rows = []
@@ -6027,7 +6067,7 @@ def generate_quant_edge_report(window_days=7, report_kind="manual", model_thresh
         model_family=family,
         model_threshold=model_threshold,
     )
-    regime_context = _current_regime_context(limit=20)
+    regime_context = _current_regime_context(window_hours=48)
     report = build_edge_report(
         report_kind=report_kind,
         window_days=window_days,
@@ -8739,7 +8779,7 @@ def api_quant_model():
     bundle = get_cached_quant_model_bundle(days=days)
     rows = bundle.get("rows") or {}
     model_family = bundle.get("family") or {}
-    regime_context = _current_regime_context(limit=20)
+    regime_context = _current_regime_context(window_hours=48)
     active_regime = regime_context.get("regime") or "neutral"
     scored = score_recent_candidates_for_regime(
         rows.get("recent_rows") or [],
@@ -8928,6 +8968,147 @@ def api_quant_shadow_equity():
             "cumulative_pnl": round(running[strat], 2),
         })
     return jsonify(equity)
+
+
+@app.route("/api/quant/shadow-activity")
+@login_required
+def api_quant_shadow_activity():
+    """Detailed shadow trading activity feed — open positions + recent closed trades."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Open positions
+        cur.execute("""
+            SELECT id, strategy_name, mint, name, entry_price, current_price, peak_price, trough_price,
+                   opened_at, max_upside_pct, max_drawdown_pct,
+                   EXTRACT(EPOCH FROM (NOW() - opened_at)) / 60.0 AS age_min
+            FROM shadow_positions
+            WHERE status='open'
+            ORDER BY opened_at DESC
+            LIMIT 50
+        """)
+        open_rows = cur.fetchall()
+        # Recent closed
+        cur.execute("""
+            SELECT id, strategy_name, mint, name, entry_price, current_price, peak_price, trough_price,
+                   opened_at, closed_at, exit_reason, realized_pnl_pct, max_upside_pct, max_drawdown_pct,
+                   EXTRACT(EPOCH FROM (closed_at - opened_at)) / 60.0 AS hold_min
+            FROM shadow_positions
+            WHERE status='closed' AND closed_at IS NOT NULL
+            ORDER BY closed_at DESC
+            LIMIT 50
+        """)
+        closed_rows = cur.fetchall()
+        # Aggregate stats
+        cur.execute("""
+            SELECT COUNT(*) AS total_open FROM shadow_positions WHERE status='open'
+        """)
+        total_open = int((cur.fetchone() or {}).get("total_open") or 0)
+        cur.execute("""
+            SELECT COUNT(*) AS total_closed,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_pnl,
+                   ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_pnl,
+                   ROUND(SUM(realized_pnl_pct)::numeric, 2) AS total_pnl
+            FROM shadow_positions WHERE status='closed'
+        """)
+        agg = cur.fetchone() or {}
+    finally:
+        db_return(conn)
+
+    def fmt_pos(row, is_open=True):
+        entry = float(row.get("entry_price") or 0)
+        current = float(row.get("current_price") or 0)
+        pnl = round(((current / entry) - 1) * 100, 2) if entry > 0 and current > 0 else 0
+        base = {
+            "id": row.get("id"),
+            "strategy": row.get("strategy_name"),
+            "mint": row.get("mint"),
+            "name": row.get("name") or (row.get("mint") or "")[:8],
+            "entry_price": entry,
+            "current_price": current,
+            "peak_price": float(row.get("peak_price") or 0),
+            "trough_price": float(row.get("trough_price") or 0),
+            "unrealized_pnl_pct": pnl if is_open else None,
+            "realized_pnl_pct": float(row.get("realized_pnl_pct") or 0) if not is_open else None,
+            "max_upside_pct": float(row.get("max_upside_pct") or 0),
+            "max_drawdown_pct": float(row.get("max_drawdown_pct") or 0),
+            "opened_at": row["opened_at"].isoformat() if row.get("opened_at") else None,
+        }
+        if is_open:
+            base["age_min"] = round(float(row.get("age_min") or 0), 1)
+        else:
+            base["closed_at"] = row["closed_at"].isoformat() if row.get("closed_at") else None
+            base["exit_reason"] = row.get("exit_reason")
+            base["hold_min"] = round(float(row.get("hold_min") or 0), 1)
+        return base
+
+    total_closed = int(agg.get("total_closed") or 0)
+    total_wins = int(agg.get("wins") or 0)
+    return jsonify({
+        "open_positions": [fmt_pos(r, True) for r in open_rows],
+        "recent_closed": [fmt_pos(r, False) for r in closed_rows],
+        "stats": {
+            "total_open": total_open,
+            "total_closed": total_closed,
+            "total_wins": total_wins,
+            "win_rate": round((total_wins / total_closed) * 100, 1) if total_closed > 0 else 0,
+            "avg_pnl_pct": float(agg.get("avg_pnl") or 0),
+            "best_pnl_pct": float(agg.get("best_pnl") or 0),
+            "worst_pnl_pct": float(agg.get("worst_pnl") or 0),
+            "total_pnl_pct": float(agg.get("total_pnl") or 0),
+        },
+    })
+
+
+@app.route("/api/quant/opportunity-settings", methods=["POST"])
+@login_required
+def api_quant_opportunity_settings():
+    """Apply opportunity-hunter preset — optimized for catching large expansions."""
+    user_id = session.get("user_id", 1)
+    data = request.get_json(silent=True) or {}
+    aggression = (data.get("aggression") or "aggressive").strip().lower()
+    if aggression not in ("aggressive", "degen"):
+        aggression = "aggressive"
+
+    # Build opportunity-optimized settings from the base preset
+    base = dict(PRESETS.get(aggression, PRESETS["aggressive"]))
+    opportunity_overrides = {
+        # ── Peak Plateau Mode: ride to the top, only exit on trailing stop ──
+        "peak_plateau_mode": True,           # Enable progressive trailing exit
+        "tp1_mult": 3.0,                     # Skim 25% at 3x to secure some profit
+        "tp1_sell_pct": 0.25,                # Only sell 25% at TP1 — keep 75% riding
+        "tp2_mult": 9999.0,                  # Effectively disabled — trailing stop handles exit
+        "trail_pct": 0.30,                   # Wide 30% base trail (tightens progressively)
+                                             #   3x+  → 25% trail
+                                             #   5x+  → 20% trail
+                                             #   10x+ → 15% trail
+                                             #   20x+ → 12% trail
+                                             #   50x+ → 10% trail — locks mega gains
+        "stop_loss": 0.55,                   # 45% stop — protect capital on duds
+        "time_stop_min": 360,                # 6 hours — moonshots need time to develop
+        "max_age_min": 120,                  # Focus on fresh tokens with most upside
+        "min_liq": max(base.get("min_liq", 500), 800),  # Minimum exit liquidity
+        "max_mc": 800000,                    # Wide MC range for moonshot potential
+        "min_score": 12,                     # Lower score floor — let volume/flow decide
+        "min_volume_spike_mult": 2.5,        # Require strong volume surge (confirmation)
+        "min_holder_growth_pct": 15,         # Loose holder growth — fresh tokens
+        "offpeak_min_change": 25,            # Higher bar for offpeak to avoid noise
+        "max_hot_change": 5000.0,            # DO NOT block hot runners — let 2000%+ through
+        "nuclear_narrative_score": 50,       # Strong narrative = let it ride
+        "max_correlated": max(base.get("max_correlated", 3), 5),
+        "drawdown_limit_sol": base.get("drawdown_limit_sol", 0.8) * 2.0,
+    }
+    merged = {**base, **opportunity_overrides}
+    merged["label"] = f"Opportunity Hunter ({aggression.title()})"
+    merged["description"] = "Peak Plateau Rider — holds until momentum dies. Progressive trailing tightens as gains grow. No fixed TP2 cap."
+
+    # Persist using the same function the settings tab uses
+    _, current_settings = load_user_effective_settings(user_id)
+    persist_bot_settings(user_id, "custom", "indefinite", 0, 0, merged)
+
+    return jsonify({"ok": True, "preset": "custom", "settings": merged, "message": f"Opportunity Hunter ({aggression.title()}) settings saved. Restart bot to apply."})
 
 
 @app.route("/api/quant/auto-tune-status")
@@ -11695,6 +11876,66 @@ DASHBOARD_HTML = _CSS + """
   </div>
   <!-- ═══════════ END LIVE BANNER ═══════════ -->
 
+  <!-- ═══════════ SHADOW ACTIVITY WINDOW ═══════════ -->
+  <style>
+  .shadow-activity{background:rgba(8,16,32,.92);border:1px solid rgba(20,199,132,.12);border-radius:16px;padding:0;margin-bottom:16px;overflow:hidden}
+  .shadow-activity-header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer;user-select:none}
+  .shadow-activity-header:hover{background:rgba(20,199,132,.04)}
+  .shadow-activity-title{display:flex;align-items:center;gap:10px}
+  .shadow-activity-title h3{margin:0;font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif}
+  .shadow-activity-badges{display:flex;gap:6px;flex-wrap:wrap}
+  .shadow-activity-chevron{transition:transform .25s;font-size:16px;color:var(--t3)}
+  .shadow-activity-chevron.open{transform:rotate(180deg)}
+  .shadow-activity-body{display:none;padding:0 18px 18px}
+  .shadow-activity-body.open{display:block}
+  .shadow-activity-tabs{display:flex;gap:0;border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:14px}
+  .shadow-activity-tab{padding:10px 16px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s}
+  .shadow-activity-tab.active{color:#14c784;border-bottom-color:#14c784}
+  .shadow-activity-tab:hover{color:var(--t1)}
+  .shadow-pos-card{padding:12px 14px;border:1px solid rgba(255,255,255,.06);border-radius:12px;background:rgba(255,255,255,.02);margin-bottom:8px;transition:border-color .2s}
+  .shadow-pos-card:hover{border-color:rgba(20,199,132,.2)}
+  .shadow-pos-row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+  .shadow-pos-name{font-size:12px;font-weight:800;color:var(--t1)}
+  .shadow-pos-meta{font-size:10px;color:var(--t3);margin-top:3px}
+  .shadow-pos-pnl{font-size:14px;font-weight:800;letter-spacing:-.3px}
+  .shadow-stats-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin-bottom:14px}
+  .shadow-stat-card{text-align:center;padding:10px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:rgba(255,255,255,.02)}
+  .shadow-stat-card .val{font-size:18px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif}
+  .shadow-stat-card .lbl{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-top:3px}
+  </style>
+  <div class="shadow-activity" id="shadow-activity-panel">
+    <div class="shadow-activity-header" onclick="toggleShadowActivity()">
+      <div class="shadow-activity-title">
+        <h3>Shadow Trading Activity</h3>
+        <span class="badge bg-grn" id="sa-status">Live</span>
+        <span class="badge bg-muted" id="sa-open-count">0 open</span>
+        <span class="badge bg-muted" id="sa-closed-count">0 closed</span>
+      </div>
+      <span class="shadow-activity-chevron" id="sa-chevron">&#9660;</span>
+    </div>
+    <div class="shadow-activity-body" id="sa-body">
+      <div class="shadow-stats-strip" id="sa-stats-strip">
+        <div class="shadow-stat-card"><div class="val neu" id="sa-wr">—</div><div class="lbl">Win Rate</div></div>
+        <div class="shadow-stat-card"><div class="val neu" id="sa-avg-pnl">—</div><div class="lbl">Avg P&L</div></div>
+        <div class="shadow-stat-card"><div class="val c-grn" id="sa-best">—</div><div class="lbl">Best Trade</div></div>
+        <div class="shadow-stat-card"><div class="val c-red" id="sa-worst">—</div><div class="lbl">Worst Trade</div></div>
+        <div class="shadow-stat-card"><div class="val neu" id="sa-total-pnl">—</div><div class="lbl">Total P&L</div></div>
+        <div class="shadow-stat-card"><div class="val neu" id="sa-total-closed">0</div><div class="lbl">Trades Closed</div></div>
+      </div>
+      <div class="shadow-activity-tabs">
+        <div class="shadow-activity-tab active" onclick="switchShadowTab('open')">Open Positions</div>
+        <div class="shadow-activity-tab" onclick="switchShadowTab('closed')">Recent Closed</div>
+      </div>
+      <div id="sa-open-list">
+        <div style="text-align:center;color:var(--t3);font-size:12px;padding:20px 0">Loading shadow positions...</div>
+      </div>
+      <div id="sa-closed-list" style="display:none">
+        <div style="text-align:center;color:var(--t3);font-size:12px;padding:20px 0">Loading closed trades...</div>
+      </div>
+    </div>
+  </div>
+  <!-- ═══════════ END SHADOW ACTIVITY ═══════════ -->
+
   <!-- Tab Bar -->
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scanner</span><span class="tab-btn-meta">Discovery, quick buy, wallet tree</span></button>
@@ -12297,6 +12538,31 @@ DASHBOARD_HTML = _CSS + """
   </div>
 
   <!-- ═══════════════════════ QUANT TAB ═══════════════════════ -->
+  <style>
+  .quant-section{background:var(--card);border:1px solid var(--b1);border-radius:16px;margin-bottom:12px;overflow:hidden}
+  .quant-section-header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;cursor:pointer;user-select:none;transition:background .15s}
+  .quant-section-header:hover{background:rgba(255,255,255,.02)}
+  .quant-section-header h3{margin:0;font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif}
+  .quant-section-header .sub{font-size:10px;color:var(--t3);margin-top:2px}
+  .quant-section-chevron{transition:transform .25s;font-size:14px;color:var(--t3)}
+  .quant-section-chevron.open{transform:rotate(180deg)}
+  .quant-section-body{display:none;padding:0 18px 18px;border-top:1px solid rgba(255,255,255,.04)}
+  .quant-section-body.open{display:block}
+  .quant-section-nav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;padding:14px 18px 0}
+  .quant-section-nav-btn{padding:6px 14px;border-radius:8px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.02);color:var(--t2);font-size:11px;font-weight:700;cursor:pointer;transition:all .2s;letter-spacing:.04em}
+  .quant-section-nav-btn:hover{background:rgba(20,199,132,.06);border-color:rgba(20,199,132,.2);color:var(--t1)}
+  .quant-section-nav-btn.active{background:rgba(20,199,132,.12);border-color:rgba(20,199,132,.3);color:#14c784}
+  .opp-xy-map{position:relative;width:100%;height:320px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(0,0,0,.3);overflow:hidden;margin-bottom:14px}
+  .opp-xy-axis-x{position:absolute;bottom:6px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--t3);letter-spacing:.08em;text-transform:uppercase}
+  .opp-xy-axis-y{position:absolute;left:6px;top:50%;transform:translateY(-50%) rotate(-90deg);font-size:9px;color:var(--t3);letter-spacing:.08em;text-transform:uppercase}
+  .opp-xy-quadrant{position:absolute;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.35}
+  .opp-xy-dot{position:absolute;width:8px;height:8px;border-radius:50%;transform:translate(-50%,-50%);transition:all .3s;cursor:default}
+  .opp-xy-dot:hover{transform:translate(-50%,-50%) scale(2);z-index:10}
+  .opp-xy-crosshair-h{position:absolute;left:0;right:0;height:1px;background:rgba(255,255,255,.06);top:50%}
+  .opp-xy-crosshair-v{position:absolute;top:0;bottom:0;width:1px;background:rgba(255,255,255,.06);left:50%}
+  .opp-settings-panel{background:rgba(20,199,132,.04);border:1px solid rgba(20,199,132,.15);border-radius:14px;padding:18px;margin-top:14px}
+  .opp-settings-panel h4{margin:0 0 10px;font-size:13px;font-weight:800;color:#14c784}
+  </style>
   <div id="tab-quant" class="tab-pane">
     <div class="tab-pane-header">
       <div>
@@ -12306,33 +12572,44 @@ DASHBOARD_HTML = _CSS + """
       </div>
       <div class="shortcut-row">
         <span class="badge bg-muted">Backtests run asynchronously</span>
+        <button class="btn btn-ghost" type="button" onclick="pollQuant()" style="margin-left:8px">Refresh All</button>
       </div>
     </div>
 
-    <div class="scanner-top-grid">
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Quant Dataset</div>
-            <div class="panel-copy">This is the institutional data layer under the live bot: captured tokens, market ticks, feature snapshots, and simulated positions.</div>
-          </div>
-          <div class="panel-actions">
-            <button class="btn btn-ghost" type="button" onclick="pollQuant()">Refresh Quant</button>
-          </div>
-        </div>
-        <div class="control-action-grid" id="quant-overview-grid">
+    <!-- Section nav pills at top -->
+    <div class="quant-section-nav">
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-dataset',this)">Dataset</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-backtest',this)">Backtest</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-regime',this)">Flow Regime</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-opportunity',this)">Opportunity Map</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-optimizer',this)">Optimizer</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-model',this)">Model Desk</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-comparison',this)">Rules vs Models</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-reports',this)">Edge Reports</button>
+      <button class="quant-section-nav-btn active" onclick="toggleQuantSection('qs-runs',this)">Runs</button>
+    </div>
+
+    <!-- 1. Dataset -->
+    <div class="quant-section" id="qs-dataset">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-dataset')">
+        <div><h3>Quant Dataset</h3><div class="sub">Captured tokens, market ticks, feature snapshots, and simulated positions</div></div>
+        <span class="quant-section-chevron open" id="qs-dataset-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-dataset-body">
+        <div class="control-action-grid" id="quant-overview-grid" style="margin-top:14px">
           <div class="scanner-summary-card"><div class="scanner-summary-label">Tracked Tokens</div><div class="scanner-summary-value">—</div><div class="scanner-summary-copy">Loading dataset</div></div>
         </div>
       </div>
+    </div>
 
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Launch Backtest</div>
-            <div class="panel-copy">Replay the saved feature stream across the canonical strategy set and store run-by-run trade outcomes.</div>
-          </div>
-        </div>
-        <div class="field-row" style="margin-bottom:12px">
+    <!-- 2. Backtest -->
+    <div class="quant-section" id="qs-backtest">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-backtest')">
+        <div><h3>Launch Backtest</h3><div class="sub">Replay the saved feature stream across strategy sets</div></div>
+        <span class="quant-section-chevron open" id="qs-backtest-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-backtest-body">
+        <div class="field-row" style="margin:14px 0 12px">
           <div class="fgroup">
             <label class="flabel">Window</label>
             <select class="finput" id="quant-days">
@@ -12363,52 +12640,115 @@ DASHBOARD_HTML = _CSS + """
       </div>
     </div>
 
-    <div class="scanner-top-grid" style="margin-top:16px">
-      <div class="glass" id="quant-flow-regime">
-        <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Flow regime analytics loading…</div>
+    <!-- 3. Flow Regime -->
+    <div class="quant-section" id="qs-regime">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-regime')">
+        <div><h3>Flow Regime Analytics</h3><div class="sub">Wallet participation, smart-money presence, and liquidity health</div></div>
+        <span class="quant-section-chevron open" id="qs-regime-chev">&#9660;</span>
       </div>
-      <div class="glass" id="quant-opportunity-map">
-        <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Opportunity map loading…</div>
+      <div class="quant-section-body open" id="qs-regime-body">
+        <div id="quant-flow-regime" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Flow regime analytics loading…</div>
+        </div>
       </div>
     </div>
 
-    <div class="glass" id="quant-optimizer" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Optimizer sweep loading…</div>
+    <!-- 4. Opportunity Map -->
+    <div class="quant-section" id="qs-opportunity">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-opportunity')">
+        <div><h3>Opportunity Map</h3><div class="sub">X/Y visualization of captured vs missed winners and losers avoided</div></div>
+        <span class="quant-section-chevron open" id="qs-opportunity-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-opportunity-body">
+        <div id="quant-opportunity-map" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Opportunity map loading…</div>
+        </div>
+      </div>
     </div>
 
-    <div class="glass" id="quant-model" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Model scoring loading…</div>
+    <!-- 5. Optimizer -->
+    <div class="quant-section" id="qs-optimizer">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-optimizer')">
+        <div><h3>Optimizer Sweep</h3><div class="sub">Best thresholds, feature edges, and top outcomes</div></div>
+        <span class="quant-section-chevron open" id="qs-optimizer-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-optimizer-body">
+        <div id="quant-optimizer" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Optimizer sweep loading…</div>
+        </div>
+      </div>
     </div>
 
-    <div class="glass" id="quant-comparison" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Rules vs models comparison loading…</div>
+    <!-- 6. Model Desk -->
+    <div class="quant-section" id="qs-model">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-model')">
+        <div><h3>Regime Model Desk</h3><div class="sub">Auto-selecting learned ranking models from live tape regime</div></div>
+        <span class="quant-section-chevron open" id="qs-model-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-model-body">
+        <div id="quant-model" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Model scoring loading…</div>
+        </div>
+      </div>
     </div>
 
-    <div class="glass" id="quant-reports" style="margin-top:16px">
-      <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Persistent edge reports loading…</div>
+    <!-- 7. Rules vs Models -->
+    <div class="quant-section" id="qs-comparison">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-comparison')">
+        <div><h3>Rules vs Models</h3><div class="sub">Side-by-side comparison using identical exit assumptions</div></div>
+        <span class="quant-section-chevron open" id="qs-comparison-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-comparison-body">
+        <div id="quant-comparison" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Rules vs models comparison loading…</div>
+        </div>
+      </div>
     </div>
 
-    <div class="signals-layout">
-      <div style="min-width:0">
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b1)">
-            <div>
-              <div style="font-weight:700;font-size:13px;color:var(--t1)">Backtest Runs</div>
-              <div style="font-size:11px;color:var(--t3)">Recent replay runs with tokens processed, snapshots used, and closed simulated trades.</div>
+    <!-- 8. Edge Reports -->
+    <div class="quant-section" id="qs-reports">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-reports')">
+        <div><h3>Edge Reports</h3><div class="sub">Persistent comparison snapshots and automated scorecards</div></div>
+        <span class="quant-section-chevron open" id="qs-reports-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-reports-body">
+        <div id="quant-reports" style="margin-top:14px">
+          <div style="text-align:center;color:var(--t3);font-size:12px;padding:32px 0">Persistent edge reports loading…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 9. Runs -->
+    <div class="quant-section" id="qs-runs">
+      <div class="quant-section-header" onclick="toggleQuantDropdown('qs-runs')">
+        <div><h3>Backtest Runs</h3><div class="sub">Recent replay runs with tokens processed and closed simulated trades</div></div>
+        <span class="quant-section-chevron open" id="qs-runs-chev">&#9660;</span>
+      </div>
+      <div class="quant-section-body open" id="qs-runs-body">
+        <div class="signals-layout" style="margin-top:14px">
+          <div style="min-width:0">
+            <div class="glass" style="padding:0;overflow:hidden">
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--b1)">
+                <div>
+                  <div style="font-weight:700;font-size:13px;color:var(--t1)">Backtest Runs</div>
+                  <div style="font-size:11px;color:var(--t3)">Recent replay runs with tokens processed, snapshots used, and closed simulated trades.</div>
+                </div>
+                <div id="quant-run-count" style="font-size:11px;color:var(--t3)">0 runs</div>
+              </div>
+              <div id="quant-runs" style="padding:14px">
+                <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">No backtest runs yet.</div>
+              </div>
             </div>
-            <div id="quant-run-count" style="font-size:11px;color:var(--t3)">0 runs</div>
           </div>
-          <div id="quant-runs" style="padding:14px">
-            <div style="text-align:center;color:var(--t3);font-size:12px;padding:24px 0">No backtest runs yet.</div>
+          <div class="signals-side">
+            <div class="glass" id="quant-run-detail">
+              <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Select a replay run to inspect strategy summaries and top simulated trades.</div>
+            </div>
           </div>
-        </div>
-      </div>
-      <div class="signals-side">
-        <div class="glass" id="quant-run-detail">
-          <div style="text-align:center;color:var(--t3);font-size:12px;padding:40px 0">Select a replay run to inspect strategy summaries and top simulated trades.</div>
         </div>
       </div>
     </div>
+
   </div>
 
 </div>
@@ -14290,13 +14630,63 @@ function renderQuantOpportunityMap() {
   const totals = opportunity.totals || {};
   const blockers = Array.isArray(opportunity.top_blockers) ? opportunity.top_blockers : [];
   const samples = opportunity.samples || {};
+  const allSamples = [];
+  // Build dots for the X/Y map from all categories
+  (samples.captured_winners || []).forEach(s => allSamples.push({...s, category: 'captured_winner'}));
+  (samples.missed_winners || []).forEach(s => allSamples.push({...s, category: 'missed_winner'}));
+  (samples.false_positives || []).forEach(s => allSamples.push({...s, category: 'false_positive'}));
+  (samples.avoided_losers || []).forEach(s => allSamples.push({...s, category: 'avoided_loser'}));
+
+  // Build scatter dots — X = score (0-100), Y = peak_return_pct (-100 to 500+)
+  const maxReturn = Math.max(200, ...allSamples.map(s => Math.abs(s.peak_return_pct || 0)));
+  const dotColors = {
+    captured_winner: '#14c784',
+    missed_winner: '#f59e0b',
+    false_positive: '#ef4444',
+    avoided_loser: '#3b82f6',
+  };
+  const dotLabels = {
+    captured_winner: 'Captured Winner',
+    missed_winner: 'Missed Winner',
+    false_positive: 'False Positive',
+    avoided_loser: 'Avoided Loser',
+  };
+  const dots = allSamples.slice(0, 80).map(s => {
+    const score = Math.min(100, Math.max(0, s.score || s.composite_score || 50));
+    const ret = s.peak_return_pct || 0;
+    const xPct = (score / 100) * 90 + 5; // 5%-95%
+    const yPct = 50 - (ret / maxReturn) * 45; // Center at 50%, winners above, losers below
+    const clampY = Math.max(3, Math.min(97, yPct));
+    return '<div class="opp-xy-dot" style="left:' + xPct + '%;top:' + clampY + '%;background:' + (dotColors[s.category] || '#666') + '" title="' + (s.name || s.mint || '') + ' | ' + (dotLabels[s.category] || '') + ' | Score: ' + score + ' | Return: ' + (ret > 0 ? '+' : '') + ret.toFixed(1) + '%"></div>';
+  }).join('');
+
   box.innerHTML = `
     <div class="panel-head" style="margin-bottom:12px">
       <div>
         <div class="panel-title">Opportunity Map</div>
-        <div class="panel-copy">Classifies the market tape into winners captured, winners missed, losers avoided, and bad longs that should be filtered harder.</div>
+        <div class="panel-copy">X/Y scatter of signal score vs realized return. Green = captured winners, yellow = missed, red = false positives, blue = avoided losers.</div>
       </div>
-      <span class="badge bg-muted">Winner threshold ${opportunity.winner_threshold_pct || 120}%</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="badge bg-muted">Winner threshold ${opportunity.winner_threshold_pct || 120}%</span>
+        <button class="btn btn-ghost" type="button" onclick="toggleOpportunitySettings()" style="font-size:11px">Settings</button>
+      </div>
+    </div>
+    <div class="opp-xy-map">
+      <div class="opp-xy-crosshair-h"></div>
+      <div class="opp-xy-crosshair-v"></div>
+      <div class="opp-xy-quadrant" style="top:8px;right:12px;color:#14c784">Winners + High Score</div>
+      <div class="opp-xy-quadrant" style="top:8px;left:12px;color:#f59e0b">Winners + Low Score (Missed)</div>
+      <div class="opp-xy-quadrant" style="bottom:8px;right:12px;color:#ef4444">Losers + High Score (False Pos)</div>
+      <div class="opp-xy-quadrant" style="bottom:8px;left:12px;color:#3b82f6">Losers + Low Score (Avoided)</div>
+      <div class="opp-xy-axis-x">Signal Score</div>
+      <div class="opp-xy-axis-y">Return %</div>
+      ${dots || '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:11px;color:var(--t3)">Waiting for data...</div>'}
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:50%;background:#14c784"></div><span style="font-size:10px;color:var(--t2)">Captured Winners</span></div>
+      <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:50%;background:#f59e0b"></div><span style="font-size:10px;color:var(--t2)">Missed Winners</span></div>
+      <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:50%;background:#ef4444"></div><span style="font-size:10px;color:var(--t2)">False Positives</span></div>
+      <div style="display:flex;align-items:center;gap:5px"><div style="width:10px;height:10px;border-radius:50%;background:#3b82f6"></div><span style="font-size:10px;color:var(--t2)">Avoided Losers</span></div>
     </div>
     <div class="control-action-grid" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:12px">
       <div class="scanner-summary-card"><div class="scanner-summary-label">Captured Winners</div><div class="scanner-summary-value">${totals.captured_winners || 0}</div><div class="scanner-summary-copy">Passed and later ran</div></div>
@@ -14321,6 +14711,34 @@ function renderQuantOpportunityMap() {
           </div>
         </div>
       `).join('') || '<div style="font-size:11px;color:var(--t3)">No missed-winner sample yet.</div>'}
+    </div>
+    <!-- Opportunity Settings Panel -->
+    <div class="opp-settings-panel" id="opp-settings-panel" style="display:none">
+      <h4>Opportunity Hunter Settings</h4>
+      <div style="font-size:11px;color:var(--t2);margin-bottom:12px">Peak Plateau Rider — holds positions until momentum dies. No fixed TP2 cap. Progressive trailing stop tightens as gains grow, locking in profit at the peak without selling early on moonshots.</div>
+      <div class="field-row" style="margin-bottom:12px">
+        <div class="fgroup">
+          <label class="flabel">Aggression Level</label>
+          <select class="finput" id="opp-aggression">
+            <option value="aggressive">Aggressive — Bigger positions, strong volume gates</option>
+            <option value="degen">Degen — Max exposure, widest trail for mega runners</option>
+          </select>
+        </div>
+      </div>
+      <div style="font-size:10px;color:var(--t3);margin-bottom:12px;line-height:1.6">
+        <strong>How it works:</strong><br>
+        · Skims only 25% at 3x to lock some profit — keeps 75% riding<br>
+        · TP2 disabled — no ceiling on gains, trailing stop is the only exit<br>
+        · Progressive trailing tightens as gains grow: 30% early → 25% at 3x → 20% at 5x → 15% at 10x → 12% at 20x → 10% at 50x+<br>
+        · 6-hour time stop (only if position is flat/losing)<br>
+        · Hot runner ceiling raised to 5000% — won't block massive pumps<br>
+        · Max MC $800K — wide range for moonshot potential<br>
+        <strong>Applied on:</strong> Next bot restart. Saved as Custom preset.
+      </div>
+      <div class="panel-actions">
+        <button class="btn btn-primary" type="button" onclick="applyOpportunitySettings()">Apply Opportunity Settings</button>
+        <button class="btn btn-ghost" type="button" onclick="toggleOpportunitySettings()">Cancel</button>
+      </div>
     </div>
   `;
 }
@@ -14907,6 +15325,160 @@ function _animateShadowVal(id, newVal) {
   }
 }
 pollShadowBanner(); setInterval(pollShadowBanner, 8000);
+
+// ═══════════ SHADOW ACTIVITY WINDOW ═══════════
+let _shadowActivityOpen = false;
+let _shadowActivityTab = 'open';
+
+function toggleShadowActivity() {
+  _shadowActivityOpen = !_shadowActivityOpen;
+  const body = document.getElementById('sa-body');
+  const chev = document.getElementById('sa-chevron');
+  if (body) body.classList.toggle('open', _shadowActivityOpen);
+  if (chev) chev.classList.toggle('open', _shadowActivityOpen);
+  if (_shadowActivityOpen) pollShadowActivity();
+}
+
+function switchShadowTab(tab) {
+  _shadowActivityTab = tab;
+  document.querySelectorAll('.shadow-activity-tab').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.shadow-activity-tab').forEach(el => {
+    if ((tab === 'open' && el.textContent.includes('Open')) || (tab === 'closed' && el.textContent.includes('Closed')))
+      el.classList.add('active');
+  });
+  const openList = document.getElementById('sa-open-list');
+  const closedList = document.getElementById('sa-closed-list');
+  if (openList) openList.style.display = tab === 'open' ? 'block' : 'none';
+  if (closedList) closedList.style.display = tab === 'closed' ? 'block' : 'none';
+}
+
+async function pollShadowActivity() {
+  try {
+    const data = await fetch('/api/quant/shadow-activity').then(r => r.json()).catch(() => null);
+    if (!data) return;
+    const stats = data.stats || {};
+    // Update badges
+    const openBadge = document.getElementById('sa-open-count');
+    const closedBadge = document.getElementById('sa-closed-count');
+    if (openBadge) openBadge.textContent = (stats.total_open || 0) + ' open';
+    if (closedBadge) closedBadge.textContent = (stats.total_closed || 0) + ' closed';
+
+    // Stats strip
+    const wrEl = document.getElementById('sa-wr');
+    if (wrEl) { wrEl.textContent = stats.win_rate ? stats.win_rate + '%' : '—'; wrEl.className = 'val ' + (stats.win_rate >= 50 ? 'c-grn' : stats.win_rate > 0 ? 'c-red' : 'neu'); }
+    const avgEl = document.getElementById('sa-avg-pnl');
+    if (avgEl) { avgEl.textContent = stats.avg_pnl_pct ? (stats.avg_pnl_pct > 0 ? '+' : '') + stats.avg_pnl_pct + '%' : '—'; avgEl.className = 'val ' + (stats.avg_pnl_pct > 0 ? 'c-grn' : stats.avg_pnl_pct < 0 ? 'c-red' : 'neu'); }
+    const bestEl = document.getElementById('sa-best');
+    if (bestEl) bestEl.textContent = stats.best_pnl_pct ? '+' + stats.best_pnl_pct + '%' : '—';
+    const worstEl = document.getElementById('sa-worst');
+    if (worstEl) worstEl.textContent = stats.worst_pnl_pct ? stats.worst_pnl_pct + '%' : '—';
+    const totalPnlEl = document.getElementById('sa-total-pnl');
+    if (totalPnlEl) { totalPnlEl.textContent = stats.total_pnl_pct ? (stats.total_pnl_pct > 0 ? '+' : '') + stats.total_pnl_pct + '%' : '—'; totalPnlEl.className = 'val ' + (stats.total_pnl_pct > 0 ? 'c-grn' : stats.total_pnl_pct < 0 ? 'c-red' : 'neu'); }
+    const totalClosedEl = document.getElementById('sa-total-closed');
+    if (totalClosedEl) totalClosedEl.textContent = stats.total_closed || 0;
+
+    // Open positions list
+    const openList = document.getElementById('sa-open-list');
+    if (openList) {
+      const openPositions = data.open_positions || [];
+      if (openPositions.length === 0) {
+        openList.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:20px 0">No open shadow positions right now.</div>';
+      } else {
+        openList.innerHTML = openPositions.map(p => {
+          const pnl = p.unrealized_pnl_pct || 0;
+          const pnlColor = pnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+          return '<div class="shadow-pos-card">' +
+            '<div class="shadow-pos-row">' +
+              '<div><div class="shadow-pos-name">' + (p.name || p.mint) + '</div>' +
+              '<div class="shadow-pos-meta">' + (p.strategy || '') + ' · ' + (p.age_min || 0).toFixed(0) + 'min old · Entry $' + (p.entry_price || 0).toPrecision(4) + '</div></div>' +
+              '<div class="shadow-pos-pnl" style="color:' + pnlColor + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '%</div>' +
+            '</div>' +
+            '<div class="shortcut-row" style="margin-top:8px">' +
+              '<span class="badge bg-muted">Peak +' + (p.max_upside_pct || 0).toFixed(1) + '%</span>' +
+              '<span class="badge bg-muted">DD ' + (p.max_drawdown_pct || 0).toFixed(1) + '%</span>' +
+              '<span class="badge bg-muted">Now $' + (p.current_price || 0).toPrecision(4) + '</span>' +
+              '<span class="badge bg-muted">' + (p.mint || '').slice(0, 6) + '...' + (p.mint || '').slice(-4) + '</span>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+      }
+    }
+
+    // Closed trades list
+    const closedList = document.getElementById('sa-closed-list');
+    if (closedList) {
+      const closedTrades = data.recent_closed || [];
+      if (closedTrades.length === 0) {
+        closedList.innerHTML = '<div style="text-align:center;color:var(--t3);font-size:12px;padding:20px 0">No closed shadow trades yet.</div>';
+      } else {
+        closedList.innerHTML = closedTrades.map(t => {
+          const pnl = t.realized_pnl_pct || 0;
+          const pnlColor = pnl >= 0 ? 'var(--grn)' : 'var(--red2)';
+          const isWin = pnl > 0;
+          return '<div class="shadow-pos-card" style="border-left:3px solid ' + (isWin ? 'rgba(20,199,132,.4)' : 'rgba(239,68,68,.4)') + '">' +
+            '<div class="shadow-pos-row">' +
+              '<div><div class="shadow-pos-name">' + (t.name || t.mint) + '</div>' +
+              '<div class="shadow-pos-meta">' + (t.strategy || '') + ' · ' + (t.exit_reason || 'closed') + ' · held ' + (t.hold_min || 0).toFixed(0) + 'min</div></div>' +
+              '<div class="shadow-pos-pnl" style="color:' + pnlColor + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '%</div>' +
+            '</div>' +
+            '<div class="shortcut-row" style="margin-top:8px">' +
+              '<span class="badge ' + (isWin ? 'bg-grn' : 'bg-red') + '">' + (isWin ? 'WIN' : 'LOSS') + '</span>' +
+              '<span class="badge bg-muted">Peak +' + (t.max_upside_pct || 0).toFixed(1) + '%</span>' +
+              '<span class="badge bg-muted">DD ' + (t.max_drawdown_pct || 0).toFixed(1) + '%</span>' +
+              '<span class="badge bg-muted">Entry $' + (t.entry_price || 0).toPrecision(4) + '</span>' +
+              '<span class="badge bg-muted">' + (t.mint || '').slice(0, 6) + '...' + (t.mint || '').slice(-4) + '</span>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+      }
+    }
+  } catch(e) {}
+}
+setInterval(() => { if (_shadowActivityOpen) pollShadowActivity(); }, 10000);
+
+// ═══════════ QUANT SECTION TOGGLES ═══════════
+function toggleQuantDropdown(sectionId) {
+  const body = document.getElementById(sectionId + '-body');
+  const chev = document.getElementById(sectionId + '-chev');
+  if (!body) return;
+  const isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  if (chev) chev.classList.toggle('open', !isOpen);
+}
+
+function toggleQuantSection(sectionId, btn) {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  const isHidden = section.style.display === 'none';
+  section.style.display = isHidden ? '' : 'none';
+  if (btn) btn.classList.toggle('active', isHidden);
+}
+
+// ═══════════ OPPORTUNITY SETTINGS ═══════════
+function toggleOpportunitySettings() {
+  const panel = document.getElementById('opp-settings-panel');
+  if (panel) panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+}
+
+async function applyOpportunitySettings() {
+  const aggression = document.getElementById('opp-aggression')?.value || 'aggressive';
+  try {
+    const res = await fetch('/api/quant/opportunity-settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ aggression }),
+    }).then(r => r.json());
+    if (res && res.ok) {
+      showToast(res.message || 'Opportunity settings applied!');
+      toggleOpportunitySettings();
+    } else {
+      showToast('Failed to apply opportunity settings', false);
+    }
+  } catch(e) {
+    showToast('Error applying settings', false);
+  }
+}
+
 </script>
 """
 

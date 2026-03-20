@@ -345,18 +345,52 @@ def shadow_position_update(position, current_price, settings, age_min):
     tp_mult = max(_safe_float(position.get("take_profit_mult"), settings.get("tp2_mult", 2.0)), 1.01)
     stop_ratio = _safe_float(position.get("stop_loss_ratio"), settings.get("stop_loss", 0.7))
     time_stop_min = _safe_int(position.get("time_stop_min"), settings.get("time_stop_min", 30))
+    peak_plateau_mode = bool(settings.get("peak_plateau_mode"))
+
+    peak_ratio = peak_price / entry_price if entry_price else 1.0
+    ratio = current_price / entry_price if entry_price else 1.0
+
+    # Progressive trailing stop calculation
+    base_trail = _safe_float(settings.get("trail_pct"), 0.20)
+    if peak_plateau_mode:
+        if peak_ratio >= 50:
+            effective_trail = min(base_trail, 0.10)
+        elif peak_ratio >= 20:
+            effective_trail = min(base_trail, 0.12)
+        elif peak_ratio >= 10:
+            effective_trail = min(base_trail, 0.15)
+        elif peak_ratio >= 5:
+            effective_trail = min(base_trail, 0.20)
+        elif peak_ratio >= 3:
+            effective_trail = min(base_trail, 0.25)
+        else:
+            effective_trail = base_trail
+    else:
+        effective_trail = base_trail
+    trail_line = peak_price * (1.0 - effective_trail)
 
     status = "open"
     exit_reason = ""
-    if current_price >= entry_price * tp_mult:
-        status = "closed"
-        exit_reason = "take_profit"
-    elif stop_ratio > 0 and current_price <= entry_price * stop_ratio:
+
+    if stop_ratio > 0 and current_price <= entry_price * stop_ratio:
         status = "closed"
         exit_reason = "stop_loss"
-    elif age_min >= time_stop_min:
-        status = "closed"
-        exit_reason = "time_stop"
+    elif peak_plateau_mode:
+        # Peak Plateau Mode: no fixed TP2 — trailing stop is the primary exit
+        if age_min >= time_stop_min and ratio < 1.10:
+            status = "closed"
+            exit_reason = "time_stop"
+        elif (peak_ratio >= 1.5) and current_price < trail_line:
+            status = "closed"
+            exit_reason = f"peak_plateau_{effective_trail*100:.0f}pct_trail"
+    else:
+        # Standard mode
+        if current_price >= entry_price * tp_mult:
+            status = "closed"
+            exit_reason = "take_profit"
+        elif age_min >= time_stop_min:
+            status = "closed"
+            exit_reason = "time_stop"
 
     realized_pnl_pct = ((current_price / entry_price) - 1.0) * 100.0 if entry_price and status == "closed" else None
     return {
