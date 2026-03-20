@@ -11624,6 +11624,77 @@ DASHBOARD_HTML = _CSS + """
     <div class="stat"><div class="slabel">Streak</div><div class="sval" id="streak">—</div></div>
   </div>
 
+  <!-- ═══════════ LIVE SHADOW PERFORMANCE BANNER ═══════════ -->
+  <style>
+  @keyframes livePulse{0%,100%{box-shadow:0 0 6px rgba(20,199,132,.4)}50%{box-shadow:0 0 18px rgba(20,199,132,.8)}}
+  @keyframes fadeSlideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes countUp{from{opacity:.5;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+  @keyframes flashGreen{0%{background:rgba(20,199,132,.35)}100%{background:rgba(20,199,132,.06)}}
+  @keyframes flashRed{0%{background:rgba(239,68,68,.35)}100%{background:rgba(239,68,68,.06)}}
+  @keyframes gradientShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+  .live-banner{
+    position:relative;overflow:hidden;
+    background:linear-gradient(135deg,rgba(10,22,40,.95),rgba(14,28,50,.92),rgba(8,18,34,.95));
+    background-size:200% 200%;animation:gradientShift 8s ease infinite;
+    border:1px solid rgba(20,199,132,.2);border-radius:20px;padding:16px 20px;margin-bottom:16px;
+    display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:center;
+  }
+  .live-banner::before{content:"";position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at 20% 50%,rgba(20,199,132,.06),transparent 50%),radial-gradient(circle at 80% 50%,rgba(59,130,246,.06),transparent 50%);pointer-events:none}
+  .live-dot-wrap{display:flex;align-items:center;gap:8px}
+  .live-dot{width:10px;height:10px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite}
+  .live-label{font-size:11px;font-weight:800;letter-spacing:.15em;text-transform:uppercase;color:#14c784}
+  .live-stats{display:flex;gap:20px;flex-wrap:wrap;align-items:center}
+  .live-stat{display:flex;flex-direction:column;align-items:center;min-width:80px}
+  .live-stat-val{font-family:'Space Grotesk','Manrope',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;transition:all .3s}
+  .live-stat-val.updating{animation:countUp .4s ease}
+  .live-stat-lbl{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--t3);margin-top:2px}
+  .live-stat-val.pos{color:#14c784}.live-stat-val.neg{color:#ef4444}.live-stat-val.neu{color:var(--blue2)}
+  .live-divider{width:1px;height:32px;background:rgba(255,255,255,.08)}
+  .live-feed{display:flex;flex-direction:column;gap:4px;max-height:64px;overflow:hidden}
+  .live-feed-item{font-size:11px;padding:4px 10px;border-radius:8px;display:flex;align-items:center;gap:6px;animation:fadeSlideIn .4s ease}
+  .live-feed-item.win{background:rgba(20,199,132,.06);border:1px solid rgba(20,199,132,.15);color:#14c784}
+  .live-feed-item.loss{background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);color:#ef4444}
+  .live-feed-icon{font-size:13px}.live-feed-name{font-weight:700;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .live-feed-pnl{font-weight:800;margin-left:auto}
+  .shadow-auto-tag{display:inline-flex;align-items:center;gap:4px;font-size:9px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px;border-radius:6px;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.25);color:var(--blue2);margin-left:8px}
+  </style>
+
+  <div class="live-banner" id="live-banner">
+    <div class="live-dot-wrap">
+      <div class="live-dot"></div>
+      <div>
+        <div class="live-label">Shadow Trading Live</div>
+        <div style="font-size:10px;color:var(--t3);margin-top:2px">AI auto-tuning filters in real time</div>
+      </div>
+    </div>
+    <div class="live-stats">
+      <div class="live-stat">
+        <div class="live-stat-val neu" id="lv-shadow-trades">0</div>
+        <div class="live-stat-lbl">Shadow Trades</div>
+      </div>
+      <div class="live-divider"></div>
+      <div class="live-stat">
+        <div class="live-stat-val neu" id="lv-shadow-wr">—</div>
+        <div class="live-stat-lbl">Win Rate</div>
+      </div>
+      <div class="live-divider"></div>
+      <div class="live-stat">
+        <div class="live-stat-val neu" id="lv-shadow-pnl">0%</div>
+        <div class="live-stat-lbl">Avg P&L</div>
+      </div>
+      <div class="live-divider"></div>
+      <div class="live-stat">
+        <div class="live-stat-val neu" id="lv-shadow-best">—</div>
+        <div class="live-stat-lbl">Best Strategy</div>
+      </div>
+      <span class="shadow-auto-tag" id="lv-auto-tune-tag">Auto-Tune Active</span>
+    </div>
+    <div class="live-feed" id="live-feed">
+      <div class="live-feed-item win"><span class="live-feed-icon">+</span><span style="color:var(--t3)">Waiting for trades...</span></div>
+    </div>
+  </div>
+  <!-- ═══════════ END LIVE BANNER ═══════════ -->
+
   <!-- Tab Bar -->
   <div class="tab-bar">
     <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scanner</span><span class="tab-btn-meta">Discovery, quick buy, wallet tree</span></button>
@@ -14766,6 +14837,76 @@ setInterval(refresh, 5000);
 pollFeed(); setInterval(pollFeed, 4000);
 pollListings(); setInterval(pollListings, 6000);
 pollEnhancedDashboard(); setInterval(pollEnhancedDashboard, 15000);
+
+// ═══════════ LIVE SHADOW BANNER ═══════════
+let _shadowFeedItems = [];
+async function pollShadowBanner() {
+  try {
+    const [perf, equity] = await Promise.all([
+      fetch('/api/quant/shadow-performance').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/quant/shadow-equity').then(r=>r.json()).catch(()=>({})),
+    ]);
+    if (!Array.isArray(perf) || perf.length === 0) return;
+    let totalTrades = 0, totalWins = 0, totalPnl = 0, bestStrat = '', bestScore = -999;
+    perf.forEach(s => {
+      const t = s.closed_trades || 0;
+      totalTrades += t;
+      totalWins += s.wins || 0;
+      totalPnl += (s.avg_pnl_pct || 0) * t;
+      const score = (s.win_rate || 0) * 0.6 + (s.avg_pnl_pct || 0) * 0.4;
+      if (score > bestScore) { bestScore = score; bestStrat = s.strategy_name; }
+    });
+    const wr = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(1) : '—';
+    const avgPnl = totalTrades > 0 ? (totalPnl / totalTrades).toFixed(1) : '0';
+
+    // Animate value changes
+    _animateShadowVal('lv-shadow-trades', totalTrades.toString());
+    _animateShadowVal('lv-shadow-wr', wr + '%');
+    const pnlEl = document.getElementById('lv-shadow-pnl');
+    if (pnlEl) {
+      pnlEl.textContent = (avgPnl > 0 ? '+' : '') + avgPnl + '%';
+      pnlEl.className = 'live-stat-val ' + (avgPnl > 0 ? 'pos' : avgPnl < 0 ? 'neg' : 'neu');
+      pnlEl.classList.add('updating');
+      setTimeout(() => pnlEl.classList.remove('updating'), 400);
+    }
+    const bestEl = document.getElementById('lv-shadow-best');
+    if (bestEl && bestStrat) {
+      bestEl.textContent = bestStrat.charAt(0).toUpperCase() + bestStrat.slice(1);
+      bestEl.className = 'live-stat-val pos';
+    }
+
+    // Build trade feed from equity data
+    const allPoints = [];
+    Object.entries(equity).forEach(([strat, points]) => {
+      if (Array.isArray(points)) {
+        points.forEach(p => allPoints.push({...p, strategy: strat}));
+      }
+    });
+    allPoints.sort((a,b) => (b.hour||'').localeCompare(a.hour||''));
+    const feedEl = document.getElementById('live-feed');
+    if (feedEl && allPoints.length > 0) {
+      const items = allPoints.slice(0, 3).map(p => {
+        const isWin = (p.period_pnl || 0) >= 0;
+        const cls = isWin ? 'win' : 'loss';
+        const icon = isWin ? '+' : '-';
+        const pnl = (p.period_pnl || 0) > 0 ? '+' + p.period_pnl + '%' : p.period_pnl + '%';
+        const name = p.strategy || 'unknown';
+        return '<div class="live-feed-item ' + cls + '"><span class="live-feed-icon">' + icon + '</span><span class="live-feed-name">' + name + '</span><span style="color:var(--t3)">' + (p.trades||0) + ' trades</span><span class="live-feed-pnl">' + pnl + '</span></div>';
+      });
+      feedEl.innerHTML = items.join('');
+    }
+  } catch(e) {}
+}
+function _animateShadowVal(id, newVal) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.textContent !== newVal) {
+    el.textContent = newVal;
+    el.classList.add('updating');
+    setTimeout(() => el.classList.remove('updating'), 400);
+  }
+}
+pollShadowBanner(); setInterval(pollShadowBanner, 8000);
 </script>
 """
 
