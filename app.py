@@ -11097,6 +11097,120 @@ LANDING_HTML = _CSS + """
 .sniper-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);color:#f59e0b;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
 </style>
 
+<style>
+/* ═══════════ ANIMATED PROMO BANNERS ═══════════ */
+@keyframes promoGradient{0%{background-position:0% 50%}25%{background-position:100% 50%}50%{background-position:0% 50%}75%{background-position:100% 0%}100%{background-position:0% 50%}}
+@keyframes promoShimmer{0%{left:-100%}100%{left:200%}}
+@keyframes promoFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+@keyframes promoNumber{0%{opacity:0;transform:translateY(14px) scale(.85)}60%{opacity:1;transform:translateY(-2px) scale(1.04)}100%{opacity:1;transform:translateY(0) scale(1)}}
+@keyframes promoPulse{0%,100%{box-shadow:0 0 20px rgba(20,199,132,.3)}50%{box-shadow:0 0 40px rgba(20,199,132,.6),0 0 80px rgba(20,199,132,.2)}}
+@keyframes promoSpark{0%{opacity:1;transform:translate(0,0) scale(1)}100%{opacity:0;transform:translate(var(--sx),var(--sy)) scale(0)}}
+@keyframes promoBorderRun{0%{background-position:0% 0%}100%{background-position:200% 0%}}
+@keyframes promoSlotRoll{0%{transform:translateY(100%);opacity:0}20%{transform:translateY(0);opacity:1}80%{transform:translateY(0);opacity:1}100%{transform:translateY(-100%);opacity:0}}
+@keyframes heroFireFlicker{0%,100%{text-shadow:0 0 10px rgba(245,158,11,.6),0 0 20px rgba(245,158,11,.3)}50%{text-shadow:0 0 20px rgba(245,158,11,.9),0 0 40px rgba(245,158,11,.5),0 0 60px rgba(245,158,11,.2)}}
+@keyframes promoBounceIn{0%{opacity:0;transform:scale(.3)}50%{opacity:1;transform:scale(1.05)}70%{transform:scale(.95)}100%{transform:scale(1)}}
+@keyframes promoTypewriter{from{width:0}to{width:100%}}
+@keyframes promoCursor{0%,100%{border-color:transparent}50%{border-color:#14c784}}
+
+.promo-topbar{
+  position:relative;overflow:hidden;
+  background:linear-gradient(90deg,#14c784,#3b82f6,#a855f7,#f59e0b,#14c784);
+  background-size:300% 100%;animation:promoGradient 6s ease infinite;
+  padding:10px 0;text-align:center;
+}
+.promo-topbar-text{font-size:12px;font-weight:800;color:#000;letter-spacing:.06em;text-transform:uppercase}
+.promo-topbar-text a{color:#000;text-decoration:underline;font-weight:900}
+
+.promo-hero-banner{
+  position:relative;overflow:hidden;
+  background:linear-gradient(135deg,rgba(8,18,38,.98),rgba(12,24,48,.96),rgba(6,14,30,.98));
+  border:1px solid rgba(20,199,132,.25);border-radius:24px;
+  padding:40px 32px;margin:0 auto 32px;max-width:900px;
+  animation:promoPulse 3s ease-in-out infinite;
+}
+.promo-hero-banner::before{
+  content:"";position:absolute;top:0;left:-100%;width:60%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.04),transparent);
+  animation:promoShimmer 3s ease-in-out infinite;
+}
+.promo-hero-banner::after{
+  content:"";position:absolute;inset:-2px;border-radius:26px;padding:2px;
+  background:linear-gradient(90deg,#14c784,#3b82f6,#a855f7,#f59e0b,#14c784);
+  background-size:200% 100%;animation:promoBorderRun 3s linear infinite;
+  -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;
+}
+.promo-hero-inner{position:relative;z-index:2;text-align:center}
+.promo-hero-kicker{font-size:11px;font-weight:800;letter-spacing:.2em;text-transform:uppercase;color:#14c784;margin-bottom:12px}
+.promo-hero-title{font-size:36px;font-weight:900;letter-spacing:-1.2px;line-height:1.1;color:#fff;margin-bottom:8px;font-family:'Space Grotesk','Manrope',sans-serif}
+.promo-hero-subtitle{font-size:14px;color:rgba(255,255,255,.6);margin-bottom:24px}
+.promo-hero-stats{display:flex;justify-content:center;gap:32px;flex-wrap:wrap;margin-bottom:24px}
+.promo-hero-stat{text-align:center}
+.promo-hero-stat-val{font-size:42px;font-weight:900;letter-spacing:-1.5px;font-family:'Space Grotesk','Manrope',sans-serif;animation:promoNumber 1s ease forwards;line-height:1}
+.promo-hero-stat-lbl{font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:rgba(255,255,255,.45);margin-top:6px}
+.promo-fire{animation:heroFireFlicker 1.5s ease-in-out infinite;display:inline}
+
+.promo-feat-strip{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:20px}
+.promo-feat-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:8px 16px;border-radius:24px;font-size:11px;font-weight:700;
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+  color:rgba(255,255,255,.75);animation:promoFloat 3s ease-in-out infinite;
+}
+.promo-feat-chip:nth-child(2){animation-delay:.4s}
+.promo-feat-chip:nth-child(3){animation-delay:.8s}
+.promo-feat-chip:nth-child(4){animation-delay:1.2s}
+.promo-feat-chip:nth-child(5){animation-delay:1.6s}
+
+.promo-cta-row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+.promo-cta{
+  padding:14px 32px;border-radius:14px;font-size:14px;font-weight:800;letter-spacing:.02em;
+  text-decoration:none;transition:all .3s;position:relative;overflow:hidden;
+}
+.promo-cta-primary{
+  background:linear-gradient(135deg,#14c784,#0fa968);color:#000;
+  box-shadow:0 4px 24px rgba(20,199,132,.4);
+}
+.promo-cta-primary:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(20,199,132,.6)}
+.promo-cta-ghost{background:transparent;border:1px solid rgba(255,255,255,.15);color:#fff}
+.promo-cta-ghost:hover{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.25)}
+
+/* Spark particles */
+.promo-spark{position:absolute;width:4px;height:4px;border-radius:50%;background:#14c784;animation:promoSpark 1.5s ease-out forwards;pointer-events:none}
+
+/* Rolling number slot machine */
+.promo-slot{display:inline-block;overflow:hidden;height:1.1em;vertical-align:bottom}
+.promo-slot-inner{animation:promoSlotRoll 4s ease-in-out infinite}
+
+/* Dashboard promo ribbon */
+.promo-ribbon{
+  position:relative;overflow:hidden;
+  background:linear-gradient(90deg,rgba(20,199,132,.08),rgba(59,130,246,.08),rgba(168,85,247,.08));
+  border:1px solid rgba(20,199,132,.15);border-radius:14px;
+  padding:14px 20px;margin-bottom:16px;
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+}
+.promo-ribbon::before{
+  content:"";position:absolute;top:0;left:-100%;width:50%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.03),transparent);
+  animation:promoShimmer 4s ease-in-out infinite;
+}
+.promo-ribbon-text{font-size:12px;font-weight:700;color:var(--t1);position:relative;z-index:2}
+.promo-ribbon-sub{font-size:10px;color:var(--t3);margin-top:3px}
+.promo-ribbon-stat{
+  display:flex;align-items:center;gap:12px;position:relative;z-index:2;
+}
+.promo-ribbon-val{font-size:20px;font-weight:900;font-family:'Space Grotesk','Manrope',sans-serif;color:#14c784;letter-spacing:-.5px}
+.promo-ribbon-lbl{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3)}
+</style>
+
+<!-- Animated Top Bar -->
+<div class="promo-topbar">
+  <div class="promo-topbar-text">AI-Powered Solana Trading &nbsp;·&nbsp; Peak Plateau Rider &nbsp;·&nbsp; Ride 2000%+ Runners &nbsp;·&nbsp; <a href="/signup">Start Free</a></div>
+</div>
+
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
@@ -11106,9 +11220,51 @@ LANDING_HTML = _CSS + """
   </div>
 </nav>
 
-<!-- Hero -->
-<div style="text-align:center;padding:80px 24px 60px;max-width:680px;margin:0 auto">
-  <div class="sniper-badge" style="margin-bottom:20px">NEW &nbsp;·&nbsp; Signal Explorer + Whale Copy Dashboard</div>
+<!-- Animated Hero Banner -->
+<div style="padding:60px 24px 0;max-width:960px;margin:0 auto">
+  <div class="promo-hero-banner">
+    <div class="promo-hero-inner">
+      <div class="promo-hero-kicker">AI Quant Trading Engine</div>
+      <div class="promo-hero-title">
+        Stop Selling at 10x.<br>
+        <span class="promo-fire">Ride to the Peak.</span>
+      </div>
+      <div class="promo-hero-subtitle">Peak Plateau Rider holds until momentum dies. Progressive trailing locks in moonshot gains.</div>
+      <div class="promo-hero-stats">
+        <div class="promo-hero-stat">
+          <div class="promo-hero-stat-val" style="color:#14c784" id="promo-stat-1">2000%+</div>
+          <div class="promo-hero-stat-lbl">Runner Capacity</div>
+        </div>
+        <div class="promo-hero-stat">
+          <div class="promo-hero-stat-val" style="color:#3b82f6" id="promo-stat-2">48h</div>
+          <div class="promo-hero-stat-lbl">Regime Analysis</div>
+        </div>
+        <div class="promo-hero-stat">
+          <div class="promo-hero-stat-val" style="color:#a855f7" id="promo-stat-3">4</div>
+          <div class="promo-hero-stat-lbl">AI Strategies</div>
+        </div>
+        <div class="promo-hero-stat">
+          <div class="promo-hero-stat-val" style="color:#f59e0b" id="promo-stat-4">24/7</div>
+          <div class="promo-hero-stat-lbl">Shadow Testing</div>
+        </div>
+      </div>
+      <div class="promo-feat-strip">
+        <div class="promo-feat-chip">Progressive Trailing Stop</div>
+        <div class="promo-feat-chip">Whale Detection</div>
+        <div class="promo-feat-chip">Regime-Aware Models</div>
+        <div class="promo-feat-chip">Anti-Rug Engine</div>
+        <div class="promo-feat-chip">Shadow Paper Trading</div>
+      </div>
+      <div class="promo-cta-row">
+        <a href="/signup" class="promo-cta promo-cta-primary">Start Trading Free</a>
+        <a href="#pricing" class="promo-cta promo-cta-ghost">View Plans</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Original Hero (simplified) -->
+<div style="text-align:center;padding:20px 24px 60px;max-width:680px;margin:0 auto">
   <h1 style="font-size:44px;font-weight:800;line-height:1.1;letter-spacing:-1.5px;margin-bottom:18px">
     The Most Advanced<br>Solana Trading Bot
   </h1>
@@ -11117,14 +11273,14 @@ LANDING_HTML = _CSS + """
   </p>
   <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
     <a href="/signup" class="btn btn-primary" style="padding:14px 36px;font-size:15px">Start Trading in 2 Minutes</a>
-    <a href="#pricing" class="btn btn-ghost" style="padding:14px 26px;font-size:15px">View Pricing ↓</a>
+    <a href="#pricing" class="btn btn-ghost" style="padding:14px 26px;font-size:15px">View Pricing</a>
   </div>
   <div class="trust" style="margin-top:30px">
-    <div class="titem">🔒 AES-256 Keys</div>
-    <div class="titem">⚡ Helius Sender</div>
-    <div class="titem">🎯 Jito Tips</div>
-    <div class="titem">🔔 CEX Sniper</div>
-    <div class="titem">✅ Cancel Anytime</div>
+    <div class="titem">AES-256 Keys</div>
+    <div class="titem">Helius Sender</div>
+    <div class="titem">Jito Tips</div>
+    <div class="titem">CEX Sniper</div>
+    <div class="titem">Cancel Anytime</div>
   </div>
 </div>
 
@@ -11692,6 +11848,97 @@ DASHBOARD_HTML = _CSS + """
 <style>.tick-item{display:inline-flex;gap:6px;align-items:center}.tick-name{font-weight:700;color:var(--t1);font-size:11px}@keyframes tickscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}</style>
 
 <div class="wrap dashboard-shell">
+
+  <!-- Animated Promo Ribbon -->
+  <style>
+  @keyframes dashPromoSlide{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+  .dash-promo-banner{
+    position:relative;overflow:hidden;
+    background:linear-gradient(135deg,rgba(8,18,38,.95),rgba(14,28,52,.92));
+    border:1px solid rgba(20,199,132,.2);border-radius:16px;
+    padding:0;margin-bottom:16px;
+  }
+  .dash-promo-banner::after{
+    content:"";position:absolute;inset:-1px;border-radius:17px;padding:1px;
+    background:linear-gradient(90deg,#14c784,#3b82f6,#a855f7,#f59e0b,#14c784);
+    background-size:200% 100%;animation:promoBorderRun 4s linear infinite;
+    -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+    mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+    -webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;
+  }
+  .dash-promo-inner{
+    position:relative;z-index:2;
+    display:grid;grid-template-columns:1fr auto;align-items:center;gap:20px;
+    padding:18px 24px;
+  }
+  .dash-promo-inner::before{
+    content:"";position:absolute;top:0;left:-100%;width:50%;height:100%;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.03),transparent);
+    animation:promoShimmer 5s ease-in-out infinite;
+  }
+  .dash-promo-headline{font-size:15px;font-weight:900;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif;letter-spacing:-.3px}
+  .dash-promo-sub{font-size:11px;color:var(--t3);margin-top:4px;line-height:1.5}
+  .dash-promo-stats{display:flex;gap:20px;align-items:center}
+  .dash-promo-stat{text-align:center}
+  .dash-promo-stat-val{font-size:20px;font-weight:900;font-family:'Space Grotesk','Manrope',sans-serif;letter-spacing:-.5px;animation:promoNumber .8s ease forwards}
+  .dash-promo-stat-lbl{font-size:8px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--t3);margin-top:2px}
+  .dash-promo-scroll{
+    overflow:hidden;border-top:1px solid rgba(255,255,255,.04);padding:8px 0;position:relative;z-index:2;
+  }
+  .dash-promo-scroll-inner{
+    display:flex;gap:32px;white-space:nowrap;
+    animation:dashPromoSlide 25s linear infinite;
+    font-size:11px;font-weight:600;color:var(--t3);
+  }
+  .dash-promo-scroll-item{display:inline-flex;align-items:center;gap:6px}
+  .dash-promo-scroll-dot{width:6px;height:6px;border-radius:50%}
+  </style>
+  <div class="dash-promo-banner" id="dash-promo-banner">
+    <div class="dash-promo-inner">
+      <div>
+        <div class="dash-promo-headline">Peak Plateau Rider <span style="color:#14c784">Active</span></div>
+        <div class="dash-promo-sub">Progressive trailing locks gains at the peak. No fixed TP2 cap — ride 2000%+ runners to their plateau.</div>
+      </div>
+      <div class="dash-promo-stats">
+        <div class="dash-promo-stat">
+          <div class="dash-promo-stat-val" style="color:#14c784" id="dp-trades">0</div>
+          <div class="dash-promo-stat-lbl">Shadow Trades</div>
+        </div>
+        <div class="dash-promo-stat">
+          <div class="dash-promo-stat-val" style="color:#3b82f6" id="dp-winrate">—</div>
+          <div class="dash-promo-stat-lbl">Win Rate</div>
+        </div>
+        <div class="dash-promo-stat">
+          <div class="dash-promo-stat-val" style="color:#a855f7" id="dp-best">—</div>
+          <div class="dash-promo-stat-lbl">Best Trade</div>
+        </div>
+      </div>
+    </div>
+    <div class="dash-promo-scroll">
+      <div class="dash-promo-scroll-inner">
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#14c784"></span>30% trail under 3x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#14c784"></span>25% trail at 3x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#3b82f6"></span>20% trail at 5x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#3b82f6"></span>15% trail at 10x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#a855f7"></span>12% trail at 20x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#f59e0b"></span>10% trail at 50x — locks mega gains</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#14c784"></span>AI Regime Detection</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#a855f7"></span>Whale Exit Signals</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#f59e0b"></span>Anti-Rug Protection</span>
+        <!-- duplicate for seamless scroll -->
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#14c784"></span>30% trail under 3x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#14c784"></span>25% trail at 3x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#3b82f6"></span>20% trail at 5x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#3b82f6"></span>15% trail at 10x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#a855f7"></span>12% trail at 20x</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#f59e0b"></span>10% trail at 50x — locks mega gains</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#14c784"></span>AI Regime Detection</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#a855f7"></span>Whale Exit Signals</span>
+        <span class="dash-promo-scroll-item"><span class="dash-promo-scroll-dot" style="background:#f59e0b"></span>Anti-Rug Protection</span>
+      </div>
+    </div>
+  </div>
+
   <div class="dashboard-hero">
     <div class="hero-panel hero-panel-primary">
       <div class="hero-kicker">Trading Cockpit</div>
@@ -15325,6 +15572,28 @@ function _animateShadowVal(id, newVal) {
   }
 }
 pollShadowBanner(); setInterval(pollShadowBanner, 8000);
+
+// ═══════════ DASHBOARD PROMO BANNER STATS ═══════════
+async function updatePromoBanner() {
+  try {
+    const perf = await fetch('/api/quant/shadow-performance').then(r=>r.json()).catch(()=>[]);
+    if (!Array.isArray(perf) || perf.length === 0) return;
+    let totalTrades = 0, totalWins = 0, bestTrade = 0;
+    perf.forEach(s => {
+      totalTrades += s.closed_trades || 0;
+      totalWins += s.wins || 0;
+      if ((s.best_trade_pct || 0) > bestTrade) bestTrade = s.best_trade_pct || 0;
+    });
+    const wr = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(1) + '%' : '—';
+    const dpTrades = document.getElementById('dp-trades');
+    const dpWr = document.getElementById('dp-winrate');
+    const dpBest = document.getElementById('dp-best');
+    if (dpTrades) dpTrades.textContent = totalTrades;
+    if (dpWr) dpWr.textContent = wr;
+    if (dpBest) dpBest.textContent = bestTrade > 0 ? '+' + bestTrade.toFixed(0) + '%' : '—';
+  } catch(e){}
+}
+updatePromoBanner(); setInterval(updatePromoBanner, 12000);
 
 // ═══════════ SHADOW ACTIVITY WINDOW ═══════════
 let _shadowActivityOpen = false;
