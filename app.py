@@ -12346,293 +12346,323 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
   <div id="tab-settings" class="tab-pane">
+    <!-- Hover Tooltip System -->
+    <style>
+    .htip{position:fixed;z-index:9999;max-width:280px;padding:12px 16px;border-radius:12px;background:rgba(8,16,32,.97);border:1px solid rgba(20,199,132,.25);box-shadow:0 8px 32px rgba(0,0,0,.5);font-size:12px;color:var(--t2);line-height:1.6;pointer-events:none;opacity:0;transition:opacity .2s;backdrop-filter:blur(12px)}
+    .htip.visible{opacity:1}
+    .htip-title{font-size:11px;font-weight:800;color:#14c784;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+    .htip-body{color:rgba(255,255,255,.75)}
+    [data-tip]{cursor:help}
+    .settings-simple{max-width:700px}
+    .settings-simple .settings-card{margin-bottom:12px}
+    .s-autotune-status{padding:14px 18px;border-radius:14px;background:rgba(20,199,132,.06);border:1px solid rgba(20,199,132,.15);margin-bottom:16px}
+    .s-autotune-status .live-dot{width:8px;height:8px}
+    .s-section-toggle{display:flex;align-items:center;justify-content:space-between;padding:10px 0;cursor:pointer;user-select:none}
+    .s-section-toggle:hover .setting-label{color:var(--t1)}
+    .s-section-body{display:none;padding-bottom:8px}
+    .s-section-body.open{display:block}
+    .s-section-chev{font-size:12px;color:var(--t3);transition:transform .2s}
+    .s-section-chev.open{transform:rotate(180deg)}
+    </style>
+
     <div class="tab-pane-header">
       <div>
         <div class="tab-kicker">Configuration</div>
-        <div class="tab-pane-title">Saved Strategy Controls</div>
-        <div class="tab-pane-copy">These values are the exact checkpoints your bot uses. Edit them here, save them once, and the launch surface reflects the persisted profile immediately.</div>
+        <div class="tab-pane-title">Bot Settings</div>
+        <div class="tab-pane-copy">Pick a strategy, adjust the key numbers, and save. The AI auto-tunes these from shadow trading results every hour.</div>
       </div>
       <div class="shortcut-row">
         <span class="badge bg-muted" id="settings-header-preset">Preset loading…</span>
-        <span class="badge bg-blue" id="settings-save-state-copy">Waiting for saved state…</span>
+        <span class="badge bg-blue" id="settings-save-state-copy">Waiting…</span>
       </div>
     </div>
+
     <div class="settings-pane-grid">
-      <div class="settings-stack">
-        <div class="settings-card">
+      <div class="settings-stack settings-simple">
+
+        <!-- Auto-Tune Status -->
+        <div class="s-autotune-status" data-tip="The bot watches shadow trades (paper trades using real prices) and every hour picks the strategy that performed best over the last 48 hours. It then automatically updates your settings so you're always running the winning strategy.">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+            <div class="live-dot"></div>
+            <div style="font-size:13px;font-weight:800;color:#14c784">AI Auto-Tune Active</div>
+          </div>
+          <div style="font-size:11px;color:var(--t2);line-height:1.6">
+            Shadow trading runs all 4 strategies on real market data. Every hour, the AI picks the best-performing one and applies it to your bot automatically. You can still override below.
+          </div>
+          <div class="shortcut-row" style="margin-top:10px">
+            <span class="badge bg-muted" id="s-tune-preset">—</span>
+            <span class="badge bg-muted" id="s-tune-last">Last tune: —</span>
+            <span class="badge bg-muted">Interval: 1 hour</span>
+          </div>
+        </div>
+
+        <!-- Strategy Preset -->
+        <div class="settings-card" data-tip="This is your base strategy template. Safe uses small buys and tight stops, Balanced is the default middle ground, Aggressive uses bigger positions, Degen goes all-in on high-risk plays. The AI auto-tune will switch between these based on what's actually working.">
           <div class="settings-save-row">
             <div>
-              <div class="settings-section-title" style="margin-bottom:6px">Saved Settings</div>
-              <div style="font-size:12px;color:var(--t2)">Edit the exact checkpoint values the bot uses, then save them before you start.</div>
+              <div class="settings-section-title" style="margin-bottom:6px">Strategy</div>
+              <div style="font-size:12px;color:var(--t2)">Pick a base profile. AI auto-tune may change this based on shadow results.</div>
             </div>
-            <div id="settings-save-state" class="save-pill">Loaded from saved state</div>
+            <div id="settings-save-state" class="save-pill">Loaded</div>
           </div>
           <div style="height:12px"></div>
           <div class="setting-row">
-            <div>
-              <div class="setting-label">Mode</div>
-              <div class="setting-desc">Choose a base profile, then fine-tune the checkpoints below.</div>
-            </div>
+            <div><div class="setting-label">Strategy Mode</div></div>
             <select class="setting-input" id="s-preset" onchange="selectPreset(this.value)">
-              <option value="safe">Safe</option>
-              <option value="balanced">Balanced (Default)</option>
-              <option value="aggressive">Aggressive</option>
-              <option value="degen">Degen</option>
-              <option value="custom">Custom</option>
+              <option value="safe">Safe — Small buys, tight stops</option>
+              <option value="balanced">Balanced — Default for most markets</option>
+              <option value="aggressive">Aggressive — Bigger positions, wider stops</option>
+              <option value="degen">Degen — Max risk, max reward</option>
+              <option value="custom">Custom — Manual control</option>
             </select>
             <div class="setting-unit">preset</div>
           </div>
-        </div>
-
-        <div class="settings-card">
-          <div class="settings-section-title">Execution Desk</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">Control whether the app spends capital or only learns, and decide whether entries follow rules, a model, or auto-promoted report winners.</div>
           <div class="setting-row">
-            <div>
-              <div class="setting-label">Execution Mode</div>
-              <div class="setting-desc">`Paper` keeps the scanner and models learning without broadcasting live buys.</div>
-            </div>
+            <div><div class="setting-label">Live or Paper?</div></div>
             <select class="setting-input" id="s-execution-mode">
-              <option value="live">Live</option>
-              <option value="paper">Paper</option>
+              <option value="live">Live — Real money</option>
+              <option value="paper">Paper — Learn only, no buys</option>
             </select>
-            <div class="setting-unit">capital</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Decision Policy</div>
-              <div class="setting-desc">`Auto` follows report leadership with guardrails. Manual modes stay fixed until you change them.</div>
-            </div>
-            <select class="setting-input" id="s-policy-mode">
-              <option value="rules">Rules</option>
-              <option value="auto">Auto</option>
-              <option value="model_global">Global model</option>
-              <option value="model_regime_auto">Regime model</option>
-            </select>
-            <div class="setting-unit">policy</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Model Threshold</div>
-              <div class="setting-desc">Score floor used when the live lane is model-driven.</div>
-            </div>
-            <input class="setting-input" id="s-model-threshold" type="number" min="40" max="90" step="0.5">
-            <div class="setting-unit">score</div>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Auto Promote Leader</div>
-              <div class="setting-desc">When `Auto` is selected, persist the leading policy and lock it for a cooldown window instead of flipping every refresh.</div>
-            </div>
-            <label class="toggle-wrap"><input id="s-auto-promote" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Promotion Window</div>
-              <div class="setting-desc">Report window used for auto policy leadership checks.</div>
-            </div>
-            <input class="setting-input" id="s-auto-window" type="number" min="3" max="30" step="1">
-            <div class="setting-unit">days</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Min Reports</div>
-              <div class="setting-desc">Required report count before auto mode trusts the leaderboard.</div>
-            </div>
-            <input class="setting-input" id="s-auto-min-reports" type="number" min="2" max="12" step="1">
-            <div class="setting-unit">reports</div>
-          </div>
-          <div class="setting-row">
-            <div>
-              <div class="setting-label">Promotion Lock</div>
-              <div class="setting-desc">Cooldown after a promotion before auto mode can switch again.</div>
-            </div>
-            <input class="setting-input" id="s-auto-lock" type="number" min="30" max="10080" step="30">
-            <div class="setting-unit">min</div>
-          </div>
-          <div id="execution-control-summary" class="settings-echo" style="margin-top:12px">
-            <span class="badge bg-muted">Execution lane loading…</span>
+            <div class="setting-unit">mode</div>
           </div>
         </div>
 
-        <div class="settings-card">
-          <div class="settings-section-title">Trade Plan</div>
+        <!-- Core Settings (always visible) -->
+        <div class="settings-card" data-tip="These are the main numbers that control how much you buy, when you take profit, and when you cut losses. The bot uses these exact values for every trade.">
+          <div class="settings-section-title">Position Management</div>
           <div class="setting-row">
-            <div><div class="setting-label">Max Buy Size</div><div class="setting-desc">SOL committed when a coin clears every checkpoint.</div></div>
+            <div><div class="setting-label">Buy Size</div><div class="setting-desc">How much SOL to spend per trade</div></div>
             <input class="setting-input" id="s-max-buy" type="number" step="0.01">
             <div class="setting-unit">SOL</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">TP1 Multiplier</div><div class="setting-desc">First partial sell trigger.</div></div>
+            <div><div class="setting-label">Take Profit 1</div><div class="setting-desc">Sell half when price hits this multiple (e.g. 2x = double)</div></div>
             <input class="setting-input" id="s-tp1" type="number" step="0.01">
             <div class="setting-unit">x</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">TP2 Multiplier</div><div class="setting-desc">Second target for the remaining size.</div></div>
+            <div><div class="setting-label">Take Profit 2</div><div class="setting-desc">Sell the rest at this multiple (set 9999 for peak plateau mode)</div></div>
             <input class="setting-input" id="s-tp2" type="number" step="0.01">
             <div class="setting-unit">x</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Hard floor as an entry ratio. `0.70` means stop near -30%.</div></div>
+            <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Exit if price drops to this ratio (0.70 = -30% max loss)</div></div>
             <input class="setting-input" id="s-sl" type="number" step="0.01">
             <div class="setting-unit">ratio</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">Trailing Loss</div><div class="setting-desc">Peak retrace used after the trail is armed.</div></div>
+            <div><div class="setting-label">Trailing Stop</div><div class="setting-desc">How far price can drop from peak before selling (0.20 = 20%)</div></div>
             <input class="setting-input" id="s-trail" type="number" step="0.01">
             <div class="setting-unit">ratio</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">Time Stop</div><div class="setting-desc">Exit if the position stalls too long.</div></div>
+            <div><div class="setting-label">Time Limit</div><div class="setting-desc">Auto-exit if trade goes nowhere after this many minutes</div></div>
             <input class="setting-input" id="s-tstop" type="number" step="1">
             <div class="setting-unit">min</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Lamports added to compete for landing.</div></div>
-            <input class="setting-input" id="s-prio" type="number" step="1000">
-            <div class="setting-unit">lamports</div>
+            <div><div class="setting-label">Max Open Trades</div><div class="setting-desc">Won't open new positions beyond this many at once</div></div>
+            <input class="setting-input" id="s-maxpos" type="number" step="1">
+            <div class="setting-unit">max</div>
           </div>
           <div class="setting-row">
-            <div><div class="setting-label">Drawdown Limit</div><div class="setting-desc">Session loss cap before the bot halts itself.</div></div>
+            <div><div class="setting-label">Session Loss Limit</div><div class="setting-desc">Bot pauses if total losses exceed this amount</div></div>
             <input class="setting-input" id="s-dd" type="number" step="0.01">
             <div class="setting-unit">SOL</div>
           </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Correlated Positions</div><div class="setting-desc">Maximum overlapping positions before new buys are skipped.</div></div>
-            <input class="setting-input" id="s-maxpos" type="number" step="1">
-            <div class="setting-unit">count</div>
-          </div>
         </div>
 
-        <div class="settings-card">
-          <div class="settings-section-title">Filter Path</div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Set to `0` to disable the liquidity checkpoint entirely.</div></div>
-            <input class="setting-input" id="s-liq" type="number" step="100">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min Market Cap</div><div class="setting-desc">Lowest market cap allowed into the path.</div></div>
-            <input class="setting-input" id="s-minmc" type="number" step="100">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Market Cap</div><div class="setting-desc">Upper market cap ceiling for new entries.</div></div>
-            <input class="setting-input" id="s-maxmc" type="number" step="1000">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Older coins fail the entry path.</div></div>
-            <input class="setting-input" id="s-age" type="number" step="1">
-            <div class="setting-unit">min</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min Volume</div><div class="setting-desc">24h volume floor for the volume checkpoint.</div></div>
-            <input class="setting-input" id="s-minvol" type="number" step="100">
-            <div class="setting-unit">USD</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Min AI Score</div><div class="setting-desc">Score floor after the AI score breakdown is computed.</div></div>
-            <input class="setting-input" id="s-minscore" type="number" step="1">
-            <div class="setting-unit">/100</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Hot Change Cap</div><div class="setting-desc">Maximum 1h move before a coin is treated as too extended.</div></div>
-            <input class="setting-input" id="s-hotchg" type="number" step="1">
-            <div class="setting-unit">%</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Green Lights Required</div><div class="setting-desc">Minimum checklist confirmations to reach `SIGNAL`.</div></div>
-            <input class="setting-input" id="s-lights" type="number" step="1">
-            <div class="setting-unit">count</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Holder Growth</div><div class="setting-desc">Required holder acceleration for the quality checklist.</div></div>
-            <input class="setting-input" id="s-holders" type="number" step="1">
-            <div class="setting-unit">%</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Narrative Score</div><div class="setting-desc">Narrative timing floor before the buy path stays alive.</div></div>
-            <input class="setting-input" id="s-narr" type="number" step="1">
-            <div class="setting-unit">pts</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Volume Spike Multiple</div><div class="setting-desc">Minimum expansion multiple used in the three-signal checklist.</div></div>
-            <input class="setting-input" id="s-volspike" type="number" step="0.1">
-            <div class="setting-unit">x</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Late Entry Limit</div><div class="setting-desc">Reject coins already too extended unless narrative strength overrides it.</div></div>
-            <input class="setting-input" id="s-latemult" type="number" step="0.1">
-            <div class="setting-unit">x</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Nuclear Narrative Score</div><div class="setting-desc">Narrative score needed to override late-entry rejection.</div></div>
-            <input class="setting-input" id="s-nuclear" type="number" step="1">
-            <div class="setting-unit">pts</div>
-          </div>
-          <div class="setting-row">
-            <div><div class="setting-label">Off-Peak Change Floor</div><div class="setting-desc">Saved with the profile for off-peak logic, even if the current runtime keeps entries open all day.</div></div>
-            <input class="setting-input" id="s-offpeak" type="number" step="1">
-            <div class="setting-unit">%</div>
-          </div>
-        </div>
-
-        <div class="settings-card">
-          <div class="settings-section-title">Safety Toggles</div>
-          <div class="setting-toggle-row">
+        <!-- Entry Filters (collapsible) -->
+        <div class="settings-card" data-tip="These filters decide which coins the bot is allowed to buy. Tokens must pass ALL of these checks before a buy happens. Tighter filters = fewer trades but higher quality. Looser filters = more trades but more risk.">
+          <div class="s-section-toggle" onclick="toggleSettingsSection('s-filters')">
             <div>
-              <div class="setting-label">Authority / Rug Check</div>
-              <div class="setting-desc">Blocks older tokens when mint or freeze authority still looks unsafe.</div>
+              <div class="settings-section-title" style="margin-bottom:0">Entry Filters</div>
+              <div style="font-size:11px;color:var(--t3);margin-top:3px">Which coins are allowed through — click to expand</div>
             </div>
-            <label class="toggle-wrap"><input id="s-antirug" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
+            <span class="s-section-chev" id="s-filters-chev">&#9660;</span>
           </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Holder Concentration Check</div>
-              <div class="setting-desc">Blocks concentrated ownership once the token is old enough for holder analysis.</div>
+          <div class="s-section-body" id="s-filters-body">
+            <div class="setting-row">
+              <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Pool must have at least this much USD to trade</div></div>
+              <input class="setting-input" id="s-liq" type="number" step="100">
+              <div class="setting-unit">USD</div>
             </div>
-            <label class="toggle-wrap"><input id="s-checkholders" type="checkbox"> <span style="color:var(--t2);font-size:12px">Enabled</span></label>
-          </div>
-          <div class="setting-toggle-row">
-            <div>
-              <div class="setting-label">Risk Per Trade</div>
-              <div class="setting-desc">Wallet percentage cap the buy logic can use as a secondary position-size guard.</div>
+            <div class="setting-row">
+              <div><div class="setting-label">Market Cap Range</div><div class="setting-desc">Only buy tokens within this market cap range</div></div>
+              <div style="display:flex;gap:6px;align-items:center">
+                <input class="setting-input" id="s-minmc" type="number" step="100" style="width:100px" placeholder="Min">
+                <span style="color:var(--t3)">to</span>
+                <input class="setting-input" id="s-maxmc" type="number" step="1000" style="width:100px" placeholder="Max">
+              </div>
+              <div class="setting-unit">USD</div>
             </div>
-            <div style="display:flex;align-items:center;gap:10px">
-              <input class="setting-input" id="s-risk" type="number" step="0.1" style="width:120px">
-              <span class="setting-unit">%</span>
+            <div class="setting-row">
+              <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Skip older coins — focus on fresh launches</div></div>
+              <input class="setting-input" id="s-age" type="number" step="1">
+              <div class="setting-unit">min</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Min Volume</div><div class="setting-desc">Skip tokens with less than this in 24h trading volume</div></div>
+              <input class="setting-input" id="s-minvol" type="number" step="100">
+              <div class="setting-unit">USD</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Min AI Score</div><div class="setting-desc">The bot's AI scores each token 0-100 — reject below this</div></div>
+              <input class="setting-input" id="s-minscore" type="number" step="1">
+              <div class="setting-unit">/100</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Max Price Pump</div><div class="setting-desc">Skip if token already pumped more than this in 1 hour</div></div>
+              <input class="setting-input" id="s-hotchg" type="number" step="1">
+              <div class="setting-unit">%</div>
             </div>
           </div>
         </div>
 
+        <!-- Advanced (collapsible) -->
+        <div class="settings-card" data-tip="Expert-level controls for fine-tuning the signal pipeline. Most users should leave these at default — the AI auto-tune handles optimization automatically.">
+          <div class="s-section-toggle" onclick="toggleSettingsSection('s-advanced')">
+            <div>
+              <div class="settings-section-title" style="margin-bottom:0">Advanced</div>
+              <div style="font-size:11px;color:var(--t3);margin-top:3px">Expert settings — usually auto-tuned</div>
+            </div>
+            <span class="s-section-chev" id="s-advanced-chev">&#9660;</span>
+          </div>
+          <div class="s-section-body" id="s-advanced-body">
+            <div class="setting-row">
+              <div><div class="setting-label">Decision Policy</div><div class="setting-desc">How the bot decides to buy: rules, AI model, or auto-switching</div></div>
+              <select class="setting-input" id="s-policy-mode">
+                <option value="rules">Rules — Filter checklist</option>
+                <option value="auto">Auto — AI picks best</option>
+                <option value="model_global">Global Model</option>
+                <option value="model_regime_auto">Regime Model</option>
+              </select>
+              <div class="setting-unit">policy</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Model Threshold</div><div class="setting-desc">AI model score required to approve a buy</div></div>
+              <input class="setting-input" id="s-model-threshold" type="number" min="40" max="90" step="0.5">
+              <div class="setting-unit">score</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Extra fee to land transactions faster on Solana</div></div>
+              <input class="setting-input" id="s-prio" type="number" step="1000">
+              <div class="setting-unit">lamports</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Green Lights</div><div class="setting-desc">How many quality checks must pass before buying</div></div>
+              <input class="setting-input" id="s-lights" type="number" step="1">
+              <div class="setting-unit">count</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Holder Growth</div><div class="setting-desc">Required % growth in token holders</div></div>
+              <input class="setting-input" id="s-holders" type="number" step="1">
+              <div class="setting-unit">%</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Narrative Score</div><div class="setting-desc">How well the token's story/theme is trending</div></div>
+              <input class="setting-input" id="s-narr" type="number" step="1">
+              <div class="setting-unit">pts</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Volume Spike</div><div class="setting-desc">Volume must be this multiple above average</div></div>
+              <input class="setting-input" id="s-volspike" type="number" step="0.1">
+              <div class="setting-unit">x</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Late Entry Limit</div><div class="setting-desc">Reject coins already pumped this much from launch</div></div>
+              <input class="setting-input" id="s-latemult" type="number" step="0.1">
+              <div class="setting-unit">x</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Nuclear Narrative</div><div class="setting-desc">Override late-entry rejection if narrative is this strong</div></div>
+              <input class="setting-input" id="s-nuclear" type="number" step="1">
+              <div class="setting-unit">pts</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Off-Peak Floor</div><div class="setting-desc">Min price change required during quiet hours</div></div>
+              <input class="setting-input" id="s-offpeak" type="number" step="1">
+              <div class="setting-unit">%</div>
+            </div>
+            <div class="setting-toggle-row">
+              <div><div class="setting-label">Auto Promote Leader</div><div class="setting-desc">Let the AI auto-switch policies based on edge reports</div></div>
+              <label class="toggle-wrap"><input id="s-auto-promote" type="checkbox"> <span style="color:var(--t2);font-size:12px">On</span></label>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Promote Window</div><div class="setting-desc">Days of data to evaluate before promoting</div></div>
+              <input class="setting-input" id="s-auto-window" type="number" min="3" max="30" step="1">
+              <div class="setting-unit">days</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Min Reports</div><div class="setting-desc">Reports needed before auto-promote trusts the data</div></div>
+              <input class="setting-input" id="s-auto-min-reports" type="number" min="2" max="12" step="1">
+              <div class="setting-unit">count</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Promote Lock</div><div class="setting-desc">Cooldown between auto policy switches</div></div>
+              <input class="setting-input" id="s-auto-lock" type="number" min="30" max="10080" step="30">
+              <div class="setting-unit">min</div>
+            </div>
+            <div class="setting-row">
+              <div><div class="setting-label">Risk Per Trade</div><div class="setting-desc">Max % of wallet to use per position</div></div>
+              <input class="setting-input" id="s-risk" type="number" step="0.1">
+              <div class="setting-unit">%</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Safety -->
+        <div class="settings-card" data-tip="Protection features that block suspicious tokens. Rug check stops tokens with unsafe mint/freeze authority. Holder check blocks tokens where a few wallets own most of the supply — a common dump setup.">
+          <div class="settings-section-title">Safety</div>
+          <div class="setting-toggle-row">
+            <div><div class="setting-label">Rug Protection</div><div class="setting-desc">Block tokens with unsafe authority settings</div></div>
+            <label class="toggle-wrap"><input id="s-antirug" type="checkbox"> <span style="color:var(--t2);font-size:12px">On</span></label>
+          </div>
+          <div class="setting-toggle-row">
+            <div><div class="setting-label">Whale Concentration Check</div><div class="setting-desc">Block tokens where a few wallets own too much</div></div>
+            <label class="toggle-wrap"><input id="s-checkholders" type="checkbox"> <span style="color:var(--t2);font-size:12px">On</span></label>
+          </div>
+        </div>
+
+        <!-- Save -->
         <div class="settings-card">
           <div class="settings-save-row">
             <button class="btn btn-primary" type="button" onclick="saveSettings()">Save Settings</button>
-            <button class="btn btn-ghost" type="button" onclick="refresh()">Reload Saved Settings</button>
+            <button class="btn btn-ghost" type="button" onclick="refresh()">Reset to Saved</button>
           </div>
+        </div>
+
+        <div id="execution-control-summary" class="settings-echo" style="margin-top:0">
+          <span class="badge bg-muted">Execution lane loading…</span>
         </div>
       </div>
 
       <div class="settings-stack">
-        <div class="settings-card">
-          <div class="settings-section-title">Operator Map</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">One shared engine handles every coin. Whales, snipes, scanners, and listings only change how a token enters the path, not how it gets approved.</div>
+        <div class="settings-card" data-tip="Shows how tokens flow through your bot's decision pipeline. Every coin goes through the same checkpoints regardless of how it was discovered — scanner, whale alert, or listing snipe.">
+          <div class="settings-section-title">How It Works</div>
+          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">Every coin passes through these checkpoints before the bot buys it.</div>
           <div id="settings-operator-map" class="operator-map">
             <div style="font-size:12px;color:var(--t3)">Building operator map…</div>
           </div>
         </div>
-        <div class="settings-card">
-          <div class="settings-section-title">Checkpoint Map</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">This is the live pass order. A coin has to survive these checkpoints before it reaches quote and buy.</div>
+        <div class="settings-card" data-tip="The exact order of checks a token must survive. If it fails any step, it's rejected. This is the filter pipeline your current settings define.">
+          <div class="settings-section-title">Filter Pipeline</div>
           <div id="settings-checkpoint-path" class="checkpoint-path"></div>
         </div>
         <div class="settings-card">
-          <div class="settings-section-title">Saved Snapshot</div>
-          <div id="settings-snapshot" class="settings-echo">
-            <span class="badge bg-muted">Waiting for saved settings…</span>
+          <div class="s-section-toggle" onclick="toggleSettingsSection('s-snapshot')">
+            <div>
+              <div class="settings-section-title" style="margin-bottom:0">Raw Settings</div>
+              <div style="font-size:11px;color:var(--t3);margin-top:3px">Technical view of saved values</div>
+            </div>
+            <span class="s-section-chev" id="s-snapshot-chev">&#9660;</span>
           </div>
-          <div id="settings-snapshot-note" style="font-size:11px;color:var(--t3);margin-top:10px;line-height:1.5">Save while the bot is off and the exact persisted values stay visible here.</div>
+          <div class="s-section-body" id="s-snapshot-body">
+            <div id="settings-snapshot" class="settings-echo">
+              <span class="badge bg-muted">Waiting for saved settings…</span>
+            </div>
+            <div id="settings-snapshot-note" style="font-size:11px;color:var(--t3);margin-top:10px;line-height:1.5">Exact persisted values the bot uses.</div>
+          </div>
         </div>
       </div>
     </div>
@@ -15572,6 +15602,87 @@ function _animateShadowVal(id, newVal) {
   }
 }
 pollShadowBanner(); setInterval(pollShadowBanner, 8000);
+
+// ═══════════ HOVER TOOLTIP SYSTEM ═══════════
+(function() {
+  const tip = document.createElement('div');
+  tip.className = 'htip';
+  tip.innerHTML = '<div class="htip-title"></div><div class="htip-body"></div>';
+  document.body.appendChild(tip);
+  let hoverTimer = null;
+  let currentTarget = null;
+
+  document.addEventListener('mouseover', function(e) {
+    const el = e.target.closest('[data-tip]');
+    if (!el) return;
+    if (el === currentTarget) return;
+    currentTarget = el;
+    clearTimeout(hoverTimer);
+    // Show after 5 seconds of hovering
+    hoverTimer = setTimeout(function() {
+      const text = el.getAttribute('data-tip');
+      if (!text) return;
+      // Get title from nearest section title or setting label
+      const titleEl = el.querySelector('.settings-section-title, .setting-label, .s-autotune-status div, h3');
+      const titleText = titleEl ? titleEl.textContent.trim() : 'Info';
+      tip.querySelector('.htip-title').textContent = titleText;
+      tip.querySelector('.htip-body').textContent = text;
+      // Position near mouse
+      const rect = el.getBoundingClientRect();
+      let top = rect.bottom + 8;
+      let left = rect.left + 20;
+      // Keep on screen
+      if (top + 200 > window.innerHeight) top = rect.top - 180;
+      if (left + 290 > window.innerWidth) left = window.innerWidth - 300;
+      tip.style.top = top + 'px';
+      tip.style.left = left + 'px';
+      tip.classList.add('visible');
+    }, 5000);
+  });
+
+  document.addEventListener('mouseout', function(e) {
+    const el = e.target.closest('[data-tip]');
+    if (el === currentTarget) {
+      clearTimeout(hoverTimer);
+      currentTarget = null;
+      tip.classList.remove('visible');
+    }
+  });
+
+  // Also hide on scroll/click
+  document.addEventListener('scroll', function() { tip.classList.remove('visible'); clearTimeout(hoverTimer); currentTarget = null; }, true);
+  document.addEventListener('click', function() { tip.classList.remove('visible'); clearTimeout(hoverTimer); currentTarget = null; });
+})();
+
+// ═══════════ SETTINGS SECTION TOGGLES ═══════════
+function toggleSettingsSection(id) {
+  const body = document.getElementById(id + '-body');
+  const chev = document.getElementById(id + '-chev');
+  if (!body) return;
+  const isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  if (chev) chev.classList.toggle('open', !isOpen);
+}
+
+// ═══════════ AUTO-TUNE STATUS IN SETTINGS ═══════════
+async function updateAutoTuneStatus() {
+  try {
+    const data = await fetch('/api/quant/auto-tune-status').then(r=>r.json()).catch(()=>null);
+    if (!data) return;
+    const presetEl = document.getElementById('s-tune-preset');
+    const lastEl = document.getElementById('s-tune-last');
+    if (presetEl) presetEl.textContent = 'Active: ' + (data.active_preset || 'balanced');
+    if (lastEl) {
+      if (data.last_shadow_tune_at) {
+        const ago = Math.round((Date.now()/1000 - data.last_shadow_tune_at) / 60);
+        lastEl.textContent = 'Last tune: ' + (ago < 60 ? ago + 'min ago' : Math.round(ago/60) + 'h ago');
+      } else {
+        lastEl.textContent = 'Last tune: waiting for data';
+      }
+    }
+  } catch(e){}
+}
+updateAutoTuneStatus(); setInterval(updateAutoTuneStatus, 30000);
 
 // ═══════════ DASHBOARD PROMO BANNER STATS ═══════════
 async function updatePromoBanner() {
