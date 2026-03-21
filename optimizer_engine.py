@@ -114,6 +114,105 @@ def summarize_feature_edges(snapshot_rows, outcome_labels, top_n=6):
     return sorted(edges, key=lambda item: abs(item["edge"]), reverse=True)[:top_n]
 
 
+def summarize_regime_edges(snapshot_rows, outcome_labels, flow_rows, top_n=6):
+    """Calculate feature edges separately for each market regime.
+
+    Uses stored regime_label from flow snapshots (or classifies on-the-fly) to assign
+    each token to a regime, then computes winner-vs-rug feature edges within that regime.
+
+    Returns dict keyed by regime name, each containing a list of feature edges.
+    """
+    labels_by_mint = {row["mint"]: row for row in outcome_labels if row.get("mint")}
+    entries = _entry_rows(snapshot_rows)
+
+    # Build regime membership for each mint from flow snapshots
+    # Prefer stored regime_label; fall back to on-the-fly classification
+    flow_by_mint = {}
+    for row in flow_rows or []:
+        mint = row.get("mint")
+        if not mint:
+            continue
+        # Use stored regime_label if available, otherwise classify from metrics
+        regime = row.get("regime_label")
+        if not regime or regime == "neutral":
+            # Try to classify from metrics
+            threat = _safe_float(row.get("threat_risk_score"))
+            liq_drop = _safe_float(row.get("liquidity_drop_pct"))
+            bsr = _safe_float(row.get("buy_sell_ratio"))
+            net_flow = _safe_float(row.get("net_flow_sol"))
+            can_exit = row.get("can_exit")
+            if can_exit in (0, "0"):
+                can_exit = False
+            elif can_exit in (1, "1"):
+                can_exit = True
+            if threat >= 70 or can_exit is False or liq_drop >= 35:
+                regime = "defensive"
+            elif net_flow > 2.5 and bsr > 1.35 and threat < 45:
+                regime = "accumulation"
+            elif net_flow < -1.5 or bsr < 0.9:
+                regime = "distribution"
+            else:
+                regime = "neutral"
+        if mint not in flow_by_mint:
+            flow_by_mint[mint] = regime
+
+    # Assign each entry to its regime
+    regime_entries = {}
+    for entry in entries:
+        regime = flow_by_mint.get(entry["mint"], "neutral")
+        regime_entries.setdefault(regime, []).append(entry)
+
+    feature_specs = [
+        ("composite_score", False, "Composite score"),
+        ("confidence", False, "Confidence"),
+        ("buy_sell_ratio", False, "Buy/sell ratio"),
+        ("net_flow_sol", False, "Net SOL flow"),
+        ("smart_wallet_buys", False, "Smart wallet buys"),
+        ("unique_buyer_count", False, "Unique buyers"),
+        ("volume_spike_ratio", False, "Volume spike"),
+        ("holder_growth_1h", False, "Holder growth"),
+        ("threat_risk_score", True, "Threat risk"),
+        ("liquidity_drop_pct", True, "Liquidity drop"),
+    ]
+
+    result = {}
+    for regime_name, r_entries in regime_entries.items():
+        winners = [e for e in r_entries if labels_by_mint.get(e["mint"], {}).get("label") in {"winner", "volatile_winner"}]
+        rugs = [e for e in r_entries if labels_by_mint.get(e["mint"], {}).get("label") == "rug"]
+        if len(winners) < 2 or len(rugs) < 2:
+            result[regime_name] = {
+                "edges": [],
+                "token_count": len(r_entries),
+                "winner_count": len(winners),
+                "rug_count": len(rugs),
+                "insufficient_data": True,
+            }
+            continue
+
+        edges = []
+        for key, invert, label in feature_specs:
+            winner_avg = sum(_safe_float(item["features"].get(key)) for item in winners) / len(winners)
+            rug_avg = sum(_safe_float(item["features"].get(key)) for item in rugs) / len(rugs)
+            raw_edge = rug_avg - winner_avg if invert else winner_avg - rug_avg
+            edges.append({
+                "feature": key,
+                "label": label,
+                "winner_avg": round(winner_avg, 2),
+                "rug_avg": round(rug_avg, 2),
+                "edge": round(raw_edge, 2),
+            })
+
+        result[regime_name] = {
+            "edges": sorted(edges, key=lambda item: abs(item["edge"]), reverse=True)[:top_n],
+            "token_count": len(r_entries),
+            "winner_count": len(winners),
+            "rug_count": len(rugs),
+            "insufficient_data": False,
+        }
+
+    return result
+
+
 def sweep_entry_filters(snapshot_rows, outcome_labels, threshold_plan=None):
     labels_by_mint = {row["mint"]: row for row in outcome_labels if row.get("mint")}
     entries = _entry_rows(snapshot_rows)

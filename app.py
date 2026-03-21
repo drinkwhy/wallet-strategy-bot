@@ -40,11 +40,12 @@ from execution_controls import (
     normalize_policy_mode,
 )
 from learning_engine import (
+    classify_flow_regime_row,
     score_feature_snapshot_with_family,
     score_recent_candidates_for_regime,
     train_regime_model_family,
 )
-from optimizer_engine import build_outcome_labels, summarize_feature_edges, sweep_entry_filters
+from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_flow_snapshot,
@@ -1035,6 +1036,7 @@ def init_db():
             threat_risk_score INTEGER DEFAULT 0,
             transfer_hook_enabled INTEGER DEFAULT 0,
             can_exit INTEGER,
+            regime_label TEXT DEFAULT 'neutral',
             flow_json TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )""")
@@ -1262,6 +1264,7 @@ def migrate_db():
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS net_flow_sol REAL DEFAULT 0",
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS buy_sell_ratio REAL DEFAULT 0",
             "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS replay_mode TEXT DEFAULT 'snapshot'",
+            "ALTER TABLE token_flow_snapshots ADD COLUMN IF NOT EXISTS regime_label TEXT DEFAULT 'neutral'",
         ]
         for m in migrations:
             try:
@@ -1479,6 +1482,7 @@ def migrate_db():
                 threat_risk_score INTEGER DEFAULT 0,
                 transfer_hook_enabled INTEGER DEFAULT 0,
                 can_exit INTEGER,
+                regime_label TEXT DEFAULT 'neutral',
                 flow_json TEXT,
                 created_at TIMESTAMP DEFAULT NOW())""")
             cur.execute("""CREATE TABLE IF NOT EXISTS shadow_decisions (
@@ -5476,14 +5480,16 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
             snapshot.get("whale_score"), snapshot.get("whale_action_score"), snapshot.get("holder_growth_1h"),
             snapshot.get("volume_spike_ratio"), snapshot.get("threat_risk_score"), json.dumps(snapshot),
         ))
+        # Classify regime at write time so it's persisted with the snapshot
+        row_regime = classify_flow_regime_row(flow_snapshot)
         cur.execute("""
             INSERT INTO token_flow_snapshots (
                 mint, source, price, mc, liq, vol, age_min, holder_count, holder_growth_1h,
                 unique_buyer_count, unique_seller_count, first_buyer_count, smart_wallet_buys,
                 smart_wallet_first10, total_buy_sol, total_sell_sol, net_flow_sol, buy_sell_ratio,
                 buy_pressure_pct, liquidity_drop_pct, threat_risk_score, transfer_hook_enabled,
-                can_exit, flow_json
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                can_exit, regime_label, flow_json
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             info.get("mint"), info.get("source") or "scanner", flow_snapshot.get("price"),
             flow_snapshot.get("mc"), flow_snapshot.get("liq"), flow_snapshot.get("vol"), flow_snapshot.get("age_min"),
@@ -5495,6 +5501,7 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
             flow_snapshot.get("buy_pressure_pct"), flow_snapshot.get("liquidity_drop_pct"),
             flow_snapshot.get("threat_risk_score"), int(bool(flow_snapshot.get("transfer_hook_enabled"))),
             None if flow_snapshot.get("can_exit") is None else int(bool(flow_snapshot.get("can_exit"))),
+            row_regime,
             json.dumps(flow_snapshot),
         ))
 
@@ -5870,7 +5877,7 @@ def _load_quant_model_rows(days=MODEL_TRAIN_DAYS, recent_hours=24, recent_limit=
         token_rows = cur.fetchall()
         cur.execute("""
             SELECT mint, buy_sell_ratio, net_flow_sol, threat_risk_score,
-                   liquidity_drop_pct, can_exit, flow_json, created_at
+                   liquidity_drop_pct, can_exit, regime_label, flow_json, created_at
             FROM token_flow_snapshots
             WHERE created_at >= NOW() - INTERVAL %s
             ORDER BY created_at ASC
@@ -7576,9 +7583,164 @@ def _auto_prune_db():
 _SHADOW_TUNE_INTERVAL = 3600  # auto-tune from shadow results every 1 hour
 _last_shadow_tune_at = 0
 
+# ---------- Coin evaluation: sweep all recorded tokens to find optimal filter thresholds ----------
+
+# Map sweep feature names → bot setting names so optimized thresholds can be applied
+_SWEEP_FEATURE_TO_SETTING = {
+    "composite_score": ("min_score", int),
+    "volume_spike_ratio": ("min_volume_spike_mult", float),
+    "holder_growth_1h": ("min_holder_growth_pct", float),
+}
+
+# Expanded threshold plan covering more granular values than the default
+_TUNE_THRESHOLD_PLAN = {
+    "composite_score": [30, 40, 50, 60, 70, 80],
+    "confidence": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+    "buy_sell_ratio": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],
+    "smart_wallet_buys": [0, 1, 2, 3, 4],
+    "net_flow_sol": [0.0, 1.0, 2.0, 5.0, 10.0],
+    "volume_spike_ratio": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
+    "holder_growth_1h": [10, 20, 30, 40, 50],
+    "unique_buyer_count": [5, 10, 15, 20, 30],
+}
+
+
+def _evaluate_all_recorded_coins(days=7):
+    """Load all recorded token data, label outcomes, sweep filter thresholds, and return optimized settings.
+
+    Returns a dict with:
+      - optimized_settings: dict of bot setting overrides derived from best sweep thresholds
+      - sweep_results: full sweep results for logging
+      - feature_edges: top features separating winners from rugs
+      - outcome_summary: counts of each outcome label
+    """
+    try:
+        model_rows = _load_quant_model_rows(days=days)
+        token_rows = model_rows.get("token_rows") or []
+        entry_rows = model_rows.get("entry_rows") or []
+
+        if len(token_rows) < 10:
+            print(f"[COIN-EVAL] only {len(token_rows)} tokens recorded, need >= 10 for meaningful analysis", flush=True)
+            return None
+
+        # Step 1: label every token's outcome (winner / rug / volatile_winner / survivor / neutral)
+        outcomes = build_outcome_labels(token_rows)
+        if not outcomes:
+            print(f"[COIN-EVAL] no outcome labels generated, skipping", flush=True)
+            return None
+
+        outcome_counts = {}
+        for item in outcomes:
+            outcome_counts[item["label"]] = outcome_counts.get(item["label"], 0) + 1
+        total_labeled = len(outcomes)
+        winner_count = outcome_counts.get("winner", 0) + outcome_counts.get("volatile_winner", 0)
+        rug_count = outcome_counts.get("rug", 0)
+
+        print(f"[COIN-EVAL] labeled {total_labeled} tokens: "
+              f"{winner_count} winners, {rug_count} rugs, "
+              f"{outcome_counts.get('survivor', 0)} survivors, "
+              f"{outcome_counts.get('neutral', 0)} neutral", flush=True)
+
+        if winner_count < 3 or rug_count < 3:
+            print(f"[COIN-EVAL] need >= 3 winners AND >= 3 rugs for sweep (got {winner_count}w/{rug_count}r), skipping", flush=True)
+            return None
+
+        flow_rows = model_rows.get("flow_rows") or []
+
+        # Step 2: sweep every feature × threshold to find optimal entry filters
+        sweep_results = sweep_entry_filters(entry_rows, outcomes, threshold_plan=_TUNE_THRESHOLD_PLAN)
+
+        # Step 3: identify top feature edges (which features best separate winners from rugs)
+        feature_edges = summarize_feature_edges(entry_rows, outcomes, top_n=8)
+
+        # Step 4: per-regime edge analysis — identify which features matter in each regime
+        regime_edges = {}
+        try:
+            regime_edges = summarize_regime_edges(entry_rows, outcomes, flow_rows, top_n=6)
+            if regime_edges:
+                print(f"[COIN-EVAL] per-regime edge analysis:", flush=True)
+                for regime_name, data in regime_edges.items():
+                    if data.get("insufficient_data"):
+                        print(f"[COIN-EVAL]   {regime_name}: {data['token_count']} tokens "
+                              f"({data['winner_count']}w/{data['rug_count']}r) — not enough data", flush=True)
+                    else:
+                        top_edge = data["edges"][0] if data["edges"] else {}
+                        print(f"[COIN-EVAL]   {regime_name}: {data['token_count']} tokens "
+                              f"({data['winner_count']}w/{data['rug_count']}r) — "
+                              f"top edge: {top_edge.get('label', '?')} ({top_edge.get('edge', 0):+.1f})", flush=True)
+        except Exception as e:
+            print(f"[COIN-EVAL] per-regime edge error: {e}", flush=True)
+
+        # Step 5: extract the best threshold per feature and map to bot settings
+        optimized_settings = {}
+        best_by_feature = sweep_results.get("best_by_feature") or []
+
+        for best in best_by_feature:
+            feat_name = best.get("feature")
+            threshold = best.get("threshold")
+            selected = best.get("selected", 0)
+            edge_score = best.get("edge_score", 0)
+            winner_rate = best.get("winner_rate_pct", 0)
+            rug_rate = best.get("rug_rate_pct", 0)
+
+            # Only apply if the sweep had enough samples and a positive edge
+            if selected < 5 or edge_score <= 0:
+                continue
+
+            # Only apply if rug rate dropped meaningfully (filter is actually helping)
+            if rug_rate > 40:
+                continue
+
+            mapping = _SWEEP_FEATURE_TO_SETTING.get(feat_name)
+            if mapping:
+                setting_name, cast_fn = mapping
+                try:
+                    optimized_settings[setting_name] = cast_fn(threshold)
+                    print(f"[COIN-EVAL]   {feat_name} >= {threshold} → {setting_name}={cast_fn(threshold)} "
+                          f"(edge={edge_score:.1f}, wr={winner_rate:.0f}%, rr={rug_rate:.0f}%, n={selected})", flush=True)
+                except Exception:
+                    pass
+
+        # Log the top feature edges for insight
+        if feature_edges:
+            print(f"[COIN-EVAL] top feature edges (winner vs rug):", flush=True)
+            for edge in feature_edges[:5]:
+                print(f"[COIN-EVAL]   {edge['label']}: winner_avg={edge['winner_avg']}, "
+                      f"rug_avg={edge['rug_avg']}, edge={edge['edge']}", flush=True)
+
+        # Determine current regime for context
+        current_regime = "neutral"
+        try:
+            regime_ctx = _current_regime_context(window_hours=48)
+            current_regime = regime_ctx.get("regime", "neutral")
+        except Exception:
+            pass
+
+        return {
+            "optimized_settings": optimized_settings,
+            "sweep_results": sweep_results,
+            "feature_edges": feature_edges,
+            "regime_edges": regime_edges,
+            "current_regime": current_regime,
+            "outcome_summary": outcome_counts,
+            "total_tokens": total_labeled,
+        }
+
+    except Exception as e:
+        print(f"[COIN-EVAL] error evaluating recorded coins: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 def _shadow_auto_tune():
-    """Background worker: periodically evaluate closed shadow positions and auto-tune bot settings."""
+    """Background worker: periodically evaluate closed shadow positions and auto-tune bot settings.
+
+    Enhanced pipeline:
+      1. Evaluate shadow position performance per strategy (pick the best preset)
+      2. Evaluate ALL recorded coins to find optimal filter thresholds
+      3. Merge optimized thresholds into the best strategy's settings before applying
+    """
     global _last_shadow_tune_at
     time.sleep(300)  # wait 5 min after startup for data to accumulate
     while True:
@@ -7625,7 +7787,22 @@ def _shadow_auto_tune():
                     "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
                 }
 
-            summary = {"strategies": strategies}
+            # --- NEW: Evaluate all recorded coins to find optimal filter thresholds ---
+            print(f"[SHADOW-TUNE] running coin evaluation on all recorded tokens...", flush=True)
+            coin_eval = _evaluate_all_recorded_coins(days=7)
+
+            # Build per_strategy with optimized settings from coin evaluation
+            per_strategy = {}
+            if coin_eval and coin_eval.get("optimized_settings"):
+                opt = coin_eval["optimized_settings"]
+                print(f"[SHADOW-TUNE] coin evaluation produced {len(opt)} optimized filter overrides", flush=True)
+                # Apply the optimized filters to ALL strategies so whichever wins gets them
+                for sname in strategies:
+                    per_strategy[sname] = {"best_settings": dict(opt)}
+            else:
+                print(f"[SHADOW-TUNE] coin evaluation returned no filter overrides (not enough data or no improvement)", flush=True)
+
+            summary = {"strategies": strategies, "per_strategy": per_strategy}
 
             # Find a user_id to attribute the tune to (pick first user with bot_settings)
             conn = db()
@@ -7641,6 +7818,20 @@ def _shadow_auto_tune():
             for sname, data in strategies.items():
                 print(f"[SHADOW-TUNE]   {sname}: {data['trades_closed']} trades, "
                       f"{data['win_rate']}% win, {data['avg_pnl_pct']:+.1f}% avg pnl", flush=True)
+
+            if coin_eval:
+                oc = coin_eval.get("outcome_summary", {})
+                print(f"[SHADOW-TUNE] coin outcomes: {coin_eval.get('total_tokens', 0)} tokens — "
+                      f"winners={oc.get('winner', 0)+oc.get('volatile_winner', 0)}, "
+                      f"rugs={oc.get('rug', 0)}, survivors={oc.get('survivor', 0)}, "
+                      f"neutral={oc.get('neutral', 0)}", flush=True)
+                print(f"[SHADOW-TUNE] current regime: {coin_eval.get('current_regime', 'unknown')}", flush=True)
+                # Log per-regime edge insights
+                for regime_name, rdata in (coin_eval.get("regime_edges") or {}).items():
+                    if not rdata.get("insufficient_data") and rdata.get("edges"):
+                        top = rdata["edges"][0]
+                        print(f"[SHADOW-TUNE]   {regime_name} regime: {rdata['token_count']} tokens, "
+                              f"top edge = {top['label']} ({top['edge']:+.1f})", flush=True)
 
             _auto_tune_from_results(user_id, summary, f"shadow-live-{int(time.time())}")
             _last_shadow_tune_at = time.time()
@@ -8745,17 +8936,40 @@ def api_quant_optimizer():
             LIMIT 6000
         """, (f"{days} days",))
         token_rows = cur.fetchall()
+        cur.execute("""
+            SELECT mint, buy_sell_ratio, net_flow_sol, threat_risk_score,
+                   liquidity_drop_pct, can_exit, regime_label, flow_json, created_at
+            FROM token_flow_snapshots
+            WHERE created_at >= NOW() - INTERVAL %s
+            ORDER BY created_at ASC
+            LIMIT 12000
+        """, (f"{days} days",))
+        flow_rows = cur.fetchall()
     finally:
         db_return(conn)
 
     outcomes = build_outcome_labels(token_rows)
     sweeps = sweep_entry_filters(snapshot_rows, outcomes)
     feature_edges = summarize_feature_edges(snapshot_rows, outcomes)
+
+    # Per-regime edge analysis
+    regime_edges_raw = summarize_regime_edges(snapshot_rows, outcomes, flow_rows, top_n=6)
+    regime_edges = {}
+    for regime_name, data in regime_edges_raw.items():
+        regime_edges[regime_name] = {
+            "token_count": data.get("token_count", 0),
+            "winner_count": data.get("winner_count", 0),
+            "rug_count": data.get("rug_count", 0),
+            "insufficient_data": data.get("insufficient_data", True),
+            "edges": data.get("edges", []),
+        }
+
     label_counts = {}
     for row in outcomes:
         key = row.get("label") or "unknown"
         label_counts[key] = label_counts.get(key, 0) + 1
 
+    regime_context = _current_regime_context(window_hours=48)
     top_outcomes = sorted(outcomes, key=lambda item: item.get("peak_return_pct") or 0, reverse=True)[:6]
     return jsonify({
         "window_days": days,
@@ -8767,6 +8981,8 @@ def api_quant_optimizer():
         "best_thresholds": sweeps.get("best_by_feature") or [],
         "top_sweeps": (sweeps.get("all") or [])[:10],
         "feature_edges": feature_edges,
+        "regime_edges": regime_edges,
+        "current_regime": regime_context.get("regime", "neutral"),
         "top_outcomes": top_outcomes,
     })
 
@@ -9141,11 +9357,78 @@ def api_quant_auto_tune_status():
     finally:
         db_return(conn)
 
+    # Include coin evaluation insight if available
+    coin_eval_summary = None
+    try:
+        # Quick check — pull outcome counts from market_tokens without running full sweep
+        cur2 = conn if not conn else None
+        conn2 = db()
+        try:
+            cur2 = conn2.cursor()
+            cur2.execute("""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN COALESCE(first_price,0) > 0 AND peak_price / NULLIF(first_price,0) >= 2.2 THEN 1 ELSE 0 END) AS winners,
+                       SUM(CASE WHEN COALESCE(first_price,0) > 0 AND (trough_price / NULLIF(first_price,0) - 1) <= -0.45 THEN 1 ELSE 0 END) AS rugs
+                FROM market_tokens
+                WHERE last_seen_at >= NOW() - INTERVAL '7 days'
+                  AND COALESCE(first_price, 0) > 0
+            """)
+            cr = cur2.fetchone()
+            if cr:
+                coin_eval_summary = {
+                    "total_tracked": int(cr.get("total", 0)),
+                    "approx_winners": int(cr.get("winners", 0)),
+                    "approx_rugs": int(cr.get("rugs", 0)),
+                    "evaluation_active": True,
+                }
+        finally:
+            db_return(conn2)
+    except Exception:
+        pass
+
     return jsonify({
         "active_preset": preset_name,
         "last_shadow_tune_at": _last_shadow_tune_at or None,
         "tune_interval_sec": _SHADOW_TUNE_INTERVAL,
         "shadow_48h_stats": shadow_stats,
+        "coin_evaluation": coin_eval_summary,
+    })
+
+
+@app.route("/api/quant/coin-evaluation")
+@login_required
+def api_quant_coin_evaluation():
+    """Run or return cached coin evaluation: outcome labels + sweep analysis for all recorded tokens."""
+    days = int(request.args.get("days", 7))
+    result = _evaluate_all_recorded_coins(days=days)
+    if not result:
+        return jsonify({"error": "Not enough data for coin evaluation", "min_tokens": 10, "min_winners": 3, "min_rugs": 3})
+
+    # Format sweep results for the dashboard
+    best_by_feature = result.get("sweep_results", {}).get("best_by_feature", [])
+    top_sweeps = result.get("sweep_results", {}).get("all", [])[:20]
+    feature_edges = result.get("feature_edges", [])
+
+    # Format regime edges for dashboard (serialize cleanly)
+    regime_edges = {}
+    for regime_name, data in (result.get("regime_edges") or {}).items():
+        regime_edges[regime_name] = {
+            "token_count": data.get("token_count", 0),
+            "winner_count": data.get("winner_count", 0),
+            "rug_count": data.get("rug_count", 0),
+            "insufficient_data": data.get("insufficient_data", True),
+            "edges": data.get("edges", []),
+        }
+
+    return jsonify({
+        "total_tokens": result.get("total_tokens", 0),
+        "outcome_summary": result.get("outcome_summary", {}),
+        "optimized_settings": result.get("optimized_settings", {}),
+        "best_by_feature": best_by_feature,
+        "top_sweeps": top_sweeps,
+        "feature_edges": feature_edges,
+        "regime_edges": regime_edges,
+        "current_regime": result.get("current_regime", "neutral"),
     })
 
 
