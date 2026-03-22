@@ -13202,16 +13202,10 @@ DASHBOARD_HTML = _CSS + """
       </div>
 
       <div class="settings-stack">
-        <div class="settings-card" data-tip="Shows how tokens flow through your bot's decision pipeline. Every coin goes through the same checkpoints regardless of how it was discovered — scanner, whale alert, or listing snipe.">
-          <div class="settings-section-title">How It Works</div>
-          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">Every coin passes through these checkpoints before the bot buys it.</div>
-          <div id="settings-operator-map" class="operator-map">
-            <div style="font-size:12px;color:var(--t3)">Building operator map…</div>
-          </div>
-        </div>
-        <div class="settings-card" data-tip="The exact order of checks a token must survive. If it fails any step, it's rejected. This is the filter pipeline your current settings define.">
-          <div class="settings-section-title">Filter Pipeline</div>
-          <div id="settings-checkpoint-path" class="checkpoint-path"></div>
+        <div class="settings-card" data-tip="The exact journey every token takes from discovery to buy or reject. Each gate uses YOUR current settings.">
+          <div class="settings-section-title">Token Journey</div>
+          <div style="font-size:12px;color:var(--t2);margin-bottom:12px">Every coin follows this exact path — fail any gate and it's rejected.</div>
+          <div id="settings-token-journey" class="checkpoint-path"></div>
         </div>
         <div class="settings-card">
           <div class="s-section-toggle" onclick="toggleSettingsSection('s-snapshot')">
@@ -14353,170 +14347,129 @@ function renderLaunchSummary(settings) {
     `<span class="badge bg-muted">Holders ${settings.check_holders ? 'on' : 'off'}</span>`,
   ].join('');
 }
-function renderOperatorMap(settings) {
-  const el = document.getElementById('settings-operator-map');
+function renderTokenJourney(settings) {
+  const el = document.getElementById('settings-token-journey');
   if (!el) return;
   const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
-  const liqText = Number(s.min_liq || 0) > 0 ? `$${Number(s.min_liq).toLocaleString()}+` : 'off';
-  const sourceFeeds = [
-    ['Dex token-profiles', 'feed'],
-    ['Dex new-pairs', 'feed'],
-    ['Helius sniper', 'feed'],
-    ['Whale tracker', 'feed'],
-    ['Listing scanner', 'feed'],
+  const liqText = Number(s.min_liq || 0) > 0 ? `>= $${Number(s.min_liq).toLocaleString()}` : 'off';
+  const stages = [
+    {
+      icon: '\ud83d\udce1', phase: 'DISCOVER', title: 'Scanner Finds Token',
+      desc: 'DexScreener profiles, new pairs, Helius sniper, whale tracker, and listing scanner all feed into the same evaluator.',
+      gate: 'All sources \u2192 one path',
+    },
+    {
+      icon: '\ud83d\udcca', phase: 'FILTER', title: 'Market Cap',
+      desc: `Must land inside your MC range.`,
+      gate: `$${Number(s.min_mc).toLocaleString()} \u2013 $${Number(s.max_mc).toLocaleString()}`,
+    },
+    {
+      icon: '\ud83d\udcb0', phase: 'FILTER', title: 'Liquidity',
+      desc: Number(s.min_liq || 0) > 0 ? 'Pool liquidity must meet your minimum.' : 'Liquidity filter is disabled.',
+      gate: liqText,
+    },
+    {
+      icon: '\u23f1\ufe0f', phase: 'FILTER', title: 'Token Age',
+      desc: 'Older tokens are rejected to catch early momentum.',
+      gate: `<= ${Number(s.max_age_min).toLocaleString()} min`,
+    },
+    {
+      icon: '\ud83d\udcc8', phase: 'FILTER', title: 'Price Change',
+      desc: 'Must be gaining but not overextended.',
+      gate: `> 0% and <= ${Number(s.max_hot_change).toLocaleString()}%`,
+    },
+    {
+      icon: '\ud83d\udcb5', phase: 'FILTER', title: '24h Volume',
+      desc: 'Minimum trading activity to prove real participation.',
+      gate: `>= $${Number(s.min_vol).toLocaleString()}`,
+    },
+    {
+      icon: '\ud83e\udde0', phase: 'FILTER', title: 'AI Score',
+      desc: 'Composite score from volume, liquidity, age, change, and momentum signals.',
+      gate: `>= ${Number(s.min_score).toLocaleString()} / 100`,
+    },
+    {
+      icon: '\ud83d\udea6', phase: 'INTEL', title: 'Green Lights Checklist',
+      desc: 'Tracked wallet edge, holder acceleration, and narrative timing must align.',
+      gate: `${Number(s.min_green_lights)} of 3 lights | holders >= ${Number(s.min_holder_growth_pct)}% | narrative >= ${Number(s.min_narrative_score)}`,
+    },
+    {
+      icon: '\u26a0\ufe0f', phase: 'INTEL', title: 'Late Entry Guard',
+      desc: 'Blocks tokens that already pumped too far \u2014 unless narrative is nuclear.',
+      gate: `<= ${Number(s.late_entry_mult)}x unless narrative >= ${Number(s.nuclear_narrative_score)}`,
+    },
+    {
+      icon: '\ud83d\udee1\ufe0f', phase: 'INTEL', title: 'Threat & Exit Check',
+      desc: 'Threat score, transfer hooks, exit route availability.',
+      gate: `Threat < 60 | exit route exists | no transfer hook`,
+    },
+    {
+      icon: '\ud83e\udd16', phase: 'DECISION', title: 'Model / Policy Gate',
+      desc: 'Rules-based, ML model, or auto-promoted policy decides final entry.',
+      gate: `Policy: ${s.decision_policy || s.policy_mode || 'rules'}`,
+    },
+    {
+      icon: '\ud83d\udd12', phase: 'BUY LOCK', title: 'Acquire Buy Lock',
+      desc: 'Serializes the buy so concurrent scanners cannot cause duplicate entries.',
+      gate: 'One buy at a time per bot',
+    },
+    {
+      icon: '\ud83d\udcb3', phase: 'RUNTIME', title: 'Balance & Position Limits',
+      desc: 'Checks live balance, max open positions, and session drawdown.',
+      gate: `Max ${Number(s.max_correlated)} positions | Drawdown ${Number(s.drawdown_limit_sol || 0).toFixed(2)} SOL`,
+    },
+    {
+      icon: '\u23f3', phase: 'RUNTIME', title: 'Cooldown & Rate Limits',
+      desc: 'Blocks re-buying a recently lost mint and enforces buy cooldown.',
+      gate: `Cooldown ${Number(s.cooldown_min || 0)}m | lost mint blocked 30m`,
+    },
+    {
+      icon: '\ud83d\udd0d', phase: 'RUNTIME', title: 'Live Market Re-check',
+      desc: 'Fresh DexScreener lookup confirms MC, liquidity, and price haven\u2019t collapsed since the scan.',
+      gate: 'MC still in range | liq still there | not dumping > -30%',
+    },
+    {
+      icon: '\ud83d\ude80', phase: 'EXECUTE', title: 'Jupiter Quote \u2192 Swap',
+      desc: 'Gets best route, signs transaction, sends via Helius Sender with Jito tip.',
+      gate: `${Number(s.max_buy_sol || 0).toFixed(2)} SOL | risk cap ${Number(s.risk_per_trade_pct || 0).toFixed(1)}% | fee ${Number(s.priority_fee || 0).toLocaleString()} lamports`,
+    },
+    {
+      icon: '\ud83d\udcb0', phase: 'SELL', title: 'Exit Monitoring',
+      desc: 'Position is tracked every loop cycle. First matching exit rule fires the sell.',
+      gate: `TP1 ${Number(s.tp1_mult||0).toFixed(1)}x \u2192 TP2 ${Number(s.tp2_mult||0).toFixed(1)}x | SL ${Number(s.stop_loss||0).toFixed(2)} | Trail ${Math.round(Number(s.trail_pct||0)*100)}% | Time ${Number(s.time_stop_min||0)}m`,
+    },
   ];
-  const entryStages = [
-    {
-      num: 'Stage 1',
-      title: 'Normalize Signal',
-      value: 'Every feed becomes one token candidate and enters the same evaluator.',
-      meta: 'Whales and snipes do not bypass any later filter. They only surface the coin earlier.',
-    },
-    {
-      num: 'Stage 2',
-      title: 'Basic Filters',
-      value: `MC $${Number(s.min_mc).toLocaleString()}-$${Number(s.max_mc).toLocaleString()} | Liq ${liqText} | Age <= ${Number(s.max_age_min).toLocaleString()}m`,
-      meta: `Change must stay above 0% and under ${Number(s.max_hot_change).toLocaleString()}%. Vol must be >= $${Number(s.min_vol).toLocaleString()} and score >= ${Number(s.min_score).toLocaleString()}.`,
-    },
-    {
-      num: 'Stage 3',
-      title: 'Checklist Gates',
-      value: `${Number(s.min_green_lights).toLocaleString()} green light(s) | holders >= ${Number(s.min_holder_growth_pct).toLocaleString()}% | narrative >= ${Number(s.min_narrative_score).toLocaleString()}`,
-      meta: `Volume spike must be >= ${Number(s.min_volume_spike_mult).toLocaleString()}x. Late entry dies above ${Number(s.late_entry_mult).toLocaleString()}x unless narrative reaches ${Number(s.nuclear_narrative_score).toLocaleString()}.`,
-    },
-    {
-      num: 'Stage 4',
-      title: 'Safety Gates',
-      value: `Authority ${s.anti_rug ? 'on' : 'off'} | holders ${s.check_holders ? 'on' : 'off'} | losing mint block 30m`,
-      meta: 'The buy path can still die here on route failure, dev blacklist, drawdown, balance, or correlated-position limits.',
-    },
-    {
-      num: 'Stage 5',
-      title: 'Execution',
-      value: `Quote -> simulate -> sign -> Helius Sender -> Jito tip -> confirm`,
-      meta: `Priority fee ${Number(s.priority_fee).toLocaleString()} lamports. Max buy ${Number(s.max_buy_sol || 0).toFixed(2)} SOL with risk cap ${Number(s.risk_per_trade_pct || 0).toFixed(1)}%.`,
-    },
-  ];
-  const exitRules = [
-    ['TP1 partial', `${Number(s.tp1_mult || 0).toFixed(2)}x`],
-    ['TP2 full', `${Number(s.tp2_mult || 0).toFixed(2)}x`],
-    ['Stop loss', `${Number(s.stop_loss || 0).toFixed(2)} ratio`],
-    ['Trailing stop', `${Math.round(Number(s.trail_pct || 0) * 100)}% retrace`],
-    ['Time stop', `${Number(s.time_stop_min || 0).toLocaleString()} min`],
-    ['Surge hold', '2.0x inside 10s -> hold until 14% drop from peak'],
-    ['Listing exits', 'listing TP / SL / timeout if source was listing scanner'],
-  ];
-  const guardRules = [
-    ['Session drawdown', `${Number(s.drawdown_limit_sol || 0).toFixed(2)} SOL`],
-    ['Max correlated positions', `${Number(s.max_correlated || 0)} open names`],
-    ['Recent losing mint', 'same mint blocked for 30 minutes after a red close'],
-    ['Holder concentration', s.check_holders ? 'blocking' : 'disabled'],
-  ];
-  el.innerHTML = `
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Signal Sources</div>
-          <div class="operator-lane-note">These feeds are watched in parallel and all route into the same buy engine.</div>
-        </div>
-      </div>
-      <div class="operator-chip-row">
-        ${sourceFeeds.map(([label, cls]) => `<span class="operator-chip ${cls}">${label}</span>`).join('')}
-      </div>
-      <div class="operator-arrow-row">
-        <span class="operator-arrow">all feeds -> broadcast signal -> evaluate_signal()</span>
-      </div>
-    </div>
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Buy Path</div>
-          <div class="operator-lane-note">A coin only reaches quote and buy after it survives every stage below in order.</div>
-        </div>
-        <div class="operator-chip-row">
-          <span class="operator-chip guard">runtime gates stay live after filters</span>
-        </div>
-      </div>
-      <div class="operator-stage-grid">
-        ${entryStages.map(stage => `
-          <div class="operator-stage">
-            <div class="operator-stage-num">${stage.num}</div>
-            <div class="operator-stage-title">${stage.title}</div>
-            <div class="operator-stage-value">${stage.value}</div>
-            <div class="operator-stage-meta">${stage.meta}</div>
+  const phaseColors = {
+    'DISCOVER': '#6366f1', 'FILTER': '#3b82f6', 'INTEL': '#a855f7',
+    'DECISION': '#f59e0b', 'BUY LOCK': '#64748b', 'RUNTIME': '#ef4444',
+    'EXECUTE': '#14c784', 'SELL': '#f97316',
+  };
+  el.innerHTML = stages.map((st, i) => {
+    const color = phaseColors[st.phase] || '#64748b';
+    const isLast = i === stages.length - 1;
+    return `
+      <div class="checkpoint-card" style="border-left:3px solid ${color}">
+        <div class="checkpoint-step">
+          <div class="checkpoint-index" style="background:${color};font-size:14px">${st.icon}</div>
+          <div style="min-width:0;flex:1">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+              <span style="font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:${color}">${st.phase}</span>
+              <span style="font-size:13px;font-weight:700;color:var(--t1)">${st.title}</span>
+            </div>
+            <div style="font-size:12px;color:var(--t2);margin-bottom:4px">${st.desc}</div>
+            <div style="font-size:11px;color:var(--t1);font-weight:600;background:rgba(255,255,255,.04);border-radius:6px;padding:4px 8px;display:inline-block">${st.gate}</div>
           </div>
-        `).join('')}
-      </div>
-    </div>
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Live Guards</div>
-          <div class="operator-lane-note">These rules are monitored even after a token passes the numeric checkpoint map.</div>
         </div>
       </div>
-      <div class="operator-rule-list">
-        ${guardRules.map(([label, value]) => `
-          <div class="operator-rule">
-            <span class="operator-rule-label">${label}</span>
-            <span class="operator-rule-value">${value}</span>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-    <div class="operator-lane">
-      <div class="operator-lane-head">
-        <div>
-          <div class="operator-lane-title">Sell + Monitor Path</div>
-          <div class="operator-lane-note">Once bought, every open position is monitored on the same loop until one exit path fires.</div>
-        </div>
-        <div class="operator-chip-row">
-          <span class="operator-chip exit">positions -> check_positions() -> sell()</span>
-        </div>
-      </div>
-      <div class="operator-rule-list">
-        ${exitRules.map(([label, value]) => `
-          <div class="operator-rule">
-            <span class="operator-rule-label">${label}</span>
-            <span class="operator-rule-value">${value}</span>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-  `;
+      ${!isLast ? '<div style="text-align:center;color:var(--t3);font-size:14px;margin:-4px 0">\u25bc</div>' : ''}
+    `;
+  }).join('');
 }
 function renderSettingsVisuals(settings) {
   const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
   renderLaunchSummary(s);
   renderSettingsSnapshot(s);
-  renderOperatorMap(s);
-  const el = document.getElementById('settings-checkpoint-path');
-  if (!el) return;
-  const liqRule = Number(s.min_liq || 0) > 0 ? `Liquidity must be >= $${Number(s.min_liq).toLocaleString()}` : 'Liquidity checkpoint disabled';
-  const cards = [
-    ['1', 'Market Cap', `$${Number(s.min_mc).toLocaleString()} to $${Number(s.max_mc).toLocaleString()}`, 'The token has to land inside the market-cap lane before any later check matters.'],
-    ['2', 'Liquidity', liqRule, 'Set liquidity to 0 to leave this checkpoint open. Any non-zero value makes it a real gate again.'],
-    ['3', 'Token Age', `Age must be <= ${Number(s.max_age_min).toLocaleString()} minutes`, 'Older coins die here before the signal reaches momentum or score.'],
-    ['4', 'Price Change', `Change must be > 0% and <= ${Number(s.max_hot_change).toLocaleString()}%`, 'Negative change and overheated moves both fail on the same checkpoint.'],
-    ['5', 'Volume', `24h volume must be >= $${Number(s.min_vol).toLocaleString()}`, 'This is the first participation proof after the raw price filters.'],
-    ['6', 'AI Score', `Score must be >= ${Number(s.min_score).toLocaleString()}`, 'The score breakdown is computed first, then this floor decides if the coin survives.'],
-    ['7', 'Three-Signal Checklist', `${Number(s.min_green_lights)} green lights | holders >= ${Number(s.min_holder_growth_pct)}% | narrative >= ${Number(s.min_narrative_score)} | volume spike >= ${Number(s.min_volume_spike_mult)}x`, 'These values feed the same checklist and quality gates shown in the Signals tab.'],
-    ['8', 'Late Entry Guard', `Late entry <= ${Number(s.late_entry_mult)}x unless narrative >= ${Number(s.nuclear_narrative_score)}`, 'A coin that is already too extended only survives if narrative timing is strong enough to override the guard.'],
-    ['9', 'Safety Checks', `Authority check ${s.anti_rug ? 'on' : 'off'} | holder concentration ${s.check_holders ? 'on' : 'off'}`, 'These can still kill the trade later, after the numeric path passes.'],
-    ['10', 'Runtime Gates', `Drawdown ${Number(s.drawdown_limit_sol).toFixed(2)} SOL | max positions ${Number(s.max_correlated)} | trade risk ${Number(s.risk_per_trade_pct).toFixed(1)}%`, 'Even after the filter path passes, the bot can still skip on drawdown, position count, balance, or recent losing-mint rules.'],
-  ];
-  el.innerHTML = cards.map(([index, title, value, meta]) => `
-    <div class="checkpoint-card">
-      <div class="checkpoint-step">
-        <div class="checkpoint-index">${index}</div>
-        <div style="min-width:0">
-          <div style="font-size:13px;font-weight:700;color:var(--t1)">${title}</div>
-          <div style="font-size:12px;color:var(--t2);margin-top:4px">${value}</div>
-          <div class="checkpoint-meta">${meta}</div>
-        </div>
-      </div>
-    </div>
-  `).join('');
+  renderTokenJourney(s);
 }
 function getSettingsFocusIds() {
   return SETTINGS_FIELD_IDS;
@@ -15088,13 +15041,6 @@ function showSignalDetail(idx, fromRender=false) {
     </div>
     <div class="sec-label">AI Score Breakdown (${sc.total||0}/100)</div>
     <canvas id="sig-radar" height="200" style="margin-bottom:14px"></canvas>
-    <div class="sec-label">Filter Pipeline</div>
-    ${(s.filters||[]).map(f => `<div class="filter-step">
-      <div class="filter-dot ${f.passed?'pass':'fail'}"></div>
-      <span style="flex:1">${f.name}</span>
-      <span style="color:var(--t1);font-weight:600;font-size:11px">${f.value}</span>
-      <span style="color:var(--t3);font-size:10px">${f.threshold}</span>
-    </div>`).join('')}
     <div class="sec-label" style="margin-top:14px">Score Components</div>
     <div style="display:flex;gap:4px;height:16px;border-radius:4px;overflow:hidden">
       <div style="flex:${sc.volume||0};background:#3b82f6" title="Volume: ${sc.volume||0}"></div>
