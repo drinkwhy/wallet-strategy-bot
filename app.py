@@ -7053,14 +7053,20 @@ def helius_pool_sniper():
     seen_signatures = set()
     timeout_state = {"streak": 0}
     max_timeout_streak = 3
+    reconnect_attempts = 0          # track consecutive reconnects for backoff
+    _MAX_RECONNECT_BACKOFF = 120    # cap backoff at 2 minutes
+    _SEEN_SIG_MAX = 20_000          # prune in-memory signature cache
 
     while True:
         try:
             import websocket as ws_lib
             wss = ws_url
-            error_state = {"plan_blocked": False, "reason": "", "fallback": False}
+            error_state = {"plan_blocked": False, "reason": "", "fallback": False,
+                           "rate_limited": False}
 
             def on_open(ws):
+                nonlocal reconnect_attempts
+                reconnect_attempts = 0  # successful connect — reset backoff
                 for idx, (program_id, label) in enumerate(tracked_programs, start=1):
                     ws.send(json.dumps({
                         "jsonrpc": "2.0",
@@ -7089,6 +7095,9 @@ def helius_pool_sniper():
                     elif RAYDIUM_AMM.lower() in joined_logs:
                         source_label = "helius-ws:raydium"
                     _sniper_process_signature(sig, source_label, seen_signatures)
+                    # Prune seen_signatures to prevent unbounded memory growth
+                    if len(seen_signatures) > _SEEN_SIG_MAX:
+                        seen_signatures.clear()
                 except Exception as e:
                     print(f"[Sniper] message error: {e}", flush=True)
 
@@ -7106,6 +7115,15 @@ def helius_pool_sniper():
                     error_state["fallback"] = True
                     error_state["reason"] = "websocket stream not available on current Helius plan"
                     print(f"[Sniper] Plan gate hit: {error_state['reason']} — falling back to RPC polling", flush=True)
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
+                # Rate-limited (429) — flag it so the outer loop backs off
+                if "429" in err_text or "too many" in err_lower or "max usage" in err_lower:
+                    error_state["rate_limited"] = True
+                    print(f"[Sniper] WS rate-limited (429) — will back off before retry", flush=True)
                     try:
                         ws.close()
                     except Exception:
@@ -7134,7 +7152,7 @@ def helius_pool_sniper():
                 print(f"[Sniper] WS error: {err}", flush=True)
 
             def on_close(ws, *a):
-                if error_state["fallback"]:
+                if error_state["fallback"] or error_state["rate_limited"]:
                     return
                 print("[Sniper] WS closed — reconnecting...", flush=True)
 
@@ -7149,9 +7167,22 @@ def helius_pool_sniper():
             if error_state["fallback"]:
                 _run_rpc_poll_sniper(tracked_programs, seen_signatures)
                 return
-            if timeout_state["streak"] > 0:
-                backoff = min(15, 2 * timeout_state["streak"])
+            # ── Exponential backoff on reconnect ──────────────────────────
+            reconnect_attempts += 1
+            if error_state["rate_limited"]:
+                # 429: aggressive backoff — 30s, 60s, 120s
+                backoff = min(_MAX_RECONNECT_BACKOFF, 30 * (2 ** (reconnect_attempts - 1)))
+                print(f"[Sniper] 429 backoff: waiting {backoff}s before retry (attempt {reconnect_attempts})", flush=True)
+                time.sleep(backoff)
+            elif timeout_state["streak"] > 0:
+                backoff = min(30, 2 * timeout_state["streak"])
                 print(f"[Sniper] WS reconnect backoff {backoff}s", flush=True)
+                time.sleep(backoff)
+            else:
+                # Normal disconnect: gentle backoff — 2s, 4s, 8s … 30s
+                backoff = min(30, 2 * reconnect_attempts)
+                if backoff > 2:
+                    print(f"[Sniper] Reconnect backoff {backoff}s (attempt {reconnect_attempts})", flush=True)
                 time.sleep(backoff)
         except ImportError:
             print("[Sniper] websocket-client not installed — using RPC polling fallback", flush=True)
