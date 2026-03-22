@@ -1,0 +1,16 @@
+.claude/
+.git/
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.db
+*.sqlite
+*.log
+.env
+*.env
+*.jks
+*.keystore
+test_*.py
+.vscode/
+.idea/

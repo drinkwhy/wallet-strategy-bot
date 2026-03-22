@@ -674,32 +674,47 @@ def replay_recent_market_feed(bot, limit=40):
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
+    print("[FATAL] DATABASE_URL not set — app will fail on first DB call", flush=True)
 
-_db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=0, maxconn=20,
-    dsn=DATABASE_URL,
-    cursor_factory=psycopg2.extras.RealDictCursor,
-)
-_db_semaphore = threading.Semaphore(20)   # mirrors maxconn — prevents blocking forever
-print("[Startup] DB pool created (lazy, minconn=0)", flush=True)
+_db_pool = None
+_db_semaphore = threading.Semaphore(15)
+_db_pool_lock = threading.Lock()
+
+def _ensure_db_pool():
+    """Create the DB pool lazily on first use — keeps module import instant."""
+    global _db_pool
+    if _db_pool is not None:
+        return _db_pool
+    with _db_pool_lock:
+        if _db_pool is not None:
+            return _db_pool
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1, maxconn=15,
+            dsn=DATABASE_URL,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            connect_timeout=10,
+        )
+        print("[Startup] DB pool created", flush=True)
+        return _db_pool
+print("[Startup] Module loaded — DB pool deferred to first request", flush=True)
 
 def db():
+    pool = _ensure_db_pool()
     if not _db_semaphore.acquire(timeout=10):
         raise RuntimeError("DB connection pool exhausted (10s timeout)")
     try:
-        conn = _db_pool.getconn()
+        conn = pool.getconn()
     except Exception:
         _db_semaphore.release()
         raise
     conn.autocommit = False
     if getattr(conn, "closed", 0):
         try:
-            _db_pool.putconn(conn, close=True)
+            pool.putconn(conn, close=True)
         except Exception:
             pass
         try:
-            conn = _db_pool.getconn()
+            conn = pool.getconn()
         except Exception:
             _db_semaphore.release()
             raise
@@ -708,12 +723,13 @@ def db():
 
 def db_return(conn):
     """Return a connection to the pool. Call this instead of conn.close()."""
+    pool = _ensure_db_pool()
     try:
         conn.rollback()  # reset any uncommitted state
     except Exception:
         pass
     try:
-        _db_pool.putconn(conn)
+        pool.putconn(conn)
     except Exception:
         pass
     _db_semaphore.release()
@@ -734,7 +750,8 @@ def db_health_check(retries=2):
             last_error = exc
             if conn is not None:
                 try:
-                    _db_pool.putconn(conn, close=True)
+                    _ensure_db_pool().putconn(conn, close=True)
+                    _db_semaphore.release()
                 except Exception:
                     pass
     return False, str(last_error or "unknown database error")
