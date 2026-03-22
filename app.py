@@ -117,6 +117,7 @@ SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
 SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
 REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
 FEE_WALLET          = os.getenv("FEE_WALLET", "")  # your SOL wallet to receive perf fees
+ANKR_RPC            = os.getenv("ANKR_RPC", "")   # optional Ankr premium RPC (e.g. https://rpc.ankr.com/solana/YOUR_KEY)
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
@@ -2319,7 +2320,11 @@ class BotInstance:
 
     def refresh_balance(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
-        for rpc_url in [HELIUS_RPC, "https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]:
+        _fallbacks = [HELIUS_RPC]
+        if ANKR_RPC:
+            _fallbacks.append(ANKR_RPC)
+        _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
+        for rpc_url in _fallbacks:
             try:
                 r = requests.post(rpc_url, json=payload, timeout=5)
                 data = safe_json_response(r)
