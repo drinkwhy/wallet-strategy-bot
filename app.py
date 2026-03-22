@@ -7537,7 +7537,7 @@ def _release_background_lock():
         _background_lock_conn = None
 
 
-atexit.register(_release_background_lock)
+# cleanup registered via atexit in _graceful_shutdown_cleanup below
 
 SEEN_TOKENS_MAX = 50_000
 
@@ -8031,9 +8031,9 @@ def handle_500(e):
     return f"<h1>500</h1><pre>{e}</pre>", 500
 
 
-def _graceful_shutdown(signum, frame):
-    """Stop all running bots and persist positions on SIGTERM/SIGINT."""
-    print(f"[SHUTDOWN] 🛑 Signal {signum} received — stopping all bots...", flush=True)
+def _graceful_shutdown_cleanup():
+    """atexit handler: stop all running bots and release the advisory lock."""
+    print("[SHUTDOWN] 🛑 Stopping all bots...", flush=True)
     with user_bots_lock:
         bots = list(user_bots.values())
     stopped = 0
@@ -8041,23 +8041,13 @@ def _graceful_shutdown(signum, frame):
         try:
             if bot.running:
                 bot.running = False
-                bot.log_msg("🛑 Server shutting down — positions preserved in DB")
                 stopped += 1
         except Exception:
             pass
-    # Give bots a moment to finish current sell cycles
-    time.sleep(2)
-    print(f"[SHUTDOWN] ✅ {stopped} bot(s) stopped. Positions persisted. Exiting.", flush=True)
     _release_background_lock()
-    raise SystemExit(0)
+    print(f"[SHUTDOWN] ✅ {stopped} bot(s) stopped. Exiting.", flush=True)
 
-# Only register custom shutdown handler for `python app.py` — gunicorn manages its own signals
-if os.environ.get("SERVER_SOFTWARE", "").startswith("gunicorn"):
-    print("[Startup] Running under gunicorn — using gunicorn signal handling", flush=True)
-    atexit.register(_release_background_lock)
-else:
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-    signal.signal(signal.SIGINT, _graceful_shutdown)
+atexit.register(_graceful_shutdown_cleanup)
 
 
 @app.route("/healthz")
@@ -8070,6 +8060,9 @@ _db_init_lock = threading.Lock()
 
 @app.before_request
 def _before_request_security():
+    # Skip all heavy work for health check — must respond instantly
+    if request.path == "/healthz":
+        return
     global _db_initialized
     if not _db_initialized:
         with _db_init_lock:
@@ -16651,6 +16644,11 @@ loadBlacklist();
 """
 
 if __name__ == "__main__":
+    # Running directly (python app.py) — init DB and start workers immediately
+    init_db()
+    migrate_db()
+    load_preset_overrides()
+    _db_initialized = True
     ensure_background_workers_started()
     print(f"\n  SolTrader Platform → http://localhost:5000")
     print(f"  Admin account: {ADMIN_EMAIL}")
