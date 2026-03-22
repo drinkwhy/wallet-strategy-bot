@@ -9,6 +9,7 @@ Required .env variables:
 """
 
 import atexit
+import html
 import os, threading, time, base64, json, requests, base58, secrets, hashlib, random
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1992,6 +1993,7 @@ class BotInstance:
         self.hour_start         = time.time()
         self.consecutive_losses = 0
         self.cooldown_until     = 0.0   # retained for API compatibility; cooldown is disabled
+        self._last_buy_ts       = 0.0   # epoch of last successful buy (for cooldown_min)
         self.loss_mints         = {}    # mint -> epoch when the bot last realized a loss on that mint
         self.auto_relax_level   = 0
         self.edge_guard_state   = None
@@ -1999,6 +2001,11 @@ class BotInstance:
         self.edge_guard_checked_at = 0.0
         self.execution_control_checked_at = 0.0
         self.execution_control_key = ""
+        # ── Concurrency lock ──────────────────────────────────────────────────
+        # Per-bot lock that serialises the evaluate_signal → buy path so that
+        # multiple scanner threads cannot cause duplicate buys, exceeded
+        # position limits, or balance overdrafts on the same BotInstance.
+        self._buy_lock = threading.Lock()
         
         # ── Enhanced Trading Systems (Research Paper Implementation) ────────
         self.enhanced_enabled = ENHANCED_SYSTEMS_AVAILABLE
@@ -2941,6 +2948,10 @@ class BotInstance:
         }
 
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, decision_context=None):
+        with self._buy_lock:
+            self._buy_inner(mint, name, price, liq=liq, dev_wallet=dev_wallet, age_min=age_min, decision_context=decision_context)
+
+    def _buy_inner(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, decision_context=None):
         s = self.entry_settings()
         edge_guard = s.get("_edge_guard") or {}
         if not edge_guard.get("allow_new_entries", True):
@@ -2949,6 +2960,13 @@ class BotInstance:
             self.log_msg(f"SKIP {name} — {reason}")
             return
         trade_sol = round(float(s.get("max_buy_sol") or 0), 4)
+        # ── Risk-per-trade cap (risk_per_trade_pct setting) ───────────────────
+        risk_pct = float(s.get("risk_per_trade_pct") or 0)
+        if risk_pct > 0 and self.sol_balance > 0:
+            risk_cap = round(self.sol_balance * risk_pct / 100.0, 4)
+            if trade_sol > risk_cap:
+                self.log_msg(f"Risk cap: {trade_sol:.4f} SOL -> {risk_cap:.4f} SOL ({risk_pct:.1f}% of {self.sol_balance:.4f})")
+                trade_sol = risk_cap
         if trade_sol <= 0:
             reason = edge_guard.get("reason") or "Effective trade size is zero"
             self.log_filter(name, mint, False, reason)
@@ -2968,6 +2986,16 @@ class BotInstance:
             self.log_filter(name, mint, False, rl)
             self.log_msg(f"SKIP {name} — {rl}")
             return
+        # ── Buy cooldown (cooldown_min setting) ──────────────────────────────
+        cooldown_min_setting = float(s.get("cooldown_min") or 0)
+        if cooldown_min_setting > 0 and self._last_buy_ts > 0:
+            elapsed_min = (time.time() - self._last_buy_ts) / 60.0
+            if elapsed_min < cooldown_min_setting:
+                remaining = round(cooldown_min_setting - elapsed_min, 1)
+                reason = f"Buy cooldown active ({remaining:.1f}m remaining of {cooldown_min_setting:.0f}m)"
+                self.log_filter(name, mint, False, reason)
+                self.log_msg(f"SKIP {name} — {reason}")
+                return
         # ── Consolidated token safety path ───────────────────────────────────
         safety = self.pre_buy_safety_check(mint, name=name, dev_wallet=dev_wallet, age_min=age_min, liq=liq)
         if not safety.get("safe"):
@@ -3119,6 +3147,7 @@ class BotInstance:
             except Exception as _e:
                 self.log_msg(f"[WARN] Could not persist position to DB: {_e}")
             self.buys_this_hour     += 1
+            self._last_buy_ts        = time.time()  # for cooldown_min
             self.consecutive_losses  = 0   # reset on successful buy
             policy_note = ""
             if decision_context:
@@ -6303,12 +6332,12 @@ def _auto_tune_from_results(requested_by, summary, run_id):
 
     # Hot-reload into running bot if one exists
     with user_bots_lock:
-        bots = user_bots.get(requested_by, {})
-        for bot in bots.values():
-            if bot.running:
-                bot.settings.update(apply_settings)
-                bot.preset_name = best_name
-                print(f"[AUTO-TUNE] hot-reloaded {best_name} settings into running bot", flush=True)
+        bot = user_bots.get(requested_by)
+        if bot and bot.running:
+            bot.settings.update(strip_auto_relax_state(apply_settings))
+            bot.preset_name = normalize_preset_name(best_name)
+            bot.auto_relax_level = 0
+            print(f"[AUTO-TUNE] hot-reloaded {best_name} settings into running bot", flush=True)
 
     # Log summary for all strategies
     for strat_name, score, wr, pnl, trades, _ in scored:
@@ -8032,7 +8061,7 @@ def handle_500(e):
     import traceback
     traceback.print_exc()
     print(f"[ERROR-500] {e}", flush=True)
-    return f"<h1>500</h1><pre>{e}</pre>", 500
+    return "<h1>500 — Internal Server Error</h1>", 500
 
 
 def _graceful_shutdown_cleanup():
@@ -8323,7 +8352,8 @@ def signup():
                 if "unique" in str(e).lower() or "duplicate" in str(e).lower():
                     error = "Email already registered"
                 else:
-                    error = f"Signup error: {e}"
+                    print(f"[ERROR] Signup: {e}", flush=True)
+                    error = "An unexpected error occurred. Please try again."
     return Response(auth_page("Create Account", "signup", error), mimetype="text/html")
 
 @app.route("/login", methods=["GET","POST"])
@@ -8347,7 +8377,8 @@ def login():
                 return redirect(url_for("dashboard"))
             error = "Invalid email or password"
         except Exception as e:
-            error = f"Login error: {e}"
+            print(f"[ERROR] Login: {e}", flush=True)
+            error = "An unexpected error occurred. Please try again."
     return Response(auth_page("Sign In", "login", error), mimetype="text/html")
 
 @app.route("/logout")
@@ -8387,8 +8418,9 @@ def setup():
                 db_return(conn)
             return redirect(url_for("dashboard"))
         except Exception as e:
-            error = f"Invalid private key: {e}"
-    return Response(SETUP_HTML.replace("{{ERROR}}", error), mimetype="text/html")
+            print(f"[ERROR] Setup invalid key: {e}", flush=True)
+            error = "Invalid private key. Please check and try again."
+    return Response(SETUP_HTML.replace("{{ERROR}}", html.escape(error)), mimetype="text/html")
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 @app.route("/dashboard")
@@ -8426,12 +8458,12 @@ def dashboard():
             upgrade_btn = '<a href="/subscribe/free" class="nbtn" style="background:var(--bg3);border:1px solid var(--grn);color:var(--grn)">Profit Only</a>'
         preset_settings_json = json.dumps(dashboard_preset_settings())
         return Response(DASHBOARD_HTML
-            .replace("{{EMAIL}}", user.get("email", ""))
-            .replace("{{PLAN_LABEL}}", plan_info.get("label", ""))
+            .replace("{{EMAIL}}", html.escape(user.get("email", "")))
+            .replace("{{PLAN_LABEL}}", html.escape(plan_info.get("label", "")))
             .replace("{{UPGRADE_BTN}}", upgrade_btn)
-            .replace("{{PLAN}}", plan_info.get("label", ""))
-            .replace("{{WALLET}}", wallet.get("public_key", ""))
-            .replace("{{PRESET}}", normalize_preset_name((bsettings or {}).get("preset", "balanced")))
+            .replace("{{PLAN}}", html.escape(plan_info.get("label", "")))
+            .replace("{{WALLET}}", html.escape(wallet.get("public_key", "")))
+            .replace("{{PRESET}}", html.escape(normalize_preset_name((bsettings or {}).get("preset", "balanced"))))
             .replace("{{PRESET_SETTINGS}}", preset_settings_json),
             mimetype="text/html"
         )
@@ -8439,7 +8471,7 @@ def dashboard():
         print(f"[ERROR] Dashboard route: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        return Response(f"<h1>Dashboard Error</h1><pre>{e}</pre>", status=500, mimetype="text/html")
+        return Response("<h1>Dashboard Error</h1><p>An unexpected error occurred.</p>", status=500, mimetype="text/html")
 
 # ── API ────────────────────────────────────────────────────────────────────────
 @app.route("/api/state")
@@ -9428,7 +9460,7 @@ def api_quant_shadow_activity():
 @login_required
 def api_quant_opportunity_settings():
     """Apply opportunity-hunter preset — optimized for catching large expansions."""
-    user_id = session.get("user_id", 1)
+    user_id = session["user_id"]
     data = request.get_json(silent=True) or {}
     aggression = (data.get("aggression") or "aggressive").strip().lower()
     if aggression not in ("aggressive", "degen"):
@@ -9477,7 +9509,7 @@ def api_quant_opportunity_settings():
 @login_required
 def api_quant_auto_tune_status():
     """Show current auto-tune state: what strategy is active, last tune time, shadow stats."""
-    user_id = session.get("user_id", 1)
+    user_id = session["user_id"]
     preset_name, settings = load_user_effective_settings(user_id)
 
     conn = db()
@@ -9794,7 +9826,7 @@ def api_quant_backtest_detail(run_id):
 # ── Database cleanup (free space) ──────────────────────────────────────────────
 
 @app.route("/api/db-cleanup", methods=["POST"])
-@login_required
+@admin_required
 def api_db_cleanup():
     """Delete old data to free up Postgres disk space."""
     conn = db()
@@ -11295,7 +11327,8 @@ def subscribe(plan):
         )
         return redirect(checkout.url)
     except Exception as e:
-        return f"Stripe error: {e}", 500
+        print(f"[ERROR] Stripe: {e}", flush=True)
+        return "An error occurred while processing your subscription. Please try again.", 500
 
 @app.route("/subscribe/success")
 @login_required
@@ -11941,7 +11974,7 @@ def auth_page(title, action, error=""):
     other_label = "Sign In" if action=="signup" else "Create Account"
     btn_label   = "Create Account" if action=="signup" else "Sign In"
     subtitle    = "Start your 7-day free trial" if action=="signup" else "Welcome back"
-    err_html    = f'<div class="alert alert-error">{error}</div>' if error else ""
+    err_html    = f'<div class="alert alert-error">{html.escape(error)}</div>' if error else ""
     trust_html  = """<div class="trust" style="margin-top:18px">
       <div class="titem">🔒 AES-256 Encrypted</div>
       <div class="titem">🛡️ Non-Custodial</div>
