@@ -674,47 +674,33 @@ def replay_recent_market_feed(bot, limit=40):
 # ── Database ───────────────────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
-    print("[FATAL] DATABASE_URL not set — app will fail on first DB call", flush=True)
+    raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
-_db_pool = None
-_db_semaphore = threading.Semaphore(15)
-_db_pool_lock = threading.Lock()
-
-def _ensure_db_pool():
-    """Create the DB pool lazily on first use — keeps module import instant."""
-    global _db_pool
-    if _db_pool is not None:
-        return _db_pool
-    with _db_pool_lock:
-        if _db_pool is not None:
-            return _db_pool
-        _db_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1, maxconn=15,
-            dsn=DATABASE_URL,
-            cursor_factory=psycopg2.extras.RealDictCursor,
-            connect_timeout=10,
-        )
-        print("[Startup] DB pool created", flush=True)
-        return _db_pool
-print("[Startup] Module loaded — DB pool deferred to first request", flush=True)
+_db_pool = psycopg2.pool.ThreadedConnectionPool(
+    minconn=1, maxconn=20,
+    dsn=DATABASE_URL,
+    cursor_factory=psycopg2.extras.RealDictCursor,
+    connect_timeout=10,
+)
+_db_semaphore = threading.Semaphore(20)
+print("[Startup] DB pool created", flush=True)
 
 def db():
-    pool = _ensure_db_pool()
     if not _db_semaphore.acquire(timeout=10):
         raise RuntimeError("DB connection pool exhausted (10s timeout)")
     try:
-        conn = pool.getconn()
+        conn = _db_pool.getconn()
     except Exception:
         _db_semaphore.release()
         raise
     conn.autocommit = False
     if getattr(conn, "closed", 0):
         try:
-            pool.putconn(conn, close=True)
+            _db_pool.putconn(conn, close=True)
         except Exception:
             pass
         try:
-            conn = pool.getconn()
+            conn = _db_pool.getconn()
         except Exception:
             _db_semaphore.release()
             raise
@@ -723,13 +709,12 @@ def db():
 
 def db_return(conn):
     """Return a connection to the pool. Call this instead of conn.close()."""
-    pool = _ensure_db_pool()
     try:
-        conn.rollback()  # reset any uncommitted state
+        conn.rollback()
     except Exception:
         pass
     try:
-        pool.putconn(conn)
+        _db_pool.putconn(conn)
     except Exception:
         pass
     _db_semaphore.release()
@@ -750,7 +735,7 @@ def db_health_check(retries=2):
             last_error = exc
             if conn is not None:
                 try:
-                    _ensure_db_pool().putconn(conn, close=True)
+                    _db_pool.putconn(conn, close=True)
                     _db_semaphore.release()
                 except Exception:
                     pass
@@ -1239,7 +1224,7 @@ def init_db():
     finally:
         db_return(conn)
 
-_db_initialized = False  # deferred to first request so gunicorn worker boots instantly
+init_db()
 
 # migrate existing DB — add new columns if missing
 def migrate_db():
@@ -1647,7 +1632,7 @@ def migrate_db():
         conn.commit()
     finally:
         db_return(conn)
-# migrate_db() deferred to first request (see @app.before_request)
+migrate_db()
 
 
 def load_preset_overrides():
@@ -1672,7 +1657,7 @@ def load_preset_overrides():
             PRESETS[preset].update(overrides)
 
 
-# load_preset_overrides() deferred to first request — see @app.before_request
+load_preset_overrides()
 
 def make_referral_code():
     return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
@@ -8037,8 +8022,10 @@ app.config.update(
     SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
-# Background workers are started lazily on first request via @app.before_request
-# Do NOT start them at module level — it blocks gunicorn worker startup and causes 502
+try:
+    ensure_background_workers_started()
+except Exception as _e:
+    print(f"[WARN] Background workers not started at module load: {_e}")
 
 @app.errorhandler(500)
 def handle_500(e):
@@ -8073,25 +8060,10 @@ def _healthz():
     return "ok", 200
 
 
-_db_init_lock = threading.Lock()
-
 @app.before_request
 def _before_request_security():
-    # Skip all heavy work for health check — must respond instantly
     if request.path == "/healthz":
         return
-    global _db_initialized
-    if not _db_initialized:
-        with _db_init_lock:
-            if not _db_initialized:
-                try:
-                    init_db()
-                    migrate_db()
-                    load_preset_overrides()
-                    _db_initialized = True
-                    print("[Startup] ✅ DB initialized on first request", flush=True)
-                except Exception as _e:
-                    print(f"[WARN] DB init failed: {_e}", flush=True)
     ensure_background_workers_started()
 
 
@@ -16661,11 +16633,6 @@ loadBlacklist();
 """
 
 if __name__ == "__main__":
-    # Running directly (python app.py) — init DB and start workers immediately
-    init_db()
-    migrate_db()
-    load_preset_overrides()
-    _db_initialized = True
     ensure_background_workers_started()
     print(f"\n  SolTrader Platform → http://localhost:5000")
     print(f"  Admin account: {ADMIN_EMAIL}")
