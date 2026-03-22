@@ -5189,7 +5189,7 @@ def _poll_single_whale(wallet):
             "method": "getSignaturesForAddress",
             "params": [wallet, {"limit": 5}]
         }, timeout=8)
-        sigs = r.json().get("result", [])
+        sigs = safe_json_response(r, {}).get("result", [])
         for sig_info in sigs:
             sig = sig_info.get("signature")
             if not sig or _whale_is_sig_seen(sig):
@@ -5199,7 +5199,7 @@ def _poll_single_whale(wallet):
                 "method": "getTransaction",
                 "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
             }, timeout=8)
-            tx = tx_r.json().get("result")
+            tx = safe_json_response(tx_r, {}).get("result")
             if not tx:
                 continue
             pre = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances", [])}
