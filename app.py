@@ -1221,7 +1221,12 @@ def init_db():
     finally:
         db_return(conn)
 
-init_db()
+try:
+    init_db()
+except Exception as _init_err:
+    print(f"[WARN] init_db failed (will retry on first request): {_init_err}", flush=True)
+
+_db_initialized = True  # will be set False if init failed, triggering retry
 
 # migrate existing DB — add new columns if missing
 def migrate_db():
@@ -1629,7 +1634,11 @@ def migrate_db():
         conn.commit()
     finally:
         db_return(conn)
-migrate_db()
+try:
+    migrate_db()
+except Exception as _mig_err:
+    print(f"[WARN] migrate_db failed (will retry on first request): {_mig_err}", flush=True)
+    _db_initialized = False
 
 
 def load_preset_overrides():
@@ -8019,10 +8028,8 @@ app.config.update(
     SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
-try:
-    ensure_background_workers_started()
-except Exception as _e:
-    print(f"[WARN] Background workers not started at module load: {_e}")
+# Background workers are started lazily on first request via @app.before_request
+# Do NOT start them at module level — it blocks gunicorn worker startup and causes 502
 
 @app.errorhandler(500)
 def handle_500(e):
@@ -8058,6 +8065,14 @@ signal.signal(signal.SIGINT, _graceful_shutdown)
 
 @app.before_request
 def _before_request_security():
+    global _db_initialized
+    if not _db_initialized:
+        try:
+            init_db()
+            migrate_db()
+            _db_initialized = True
+        except Exception as _e:
+            print(f"[WARN] DB init retry failed: {_e}", flush=True)
     ensure_background_workers_started()
 
 
