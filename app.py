@@ -671,20 +671,31 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
 _db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=5, maxconn=35,
+    minconn=1, maxconn=20,
     dsn=DATABASE_URL,
     cursor_factory=psycopg2.extras.RealDictCursor,
 )
+_db_semaphore = threading.Semaphore(20)   # mirrors maxconn — prevents blocking forever
 
 def db():
-    conn = _db_pool.getconn()
+    if not _db_semaphore.acquire(timeout=10):
+        raise RuntimeError("DB connection pool exhausted (10s timeout)")
+    try:
+        conn = _db_pool.getconn()
+    except Exception:
+        _db_semaphore.release()
+        raise
     conn.autocommit = False
     if getattr(conn, "closed", 0):
         try:
             _db_pool.putconn(conn, close=True)
         except Exception:
             pass
-        conn = _db_pool.getconn()
+        try:
+            conn = _db_pool.getconn()
+        except Exception:
+            _db_semaphore.release()
+            raise
         conn.autocommit = False
     return conn
 
@@ -694,7 +705,11 @@ def db_return(conn):
         conn.rollback()  # reset any uncommitted state
     except Exception:
         pass
-    _db_pool.putconn(conn)
+    try:
+        _db_pool.putconn(conn)
+    except Exception:
+        pass
+    _db_semaphore.release()
 
 
 def db_health_check(retries=2):
@@ -7665,11 +7680,17 @@ def _auto_prune_db():
                         print(f"[DB-PRUNE] {table}: error {te}", flush=True)
                 if total_deleted > 0:
                     conn.commit()
-                    # VACUUM in autocommit
-                    conn.autocommit = True
-                    cur.execute("VACUUM")
-                    conn.autocommit = False
-                    print(f"[DB-PRUNE] Done: {total_deleted} total rows pruned + VACUUM", flush=True)
+                    print(f"[DB-PRUNE] Done: {total_deleted} total rows pruned", flush=True)
+                    # VACUUM on a separate connection so we don't hold a pool slot
+                    try:
+                        _vconn = psycopg2.connect(DATABASE_URL)
+                        _vconn.autocommit = True
+                        with _vconn.cursor() as _vc:
+                            _vc.execute("VACUUM")
+                        _vconn.close()
+                        print(f"[DB-PRUNE] VACUUM complete", flush=True)
+                    except Exception as _ve:
+                        print(f"[DB-PRUNE] VACUUM skipped: {_ve}", flush=True)
             finally:
                 db_return(conn)
         except Exception as e:
@@ -8067,7 +8088,13 @@ def _apply_security_headers(resp):
 
 @app.route("/health")
 def health_check():
-    """Health check endpoint for Railway / load balancers."""
+    """Lightweight health check — always 200 so Railway keeps the service alive.
+    Use /health/db for a deep check that includes the database."""
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/health/db")
+def health_check_db():
+    """Deep health check that verifies the database connection."""
     ok, error = db_health_check(retries=2)
     if ok:
         return jsonify({"status": "ok", "db": "ok"}), 200
