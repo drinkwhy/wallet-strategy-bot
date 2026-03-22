@@ -284,6 +284,8 @@ PRESETS = {
         "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
         "listing_sniper":True,
+        "min_composite_score":20,"min_confidence":0.45,"min_buy_sell_ratio":1.2,
+        "min_smart_wallet_buys":1,"min_net_flow_sol":0.5,"min_unique_buyers":3,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
@@ -299,6 +301,8 @@ PRESETS = {
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
+        "min_composite_score":15,"min_confidence":0.35,"min_buy_sell_ratio":1.0,
+        "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
     },
     "aggressive": {
         "label":"Aggressive — Higher Risk / Bigger Swings",
@@ -314,6 +318,8 @@ PRESETS = {
         "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
         "listing_sniper":True,
+        "min_composite_score":15,"min_confidence":0.25,"min_buy_sell_ratio":0.8,
+        "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
     },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
@@ -329,6 +335,8 @@ PRESETS = {
         "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
         "listing_sniper":True,
+        "min_composite_score":15,"min_confidence":0.15,"min_buy_sell_ratio":0.5,
+        "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
     },
     "custom": {
         "label":"Custom — Manual Exit Tuning",
@@ -5346,12 +5354,20 @@ def _process_dex_pair(p):
         return None
 
 
-def _shadow_strategy_settings():
-    return {
+def _shadow_strategy_settings(user_id=None):
+    strategies = {
         strategy_name: dict(PRESETS.get(strategy_name, {}))
         for strategy_name in CANONICAL_STRATEGIES
         if strategy_name in PRESETS
     }
+    if user_id:
+        try:
+            _preset_name, live_settings = load_user_effective_settings(user_id)
+            if live_settings and isinstance(live_settings, dict):
+                strategies["live"] = dict(live_settings)
+        except Exception as e:
+            print(f"[SHADOW] failed to load live settings for user {user_id}: {e}", flush=True)
+    return strategies
 
 
 def _classify_market_event(previous_row, info):
@@ -5489,11 +5505,11 @@ def persist_liquidity_delta_event(mint, previous_row, info, event_type):
         db_return(conn)
 
 
-def _record_market_intelligence(info, include_strategy_decisions=True, include_model_decisions=True):
+def _record_market_intelligence(info, include_strategy_decisions=True, include_model_decisions=True, user_id=None):
     intel = info.get("intel") or {}
     snapshot = build_feature_snapshot(info, intel)
     flow_snapshot = build_flow_snapshot(info, intel)
-    strategies = _shadow_strategy_settings()
+    strategies = _shadow_strategy_settings(user_id=user_id)
     conn = db()
     try:
         cur = conn.cursor()
@@ -5634,8 +5650,8 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                     trough_price = LEAST(trough_price, %s),
                     max_upside_pct = GREATEST(COALESCE(max_upside_pct, 0),
                         ((%s - entry_price) / NULLIF(entry_price, 0)) * 100),
-                    max_drawdown_pct = GREATEST(COALESCE(max_drawdown_pct, 0),
-                        ((entry_price - %s) / NULLIF(entry_price, 0)) * 100),
+                    max_drawdown_pct = LEAST(COALESCE(max_drawdown_pct, 0),
+                        ((%s - entry_price) / NULLIF(entry_price, 0)) * 100),
                     observations = COALESCE(observations, 0) + 1,
                     last_seen_at = NOW()
                 WHERE mint = %s AND status = 'open'
@@ -5788,6 +5804,12 @@ def execution_tape_monitor():
                 rows = cur.fetchall()
             finally:
                 db_return(conn)
+            _active_uid = None
+            with user_bots_lock:
+                for _uid, _bot in user_bots.items():
+                    if _bot.running:
+                        _active_uid = _uid
+                        break
             for row in rows:
                 intel = refresh_token_intel(row.get("mint"), base_info={
                     "mint": row.get("mint"),
@@ -5833,6 +5855,7 @@ def execution_tape_monitor():
                     tape_info,
                     include_strategy_decisions=True,
                     include_model_decisions=True,
+                    user_id=_active_uid,
                 )
                 time.sleep(2)
         except Exception as e:
@@ -6446,10 +6469,21 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
             "replay_mode": normalized_mode,
         })
         # Auto-tune: apply the best strategy from this backtest to live settings
+        # Check if auto_promote is enabled for this user before proceeding
+        _ap_conn = db()
         try:
-            _auto_tune_from_results(requested_by, summary, run_id)
-        except Exception as tune_err:
-            print(f"[AUTO-TUNE] error after backtest {run_id}: {tune_err}", flush=True)
+            _ap_cur = _ap_conn.cursor()
+            _ap_cur.execute("SELECT auto_promote FROM bot_settings WHERE user_id=%s", (requested_by,))
+            _ap_row = _ap_cur.fetchone()
+        finally:
+            db_return(_ap_conn)
+        if not _ap_row or not _ap_row.get("auto_promote"):
+            print(f"[AUTO-TUNE] Skipped — auto_promote disabled for U{requested_by}", flush=True)
+        else:
+            try:
+                _auto_tune_from_results(requested_by, summary, run_id)
+            except Exception as tune_err:
+                print(f"[AUTO-TUNE] error after backtest {run_id}: {tune_err}", flush=True)
     except Exception as e:
         conn = db()
         try:
@@ -6687,10 +6721,21 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
         print(f"[OPTIMIZE] run {run_id} complete: {len(all_best_trades)} trades saved (best levels only)", flush=True)
 
         # Auto-tune: apply the best strategy from this optimization to live settings
+        # Check if auto_promote is enabled for this user before proceeding
+        _ap_conn = db()
         try:
-            _auto_tune_from_results(requested_by, opt_summary, run_id)
-        except Exception as tune_err:
-            print(f"[AUTO-TUNE] error after optimization {run_id}: {tune_err}", flush=True)
+            _ap_cur = _ap_conn.cursor()
+            _ap_cur.execute("SELECT auto_promote FROM bot_settings WHERE user_id=%s", (requested_by,))
+            _ap_row = _ap_cur.fetchone()
+        finally:
+            db_return(_ap_conn)
+        if not _ap_row or not _ap_row.get("auto_promote"):
+            print(f"[AUTO-TUNE] Skipped — auto_promote disabled for U{requested_by}", flush=True)
+        else:
+            try:
+                _auto_tune_from_results(requested_by, opt_summary, run_id)
+            except Exception as tune_err:
+                print(f"[AUTO-TUNE] error after optimization {run_id}: {tune_err}", flush=True)
 
     except Exception as e:
         conn = db()
@@ -6773,7 +6818,13 @@ def _broadcast_signal(info):
             "source": info.get("source") or "scanner",
         })
     record_price(mint, info["price"])
-    _record_market_intelligence(info)
+    _active_uid = None
+    with user_bots_lock:
+        for _uid, _bot in user_bots.items():
+            if _bot.running:
+                _active_uid = _uid
+                break
+    _record_market_intelligence(info, user_id=_active_uid)
     # Feed momentum sniper tracker so it can detect surges across scans
     _momentum_track(
         mint, info.get("price", 0), info.get("vol", 0), info.get("mc", 0),
@@ -7723,6 +7774,11 @@ _SWEEP_FEATURE_TO_SETTING = {
     "composite_score": ("min_score", int),
     "volume_spike_ratio": ("min_volume_spike_mult", float),
     "holder_growth_1h": ("min_holder_growth_pct", float),
+    "confidence": ("min_confidence", float),
+    "buy_sell_ratio": ("min_buy_sell_ratio", float),
+    "smart_wallet_buys": ("min_smart_wallet_buys", int),
+    "net_flow_sol": ("min_net_flow_sol", float),
+    "unique_buyer_count": ("min_unique_buyers", int),
 }
 
 # Expanded threshold plan covering more granular values than the default
@@ -7937,16 +7993,17 @@ def _shadow_auto_tune():
 
             summary = {"strategies": strategies, "per_strategy": per_strategy}
 
-            # Find a user_id to attribute the tune to (pick first user with bot_settings)
+            # Find ALL users who have auto_promote enabled
             conn = db()
             try:
                 cur = conn.cursor()
-                cur.execute("SELECT user_id FROM bot_settings ORDER BY user_id LIMIT 1")
-                user_row = cur.fetchone()
+                cur.execute("SELECT user_id FROM bot_settings WHERE auto_promote = 1")
+                auto_promote_rows = cur.fetchall()
             finally:
                 db_return(conn)
 
-            user_id = (user_row or {}).get("user_id", 1)
+            auto_promote_user_ids = [r["user_id"] for r in auto_promote_rows if r.get("user_id")]
+
             print(f"[SHADOW-TUNE] evaluating {len(rows)} strategies from live shadow data (48h window)", flush=True)
             for sname, data in strategies.items():
                 print(f"[SHADOW-TUNE]   {sname}: {data['trades_closed']} trades, "
@@ -7966,7 +8023,17 @@ def _shadow_auto_tune():
                         print(f"[SHADOW-TUNE]   {regime_name} regime: {rdata['token_count']} tokens, "
                               f"top edge = {top['label']} ({top['edge']:+.1f})", flush=True)
 
-            _auto_tune_from_results(user_id, summary, f"shadow-live-{int(time.time())}")
+            # Tune each auto_promote user independently
+            if not auto_promote_user_ids:
+                print(f"[AUTO-TUNE] Skipped — no users have auto_promote enabled", flush=True)
+            else:
+                print(f"[AUTO-TUNE] tuning {len(auto_promote_user_ids)} user(s) with auto_promote: {auto_promote_user_ids}", flush=True)
+                for uid in auto_promote_user_ids:
+                    try:
+                        _auto_tune_from_results(uid, summary, f"shadow-live-{int(time.time())}")
+                        print(f"[AUTO-TUNE] U{uid} tuned successfully", flush=True)
+                    except Exception as tune_err:
+                        print(f"[AUTO-TUNE] U{uid} tune failed: {tune_err}", flush=True)
             _last_shadow_tune_at = time.time()
 
         except Exception as e:
