@@ -7285,51 +7285,24 @@ def _start_bot_from_row(row):
     return uid, bot
 
 def auto_restart_bots():
-    """Restart bots that were running before a server restart, then monitor for dead threads."""
+    """Monitor for dead bot threads (user must click Start Bot manually)."""
     time.sleep(5)  # wait for app to fully initialize
-    # Phase 1: Initial restart from DB
+    # Phase 1: Clear stale is_running flags — bots only start when user clicks Start Bot
     try:
         conn = db()
         try:
             cur = conn.cursor()
-            cur.execute("""
-                SELECT bs.user_id, bs.preset, bs.run_mode, bs.run_duration_min, bs.profit_target_sol,
-                       bs.max_correlated, bs.drawdown_limit_sol, bs.custom_settings,
-                       bs.execution_mode, bs.decision_policy, bs.model_threshold, bs.auto_promote,
-                       bs.auto_promote_window_days, bs.auto_promote_min_reports, bs.auto_promote_lock_minutes,
-                       bs.active_policy, bs.active_policy_source, bs.active_policy_report_id,
-                       bs.active_policy_updated_at, bs.auto_promote_locked_until,
-                       w.encrypted_key, u.plan, u.email
-                FROM bot_settings bs
-                JOIN wallets w ON w.user_id = bs.user_id
-                JOIN users u ON u.id = bs.user_id
-                WHERE bs.is_running = 1
-            """)
-            rows = cur.fetchall()
+            cur.execute("UPDATE bot_settings SET is_running = 0 WHERE is_running = 1")
+            cleared = cur.rowcount
+            conn.commit()
         finally:
             db_return(conn)
-        restarted = 0
-        for row in rows:
-            uid = row["user_id"]
-            try:
-                _start_bot_from_row(row)
-                restarted += 1
-                print(f"[AutoRestart] ✅ U{uid} restarted ({row['preset']})", flush=True)
-            except Exception as e:
-                print(f"[AutoRestart] ❌ U{uid} failed: {e}", flush=True)
-                try:
-                    _conn = db()
-                    try:
-                        _conn.cursor().execute("UPDATE bot_settings SET is_running=0 WHERE user_id=%s", (uid,))
-                        _conn.commit()
-                    finally:
-                        db_return(_conn)
-                except Exception:
-                    pass
-        if restarted:
-            print(f"[AutoRestart] 🔄 Restarted {restarted}/{len(rows)} bot(s)", flush=True)
+        if cleared:
+            print(f"[Startup] 🛑 Cleared is_running flag for {cleared} bot(s) — waiting for manual start", flush=True)
+        else:
+            print(f"[Startup] ✅ No stale bot flags to clear", flush=True)
     except Exception as e:
-        print(f"[AutoRestart] startup error: {e}", flush=True)
+        print(f"[Startup] error clearing bot flags: {e}", flush=True)
 
     # Phase 2: Dead-thread watchdog — check every 60s for crashed bot threads
     while True:
