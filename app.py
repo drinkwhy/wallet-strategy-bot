@@ -3697,6 +3697,16 @@ class BotInstance:
             self.sell(mint, 1.0, "CASHOUT")
 
     def run(self):
+        try:
+            self._run_inner()
+        except Exception as e:
+            # Catch-all: if anything escapes the main loop, log it so the
+            # watchdog can detect the dead thread and auto-restart.
+            self.log_msg(f"🔴 FATAL run() crash: {e}")
+            print(f"[BOT-FATAL] {getattr(self, 'user_id', '?')}: {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+    def _run_inner(self):
         # Retry balance fetch on startup — RPC may be degraded
         for attempt in range(5):
             self.refresh_balance()
@@ -7504,6 +7514,54 @@ def _prune_seen_tokens():
                 print(f"[PRUNE] Cleared seen_tokens ({size} entries)", flush=True)
 
 
+def _self_ping_keepalive():
+    """Ping our own /health endpoint every 4 minutes to prevent Railway from
+    idling the service when there is no browser traffic (e.g. overnight)."""
+    import gc
+    _PING_INTERVAL = 240  # 4 minutes
+    _MEM_LOG_INTERVAL = 900  # log memory every 15 min
+    _last_mem_log = 0
+    # Wait for server to be fully ready
+    time.sleep(30)
+    port = int(os.getenv("PORT", 5000))
+    url = f"http://127.0.0.1:{port}/health"
+    consecutive_failures = 0
+    while True:
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                print(f"[KeepAlive] ⚠️ /health returned {resp.status_code} ({consecutive_failures}x)", flush=True)
+        except Exception as e:
+            consecutive_failures += 1
+            print(f"[KeepAlive] ⚠️ ping failed ({consecutive_failures}x): {e}", flush=True)
+
+        # Periodic memory monitoring
+        now = time.time()
+        if now - _last_mem_log > _MEM_LOG_INTERVAL:
+            _last_mem_log = now
+            try:
+                import resource
+                mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            except ImportError:
+                # Windows / fallback
+                try:
+                    import psutil
+                    mem_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+                except ImportError:
+                    mem_mb = 0
+            if mem_mb > 0:
+                print(f"[KeepAlive] 📊 Memory: {mem_mb:.0f} MB | Threads: {threading.active_count()}", flush=True)
+                # Force GC if memory is getting high (>450 MB)
+                if mem_mb > 450:
+                    gc.collect()
+                    print(f"[KeepAlive] 🧹 Forced GC (memory was {mem_mb:.0f} MB)", flush=True)
+
+        time.sleep(_PING_INTERVAL)
+
+
 def _acquire_background_worker_lock():
     global _background_lock_conn
     if _background_lock_conn is not None:
@@ -7841,6 +7899,33 @@ def _shadow_auto_tune():
         time.sleep(_SHADOW_TUNE_INTERVAL)
 
 
+_background_worker_threads = {}  # {func_name: (thread, target_func)}
+
+def _background_worker_watchdog():
+    """Monitor all background worker threads and restart any that have died.
+    This is the last line of defence — if any worker (including auto_restart_bots)
+    crashes, this will bring it back."""
+    time.sleep(120)  # let everything stabilize first
+    while True:
+        try:
+            dead = []
+            for name, (thread, target) in list(_background_worker_threads.items()):
+                if not thread.is_alive():
+                    dead.append((name, target))
+            for name, target in dead:
+                print(f"[WorkerWatchdog] 🔴 '{name}' died — restarting", flush=True)
+                try:
+                    t = threading.Thread(target=target, daemon=True, name=f"bg-{name}")
+                    t.start()
+                    _background_worker_threads[name] = (t, target)
+                    print(f"[WorkerWatchdog] ✅ '{name}' restarted", flush=True)
+                except Exception as e:
+                    print(f"[WorkerWatchdog] ❌ '{name}' restart failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[WorkerWatchdog] error: {e}", flush=True)
+        time.sleep(90)  # check every 90s
+
+
 def ensure_background_workers_started():
     global _background_workers_started
     if _background_workers_started:
@@ -7868,9 +7953,15 @@ def ensure_background_workers_started():
             _prune_seen_tokens,
             _auto_prune_db,
             _shadow_auto_tune,
+            _self_ping_keepalive,
         ]
         for target in worker_targets:
-            threading.Thread(target=target, daemon=True).start()
+            t = threading.Thread(target=target, daemon=True, name=f"bg-{target.__name__}")
+            t.start()
+            _background_worker_threads[target.__name__] = (t, target)
+        # Start the watchdog last — it monitors everything above
+        wd = threading.Thread(target=_background_worker_watchdog, daemon=True, name="bg-worker-watchdog")
+        wd.start()
         _background_workers_started = True
 
 
