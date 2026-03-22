@@ -3031,6 +3031,41 @@ class BotInstance:
         if mint in self.positions:
             self.log_msg(f"SKIP {name} — already in position")
             return
+        # ── Live market re-validation ────────────────────────────────────────
+        # Filter ran on scanner data which may be stale.  Quick DexScreener
+        # lookup to confirm the token still meets the minimum thresholds.
+        try:
+            _dex = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+            _pairs = safe_json_response(_dex)
+            if _pairs and isinstance(_pairs, dict):
+                _p = next((p for p in (_pairs.get("pairs") or []) if p.get("chainId") == "solana"), None)
+                if _p:
+                    live_mc  = float(_p.get("marketCap") or 0)
+                    live_liq = float((_p.get("liquidity") or {}).get("usd") or 0)
+                    live_chg = float((_p.get("priceChange") or {}).get("h1") or 0)
+                    min_mc   = float(s.get("min_mc", 0) or 0)
+                    max_mc   = float(s.get("max_mc", 999999) or 999999)
+                    min_liq  = float(s.get("min_liq", 0) or 0)
+                    if live_mc > 0 and not (min_mc <= live_mc <= max_mc):
+                        reason = f"Live MC ${live_mc:,.0f} outside [{min_mc:,}–{max_mc:,}] (was valid at scan)"
+                        self.log_filter(name, mint, False, reason)
+                        self.log_msg(f"SKIP {name} — {reason}")
+                        return
+                    if min_liq > 0 and live_liq > 0 and live_liq < min_liq:
+                        reason = f"Live liquidity ${live_liq:,.0f} < min ${min_liq:,.0f} (drained since scan)"
+                        self.log_filter(name, mint, False, reason)
+                        self.log_msg(f"SKIP {name} — {reason}")
+                        return
+                    if live_chg <= -30:
+                        reason = f"Live 1h change {live_chg:+.0f}% — dumping since scan"
+                        self.log_filter(name, mint, False, reason)
+                        self.log_msg(f"SKIP {name} — {reason}")
+                        return
+                    # Update liq for dynamic slippage calc
+                    liq = live_liq or liq
+        except Exception as _e:
+            print(f"[WARN] Live re-check failed for {name}: {_e}", flush=True)
+            # Continue with original data — don't block buy on a DexScreener hiccup
         # Dynamic slippage
         slippage = dynamic_slippage_bps(liq)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
