@@ -2319,10 +2319,12 @@ class BotInstance:
 
     def refresh_balance(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
-        for rpc_url in [HELIUS_RPC, "https://rpc.ankr.com/solana", "https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]:
+        for rpc_url in [HELIUS_RPC, "https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]:
             try:
                 r = requests.post(rpc_url, json=payload, timeout=5)
-                data = r.json()
+                data = safe_json_response(r)
+                if not data:
+                    continue
                 if "error" in data:
                     print(f"[WARN] Balance RPC error from {rpc_url[:40]}: {data['error']}", flush=True)
                     continue
