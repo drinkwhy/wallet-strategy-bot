@@ -677,11 +677,12 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
 _db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=1, maxconn=20,
+    minconn=0, maxconn=20,
     dsn=DATABASE_URL,
     cursor_factory=psycopg2.extras.RealDictCursor,
 )
 _db_semaphore = threading.Semaphore(20)   # mirrors maxconn — prevents blocking forever
+print("[Startup] DB pool created (lazy, minconn=0)", flush=True)
 
 def db():
     if not _db_semaphore.acquire(timeout=10):
@@ -1221,12 +1222,7 @@ def init_db():
     finally:
         db_return(conn)
 
-try:
-    init_db()
-except Exception as _init_err:
-    print(f"[WARN] init_db failed (will retry on first request): {_init_err}", flush=True)
-
-_db_initialized = True  # will be set False if init failed, triggering retry
+_db_initialized = False  # deferred to first request so gunicorn worker boots instantly
 
 # migrate existing DB — add new columns if missing
 def migrate_db():
@@ -1634,11 +1630,7 @@ def migrate_db():
         conn.commit()
     finally:
         db_return(conn)
-try:
-    migrate_db()
-except Exception as _mig_err:
-    print(f"[WARN] migrate_db failed (will retry on first request): {_mig_err}", flush=True)
-    _db_initialized = False
+# migrate_db() deferred to first request (see @app.before_request)
 
 
 def load_preset_overrides():
@@ -1663,7 +1655,7 @@ def load_preset_overrides():
             PRESETS[preset].update(overrides)
 
 
-load_preset_overrides()
+# load_preset_overrides() deferred to first request — see @app.before_request
 
 def make_referral_code():
     return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
@@ -8059,20 +8051,37 @@ def _graceful_shutdown(signum, frame):
     _release_background_lock()
     raise SystemExit(0)
 
-signal.signal(signal.SIGTERM, _graceful_shutdown)
-signal.signal(signal.SIGINT, _graceful_shutdown)
+# Only register custom shutdown handler for `python app.py` — gunicorn manages its own signals
+if os.environ.get("SERVER_SOFTWARE", "").startswith("gunicorn"):
+    print("[Startup] Running under gunicorn — using gunicorn signal handling", flush=True)
+    atexit.register(_release_background_lock)
+else:
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
 
+
+@app.route("/healthz")
+def _healthz():
+    """Lightweight health check — no DB, no auth, instant response."""
+    return "ok", 200
+
+
+_db_init_lock = threading.Lock()
 
 @app.before_request
 def _before_request_security():
     global _db_initialized
     if not _db_initialized:
-        try:
-            init_db()
-            migrate_db()
-            _db_initialized = True
-        except Exception as _e:
-            print(f"[WARN] DB init retry failed: {_e}", flush=True)
+        with _db_init_lock:
+            if not _db_initialized:
+                try:
+                    init_db()
+                    migrate_db()
+                    load_preset_overrides()
+                    _db_initialized = True
+                    print("[Startup] ✅ DB initialized on first request", flush=True)
+                except Exception as _e:
+                    print(f"[WARN] DB init failed: {_e}", flush=True)
     ensure_background_workers_started()
 
 
