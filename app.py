@@ -117,7 +117,13 @@ SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
 SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
 REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
 FEE_WALLET          = os.getenv("FEE_WALLET", "")  # your SOL wallet to receive perf fees
-ANKR_RPC            = os.getenv("ANKR_RPC", "")   # optional Ankr premium RPC (e.g. https://rpc.ankr.com/solana/YOUR_KEY)
+ANKR_RPC            = os.getenv("ANKR_RPC", "").strip()
+# Sanitize: Railway UI sometimes stores "Value: https://..." — strip the prefix
+if ANKR_RPC.lower().startswith("value:"):
+    ANKR_RPC = ANKR_RPC.split(":", 1)[1].strip()
+if ANKR_RPC and not ANKR_RPC.startswith("http"):
+    print(f"[WARN] ANKR_RPC ignored — not a valid URL: {ANKR_RPC[:60]}", flush=True)
+    ANKR_RPC = ""
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
@@ -2217,8 +2223,13 @@ class BotInstance:
             if len(exit_checks) >= 5 and all(not row.get("ok") for row in exit_checks):
                 return "Recent exit simulations all failed"
         rpc_stats = rpc_health_snapshot(window_sec=900)
-        if rpc_stats["total"] >= 12 and (rpc_stats["fail_rate"] >= 55 or rpc_stats["p95_ms"] >= 4500):
-            return f"RPC degraded — fail {rpc_stats['fail_rate']:.0f}% / p95 {rpc_stats['p95_ms']:.0f}ms"
+        # Only consider actual Solana RPC sources — exclude DexScreener/third-party APIs
+        rpc_only = [s for s in rpc_stats.get("by_source", []) if s["source"] not in ("dexscreener",)]
+        rpc_total = sum(s["total"] for s in rpc_only)
+        rpc_ok = sum(s["ok"] for s in rpc_only)
+        rpc_fail_rate = round((1 - (rpc_ok / rpc_total)) * 100, 1) if rpc_total else 0.0
+        if rpc_total >= 12 and (rpc_fail_rate >= 55 or rpc_stats["p95_ms"] >= 4500):
+            return f"RPC degraded — fail {rpc_fail_rate:.0f}% / p95 {rpc_stats['p95_ms']:.0f}ms"
         return None
 
     def log_msg(self, msg):
