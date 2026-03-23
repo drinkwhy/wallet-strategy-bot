@@ -8992,6 +8992,26 @@ def api_market_feed():
     tokens = sorted(latest.values(), key=lambda item: int(item.get("ts", 0) or 0), reverse=True)
     return jsonify(tokens[:40])
 
+@app.route("/api/paper-prices", methods=["POST"])
+@login_required
+def api_paper_prices():
+    """Return current prices for a list of mints from the market feed cache."""
+    mints = (request.json or {}).get("mints", [])
+    if not isinstance(mints, list) or len(mints) > 30:
+        return jsonify({})
+    wanted = set(mints)
+    prices = {}
+    for item in list(market_feed):
+        m = item.get("mint")
+        if m in wanted and m not in prices:
+            prices[m] = {
+                "price": item.get("price", 0),
+                "mc": item.get("mc", 0),
+                "name": item.get("name", ""),
+                "symbol": item.get("symbol", ""),
+            }
+    return jsonify(prices)
+
 @app.route("/api/manual-buy", methods=["POST"])
 @login_required
 def api_manual_buy():
@@ -12797,6 +12817,7 @@ DASHBOARD_HTML = _CSS + """
     <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
     <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
     <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Replay runs and strategy research</span></button>
+    <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')"><span class="tab-btn-label">Paper</span><span class="tab-btn-meta">Simulated trades, no real money</span></button>
   </div>
 
   <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
@@ -13625,6 +13646,60 @@ DASHBOARD_HTML = _CSS + """
       </div>
     </div>
 
+    <!-- ── Paper Trading Tab ─────────────────────────────────────────────── -->
+    <div id="tab-paper" class="tab-pane">
+      <div style="max-width:900px;margin:0 auto">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+          <h2 style="margin:0;font-size:18px;color:var(--t1)">Paper Trading</h2>
+          <span style="font-size:12px;color:var(--t3)">Simulated trades using your current bot settings &mdash; no real money</span>
+        </div>
+        <!-- Controls -->
+        <div class="glass" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:12px 16px;margin-bottom:12px">
+          <div style="display:flex;align-items:center;gap:6px">
+            <label style="font-size:12px;color:var(--t2)">Starting SOL</label>
+            <input id="paper-balance-input" type="number" step="0.1" min="0.1" value="10" style="width:80px;background:var(--bg2);border:1px solid var(--border);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px">
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <label style="font-size:12px;color:var(--t2)">Per trade</label>
+            <input id="paper-trade-size" type="number" step="0.01" min="0.01" value="0.1" style="width:70px;background:var(--bg2);border:1px solid var(--border);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px">
+            <span style="font-size:11px;color:var(--t3)">SOL</span>
+          </div>
+          <button onclick="paperStart()" style="background:var(--grn);color:#000;border:none;border-radius:6px;padding:6px 16px;font-size:12px;font-weight:700;cursor:pointer">Start Session</button>
+          <button onclick="paperReset()" style="background:var(--bg2);color:var(--t2);border:1px solid var(--border);border-radius:6px;padding:6px 16px;font-size:12px;cursor:pointer">Reset</button>
+          <span id="paper-status" style="font-size:11px;color:var(--t3)"></span>
+        </div>
+        <!-- Summary cards -->
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px">
+          <div class="glass" style="text-align:center;padding:12px">
+            <div style="font-size:11px;color:var(--t3)">Balance</div>
+            <div id="paper-bal" style="font-size:18px;font-weight:800;color:var(--t1)">10.000</div>
+          </div>
+          <div class="glass" style="text-align:center;padding:12px">
+            <div style="font-size:11px;color:var(--t3)">Open Positions</div>
+            <div id="paper-open-count" style="font-size:18px;font-weight:800;color:var(--t1)">0</div>
+          </div>
+          <div class="glass" style="text-align:center;padding:12px">
+            <div style="font-size:11px;color:var(--t3)">Total P&amp;L</div>
+            <div id="paper-pnl" style="font-size:18px;font-weight:800;color:var(--grn)">0.000 SOL</div>
+          </div>
+          <div class="glass" style="text-align:center;padding:12px">
+            <div style="font-size:11px;color:var(--t3)">Win Rate</div>
+            <div id="paper-wr" style="font-size:18px;font-weight:800;color:var(--t1)">-</div>
+          </div>
+        </div>
+        <!-- Open positions -->
+        <div class="glass" style="margin-bottom:12px;padding:12px 16px">
+          <div style="font-size:13px;font-weight:700;color:var(--t1);margin-bottom:8px">Open Positions</div>
+          <div id="paper-positions" style="font-size:12px;color:var(--t3)">No open positions</div>
+        </div>
+        <!-- Trade history -->
+        <div class="glass" style="padding:12px 16px">
+          <div style="font-size:13px;font-weight:700;color:var(--t1);margin-bottom:8px">Trade History</div>
+          <div id="paper-history" style="font-size:12px;color:var(--t3)">No trades yet &mdash; start a session and the bot will paper-trade signals that pass your filters</div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
 </div>
@@ -13706,6 +13781,7 @@ function switchTab(tab, btn) {
     loadPnl(activeRange);
   }
   if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
+  if (tab === 'paper') { renderPaper(); _tabPollers.paper = setInterval(paperTick, 5000); }
 }
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
@@ -13910,7 +13986,7 @@ function registerKeyboardShortcuts() {
       if (event.key === 'Escape') document.activeElement?.blur?.();
       return;
     }
-    const tabMap = { '1': 'scanner', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl', '7': 'quant' };
+    const tabMap = { '1': 'scanner', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl', '7': 'quant', '8': 'paper' };
     if (tabMap[event.key]) {
       event.preventDefault();
       activateTab(tabMap[event.key]);
@@ -14123,6 +14199,7 @@ async function pollFeed() {
       feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
       renderTokenRows();
       updateTicker();
+      paperUpdatePrices();
       setText('scanner-last-market', `Feed ${fmtClock()}`);
     }
   } catch(e) {}
@@ -14662,6 +14739,7 @@ async function refresh() {
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
+    paperProcessFilterLog(d.filter_log);
   }
   if (d.settings && Object.keys(d.settings).length) {
     const savedSettings = {
@@ -16409,6 +16487,245 @@ async function applyOpportunitySettings() {
     showToast('Error applying settings', false);
   }
 }
+
+// ── Paper Trading Engine ──────────────────────────────────────────────────────
+let _paperActive = false;
+let _paperBal = 10;
+let _paperStartBal = 10;
+let _paperTradeSize = 0.1;
+let _paperPositions = {};  // mint -> {name, symbol, entryPrice, entryTime, solSize, tokensHeld, currentPrice, peakPrice}
+let _paperHistory = [];    // closed trades
+let _paperSeenMints = {};  // mint -> true, prevent re-buying same token
+let _paperStats = { wins: 0, losses: 0, totalPnl: 0 };
+
+function paperLoadState() {
+  try {
+    const s = localStorage.getItem('paperState');
+    if (!s) return;
+    const d = JSON.parse(s);
+    _paperActive = d.active || false;
+    _paperBal = d.bal || 10;
+    _paperStartBal = d.startBal || 10;
+    _paperTradeSize = d.tradeSize || 0.1;
+    _paperPositions = d.positions || {};
+    _paperHistory = d.history || [];
+    _paperSeenMints = d.seen || {};
+    _paperStats = d.stats || { wins: 0, losses: 0, totalPnl: 0 };
+    document.getElementById('paper-balance-input').value = _paperStartBal;
+    document.getElementById('paper-trade-size').value = _paperTradeSize;
+  } catch(e) {}
+}
+
+function paperSaveState() {
+  try {
+    localStorage.setItem('paperState', JSON.stringify({
+      active: _paperActive, bal: _paperBal, startBal: _paperStartBal,
+      tradeSize: _paperTradeSize, positions: _paperPositions,
+      history: _paperHistory, seen: _paperSeenMints, stats: _paperStats
+    }));
+  } catch(e) {}
+}
+
+function paperStart() {
+  _paperStartBal = parseFloat(document.getElementById('paper-balance-input').value) || 10;
+  _paperTradeSize = parseFloat(document.getElementById('paper-trade-size').value) || 0.1;
+  if (_paperTradeSize > _paperStartBal) { showToast('Trade size cannot exceed balance', false); return; }
+  if (!_paperActive) {
+    _paperBal = _paperStartBal;
+    _paperPositions = {};
+    _paperHistory = [];
+    _paperSeenMints = {};
+    _paperStats = { wins: 0, losses: 0, totalPnl: 0 };
+  }
+  _paperActive = true;
+  paperSaveState();
+  renderPaper();
+  showToast('Paper session started with ' + _paperStartBal.toFixed(2) + ' SOL');
+}
+
+function paperReset() {
+  _paperActive = false;
+  _paperBal = parseFloat(document.getElementById('paper-balance-input').value) || 10;
+  _paperStartBal = _paperBal;
+  _paperPositions = {};
+  _paperHistory = [];
+  _paperSeenMints = {};
+  _paperStats = { wins: 0, losses: 0, totalPnl: 0 };
+  paperSaveState();
+  renderPaper();
+  showToast('Paper session reset');
+}
+
+function paperBuy(mint, name, symbol, price) {
+  if (!_paperActive || !price || price <= 0) return;
+  if (_paperPositions[mint] || _paperSeenMints[mint]) return;
+  const size = Math.min(_paperTradeSize, _paperBal);
+  if (size < 0.001) return;
+  _paperBal -= size;
+  const tokens = size / price;
+  _paperPositions[mint] = {
+    name: name || symbol || '?', symbol: symbol || '?',
+    entryPrice: price, entryTime: Date.now(), solSize: size,
+    tokensHeld: tokens, currentPrice: price, peakPrice: price
+  };
+  _paperSeenMints[mint] = true;
+  paperSaveState();
+  if (_activeTab === 'paper') renderPaper();
+}
+
+function paperSell(mint, reason) {
+  const pos = _paperPositions[mint];
+  if (!pos) return;
+  const exitPrice = pos.currentPrice || pos.entryPrice;
+  const exitValue = pos.tokensHeld * exitPrice;
+  const pnl = exitValue - pos.solSize;
+  _paperBal += exitValue;
+  if (pnl >= 0) _paperStats.wins++; else _paperStats.losses++;
+  _paperStats.totalPnl += pnl;
+  _paperHistory.unshift({
+    name: pos.name, symbol: pos.symbol, mint: mint,
+    entryPrice: pos.entryPrice, exitPrice: exitPrice,
+    solSize: pos.solSize, pnl: pnl,
+    pnlPct: ((exitPrice / pos.entryPrice) - 1) * 100,
+    holdTime: Date.now() - pos.entryTime,
+    reason: reason || 'manual', ts: Date.now()
+  });
+  if (_paperHistory.length > 50) _paperHistory.pop();
+  delete _paperPositions[mint];
+  paperSaveState();
+  if (_activeTab === 'paper') renderPaper();
+}
+
+function paperProcessFilterLog(logs) {
+  if (!_paperActive || !logs || !logs.length) return;
+  logs.forEach(f => {
+    if (!f.passed || !f.mint) return;
+    if (_paperPositions[f.mint] || _paperSeenMints[f.mint]) return;
+    // Find price from allTokens
+    const tok = allTokens.find(t => t.mint === f.mint);
+    if (!tok || !tok.price || tok.price <= 0) return;
+    paperBuy(f.mint, tok.name || f.name, tok.symbol, tok.price);
+  });
+}
+
+function paperUpdatePrices() {
+  if (!_paperActive) return;
+  const openMints = Object.keys(_paperPositions);
+  if (!openMints.length) return;
+  openMints.forEach(mint => {
+    const tok = allTokens.find(t => t.mint === mint);
+    if (tok && tok.price > 0) {
+      _paperPositions[mint].currentPrice = tok.price;
+      if (tok.price > _paperPositions[mint].peakPrice)
+        _paperPositions[mint].peakPrice = tok.price;
+      // Auto TP at 2x, auto SL at -30%, trailing stop at 50% from peak
+      const ratio = tok.price / _paperPositions[mint].entryPrice;
+      const fromPeak = tok.price / _paperPositions[mint].peakPrice;
+      if (ratio >= 2.0) paperSell(mint, 'TP +100%');
+      else if (ratio <= 0.70) paperSell(mint, 'SL -30%');
+      else if (fromPeak <= 0.50 && ratio > 1.1) paperSell(mint, 'Trail stop');
+    }
+  });
+  paperSaveState();
+  if (_activeTab === 'paper') renderPaper();
+}
+
+async function paperTick() {
+  if (!_paperActive) return;
+  const openMints = Object.keys(_paperPositions);
+  if (!openMints.length) { renderPaper(); return; }
+  try {
+    const prices = await fetch('/api/paper-prices', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mints: openMints})
+    }).then(r => r.json());
+    openMints.forEach(mint => {
+      const p = prices[mint];
+      if (p && p.price > 0) {
+        _paperPositions[mint].currentPrice = p.price;
+        if (p.price > _paperPositions[mint].peakPrice)
+          _paperPositions[mint].peakPrice = p.price;
+        const ratio = p.price / _paperPositions[mint].entryPrice;
+        const fromPeak = p.price / _paperPositions[mint].peakPrice;
+        if (ratio >= 2.0) paperSell(mint, 'TP +100%');
+        else if (ratio <= 0.70) paperSell(mint, 'SL -30%');
+        else if (fromPeak <= 0.50 && ratio > 1.1) paperSell(mint, 'Trail stop');
+      }
+    });
+    paperSaveState();
+  } catch(e) {}
+  renderPaper();
+}
+
+function fmtHold(ms) {
+  const s = Math.floor(ms/1000);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+
+function renderPaper() {
+  // Status
+  const status = document.getElementById('paper-status');
+  if (_paperActive) {
+    status.innerHTML = '<span style="color:var(--grn)">&#x25cf; Session active</span>';
+  } else {
+    status.textContent = 'Click Start to begin';
+  }
+  // Summary cards
+  document.getElementById('paper-bal').textContent = _paperBal.toFixed(3);
+  document.getElementById('paper-open-count').textContent = Object.keys(_paperPositions).length;
+  const pnlVal = _paperBal - _paperStartBal + Object.values(_paperPositions).reduce((s, p) => s + (p.tokensHeld * p.currentPrice - p.solSize), 0);
+  const pnlEl = document.getElementById('paper-pnl');
+  pnlEl.textContent = (pnlVal >= 0 ? '+' : '') + pnlVal.toFixed(4) + ' SOL';
+  pnlEl.style.color = pnlVal >= 0 ? 'var(--grn)' : 'var(--red)';
+  const total = _paperStats.wins + _paperStats.losses;
+  document.getElementById('paper-wr').textContent = total > 0 ? Math.round((_paperStats.wins / total) * 100) + '%' : '-';
+
+  // Open positions
+  const posDiv = document.getElementById('paper-positions');
+  const openEntries = Object.entries(_paperPositions);
+  if (!openEntries.length) {
+    posDiv.innerHTML = '<div style="color:var(--t3);font-size:12px">No open positions' + (_paperActive ? ' &#8212; waiting for signals' : '') + '</div>';
+  } else {
+    posDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--border)">' +
+      '<th style="text-align:left;padding:4px">Token</th><th>Entry</th><th>Current</th><th>P&L</th><th>Hold</th><th></th></tr>' +
+      openEntries.map(([mint, p]) => {
+        const pnl = ((p.currentPrice / p.entryPrice) - 1) * 100;
+        const pnlCol = pnl >= 0 ? 'var(--grn)' : 'var(--red)';
+        return '<tr style="border-bottom:1px solid var(--border)">' +
+          '<td style="padding:4px;font-weight:600;color:var(--t1)">' + (p.symbol || p.name) + '</td>' +
+          '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.entryPrice) + '</td>' +
+          '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.currentPrice) + '</td>' +
+          '<td style="text-align:center;font-weight:700;color:' + pnlCol + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%</td>' +
+          '<td style="text-align:center;color:var(--t3)">' + fmtHold(Date.now() - p.entryTime) + '</td>' +
+          '<td><button onclick="paperSell(\'' + mint + '\',\'manual\')" style="background:var(--red);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">Sell</button></td></tr>';
+      }).join('') + '</table>';
+  }
+
+  // Trade history
+  const histDiv = document.getElementById('paper-history');
+  if (!_paperHistory.length) {
+    histDiv.innerHTML = '<div style="color:var(--t3);font-size:12px">No trades yet</div>';
+  } else {
+    histDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--border)">' +
+      '<th style="text-align:left;padding:4px">Token</th><th>Entry</th><th>Exit</th><th>P&L</th><th>SOL</th><th>Hold</th><th>Exit</th></tr>' +
+      _paperHistory.slice(0, 20).map(t => {
+        const pnlCol = t.pnl >= 0 ? 'var(--grn)' : 'var(--red)';
+        return '<tr style="border-bottom:1px solid var(--border)">' +
+          '<td style="padding:4px;font-weight:600;color:var(--t1)">' + (t.symbol || t.name) + '</td>' +
+          '<td style="text-align:center;font-family:monospace">' + fmtPrice(t.entryPrice) + '</td>' +
+          '<td style="text-align:center;font-family:monospace">' + fmtPrice(t.exitPrice) + '</td>' +
+          '<td style="text-align:center;font-weight:700;color:' + pnlCol + '">' + (t.pnlPct >= 0 ? '+' : '') + t.pnlPct.toFixed(1) + '%</td>' +
+          '<td style="text-align:center;color:' + pnlCol + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(4) + '</td>' +
+          '<td style="text-align:center;color:var(--t3)">' + fmtHold(t.holdTime) + '</td>' +
+          '<td style="text-align:center;color:var(--t3)">' + (t.reason || '') + '</td></tr>';
+      }).join('') + '</table>';
+  }
+}
+
+// Load paper state on page load
+paperLoadState();
 
 </script>
 """
