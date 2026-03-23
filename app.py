@@ -16571,6 +16571,151 @@ async function applyOpportunitySettings() {
   }
 }
 
+// ── Paper Trading ─────────────────────────────────────────────────────────────
+let _paperData = null;
+let _paperInterval = null;
+
+async function loadPaper() {
+  const bal = parseFloat(document.getElementById('paper-balance').value) || 1;
+  const strat = document.getElementById('paper-strategy').value;
+  const qs = `balance=${bal}` + (strat ? `&strategy=${strat}` : '');
+  document.getElementById('paper-last-update').textContent = 'Loading...';
+  try {
+    const resp = await fetch(`/api/paper-trading?${qs}`);
+    if (!resp.ok) {
+      document.getElementById('paper-last-update').textContent = 'Error: ' + resp.status;
+      console.error('Paper API error', resp.status, await resp.text().catch(()=>''));
+      return;
+    }
+    const r = await resp.json();
+    _paperData = r;
+    renderPaper(r);
+    document.getElementById('paper-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    // Auto-refresh every 45s
+    if (_paperInterval) clearInterval(_paperInterval);
+    _paperInterval = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 45000);
+  } catch(e) {
+    document.getElementById('paper-last-update').textContent = 'Error: ' + (e.message || e);
+    console.error('Paper trading error', e);
+  }
+}
+
+function renderPaper(d) {
+  const pnlColor = d.total_pnl_sol >= 0 ? '#4ade80' : '#f87171';
+  document.getElementById('paper-current-bal').textContent = d.total_balance.toFixed(4) + ' SOL';
+  const pctEl = document.getElementById('paper-pnl-pct');
+  pctEl.textContent = (d.total_pnl_pct >= 0 ? '+' : '') + d.total_pnl_pct.toFixed(2) + '%';
+  pctEl.style.color = pnlColor;
+
+  const wr = document.getElementById('paper-winrate');
+  wr.textContent = d.win_rate.toFixed(1) + '%';
+  wr.style.color = d.win_rate >= 50 ? '#4ade80' : '#fbbf24';
+  document.getElementById('paper-wl').textContent = d.wins + 'W / ' + d.losses + 'L (' + d.total_trades + ')';
+
+  const tpnl = document.getElementById('paper-total-pnl');
+  tpnl.textContent = (d.total_pnl_sol >= 0 ? '+' : '') + d.total_pnl_sol.toFixed(4);
+  tpnl.style.color = pnlColor;
+
+  document.getElementById('paper-max-dd').textContent = d.max_drawdown_pct.toFixed(2) + '%';
+  document.getElementById('paper-open-count').textContent = d.open_positions.length;
+  const unrEl = document.getElementById('paper-unrealized');
+  unrEl.textContent = (d.unrealized_sol >= 0 ? '+' : '') + d.unrealized_sol.toFixed(4) + ' SOL';
+  unrEl.style.color = d.unrealized_sol >= 0 ? '#4ade80' : '#f87171';
+
+  // Equity curve
+  drawEquityCurve(d.equity_curve, d.start_balance);
+
+  // Open positions
+  const openEl = document.getElementById('paper-open-list');
+  if (!d.open_positions.length) {
+    openEl.innerHTML = '<div style="color:var(--t3);padding:12px 0">No open positions</div>';
+  } else {
+    openEl.innerHTML = '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:4px;font-size:11px;color:var(--t3);padding:4px 0;border-bottom:1px solid var(--bdr)"><span>Token</span><span>Strategy</span><span>P&L</span><span>Age</span></div>' +
+      d.open_positions.map(p => {
+        const c = p.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:4px;font-size:12px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03)">
+          <span style="color:var(--t1);font-weight:600">${p.name}</span>
+          <span style="color:var(--t3)">${p.strategy}</span>
+          <span style="color:${c};font-weight:600">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}% (${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)})</span>
+          <span style="color:var(--t3)">${p.age_min.toFixed(0)}m</span>
+        </div>`;
+      }).join('');
+  }
+
+  // Trade log (most recent first)
+  const logEl = document.getElementById('paper-trade-log');
+  const trades = [...d.trade_log].reverse();
+  if (!trades.length) {
+    logEl.innerHTML = '<div style="color:var(--t3);padding:12px 0">No closed trades yet — shadow positions are being tracked</div>';
+  } else {
+    logEl.innerHTML = '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:4px;font-size:11px;color:var(--t3);padding:4px 0;border-bottom:1px solid var(--bdr)"><span>Token</span><span>P&L</span><span>SOL</span><span>Balance</span><span>Exit</span></div>' +
+      trades.slice(0, 50).map(t => {
+        const c = t.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:4px;font-size:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.03)">
+          <span style="color:var(--t1)">${t.name}</span>
+          <span style="color:${c};font-weight:600">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(1)}%</span>
+          <span style="color:${c}">${t.pnl_sol >= 0 ? '+' : ''}${t.pnl_sol.toFixed(4)}</span>
+          <span style="color:var(--t2)">${t.balance_after.toFixed(4)}</span>
+          <span style="color:var(--t3);font-size:11px">${t.exit_reason || '—'}</span>
+        </div>`;
+      }).join('');
+  }
+}
+
+function drawEquityCurve(curve, startBal) {
+  const canvas = document.getElementById('paper-equity-canvas');
+  if (!canvas || !curve.length) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const vals = [startBal, ...curve.map(c => c.balance)];
+  const mn = Math.min(...vals) * 0.98;
+  const mx = Math.max(...vals) * 1.02;
+  const range = mx - mn || 1;
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,.04)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const y = H * i / 3;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  // Start line
+  const startY = H - ((startBal - mn) / range) * H;
+  ctx.strokeStyle = 'rgba(255,255,255,.15)';
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(0, startY); ctx.lineTo(W, startY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Equity line
+  ctx.beginPath();
+  ctx.strokeStyle = vals[vals.length-1] >= startBal ? '#4ade80' : '#f87171';
+  ctx.lineWidth = 2;
+  for (let i = 0; i < vals.length; i++) {
+    const x = (i / (vals.length - 1)) * W;
+    const y = H - ((vals[i] - mn) / range) * H;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Fill
+  const lastX = W, lastY = H - ((vals[vals.length-1] - mn) / range) * H;
+  ctx.lineTo(lastX, H); ctx.lineTo(0, H); ctx.closePath();
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  const isUp = vals[vals.length-1] >= startBal;
+  grad.addColorStop(0, isUp ? 'rgba(74,222,128,.15)' : 'rgba(248,113,113,.15)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+}
+
 </script>
 """
 
@@ -16912,151 +17057,6 @@ async function loadBlacklist() {
 loadPreset('balanced');
 loadAI();
 loadBlacklist();
-
-// ── Paper Trading ─────────────────────────────────────────────────────────────
-let _paperData = null;
-let _paperInterval = null;
-
-async function loadPaper() {
-  const bal = parseFloat(document.getElementById('paper-balance').value) || 1;
-  const strat = document.getElementById('paper-strategy').value;
-  const qs = `balance=${bal}` + (strat ? `&strategy=${strat}` : '');
-  document.getElementById('paper-last-update').textContent = 'Loading...';
-  try {
-    const resp = await fetch(`/api/paper-trading?${qs}`);
-    if (!resp.ok) {
-      document.getElementById('paper-last-update').textContent = 'Error: ' + resp.status;
-      console.error('Paper API error', resp.status, await resp.text().catch(()=>''));
-      return;
-    }
-    const r = await resp.json();
-    _paperData = r;
-    renderPaper(r);
-    document.getElementById('paper-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
-    // Auto-refresh every 45s
-    if (_paperInterval) clearInterval(_paperInterval);
-    _paperInterval = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 45000);
-  } catch(e) {
-    document.getElementById('paper-last-update').textContent = 'Error: ' + (e.message || e);
-    console.error('Paper trading error', e);
-  }
-}
-
-function renderPaper(d) {
-  const pnlColor = d.total_pnl_sol >= 0 ? '#4ade80' : '#f87171';
-  document.getElementById('paper-current-bal').textContent = d.total_balance.toFixed(4) + ' SOL';
-  const pctEl = document.getElementById('paper-pnl-pct');
-  pctEl.textContent = (d.total_pnl_pct >= 0 ? '+' : '') + d.total_pnl_pct.toFixed(2) + '%';
-  pctEl.style.color = pnlColor;
-
-  const wr = document.getElementById('paper-winrate');
-  wr.textContent = d.win_rate.toFixed(1) + '%';
-  wr.style.color = d.win_rate >= 50 ? '#4ade80' : '#fbbf24';
-  document.getElementById('paper-wl').textContent = d.wins + 'W / ' + d.losses + 'L (' + d.total_trades + ')';
-
-  const tpnl = document.getElementById('paper-total-pnl');
-  tpnl.textContent = (d.total_pnl_sol >= 0 ? '+' : '') + d.total_pnl_sol.toFixed(4);
-  tpnl.style.color = pnlColor;
-
-  document.getElementById('paper-max-dd').textContent = d.max_drawdown_pct.toFixed(2) + '%';
-  document.getElementById('paper-open-count').textContent = d.open_positions.length;
-  const unrEl = document.getElementById('paper-unrealized');
-  unrEl.textContent = (d.unrealized_sol >= 0 ? '+' : '') + d.unrealized_sol.toFixed(4) + ' SOL';
-  unrEl.style.color = d.unrealized_sol >= 0 ? '#4ade80' : '#f87171';
-
-  // Equity curve
-  drawEquityCurve(d.equity_curve, d.start_balance);
-
-  // Open positions
-  const openEl = document.getElementById('paper-open-list');
-  if (!d.open_positions.length) {
-    openEl.innerHTML = '<div style="color:var(--t3);padding:12px 0">No open positions</div>';
-  } else {
-    openEl.innerHTML = '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:4px;font-size:11px;color:var(--t3);padding:4px 0;border-bottom:1px solid var(--bdr)"><span>Token</span><span>Strategy</span><span>P&L</span><span>Age</span></div>' +
-      d.open_positions.map(p => {
-        const c = p.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:4px;font-size:12px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03)">
-          <span style="color:var(--t1);font-weight:600">${p.name}</span>
-          <span style="color:var(--t3)">${p.strategy}</span>
-          <span style="color:${c};font-weight:600">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}% (${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)})</span>
-          <span style="color:var(--t3)">${p.age_min.toFixed(0)}m</span>
-        </div>`;
-      }).join('');
-  }
-
-  // Trade log (most recent first)
-  const logEl = document.getElementById('paper-trade-log');
-  const trades = [...d.trade_log].reverse();
-  if (!trades.length) {
-    logEl.innerHTML = '<div style="color:var(--t3);padding:12px 0">No closed trades yet — shadow positions are being tracked</div>';
-  } else {
-    logEl.innerHTML = '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:4px;font-size:11px;color:var(--t3);padding:4px 0;border-bottom:1px solid var(--bdr)"><span>Token</span><span>P&L</span><span>SOL</span><span>Balance</span><span>Exit</span></div>' +
-      trades.slice(0, 50).map(t => {
-        const c = t.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:4px;font-size:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.03)">
-          <span style="color:var(--t1)">${t.name}</span>
-          <span style="color:${c};font-weight:600">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(1)}%</span>
-          <span style="color:${c}">${t.pnl_sol >= 0 ? '+' : ''}${t.pnl_sol.toFixed(4)}</span>
-          <span style="color:var(--t2)">${t.balance_after.toFixed(4)}</span>
-          <span style="color:var(--t3);font-size:11px">${t.exit_reason || '—'}</span>
-        </div>`;
-      }).join('');
-  }
-}
-
-function drawEquityCurve(curve, startBal) {
-  const canvas = document.getElementById('paper-equity-canvas');
-  if (!canvas || !curve.length) return;
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  ctx.scale(dpr, dpr);
-  const W = rect.width, H = rect.height;
-  ctx.clearRect(0, 0, W, H);
-
-  const vals = [startBal, ...curve.map(c => c.balance)];
-  const mn = Math.min(...vals) * 0.98;
-  const mx = Math.max(...vals) * 1.02;
-  const range = mx - mn || 1;
-
-  // Grid lines
-  ctx.strokeStyle = 'rgba(255,255,255,.04)';
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 4; i++) {
-    const y = H * i / 3;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-  }
-
-  // Start line
-  const startY = H - ((startBal - mn) / range) * H;
-  ctx.strokeStyle = 'rgba(255,255,255,.15)';
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath(); ctx.moveTo(0, startY); ctx.lineTo(W, startY); ctx.stroke();
-  ctx.setLineDash([]);
-
-  // Equity line
-  ctx.beginPath();
-  ctx.strokeStyle = vals[vals.length-1] >= startBal ? '#4ade80' : '#f87171';
-  ctx.lineWidth = 2;
-  for (let i = 0; i < vals.length; i++) {
-    const x = (i / (vals.length - 1)) * W;
-    const y = H - ((vals[i] - mn) / range) * H;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-
-  // Fill
-  const lastX = W, lastY = H - ((vals[vals.length-1] - mn) / range) * H;
-  ctx.lineTo(lastX, H); ctx.lineTo(0, H); ctx.closePath();
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  const isUp = vals[vals.length-1] >= startBal;
-  grad.addColorStop(0, isUp ? 'rgba(74,222,128,.15)' : 'rgba(248,113,113,.15)');
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = grad;
-  ctx.fill();
-}
 </script>
 """
 
