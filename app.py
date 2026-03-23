@@ -126,6 +126,15 @@ if ANKR_RPC and not ANKR_RPC.startswith("http"):
     print(f"[WARN] ANKR_RPC ignored — not a valid URL: {ANKR_RPC[:60]}", flush=True)
     ANKR_RPC = ""
 
+SPECTRUM_RPC        = os.getenv("SPECTRUM_RPC", "").strip()
+if SPECTRUM_RPC.lower().startswith("value:"):
+    SPECTRUM_RPC = SPECTRUM_RPC.split(":", 1)[1].strip()
+if SPECTRUM_RPC and not SPECTRUM_RPC.startswith("http"):
+    print(f"[WARN] SPECTRUM_RPC ignored — not a valid URL: {SPECTRUM_RPC[:60]}", flush=True)
+    SPECTRUM_RPC = ""
+if SPECTRUM_RPC:
+    print("[CONFIG] SpectrumNode RPC loaded — primary Solana RPC", flush=True)
+
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
 SOL_MINT      = "So11111111111111111111111111111111111111112"
@@ -2365,7 +2374,10 @@ class BotInstance:
 
     def refresh_balance(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
-        _fallbacks = [HELIUS_RPC]
+        _fallbacks = []
+        if SPECTRUM_RPC:
+            _fallbacks.append(SPECTRUM_RPC)
+        _fallbacks.append(HELIUS_RPC)
         if ANKR_RPC:
             _fallbacks.append(ANKR_RPC)
         _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
@@ -4229,22 +4241,38 @@ def get_helius_api_key():
 
 
 def rpc_call(method, params=None, timeout=10):
-    started = time.perf_counter()
-    try:
-        resp = requests.post(HELIUS_RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params or [],
-        }, headers=HEADERS, timeout=timeout)
-        if resp.ok:
-            body = resp.json()
-            record_rpc_health("helius", True, round((time.perf_counter() - started) * 1000), method)
-            return body.get("result")
-        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
-    except Exception as e:
-        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
-        print(f"[RPC] {method} failed: {e}", flush=True)
+    """Call Solana RPC with fallback chain: SpectrumNode → Helius → ANKR → public."""
+    _rpc_endpoints = []
+    if SPECTRUM_RPC:
+        _rpc_endpoints.append(("spectrum", SPECTRUM_RPC))
+    _rpc_endpoints.append(("helius", HELIUS_RPC))
+    if ANKR_RPC:
+        _rpc_endpoints.append(("ankr", ANKR_RPC))
+    _rpc_endpoints.append(("public", "https://solana-rpc.publicnode.com"))
+
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
+    last_err = None
+    for label, url in _rpc_endpoints:
+        started = time.perf_counter()
+        try:
+            resp = requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
+            latency = round((time.perf_counter() - started) * 1000)
+            if resp.ok:
+                body = resp.json()
+                if "error" not in body:
+                    record_rpc_health(label, True, latency, method)
+                    return body.get("result")
+                last_err = f"{label}: {body.get('error')}"
+                record_rpc_health(label, False, latency, method)
+            else:
+                last_err = f"{label}: HTTP {resp.status_code}"
+                record_rpc_health(label, False, latency, method)
+        except Exception as e:
+            latency = round((time.perf_counter() - started) * 1000)
+            record_rpc_health(label, False, latency, method)
+            last_err = f"{label}: {e}"
+    if last_err:
+        print(f"[RPC] {method} all failed — last: {last_err}", flush=True)
     return None
 
 
