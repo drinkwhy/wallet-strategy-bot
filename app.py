@@ -125,6 +125,11 @@ if ANKR_RPC.lower().startswith("value:"):
 if ANKR_RPC and not ANKR_RPC.startswith("http"):
     print(f"[WARN] ANKR_RPC ignored — not a valid URL: {ANKR_RPC[:60]}", flush=True)
     ANKR_RPC = ""
+MORALIS_API_KEY     = os.getenv("MORALIS_API_KEY", "").strip()
+if MORALIS_API_KEY:
+    print("[CONFIG] Moralis API key loaded — Token + Price + Wallet APIs enabled", flush=True)
+else:
+    print("[CONFIG] MORALIS_API_KEY not set — Moralis features disabled (optional)", flush=True)
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
@@ -256,6 +261,82 @@ def safe_json_response(resp, default=None):
         return default if data is None else data
     except Exception:
         return default
+
+# ── Moralis API ────────────────────────────────────────────────────────────────
+_moralis_limiter = _RateLimiter(rate=5, per=1.0)   # 5 req/s
+_moralis_backoff_until = 0.0
+MORALIS_BASE = "https://solana-gateway.moralis.io"
+
+def moralis_get(path, **kwargs):
+    """Rate-limited GET to Moralis Solana Gateway with health tracking."""
+    global _moralis_backoff_until
+    if not MORALIS_API_KEY:
+        return None
+    now = time.time()
+    if now < _moralis_backoff_until:
+        return None
+    _moralis_limiter.acquire()
+    url = f"{MORALIS_BASE}{path}"
+    kwargs.setdefault("timeout", 8)
+    hdrs = kwargs.pop("headers", {})
+    hdrs["X-API-Key"] = MORALIS_API_KEY
+    hdrs["accept"] = "application/json"
+    started = time.perf_counter()
+    try:
+        resp = requests.get(url, headers=hdrs, **kwargs)
+        record_rpc_health("moralis", resp.ok, round((time.perf_counter() - started) * 1000), "GET")
+        if resp.status_code == 429:
+            _moralis_backoff_until = time.time() + 30
+        return resp
+    except Exception:
+        record_rpc_health("moralis", False, round((time.perf_counter() - started) * 1000), "GET")
+        return None
+
+def moralis_token_price(mint):
+    """Get token USD price from Moralis Token/Price API."""
+    resp = moralis_get(f"/token/mainnet/{mint}/price")
+    if resp and resp.status_code == 200:
+        data = safe_json_response(resp)
+        return float(data.get("usdPrice") or 0) or None
+    return None
+
+def moralis_token_metadata(mint):
+    """Get token metadata (name, symbol, decimals, supply) from Moralis."""
+    resp = moralis_get(f"/token/mainnet/{mint}/metadata")
+    if resp and resp.status_code == 200:
+        return safe_json_response(resp)
+    return None
+
+def moralis_token_pairs(mint):
+    """Get DEX pairs for a token from Moralis — liquidity, volume, price."""
+    resp = moralis_get(f"/token/mainnet/{mint}/pairs")
+    if resp and resp.status_code == 200:
+        data = safe_json_response(resp)
+        return data.get("pairs", []) if isinstance(data, dict) else []
+    return []
+
+def moralis_wallet_swaps(wallet, limit=10):
+    """Get recent swap history for a wallet from Moralis Wallet API."""
+    resp = moralis_get(f"/account/mainnet/{wallet}/swaps?order=DESC&limit={limit}")
+    if resp and resp.status_code == 200:
+        data = safe_json_response(resp)
+        return data.get("result", []) if isinstance(data, dict) else []
+    return []
+
+def moralis_wallet_tokens(wallet):
+    """Get all token holdings for a wallet from Moralis."""
+    resp = moralis_get(f"/account/mainnet/{wallet}/tokens")
+    if resp and resp.status_code == 200:
+        data = safe_json_response(resp)
+        return data if isinstance(data, list) else data.get("result", []) if isinstance(data, dict) else []
+    return []
+
+def moralis_wallet_portfolio(wallet):
+    """Get wallet portfolio with PnL from Moralis."""
+    resp = moralis_get(f"/account/mainnet/{wallet}/portfolio")
+    if resp and resp.status_code == 200:
+        return safe_json_response(resp)
+    return None
 
 PLAN_LIMITS = {
     "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
@@ -2783,11 +2864,19 @@ class BotInstance:
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                 timeout=5
             )
-            if resp.status_code != 200:
-                return None
-            pairs = resp.json().get("pairs")
-            if pairs:
-                return float(pairs[0].get("priceUsd") or 0)
+            if resp.status_code == 200:
+                pairs = resp.json().get("pairs")
+                if pairs:
+                    price = float(pairs[0].get("priceUsd") or 0)
+                    if price > 0:
+                        return price
+        except Exception:
+            pass
+        # Fallback: Moralis Token/Price API
+        try:
+            mp = moralis_token_price(mint)
+            if mp and mp > 0:
+                return mp
         except Exception:
             pass
         return None
@@ -5283,16 +5372,42 @@ def _poll_single_whale(wallet):
                     continue
                 try:
                     _wr = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
-                    if _wr.status_code != 200:
-                        continue
-                    pairs = safe_json_response(_wr, {}).get("pairs") or []
+                    pairs = (safe_json_response(_wr, {}).get("pairs") or []) if _wr.status_code == 200 else []
+                    if not pairs and MORALIS_API_KEY:
+                        pairs = moralis_token_pairs(mint)
                     if pairs:
                         _whale_process_dex_pair(wallet, mint, pairs[0])
                 except Exception as _e:
                     print(f"[WHALE] dex lookup error: {_e}", flush=True)
         if used_enhanced:
             return
-        # Fallback: raw RPC signatures
+        # Fallback 1: Moralis Wallet Swaps API
+        if MORALIS_API_KEY:
+            try:
+                swaps = moralis_wallet_swaps(wallet, limit=8)
+                moralis_used = False
+                for swap in swaps:
+                    bought_token = swap.get("bought", {})
+                    mint = bought_token.get("address") or ""
+                    if not mint or mint == SOL_MINT:
+                        continue
+                    tx_hash = swap.get("transactionHash") or swap.get("txHash") or ""
+                    if tx_hash and _whale_is_sig_seen(tx_hash):
+                        continue
+                    moralis_used = True
+                    try:
+                        _wr = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+                        if _wr and _wr.status_code == 200:
+                            pairs = safe_json_response(_wr, {}).get("pairs") or []
+                            if pairs:
+                                _whale_process_dex_pair(wallet, mint, pairs[0])
+                    except Exception:
+                        pass
+                if moralis_used:
+                    return
+            except Exception as _me:
+                print(f"[WHALE] Moralis fallback error for {wallet[:8]}...: {_me}", flush=True)
+        # Fallback 2: raw RPC signatures
         r = requests.post(HELIUS_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getSignaturesForAddress",
