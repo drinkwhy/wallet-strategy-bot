@@ -13857,7 +13857,7 @@ DASHBOARD_HTML = _CSS + """
           <option value="degen">Degen</option>
           <option value="live">Live (Your Settings)</option>
         </select>
-        <button class="btn btn-primary" onclick="loadPaper()" style="padding:8px 20px">&#9654; Simulate</button>
+        <button class="btn btn-primary" onclick="loadPaper()" style="padding:8px 20px">&#9654; Update Balance</button>
       </div>
     </div>
 
@@ -13919,10 +13919,19 @@ DASHBOARD_HTML = _CSS + """
           <div class="panel-head">
             <div>
               <div class="panel-title">Paper Positions</div>
-              <div class="panel-copy">Shadow trades scaled to your hypothetical balance.</div>
+              <div class="panel-copy">Live shadow trades scaled to your hypothetical balance.</div>
             </div>
           </div>
-          <div id="paper-open-list" style="max-height:280px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Click &#9654; Simulate to begin</div></div>
+          <div id="paper-open-list" style="max-height:220px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Loading shadow positions…</div></div>
+        </div>
+        <div class="glass">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Filter Pipeline</div>
+              <div class="panel-copy">Real-time pass/fail decisions from the algorithm.</div>
+            </div>
+          </div>
+          <div id="paper-filter-pipe" style="max-height:160px;overflow-y:auto"><div style="font-size:11px;color:var(--t3)">Scanning…</div></div>
         </div>
         <div class="glass">
           <div class="panel-head">
@@ -13931,7 +13940,7 @@ DASHBOARD_HTML = _CSS + """
               <div class="panel-copy">Closed shadow positions with hypothetical P&L.</div>
             </div>
           </div>
-          <div id="paper-trade-log" style="max-height:260px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Click &#9654; Simulate to see trade history</div></div>
+          <div id="paper-trade-log" style="max-height:200px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Loading trade history…</div></div>
         </div>
       </div>
       <div class="scanner-main">
@@ -14037,7 +14046,7 @@ function switchTab(tab, btn) {
     loadPnl(activeRange);
   }
   if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
-  if (tab === 'paper') { if (!_paperData) loadPaper(); renderPaperTokenRows(); _tabPollers.paper = setInterval(renderPaperTokenRows, 4000); }
+  if (tab === 'paper') { loadPaper(); renderPaperTokenRows(); _tabPollers.paper = setInterval(renderPaperTokenRows, 4000); _tabPollers.paperData = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 12000); }
 }
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
@@ -14995,6 +15004,8 @@ async function refresh() {
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
+    // Mirror filter pipeline to Paper tab
+    renderPaperFilterPipe(d.filter_log);
   }
   if (d.settings && Object.keys(d.settings).length) {
     const savedSettings = {
@@ -16748,12 +16759,13 @@ let _paperData = null;
 let _paperInterval = null;
 let _paperMints = {};
 let _paperSortCol = 'score';
+let _paperAutoStarted = false;
 
 async function loadPaper() {
   const bal = parseFloat(document.getElementById('paper-balance').value) || 1;
   const strat = document.getElementById('paper-strategy').value;
   const qs = `balance=${bal}` + (strat ? `&strategy=${strat}` : '');
-  document.getElementById('paper-last-update').textContent = 'Loading...';
+  document.getElementById('paper-last-update').textContent = 'Syncing...';
   try {
     const resp = await fetch(`/api/paper-trading?${qs}`);
     if (!resp.ok) {
@@ -16775,13 +16787,23 @@ async function loadPaper() {
     renderPaperTradeLog(r);
     renderPaperTokenRows();
     drawEquityCurve(r.equity_curve, r.start_balance);
-    document.getElementById('paper-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    document.getElementById('paper-last-update').textContent = 'Live \u00b7 ' + new Date().toLocaleTimeString();
     document.getElementById('paper-sync-badge').textContent = r.total_trades + ' trades \u00b7 ' + r.open_positions.length + ' open';
-    if (_paperInterval) clearInterval(_paperInterval);
-    _paperInterval = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 30000);
   } catch(e) {
     document.getElementById('paper-last-update').textContent = 'Error: ' + (e.message || e);
   }
+}
+
+// Also pull filter pipeline into Paper tab during main refresh
+function renderPaperFilterPipe(filterLog) {
+  const el = document.getElementById('paper-filter-pipe');
+  if (!el || !filterLog || !filterLog.length) return;
+  el.innerHTML = filterLog.map(f => `
+    <div class="fp-item">
+      <span class="${f.passed?'fp-pass':'fp-fail'}">${f.passed?'\u2713':'\u2717'}</span>
+      <span class="fp-name">${f.name||'?'}</span>
+      <span class="fp-reason">${f.reason||''}</span>
+    </div>`).join('');
 }
 
 function renderPaperStats(d) {
