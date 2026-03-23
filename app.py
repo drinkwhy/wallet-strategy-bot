@@ -4343,13 +4343,12 @@ def rpc_call(method, params=None, timeout=10):
 
             if resp.ok:
                 body = safe_json_response(resp)
-                if body and "error" not in body:
+                if body and not body.get("error"):
                     record_rpc_health(label, True, latency, method)
                     return body.get("result")
                 # RPC-level error (e.g. method not found, invalid params)
-                err_msg = (body or {}).get("error", {})
-                if isinstance(err_msg, dict):
-                    err_msg = err_msg.get("message", str(err_msg))
+                err_obj = (body or {}).get("error") or {}
+                err_msg = err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
                 record_rpc_health(label, False, latency, method)
                 last_err = f"{label}: {err_msg}"
                 continue
