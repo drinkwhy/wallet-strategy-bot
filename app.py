@@ -16920,15 +16920,25 @@ async function loadPaper() {
   const bal = parseFloat(document.getElementById('paper-balance').value) || 1;
   const strat = document.getElementById('paper-strategy').value;
   const qs = `balance=${bal}` + (strat ? `&strategy=${strat}` : '');
+  document.getElementById('paper-last-update').textContent = 'Loading...';
   try {
-    const r = await fetch(`/api/paper-trading?${qs}`).then(r => r.json());
+    const resp = await fetch(`/api/paper-trading?${qs}`);
+    if (!resp.ok) {
+      document.getElementById('paper-last-update').textContent = 'Error: ' + resp.status;
+      console.error('Paper API error', resp.status, await resp.text().catch(()=>''));
+      return;
+    }
+    const r = await resp.json();
     _paperData = r;
     renderPaper(r);
     document.getElementById('paper-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
     // Auto-refresh every 45s
     if (_paperInterval) clearInterval(_paperInterval);
     _paperInterval = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 45000);
-  } catch(e) { console.error('Paper trading error', e); }
+  } catch(e) {
+    document.getElementById('paper-last-update').textContent = 'Error: ' + (e.message || e);
+    console.error('Paper trading error', e);
+  }
 }
 
 function renderPaper(d) {
