@@ -125,11 +125,6 @@ if ANKR_RPC.lower().startswith("value:"):
 if ANKR_RPC and not ANKR_RPC.startswith("http"):
     print(f"[WARN] ANKR_RPC ignored — not a valid URL: {ANKR_RPC[:60]}", flush=True)
     ANKR_RPC = ""
-MORALIS_API_KEY     = os.getenv("MORALIS_API_KEY", "").strip()
-if MORALIS_API_KEY:
-    print("[CONFIG] Moralis API key loaded — Token + Price + Wallet APIs enabled", flush=True)
-else:
-    print("[CONFIG] MORALIS_API_KEY not set — Moralis features disabled (optional)", flush=True)
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
@@ -171,14 +166,6 @@ class _RateLimiter:
 _dex_limiter = _RateLimiter(rate_per_sec=4)
 _dex_backoff_until = 0  # epoch timestamp — skip requests until this time
 _rpc_health = deque(maxlen=600)
-
-# ── RPC fallback chain ─────────────────────────────────────────────────────
-# Helius is primary; public RPCs are free but heavily rate-limited — last resort
-_PUBLIC_RPCS = [
-    "https://solana-rpc.publicnode.com",
-    "https://api.mainnet-beta.solana.com",
-]
-_helius_backoff_until = 0.0   # epoch — skip Helius until this time after 429
 
 
 def record_rpc_health(source, ok, latency_ms, method=""):
@@ -269,82 +256,6 @@ def safe_json_response(resp, default=None):
         return default if data is None else data
     except Exception:
         return default
-
-# ── Moralis API ────────────────────────────────────────────────────────────────
-_moralis_limiter = _RateLimiter(rate_per_sec=5)   # 5 req/s
-_moralis_backoff_until = 0.0
-MORALIS_BASE = "https://solana-gateway.moralis.io"
-
-def moralis_get(path, **kwargs):
-    """Rate-limited GET to Moralis Solana Gateway with health tracking."""
-    global _moralis_backoff_until
-    if not MORALIS_API_KEY:
-        return None
-    now = time.time()
-    if now < _moralis_backoff_until:
-        return None
-    _moralis_limiter.acquire()
-    url = f"{MORALIS_BASE}{path}"
-    kwargs.setdefault("timeout", 8)
-    hdrs = kwargs.pop("headers", {})
-    hdrs["X-API-Key"] = MORALIS_API_KEY
-    hdrs["accept"] = "application/json"
-    started = time.perf_counter()
-    try:
-        resp = requests.get(url, headers=hdrs, **kwargs)
-        record_rpc_health("moralis", resp.ok, round((time.perf_counter() - started) * 1000), "GET")
-        if resp.status_code == 429:
-            _moralis_backoff_until = time.time() + 30
-        return resp
-    except Exception:
-        record_rpc_health("moralis", False, round((time.perf_counter() - started) * 1000), "GET")
-        return None
-
-def moralis_token_price(mint):
-    """Get token USD price from Moralis Token/Price API."""
-    resp = moralis_get(f"/token/mainnet/{mint}/price")
-    if resp and resp.status_code == 200:
-        data = safe_json_response(resp)
-        return float(data.get("usdPrice") or 0) or None
-    return None
-
-def moralis_token_metadata(mint):
-    """Get token metadata (name, symbol, decimals, supply) from Moralis."""
-    resp = moralis_get(f"/token/mainnet/{mint}/metadata")
-    if resp and resp.status_code == 200:
-        return safe_json_response(resp)
-    return None
-
-def moralis_token_pairs(mint):
-    """Get DEX pairs for a token from Moralis — liquidity, volume, price."""
-    resp = moralis_get(f"/token/mainnet/{mint}/pairs")
-    if resp and resp.status_code == 200:
-        data = safe_json_response(resp)
-        return data.get("pairs", []) if isinstance(data, dict) else []
-    return []
-
-def moralis_wallet_swaps(wallet, limit=10):
-    """Get recent swap history for a wallet from Moralis Wallet API."""
-    resp = moralis_get(f"/account/mainnet/{wallet}/swaps?order=DESC&limit={limit}")
-    if resp and resp.status_code == 200:
-        data = safe_json_response(resp)
-        return data.get("result", []) if isinstance(data, dict) else []
-    return []
-
-def moralis_wallet_tokens(wallet):
-    """Get all token holdings for a wallet from Moralis."""
-    resp = moralis_get(f"/account/mainnet/{wallet}/tokens")
-    if resp and resp.status_code == 200:
-        data = safe_json_response(resp)
-        return data if isinstance(data, list) else data.get("result", []) if isinstance(data, dict) else []
-    return []
-
-def moralis_wallet_portfolio(wallet):
-    """Get wallet portfolio with PnL from Moralis."""
-    resp = moralis_get(f"/account/mainnet/{wallet}/portfolio")
-    if resp and resp.status_code == 200:
-        return safe_json_response(resp)
-    return None
 
 PLAN_LIMITS = {
     "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
@@ -1921,14 +1832,16 @@ def ai_score(info):
 def check_holder_concentration(mint):
     """Returns True if top holders don't own >50% of supply."""
     try:
-        result = rpc_call("getTokenLargestAccounts", [mint], timeout=6)
-        accounts = (result or {}).get("value", []) if isinstance(result, dict) else []
-        if not accounts:
-            return True
+        r = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,
+            "method":"getTokenLargestAccounts",
+            "params":[mint]
+        }, timeout=6).json()
+        accounts = r.get("result",{}).get("value",[])
+        if not accounts: return True
         total = sum(float(a.get("uiAmount") or 0) for a in accounts)
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
-        if total <= 0:
-            return True
+        if total <= 0: return True
         return (top5 / total) < 0.50
     except Exception as _e:
         print(f"[ERROR] Holder check failed: {_e}", flush=True)
@@ -2030,21 +1943,21 @@ def send_sol(keypair, to_address, amount_sol):
         from solders.hash import Hash as SolHash
         lamports = int(amount_sol * 1e9)
         # get recent blockhash
-        bh_result = rpc_call("getLatestBlockhash", [{"commitment": "confirmed"}], timeout=8) or {}
-        bh_value = bh_result.get("value", {}) if isinstance(bh_result, dict) else {}
-        if not bh_value or not bh_value.get("blockhash"):
-            print("[send_sol] Failed to get blockhash from any RPC", flush=True)
-            return None
-        blockhash = SolHash.from_string(bh_value["blockhash"])
+        bh_r = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,"method":"getLatestBlockhash",
+            "params":[{"commitment":"confirmed"}]
+        }, timeout=8).json()
+        blockhash = SolHash.from_string(bh_r["result"]["value"]["blockhash"])
         to_pk = Pubkey.from_string(to_address)
         ix    = transfer(TransferParams(from_pubkey=keypair.pubkey(), to_pubkey=to_pk, lamports=lamports))
         msg   = MessageV0.try_compile(keypair.pubkey(), [ix], [], blockhash)
         tx    = VersionedTransaction(msg, [keypair])
         enc   = base64.b64encode(bytes(tx)).decode()
-        result = rpc_call("sendTransaction",
-                          [enc, {"encoding": "base64", "skipPreflight": False, "preflightCommitment": "confirmed"}],
-                          timeout=15)
-        return result
+        res   = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,"method":"sendTransaction",
+            "params":[enc,{"encoding":"base64","skipPreflight":False,"preflightCommitment":"confirmed"}]
+        }, timeout=15).json()
+        return res.get("result")
     except Exception as e:
         print(f"send_sol error: {e}")
         return None
@@ -2451,13 +2364,27 @@ class BotInstance:
         return False
 
     def refresh_balance(self):
-        result = rpc_call("getBalance", [self.wallet], timeout=5)
-        if result and isinstance(result, dict):
-            val = result.get("value", 0)
-            self.sol_balance = val / 1e9
-            if self.sol_balance > self.peak_balance:
-                self.peak_balance = self.sol_balance
-            return
+        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
+        _fallbacks = [HELIUS_RPC]
+        if ANKR_RPC:
+            _fallbacks.append(ANKR_RPC)
+        _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
+        for rpc_url in _fallbacks:
+            try:
+                r = requests.post(rpc_url, json=payload, timeout=5)
+                data = safe_json_response(r)
+                if not data:
+                    continue
+                if "error" in data:
+                    print(f"[WARN] Balance RPC error from {rpc_url[:40]}: {data['error']}", flush=True)
+                    continue
+                val = data.get("result",{}).get("value",0)
+                self.sol_balance = val / 1e9
+                if self.sol_balance > self.peak_balance:
+                    self.peak_balance = self.sol_balance
+                return
+            except Exception as _e:
+                print(f"[ERROR] Balance fetch failed ({rpc_url[:40]}): {_e}", flush=True)
         print(f"[ERROR] All RPCs failed for balance check, wallet={self.wallet}", flush=True)
 
     # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
@@ -2687,38 +2614,33 @@ class BotInstance:
         except Exception as e:
             region_errors.append(str(e))
 
-        # ── fallback: try all RPC endpoints for sendTransaction ────────────
-        send_payload = {"jsonrpc":"2.0","id":1,"method":"sendTransaction",
-                        "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]}
-        for fb_label, fb_url in _build_rpc_endpoints():
-            try:
-                r   = requests.post(fb_url, json=send_payload, timeout=15)
-                if r.status_code == 429:
-                    continue
-                res = r.json()
-                if res.get("result"):
-                    return {
-                        "sig": res["result"],
-                        "source": f"{fb_label}-rpc-fallback",
-                        "error": None,
-                    }
-                error_text = ""
-                if res.get("error"):
-                    error_text = res["error"].get("message", "")
-                # If it's a real error (not rate limit), return it
-                if error_text:
-                    return {
-                        "sig": None,
-                        "source": f"{fb_label}-rpc-fallback",
-                        "error": error_text,
-                    }
-            except Exception:
-                continue
-        return {
-            "sig": None,
-            "source": "all-rpc-fallback",
-            "error": "; ".join(region_errors[:3]) or "transaction-send-failed",
-        }
+        # ── fallback: regular Helius RPC ────────────────────────────────────
+        try:
+            r   = requests.post(HELIUS_RPC, json={
+                "jsonrpc":"2.0","id":1,"method":"sendTransaction",
+                "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]
+            }, timeout=15)
+            res = r.json()
+            if res.get("result"):
+                return {
+                    "sig": res["result"],
+                    "source": "helius-rpc-fallback",
+                    "error": None,
+                }
+            error_text = ""
+            if res.get("error"):
+                error_text = res["error"].get("message", "")
+            return {
+                "sig": None,
+                "source": "helius-rpc-fallback",
+                "error": error_text or "; ".join(region_errors[:3]) or "transaction-send-failed",
+            }
+        except Exception as e:
+            return {
+                "sig": None,
+                "source": "helius-rpc-fallback",
+                "error": str(e) or "; ".join(region_errors[:3]) or "transaction-send-failed",
+            }
 
     def sign_and_send(self, swap_tx_b64):
         raw = base64.b64decode(swap_tx_b64)
@@ -2846,15 +2768,14 @@ class BotInstance:
         return None
 
     def get_token_balance(self, mint):
-        result = rpc_call("getTokenAccountsByOwner",
-                          [self.wallet, {"mint": mint}, {"encoding": "jsonParsed"}], timeout=5)
-        accounts = (result or {}).get("value", []) if isinstance(result, dict) else []
+        r = requests.post(HELIUS_RPC, json={
+            "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
+            "params":[self.wallet,{"mint":mint},{"encoding":"jsonParsed"}]
+        }, timeout=5)
+        accounts = r.json().get("result",{}).get("value",[])
         if not accounts:
             return 0
-        try:
-            return int(accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
-        except (KeyError, IndexError, TypeError):
-            return 0
+        return int(accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
 
     def get_token_price(self, mint):
         try:
@@ -2862,30 +2783,25 @@ class BotInstance:
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
                 timeout=5
             )
-            if resp.status_code == 200:
-                pairs = resp.json().get("pairs")
-                if pairs:
-                    price = float(pairs[0].get("priceUsd") or 0)
-                    if price > 0:
-                        return price
-        except Exception:
-            pass
-        # Fallback: Moralis Token/Price API
-        try:
-            mp = moralis_token_price(mint)
-            if mp and mp > 0:
-                return mp
+            if resp.status_code != 200:
+                return None
+            pairs = resp.json().get("pairs")
+            if pairs:
+                return float(pairs[0].get("priceUsd") or 0)
         except Exception:
             pass
         return None
 
     def is_safe_token(self, mint):
         try:
-            result = rpc_call("getAccountInfo", [mint, {"encoding": "jsonParsed"}], timeout=5)
-            info = (result or {}).get("value", {}) if isinstance(result, dict) else {}
+            r = requests.post(HELIUS_RPC, json={
+                "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
+                "params":[mint,{"encoding":"jsonParsed"}]
+            }, timeout=5).json()
+            info = r.get("result",{}).get("value",{})
             if not info:
                 return True
-            parsed      = info.get("data", {}).get("parsed", {}).get("info", {})
+            parsed      = info.get("data",{}).get("parsed",{}).get("info",{})
             mint_auth   = parsed.get("mintAuthority")
             freeze_auth = parsed.get("freezeAuthority")
             if mint_auth is not None and mint_auth != PUMP_PROGRAM:
@@ -3662,7 +3578,7 @@ class BotInstance:
         max_age = s.get("max_age_min", 999)
         min_vol = s.get("min_vol", 0)
         min_score = s.get("min_score", 0)
-        min_green_lights = int(s.get("min_green_lights", 0))
+        min_green_lights = max(1, int(s.get("min_green_lights", 1)))
         min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
         min_narrative_score = int(s.get("min_narrative_score", 16))
         min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
@@ -4300,68 +4216,23 @@ def get_helius_api_key():
     return "" if "?" in tail else tail
 
 
-def _build_rpc_endpoints():
-    """Build ordered list of (label, url) RPC endpoints for fallback."""
-    global _helius_backoff_until
-    eps = []
-    now = time.time()
-    if now >= _helius_backoff_until:
-        eps.append(("helius", HELIUS_RPC))
-    else:
-        # Helius is in backoff — push to end so fallbacks get tried first
-        pass
-    if ANKR_RPC:
-        eps.append(("ankr", ANKR_RPC))
-    for pub_url in _PUBLIC_RPCS:
-        label = "publicnode" if "publicnode" in pub_url else "solana-mainnet"
-        eps.append((label, pub_url))
-    # If Helius was in backoff, still add it last as ultimate fallback
-    if now < _helius_backoff_until:
-        eps.append(("helius", HELIUS_RPC))
-    return eps
-
-
 def rpc_call(method, params=None, timeout=10):
-    """RPC call with automatic fallback chain: Helius → ANKR → public RPCs."""
-    global _helius_backoff_until
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
-    last_err = None
-
-    for label, url in _build_rpc_endpoints():
-        started = time.perf_counter()
-        try:
-            resp = requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
-            latency = round((time.perf_counter() - started) * 1000)
-
-            # Handle 429 rate-limit
-            if resp.status_code == 429:
-                record_rpc_health(label, False, latency, method)
-                if label == "helius":
-                    _helius_backoff_until = time.time() + 10  # back off Helius for 10s
-                    print(f"[RPC] Helius 429 on {method} — backing off 10s, trying fallback", flush=True)
-                continue
-
-            if resp.ok:
-                body = safe_json_response(resp)
-                if body and not body.get("error"):
-                    record_rpc_health(label, True, latency, method)
-                    return body.get("result")
-                # RPC-level error (e.g. method not found, invalid params)
-                err_obj = (body or {}).get("error") or {}
-                err_msg = err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
-                record_rpc_health(label, False, latency, method)
-                last_err = f"{label}: {err_msg}"
-                continue
-
-            record_rpc_health(label, False, latency, method)
-            last_err = f"{label}: HTTP {resp.status_code}"
-        except Exception as e:
-            latency = round((time.perf_counter() - started) * 1000)
-            record_rpc_health(label, False, latency, method)
-            last_err = f"{label}: {e}"
-
-    if last_err:
-        print(f"[RPC] {method} failed (all endpoints): {last_err}", flush=True)
+    started = time.perf_counter()
+    try:
+        resp = requests.post(HELIUS_RPC, json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or [],
+        }, headers=HEADERS, timeout=timeout)
+        if resp.ok:
+            body = resp.json()
+            record_rpc_health("helius", True, round((time.perf_counter() - started) * 1000), method)
+            return body.get("result")
+        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
+    except Exception as e:
+        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
+        print(f"[RPC] {method} failed: {e}", flush=True)
     return None
 
 
@@ -5412,51 +5283,32 @@ def _poll_single_whale(wallet):
                     continue
                 try:
                     _wr = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
-                    pairs = (safe_json_response(_wr, {}).get("pairs") or []) if _wr.status_code == 200 else []
-                    if not pairs and MORALIS_API_KEY:
-                        pairs = moralis_token_pairs(mint)
+                    if _wr.status_code != 200:
+                        continue
+                    pairs = safe_json_response(_wr, {}).get("pairs") or []
                     if pairs:
                         _whale_process_dex_pair(wallet, mint, pairs[0])
                 except Exception as _e:
                     print(f"[WHALE] dex lookup error: {_e}", flush=True)
         if used_enhanced:
             return
-        # Fallback 1: Moralis Wallet Swaps API
-        if MORALIS_API_KEY:
-            try:
-                swaps = moralis_wallet_swaps(wallet, limit=8)
-                moralis_used = False
-                for swap in swaps:
-                    bought_token = swap.get("bought", {})
-                    mint = bought_token.get("address") or ""
-                    if not mint or mint == SOL_MINT:
-                        continue
-                    tx_hash = swap.get("transactionHash") or swap.get("txHash") or ""
-                    if tx_hash and _whale_is_sig_seen(tx_hash):
-                        continue
-                    moralis_used = True
-                    try:
-                        _wr = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
-                        if _wr and _wr.status_code == 200:
-                            pairs = safe_json_response(_wr, {}).get("pairs") or []
-                            if pairs:
-                                _whale_process_dex_pair(wallet, mint, pairs[0])
-                    except Exception:
-                        pass
-                if moralis_used:
-                    return
-            except Exception as _me:
-                print(f"[WHALE] Moralis fallback error for {wallet[:8]}...: {_me}", flush=True)
-        # Fallback 2: raw RPC signatures (with fallback chain)
-        sigs_result = rpc_call("getSignaturesForAddress", [wallet, {"limit": 5}], timeout=8)
-        sigs = sigs_result if isinstance(sigs_result, list) else []
+        # Fallback: raw RPC signatures
+        r = requests.post(HELIUS_RPC, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [wallet, {"limit": 5}]
+        }, timeout=8)
+        sigs = safe_json_response(r, {}).get("result", [])
         for sig_info in sigs:
             sig = sig_info.get("signature")
             if not sig or _whale_is_sig_seen(sig):
                 continue
-            tx = rpc_call("getTransaction",
-                          [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-                          timeout=8)
+            tx_r = requests.post(HELIUS_RPC, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTransaction",
+                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+            }, timeout=8)
+            tx = safe_json_response(tx_r, {}).get("result")
             if not tx:
                 continue
             pre = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances", [])}
@@ -7470,10 +7322,7 @@ def helius_pool_sniper():
             # ── Exponential backoff on reconnect ──────────────────────────
             reconnect_attempts += 1
             if error_state["rate_limited"]:
-                if reconnect_attempts >= 5:
-                    print(f"[Sniper] 429 after {reconnect_attempts} attempts — switching to RPC polling (Helius plan may not support WebSocket)", flush=True)
-                    _run_rpc_poll_sniper(tracked_programs, seen_signatures)
-                    return
+                # 429: aggressive backoff — 30s, 60s, 120s
                 backoff = min(_MAX_RECONNECT_BACKOFF, 30 * (2 ** (reconnect_attempts - 1)))
                 print(f"[Sniper] 429 backoff: waiting {backoff}s before retry (attempt {reconnect_attempts})", flush=True)
                 time.sleep(backoff)
@@ -8718,8 +8567,7 @@ def dashboard():
             .replace("{{PLAN}}", html.escape(plan_info.get("label", "")))
             .replace("{{WALLET}}", html.escape(wallet.get("public_key", "")))
             .replace("{{PRESET}}", html.escape(normalize_preset_name((bsettings or {}).get("preset", "balanced"))))
-            .replace("{{PRESET_SETTINGS}}", preset_settings_json)
-            .replace("{{PRESET_DEFAULTS}}", preset_settings_json),
+            .replace("{{PRESET_SETTINGS}}", preset_settings_json),
             mimetype="text/html"
         )
     except Exception as e:
@@ -9617,129 +9465,6 @@ def api_quant_shadow_equity():
             "cumulative_pnl": round(running[strat], 2),
         })
     return jsonify(equity)
-
-
-@app.route("/api/paper-trading")
-@login_required
-def api_paper_trading():
-    """Paper trading simulator — applies shadow trades to a user-defined starting balance."""
-    start_bal = float(request.args.get("balance") or 1.0)
-    strategy = (request.args.get("strategy") or "").strip().lower()
-    conn = db()
-    try:
-        cur = conn.cursor()
-        # Closed trades ordered by time
-        sql_closed = """
-            SELECT id, strategy_name, mint, name, entry_price, exit_price, peak_price, trough_price,
-                   realized_pnl_pct, max_upside_pct, max_drawdown_pct, exit_reason, score, confidence,
-                   opened_at, closed_at,
-                   EXTRACT(EPOCH FROM (closed_at - opened_at))/60 AS hold_min
-            FROM shadow_positions
-            WHERE status='closed' AND closed_at IS NOT NULL
-        """
-        params_closed = []
-        if strategy:
-            sql_closed += " AND strategy_name=%s"
-            params_closed.append(strategy)
-        sql_closed += " ORDER BY closed_at ASC"
-        cur.execute(sql_closed, tuple(params_closed))
-        closed = cur.fetchall()
-
-        # Open positions
-        sql_open = """
-            SELECT id, strategy_name, mint, name, entry_price, current_price, peak_price, trough_price,
-                   max_upside_pct, max_drawdown_pct, score, confidence,
-                   opened_at,
-                   EXTRACT(EPOCH FROM (NOW() - opened_at))/60 AS age_min
-            FROM shadow_positions
-            WHERE status='open'
-        """
-        params_open = []
-        if strategy:
-            sql_open += " AND strategy_name=%s"
-            params_open.append(strategy)
-        sql_open += " ORDER BY opened_at DESC"
-        cur.execute(sql_open, tuple(params_open))
-        openpos = cur.fetchall()
-    finally:
-        db_return(conn)
-
-    # Simulate balance progression using a fixed per-trade risk
-    balance = start_bal
-    peak_bal = start_bal
-    max_dd = 0.0
-    trade_log = []
-    wins = 0
-    losses = 0
-    total_pnl_sol = 0.0
-    for row in closed:
-        pnl_pct = float(row.get("realized_pnl_pct") or 0)
-        # Risk 5% of current balance per trade (capped at balance)
-        risk_sol = min(balance * 0.05, balance)
-        pnl_sol = round(risk_sol * pnl_pct / 100.0, 6)
-        balance = round(balance + pnl_sol, 6)
-        total_pnl_sol += pnl_sol
-        if balance > peak_bal:
-            peak_bal = balance
-        dd = round((peak_bal - balance) / peak_bal * 100, 2) if peak_bal > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
-        if pnl_pct > 0:
-            wins += 1
-        else:
-            losses += 1
-        trade_log.append({
-            "id": row["id"],
-            "mint": row.get("mint"),
-            "strategy": row.get("strategy_name"),
-            "name": row.get("name") or row.get("mint", "")[:8],
-            "pnl_pct": round(pnl_pct, 2),
-            "pnl_sol": round(pnl_sol, 6),
-            "balance_after": round(balance, 6),
-            "exit_reason": row.get("exit_reason"),
-            "hold_min": round(float(row.get("hold_min") or 0), 1),
-            "closed_at": row["closed_at"].isoformat() if row.get("closed_at") else None,
-        })
-
-    # Open position unrealized
-    open_list = []
-    unrealized_sol = 0.0
-    for row in openpos:
-        ep = float(row.get("entry_price") or 0)
-        cp = float(row.get("current_price") or ep)
-        pnl_pct = ((cp - ep) / ep * 100) if ep > 0 else 0
-        risk_sol = min(balance * 0.05, balance)
-        pnl_sol = round(risk_sol * pnl_pct / 100.0, 6)
-        unrealized_sol += pnl_sol
-        open_list.append({
-            "id": row["id"],
-            "mint": row.get("mint"),
-            "strategy": row.get("strategy_name"),
-            "name": row.get("name") or row.get("mint", "")[:8],
-            "pnl_pct": round(pnl_pct, 2),
-            "pnl_sol": round(pnl_sol, 6),
-            "age_min": round(float(row.get("age_min") or 0), 1),
-            "peak_up_pct": round(float(row.get("max_upside_pct") or 0), 2),
-        })
-
-    total_trades = wins + losses
-    return jsonify({
-        "start_balance": start_bal,
-        "current_balance": round(balance, 6),
-        "unrealized_sol": round(unrealized_sol, 6),
-        "total_balance": round(balance + unrealized_sol, 6),
-        "total_pnl_sol": round(total_pnl_sol, 6),
-        "total_pnl_pct": round((balance - start_bal) / start_bal * 100, 2) if start_bal > 0 else 0,
-        "peak_balance": round(peak_bal, 6),
-        "max_drawdown_pct": round(max_dd, 2),
-        "wins": wins,
-        "losses": losses,
-        "total_trades": total_trades,
-        "win_rate": round(wins / total_trades * 100, 1) if total_trades > 0 else 0,
-        "open_positions": open_list,
-        "trade_log": trade_log[-100:],  # last 100 trades
-        "equity_curve": [{"balance": t["balance_after"], "ts": t["closed_at"]} for t in trade_log],
-    })
 
 
 @app.route("/api/quant/shadow-activity")
@@ -13032,7 +12757,6 @@ DASHBOARD_HTML = _CSS + """
     <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
     <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
     <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Replay runs and strategy research</span></button>
-    <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')"><span class="tab-btn-label">Paper</span><span class="tab-btn-meta">Simulated trading with custom balance</span></button>
   </div>
 
   <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
@@ -13865,146 +13589,6 @@ DASHBOARD_HTML = _CSS + """
 
 </div>
 
-  <!-- ═══════════════════════ PAPER TRADING TAB ═══════════════════════ -->
-  <div id="tab-paper" class="tab-pane">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Paper Trading</div>
-        <div class="tab-pane-title">Simulated Scanner</div>
-        <div class="tab-pane-copy">Live scanner mirror using your hypothetical balance. Shadow trades appear as coins flow through the scanner in real-time.</div>
-      </div>
-      <div class="shortcut-row">
-        <span class="badge bg-blue" id="paper-sync-badge">Waiting for data…</span>
-        <span id="paper-last-update" style="font-size:11px;color:var(--t3)"></span>
-      </div>
-    </div>
-
-    <!-- Balance Controls -->
-    <div class="glass" style="margin-bottom:14px">
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <label style="font-size:13px;color:var(--t2);font-weight:600">Starting Balance</label>
-        <input type="number" id="paper-balance" value="1" min="0.01" step="0.1" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--t1);padding:8px 12px;border-radius:6px;width:110px;font-size:14px;font-weight:600;font-family:monospace">
-        <span style="font-size:13px;color:var(--t3)">SOL</span>
-        <select id="paper-strategy" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--t1);padding:8px 12px;border-radius:6px;font-size:13px">
-          <option value="">All Strategies</option>
-          <option value="safe">Safe</option>
-          <option value="balanced">Balanced</option>
-          <option value="aggressive">Aggressive</option>
-          <option value="degen">Degen</option>
-          <option value="live">Live (Your Settings)</option>
-        </select>
-        <button class="btn btn-primary" onclick="loadPaper()" style="padding:8px 20px">&#9654; Update Balance</button>
-      </div>
-    </div>
-
-    <!-- Paper Portfolio Summary -->
-    <div class="scanner-top-grid">
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Paper Portfolio</div>
-            <div class="panel-copy">Hypothetical performance based on shadow trades running against live market data.</div>
-          </div>
-        </div>
-        <div class="control-action-grid">
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Balance</div>
-            <div class="scanner-summary-value" id="paper-current-bal">—</div>
-            <div class="scanner-summary-copy" id="paper-pnl-pct">—</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Win Rate</div>
-            <div class="scanner-summary-value" id="paper-winrate">—</div>
-            <div class="scanner-summary-copy" id="paper-wl">—</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Total P&L</div>
-            <div class="scanner-summary-value" id="paper-total-pnl">—</div>
-            <div class="scanner-summary-copy">SOL</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Max Drawdown</div>
-            <div class="scanner-summary-value" id="paper-max-dd" style="color:#f87171">—</div>
-            <div class="scanner-summary-copy">from peak</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Open Now</div>
-            <div class="scanner-summary-value" id="paper-open-count" style="color:#818cf8">—</div>
-            <div class="scanner-summary-copy" id="paper-unrealized">—</div>
-          </div>
-        </div>
-      </div>
-
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Equity Curve</div>
-            <div class="panel-copy">Balance progression from shadow trade outcomes scaled to your starting amount.</div>
-          </div>
-        </div>
-        <div id="paper-equity-chart" style="height:160px;position:relative;overflow:hidden">
-          <canvas id="paper-equity-canvas" style="width:100%;height:100%"></canvas>
-        </div>
-      </div>
-    </div>
-
-    <!-- Scanner Layout (mirrors main scanner) -->
-    <div class="scanner-layout">
-      <div class="scanner-sidebar">
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Paper Positions</div>
-              <div class="panel-copy">Live shadow trades scaled to your hypothetical balance.</div>
-            </div>
-          </div>
-          <div id="paper-open-list" style="max-height:220px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Loading shadow positions…</div></div>
-        </div>
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Filter Pipeline</div>
-              <div class="panel-copy">Real-time pass/fail decisions from the algorithm.</div>
-            </div>
-          </div>
-          <div id="paper-filter-pipe" style="max-height:160px;overflow-y:auto"><div style="font-size:11px;color:var(--t3)">Scanning…</div></div>
-        </div>
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Recent Trades</div>
-              <div class="panel-copy">Closed shadow positions with hypothetical P&L.</div>
-            </div>
-          </div>
-          <div id="paper-trade-log" style="max-height:200px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Loading trade history…</div></div>
-        </div>
-      </div>
-      <div class="scanner-main">
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap">
-            <div>
-              <div style="font-weight:800;font-size:16px;font-family:'Space Grotesk','Manrope',sans-serif">Live Scanner <span style="font-size:11px;font-weight:400;color:var(--t3)">&middot; paper mode</span></div>
-              <div id="paper-token-count" style="font-size:11px;color:var(--t3);margin-top:3px">0 tokens</div>
-            </div>
-            <div class="scanner-header-actions">
-              <input id="paper-scan-search" class="scanner-search" type="text" placeholder="Search token or symbol…" oninput="renderPaperTokenRows()">
-              <button class="sort-pill active" onclick="setPaperSort('score',this)">Score</button>
-              <button class="sort-pill" onclick="setPaperSort('vol',this)">Vol</button>
-              <button class="sort-pill" onclick="setPaperSort('chg',this)">Chg</button>
-              <button class="sort-pill" onclick="setPaperSort('age',this)">Age</button>
-            </div>
-          </div>
-          <div style="max-height:550px;overflow-y:auto">
-            <table class="tbl" style="font-size:11px">
-              <thead><tr><th>#</th><th>Token</th><th>Price</th><th>1h</th><th>Vol</th><th>MCap</th><th>Liq</th><th>Age</th><th>Score</th><th>Shadow</th></tr></thead>
-            </table>
-            <div id="paper-token-rows"></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
 <!-- Toast -->
 <div id="toast" style="position:fixed;bottom:230px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--grn);color:var(--grn);padding:10px 24px;border-radius:8px;font-size:13px;font-weight:600;z-index:200;opacity:0;transition:opacity .3s;pointer-events:none"></div>
 <style>#toast.show{opacity:1}</style>
@@ -14082,7 +13666,6 @@ function switchTab(tab, btn) {
     loadPnl(activeRange);
   }
   if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
-  if (tab === 'paper') { loadPaper(); renderPaperTokenRows(); _tabPollers.paper = setInterval(renderPaperTokenRows, 4000); _tabPollers.paperData = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 12000); }
 }
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
@@ -14499,7 +14082,6 @@ async function pollFeed() {
       allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 100);
       feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
       renderTokenRows();
-      if (_activeTab === 'paper') renderPaperTokenRows();
       updateTicker();
       setText('scanner-last-market', `Feed ${fmtClock()}`);
     }
@@ -15040,8 +14622,6 @@ async function refresh() {
         <span class="fp-name">${f.name||'?'}</span>
         <span class="fp-reason">${f.reason||''}</span>
       </div>`).join('') || '<div style="font-size:11px;color:var(--t3)">Scanning\u2026</div>';
-    // Mirror filter pipeline to Paper tab
-    renderPaperFilterPipe(d.filter_log);
   }
   if (d.settings && Object.keys(d.settings).length) {
     const savedSettings = {
@@ -16788,244 +16368,6 @@ async function applyOpportunitySettings() {
   } catch(e) {
     showToast('Error applying settings', false);
   }
-}
-
-// ── Paper Trading ─────────────────────────────────────────────────────────────
-let _paperData = null;
-let _paperInterval = null;
-let _paperMints = {};
-let _paperSortCol = 'score';
-let _paperAutoStarted = false;
-
-async function loadPaper() {
-  const bal = parseFloat(document.getElementById('paper-balance').value) || 1;
-  const strat = document.getElementById('paper-strategy').value;
-  const qs = `balance=${bal}` + (strat ? `&strategy=${strat}` : '');
-  document.getElementById('paper-last-update').textContent = 'Syncing...';
-  try {
-    const resp = await fetch(`/api/paper-trading?${qs}`);
-    if (!resp.ok) {
-      document.getElementById('paper-last-update').textContent = 'Error: ' + resp.status;
-      return;
-    }
-    const r = await resp.json();
-    _paperData = r;
-    // Build mint lookup for scanner annotations
-    _paperMints = {};
-    (r.open_positions || []).forEach(p => {
-      if (p.mint) _paperMints[p.mint] = { status:'open', pnl_pct:p.pnl_pct, pnl_sol:p.pnl_sol, strategy:p.strategy, name:p.name };
-    });
-    (r.trade_log || []).forEach(t => {
-      if (t.mint) _paperMints[t.mint] = { status:'closed', pnl_pct:t.pnl_pct, pnl_sol:t.pnl_sol, strategy:t.strategy, name:t.name, exit_reason:t.exit_reason };
-    });
-    renderPaperStats(r);
-    renderPaperPositions(r);
-    renderPaperTradeLog(r);
-    renderPaperTokenRows();
-    drawEquityCurve(r.equity_curve, r.start_balance);
-    document.getElementById('paper-last-update').textContent = 'Live \u00b7 ' + new Date().toLocaleTimeString();
-    document.getElementById('paper-sync-badge').textContent = r.total_trades + ' trades \u00b7 ' + r.open_positions.length + ' open';
-  } catch(e) {
-    document.getElementById('paper-last-update').textContent = 'Error: ' + (e.message || e);
-  }
-}
-
-// Also pull filter pipeline into Paper tab during main refresh
-function renderPaperFilterPipe(filterLog) {
-  const el = document.getElementById('paper-filter-pipe');
-  if (!el || !filterLog || !filterLog.length) return;
-  el.innerHTML = filterLog.map(f => `
-    <div class="fp-item">
-      <span class="${f.passed?'fp-pass':'fp-fail'}">${f.passed?'\u2713':'\u2717'}</span>
-      <span class="fp-name">${f.name||'?'}</span>
-      <span class="fp-reason">${f.reason||''}</span>
-    </div>`).join('');
-}
-
-function renderPaperStats(d) {
-  const pnlColor = d.total_pnl_sol >= 0 ? '#4ade80' : '#f87171';
-  document.getElementById('paper-current-bal').textContent = d.total_balance.toFixed(4);
-  const pctEl = document.getElementById('paper-pnl-pct');
-  pctEl.textContent = (d.total_pnl_pct >= 0 ? '+' : '') + d.total_pnl_pct.toFixed(2) + '%';
-  pctEl.style.color = pnlColor;
-  const wr = document.getElementById('paper-winrate');
-  wr.textContent = d.win_rate.toFixed(1) + '%';
-  wr.style.color = d.win_rate >= 50 ? '#4ade80' : '#fbbf24';
-  document.getElementById('paper-wl').textContent = d.wins + 'W / ' + d.losses + 'L';
-  const tpnl = document.getElementById('paper-total-pnl');
-  tpnl.textContent = (d.total_pnl_sol >= 0 ? '+' : '') + d.total_pnl_sol.toFixed(4);
-  tpnl.style.color = pnlColor;
-  document.getElementById('paper-max-dd').textContent = d.max_drawdown_pct.toFixed(2) + '%';
-  document.getElementById('paper-open-count').textContent = d.open_positions.length;
-  const unrEl = document.getElementById('paper-unrealized');
-  unrEl.textContent = (d.unrealized_sol >= 0 ? '+' : '') + d.unrealized_sol.toFixed(4) + ' SOL';
-  unrEl.style.color = d.unrealized_sol >= 0 ? '#4ade80' : '#f87171';
-}
-
-function renderPaperPositions(d) {
-  const el = document.getElementById('paper-open-list');
-  if (!d.open_positions.length) {
-    el.innerHTML = '<div style="color:var(--t3);padding:12px 0;font-size:12px">No open shadow positions</div>';
-    return;
-  }
-  el.innerHTML = d.open_positions.map(p => {
-    const c = p.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-    return `<div style="padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.04)">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <div>
-          <div style="font-size:12px;font-weight:600;color:var(--t1)">${p.name}</div>
-          <div style="font-size:10px;color:var(--t3)">${p.strategy} \u00b7 ${p.age_min.toFixed(0)}m</div>
-        </div>
-        <div style="text-align:right">
-          <div style="font-size:12px;font-weight:700;color:${c}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}%</div>
-          <div style="font-size:10px;color:${c}">${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)} SOL</div>
-        </div>
-      </div>
-      ${p.peak_up_pct > 0 ? `<div style="font-size:9px;color:var(--t3);margin-top:3px">Peak: +${p.peak_up_pct.toFixed(1)}%</div>` : ''}
-    </div>`;
-  }).join('');
-}
-
-function renderPaperTradeLog(d) {
-  const el = document.getElementById('paper-trade-log');
-  const trades = [...d.trade_log].reverse().slice(0, 40);
-  if (!trades.length) {
-    el.innerHTML = '<div style="color:var(--t3);padding:12px 0;font-size:12px">No closed trades yet \u2014 shadow positions are being tracked</div>';
-    return;
-  }
-  el.innerHTML = trades.map(t => {
-    const c = t.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-    return `<div style="display:flex;justify-content:space-between;padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.03);font-size:11px">
-      <div>
-        <span style="color:var(--t1);font-weight:600">${t.name}</span>
-        <span style="color:var(--t3)"> \u00b7 ${t.strategy || ''}</span>
-      </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <span style="color:${c};font-weight:700">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(1)}%</span>
-        <span style="color:${c};font-size:10px">${t.pnl_sol >= 0 ? '+' : ''}${t.pnl_sol.toFixed(4)}</span>
-        <span style="color:var(--t3);font-size:9px">${t.exit_reason || ''}</span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function setPaperSort(col, btn) {
-  _paperSortCol = col;
-  btn.parentElement.querySelectorAll('.sort-pill').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderPaperTokenRows();
-}
-
-function renderPaperTokenRows() {
-  const q = (document.getElementById('paper-scan-search')?.value || '').toLowerCase();
-  let tokens = allTokens.filter(t =>
-    !q || (t.name||'').toLowerCase().includes(q) || (t.symbol||'').toLowerCase().includes(q)
-  );
-  tokens = [...tokens].sort((a, b) => {
-    if (_paperSortCol === 'score') return (b.score||0) - (a.score||0);
-    if (_paperSortCol === 'vol')   return (b.vol||0)   - (a.vol||0);
-    if (_paperSortCol === 'chg')   return (b.change||0) - (a.change||0);
-    if (_paperSortCol === 'age')   return (a.age_min||0) - (b.age_min||0);
-    return 0;
-  }).slice(0, 80);
-  const countEl = document.getElementById('paper-token-count');
-  if (countEl) countEl.textContent = tokens.length + ' tokens';
-  const container = document.getElementById('paper-token-rows');
-  if (!container) return;
-  if (!tokens.length) {
-    container.innerHTML = '<div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">No tokens yet \u2014 start the bot to begin scanning</div>';
-    return;
-  }
-  container.innerHTML = tokens.map((t, i) => {
-    const chg = t.change || 0;
-    const sc  = t.score  || 0;
-    const col = tokColor(t.name || '?');
-    const sym = (t.symbol || t.name || '?').slice(0, 7);
-    const nameSafe = (t.name||'').replace(/'/g, '');
-    // Shadow status annotation
-    const shadow = _paperMints[t.mint];
-    let shadowCell = '<span style="color:var(--t3);font-size:10px">\u2014</span>';
-    if (shadow) {
-      const sc2 = shadow.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-      if (shadow.status === 'open') {
-        shadowCell = `<span style="color:${sc2};font-weight:700;font-size:11px">\u25cf ${shadow.pnl_pct >= 0 ? '+' : ''}${shadow.pnl_pct.toFixed(1)}%</span>`;
-      } else {
-        shadowCell = `<span style="color:${sc2};font-size:11px;opacity:.7">${shadow.pnl_pct >= 0 ? '+' : ''}${shadow.pnl_pct.toFixed(1)}%</span>`;
-      }
-    }
-    return `<table style="width:100%;border-collapse:collapse"><tbody>
-      <tr class="dex-row${shadow && shadow.status==='open' ? ' selected' : ''}">
-        <td style="width:30px;color:var(--t3);font-size:10px;font-family:monospace">${i+1}</td>
-        <td>
-          <div style="display:flex;align-items:center">
-            <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
-            <div>
-              <div class="tok-name">${t.name||sym}${sc>=80?' &#x1f525;':''}</div>
-              <div class="tok-sym">${sym}${t.whale?' &#x1f40b;':''} \u00b7 ${(t.green_lights||0)}/3 GL \u00b7 N${t.narrative_score||0}</div>
-            </div>
-          </div>
-        </td>
-        <td><span class="price-val">${fmtPrice(t.price)}</span></td>
-        <td><span class="${chgClass(chg)}">${chgStr(chg)}</span></td>
-        <td><span class="num-val">${fmtK(t.vol)}</span></td>
-        <td><span class="num-val">${fmtK(t.mc)}</span></td>
-        <td><span class="num-val">${fmtK(t.liq)}</span></td>
-        <td><span class="num-val">${fmtAge(t.age_min||0)}</span></td>
-        <td>
-          <div style="display:flex;align-items:center;gap:5px">
-            <div class="score-mini"><div class="score-fill" style="width:${sc}%;background:${scoreColor(sc)}"></div></div>
-            <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
-          </div>
-        </td>
-        <td>${shadowCell}</td>
-      </tr>
-    </tbody></table>`;
-  }).join('');
-}
-
-function drawEquityCurve(curve, startBal) {
-  const canvas = document.getElementById('paper-equity-canvas');
-  if (!canvas || !curve.length) return;
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  ctx.scale(dpr, dpr);
-  const W = rect.width, H = rect.height;
-  ctx.clearRect(0, 0, W, H);
-  const vals = [startBal, ...curve.map(c => c.balance)];
-  const mn = Math.min(...vals) * 0.98;
-  const mx = Math.max(...vals) * 1.02;
-  const range = mx - mn || 1;
-  ctx.strokeStyle = 'rgba(255,255,255,.04)';
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 4; i++) {
-    const y = H * i / 3;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-  }
-  const startY = H - ((startBal - mn) / range) * H;
-  ctx.strokeStyle = 'rgba(255,255,255,.15)';
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath(); ctx.moveTo(0, startY); ctx.lineTo(W, startY); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.beginPath();
-  ctx.strokeStyle = vals[vals.length-1] >= startBal ? '#4ade80' : '#f87171';
-  ctx.lineWidth = 2;
-  for (let i = 0; i < vals.length; i++) {
-    const x = (i / (vals.length - 1)) * W;
-    const y = H - ((vals[i] - mn) / range) * H;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-  const lastX = W, lastY = H - ((vals[vals.length-1] - mn) / range) * H;
-  ctx.lineTo(lastX, H); ctx.lineTo(0, H); ctx.closePath();
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  const isUp = vals[vals.length-1] >= startBal;
-  grad.addColorStop(0, isUp ? 'rgba(74,222,128,.15)' : 'rgba(248,113,113,.15)');
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = grad;
-  ctx.fill();
 }
 
 </script>
