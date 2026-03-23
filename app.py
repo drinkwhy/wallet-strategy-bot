@@ -11539,7 +11539,7 @@ def admin():
     return redirect(url_for("dashboard"))
 
 # ── HTML Templates ─────────────────────────────────────────────────────────────
-_CSS = """<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+_CSS = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#07101E">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -11830,6 +11830,7 @@ LANDING_HTML = _CSS + """
 .promo-ribbon-val{font-size:20px;font-weight:900;font-family:'Space Grotesk','Manrope',sans-serif;color:#14c784;letter-spacing:-.5px}
 .promo-ribbon-lbl{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3)}
 </style>
+</head><body>
 
 <!-- Animated Top Bar -->
 <div class="promo-topbar">
@@ -12226,6 +12227,7 @@ function toggleStop(v){
   document.getElementById('f-pft').style.display = v==='profit'   ? 'block' : 'none';
 }
 </script>
+</body></html>
 """
 
 # ── Dashboard Page ─────────────────────────────────────────────────────────────
@@ -12458,6 +12460,7 @@ DASHBOARD_HTML = _CSS + """
   .activity-shell{height:190px}
 }
 </style>
+</head><body>
 
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
@@ -16728,6 +16731,7 @@ function renderPaper() {
 paperLoadState();
 
 </script>
+</body></html>
 """
 
 
@@ -16744,6 +16748,7 @@ ADMIN_HTML = _CSS + """
 .setting-input{background:var(--bg3);border:1px solid var(--bdr);color:var(--t1);padding:6px 10px;border-radius:6px;font-size:12px;width:100%;font-family:monospace}
 .setting-unit{font-size:11px;color:var(--t3)}
 </style>
+</head><body>
 
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
@@ -17069,6 +17074,7 @@ loadPreset('balanced');
 loadAI();
 loadBlacklist();
 </script>
+</body></html>
 """
 
 if __name__ == "__main__":
