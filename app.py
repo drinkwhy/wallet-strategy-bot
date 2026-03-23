@@ -13649,6 +13649,8 @@ DASHBOARD_HTML = _CSS + """
       </div>
     </div>
 
+    </div><!-- close tab-quant -->
+
     <!-- ── Paper Trading Tab ─────────────────────────────────────────────── -->
     <div id="tab-paper" class="tab-pane">
       <div style="max-width:900px;margin:0 auto">
