@@ -3667,7 +3667,7 @@ class BotInstance:
         max_age = s.get("max_age_min", 999)
         min_vol = s.get("min_vol", 0)
         min_score = s.get("min_score", 0)
-        min_green_lights = max(1, int(s.get("min_green_lights", 1)))
+        min_green_lights = int(s.get("min_green_lights", 0))
         min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
         min_narrative_score = int(s.get("min_narrative_score", 16))
         min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
@@ -7437,7 +7437,10 @@ def helius_pool_sniper():
             # ── Exponential backoff on reconnect ──────────────────────────
             reconnect_attempts += 1
             if error_state["rate_limited"]:
-                # 429: aggressive backoff — 30s, 60s, 120s
+                if reconnect_attempts >= 5:
+                    print(f"[Sniper] 429 after {reconnect_attempts} attempts — switching to RPC polling (Helius plan may not support WebSocket)", flush=True)
+                    _run_rpc_poll_sniper(tracked_programs, seen_signatures)
+                    return
                 backoff = min(_MAX_RECONNECT_BACKOFF, 30 * (2 ** (reconnect_attempts - 1)))
                 print(f"[Sniper] 429 backoff: waiting {backoff}s before retry (attempt {reconnect_attempts})", flush=True)
                 time.sleep(backoff)
