@@ -2247,7 +2247,7 @@ class BotInstance:
         rpc_total = sum(s["total"] for s in rpc_only)
         rpc_ok = sum(s["ok"] for s in rpc_only)
         rpc_fail_rate = round((1 - (rpc_ok / rpc_total)) * 100, 1) if rpc_total else 0.0
-        if rpc_total >= 12 and (rpc_fail_rate >= 55 or rpc_stats["p95_ms"] >= 4500):
+        if rpc_total >= 20 and (rpc_fail_rate >= 80 or rpc_stats["p95_ms"] >= 4500):
             return f"RPC degraded — fail {rpc_fail_rate:.0f}% / p95 {rpc_stats['p95_ms']:.0f}ms"
         return None
 
@@ -2370,20 +2370,28 @@ class BotInstance:
             _fallbacks.append(ANKR_RPC)
         _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
         for rpc_url in _fallbacks:
+            started = time.perf_counter()
+            label = "helius" if "helius" in rpc_url else "public"
             try:
                 r = requests.post(rpc_url, json=payload, timeout=5)
+                latency = round((time.perf_counter() - started) * 1000)
                 data = safe_json_response(r)
                 if not data:
+                    record_rpc_health(label, False, latency, "getBalance")
                     continue
                 if "error" in data:
                     print(f"[WARN] Balance RPC error from {rpc_url[:40]}: {data['error']}", flush=True)
+                    record_rpc_health(label, False, latency, "getBalance")
                     continue
                 val = data.get("result",{}).get("value",0)
                 self.sol_balance = val / 1e9
                 if self.sol_balance > self.peak_balance:
                     self.peak_balance = self.sol_balance
+                record_rpc_health(label, True, latency, "getBalance")
                 return
             except Exception as _e:
+                latency = round((time.perf_counter() - started) * 1000)
+                record_rpc_health(label, False, latency, "getBalance")
                 print(f"[ERROR] Balance fetch failed ({rpc_url[:40]}): {_e}", flush=True)
         print(f"[ERROR] All RPCs failed for balance check, wallet={self.wallet}", flush=True)
 
@@ -2986,6 +2994,10 @@ class BotInstance:
         # ── Circuit breakers ─────────────────────────────────────────────────
         cb = self.check_circuit_breakers()
         if cb:
+            is_rpc_issue = "RPC degraded" in cb
+            if is_rpc_issue:
+                self.log_msg(f"⚠️ RPC degraded — skipping trade for {name}")
+                return
             self.log_msg(f"⛔ CIRCUIT BREAKER — {cb} — halting bot")
             self.running = False
             return
