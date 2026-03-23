@@ -9539,6 +9539,7 @@ def api_paper_trading():
             losses += 1
         trade_log.append({
             "id": row["id"],
+            "mint": row.get("mint"),
             "strategy": row.get("strategy_name"),
             "name": row.get("name") or row.get("mint", "")[:8],
             "pnl_pct": round(pnl_pct, 2),
@@ -9561,6 +9562,7 @@ def api_paper_trading():
         unrealized_sol += pnl_sol
         open_list.append({
             "id": row["id"],
+            "mint": row.get("mint"),
             "strategy": row.get("strategy_name"),
             "name": row.get("name") or row.get("mint", "")[:8],
             "pnl_pct": round(pnl_pct, 2),
@@ -13716,17 +13718,22 @@ DASHBOARD_HTML = _CSS + """
   <div id="tab-paper" class="tab-pane">
     <div class="tab-pane-header">
       <div>
-        <div class="tab-kicker">Simulator</div>
-        <div class="tab-pane-title">Paper Trading</div>
-        <div class="tab-pane-copy">See how the bot would perform with any starting balance. Uses real shadow trades running against live market data.</div>
+        <div class="tab-kicker">Paper Trading</div>
+        <div class="tab-pane-title">Simulated Scanner</div>
+        <div class="tab-pane-copy">Live scanner mirror using your hypothetical balance. Shadow trades appear as coins flow through the scanner in real-time.</div>
+      </div>
+      <div class="shortcut-row">
+        <span class="badge bg-blue" id="paper-sync-badge">Waiting for data…</span>
+        <span id="paper-last-update" style="font-size:11px;color:var(--t3)"></span>
       </div>
     </div>
 
-    <!-- Balance Input -->
-    <div class="glass" style="margin-bottom:16px">
+    <!-- Balance Controls -->
+    <div class="glass" style="margin-bottom:14px">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <label style="font-size:13px;color:var(--t2)">Starting Balance (SOL)</label>
-        <input type="number" id="paper-balance" value="1" min="0.01" step="0.1" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--t1);padding:8px 12px;border-radius:6px;width:120px;font-size:14px;font-weight:600">
+        <label style="font-size:13px;color:var(--t2);font-weight:600">Starting Balance</label>
+        <input type="number" id="paper-balance" value="1" min="0.01" step="0.1" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--t1);padding:8px 12px;border-radius:6px;width:110px;font-size:14px;font-weight:600;font-family:monospace">
+        <span style="font-size:13px;color:var(--t3)">SOL</span>
         <select id="paper-strategy" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--t1);padding:8px 12px;border-radius:6px;font-size:13px">
           <option value="">All Strategies</option>
           <option value="safe">Safe</option>
@@ -13735,58 +13742,106 @@ DASHBOARD_HTML = _CSS + """
           <option value="degen">Degen</option>
           <option value="live">Live (Your Settings)</option>
         </select>
-        <button class="btn btn-primary" onclick="loadPaper()" style="padding:8px 20px">Simulate</button>
-        <span id="paper-last-update" style="font-size:11px;color:var(--t3);margin-left:auto"></span>
+        <button class="btn btn-primary" onclick="loadPaper()" style="padding:8px 20px">&#9654; Simulate</button>
       </div>
     </div>
 
-    <!-- Stats Cards -->
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px">
-      <div class="glass" style="text-align:center;padding:16px 10px">
-        <div style="font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px">Balance</div>
-        <div id="paper-current-bal" style="font-size:22px;font-weight:700;color:var(--t1);margin:4px 0">—</div>
-        <div id="paper-pnl-pct" style="font-size:12px;font-weight:600">—</div>
+    <!-- Paper Portfolio Summary -->
+    <div class="scanner-top-grid">
+      <div class="glass">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Paper Portfolio</div>
+            <div class="panel-copy">Hypothetical performance based on shadow trades running against live market data.</div>
+          </div>
+        </div>
+        <div class="control-action-grid">
+          <div class="scanner-summary-card">
+            <div class="scanner-summary-label">Balance</div>
+            <div class="scanner-summary-value" id="paper-current-bal">—</div>
+            <div class="scanner-summary-copy" id="paper-pnl-pct">—</div>
+          </div>
+          <div class="scanner-summary-card">
+            <div class="scanner-summary-label">Win Rate</div>
+            <div class="scanner-summary-value" id="paper-winrate">—</div>
+            <div class="scanner-summary-copy" id="paper-wl">—</div>
+          </div>
+          <div class="scanner-summary-card">
+            <div class="scanner-summary-label">Total P&L</div>
+            <div class="scanner-summary-value" id="paper-total-pnl">—</div>
+            <div class="scanner-summary-copy">SOL</div>
+          </div>
+          <div class="scanner-summary-card">
+            <div class="scanner-summary-label">Max Drawdown</div>
+            <div class="scanner-summary-value" id="paper-max-dd" style="color:#f87171">—</div>
+            <div class="scanner-summary-copy">from peak</div>
+          </div>
+          <div class="scanner-summary-card">
+            <div class="scanner-summary-label">Open Now</div>
+            <div class="scanner-summary-value" id="paper-open-count" style="color:#818cf8">—</div>
+            <div class="scanner-summary-copy" id="paper-unrealized">—</div>
+          </div>
+        </div>
       </div>
-      <div class="glass" style="text-align:center;padding:16px 10px">
-        <div style="font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px">Win Rate</div>
-        <div id="paper-winrate" style="font-size:22px;font-weight:700;color:var(--t1);margin:4px 0">—</div>
-        <div id="paper-wl" style="font-size:12px;color:var(--t3)">—</div>
-      </div>
-      <div class="glass" style="text-align:center;padding:16px 10px">
-        <div style="font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px">Total P&L</div>
-        <div id="paper-total-pnl" style="font-size:22px;font-weight:700;color:var(--t1);margin:4px 0">—</div>
-        <div style="font-size:12px;color:var(--t3)">SOL</div>
-      </div>
-      <div class="glass" style="text-align:center;padding:16px 10px">
-        <div style="font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px">Max Drawdown</div>
-        <div id="paper-max-dd" style="font-size:22px;font-weight:700;color:#f87171;margin:4px 0">—</div>
-        <div style="font-size:12px;color:var(--t3)">from peak</div>
-      </div>
-      <div class="glass" style="text-align:center;padding:16px 10px">
-        <div style="font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px">Open Now</div>
-        <div id="paper-open-count" style="font-size:22px;font-weight:700;color:#818cf8;margin:4px 0">—</div>
-        <div id="paper-unrealized" style="font-size:12px">—</div>
+
+      <div class="glass">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Equity Curve</div>
+            <div class="panel-copy">Balance progression from shadow trade outcomes scaled to your starting amount.</div>
+          </div>
+        </div>
+        <div id="paper-equity-chart" style="height:160px;position:relative;overflow:hidden">
+          <canvas id="paper-equity-canvas" style="width:100%;height:100%"></canvas>
+        </div>
       </div>
     </div>
 
-    <!-- Equity Curve -->
-    <div class="glass" style="margin-bottom:16px">
-      <div style="font-size:13px;font-weight:600;color:var(--t1);margin-bottom:10px">Equity Curve</div>
-      <div id="paper-equity-chart" style="height:200px;position:relative;overflow:hidden">
-        <canvas id="paper-equity-canvas" style="width:100%;height:100%"></canvas>
+    <!-- Scanner Layout (mirrors main scanner) -->
+    <div class="scanner-layout">
+      <div class="scanner-sidebar">
+        <div class="glass">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Paper Positions</div>
+              <div class="panel-copy">Shadow trades scaled to your hypothetical balance.</div>
+            </div>
+          </div>
+          <div id="paper-open-list" style="max-height:280px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Click &#9654; Simulate to begin</div></div>
+        </div>
+        <div class="glass">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Recent Trades</div>
+              <div class="panel-copy">Closed shadow positions with hypothetical P&L.</div>
+            </div>
+          </div>
+          <div id="paper-trade-log" style="max-height:260px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">Click &#9654; Simulate to see trade history</div></div>
+        </div>
       </div>
-    </div>
-
-    <!-- Open Positions -->
-    <div class="glass" style="margin-bottom:16px">
-      <div style="font-size:13px;font-weight:600;color:var(--t1);margin-bottom:10px">Open Positions</div>
-      <div id="paper-open-list" style="font-size:12px;color:var(--t3)">Run a simulation to see open positions</div>
-    </div>
-
-    <!-- Trade Log -->
-    <div class="glass">
-      <div style="font-size:13px;font-weight:600;color:var(--t1);margin-bottom:10px">Recent Trades</div>
-      <div id="paper-trade-log" style="font-size:12px;color:var(--t3)">Run a simulation to see trade history</div>
+      <div class="scanner-main">
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap">
+            <div>
+              <div style="font-weight:800;font-size:16px;font-family:'Space Grotesk','Manrope',sans-serif">Live Scanner <span style="font-size:11px;font-weight:400;color:var(--t3)">&middot; paper mode</span></div>
+              <div id="paper-token-count" style="font-size:11px;color:var(--t3);margin-top:3px">0 tokens</div>
+            </div>
+            <div class="scanner-header-actions">
+              <input id="paper-scan-search" class="scanner-search" type="text" placeholder="Search token or symbol…" oninput="renderPaperTokenRows()">
+              <button class="sort-pill active" onclick="setPaperSort('score',this)">Score</button>
+              <button class="sort-pill" onclick="setPaperSort('vol',this)">Vol</button>
+              <button class="sort-pill" onclick="setPaperSort('chg',this)">Chg</button>
+              <button class="sort-pill" onclick="setPaperSort('age',this)">Age</button>
+            </div>
+          </div>
+          <div style="max-height:550px;overflow-y:auto">
+            <table class="tbl" style="font-size:11px">
+              <thead><tr><th>#</th><th>Token</th><th>Price</th><th>1h</th><th>Vol</th><th>MCap</th><th>Liq</th><th>Age</th><th>Score</th><th>Shadow</th></tr></thead>
+            </table>
+            <div id="paper-token-rows"></div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -13867,6 +13922,7 @@ function switchTab(tab, btn) {
     loadPnl(activeRange);
   }
   if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
+  if (tab === 'paper') { if (!_paperData) loadPaper(); renderPaperTokenRows(); _tabPollers.paper = setInterval(renderPaperTokenRows, 4000); }
 }
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
@@ -14283,6 +14339,7 @@ async function pollFeed() {
       allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 100);
       feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
       renderTokenRows();
+      if (_activeTab === 'paper') renderPaperTokenRows();
       updateTicker();
       setText('scanner-last-market', `Feed ${fmtClock()}`);
     }
@@ -16574,6 +16631,8 @@ async function applyOpportunitySettings() {
 // ── Paper Trading ─────────────────────────────────────────────────────────────
 let _paperData = null;
 let _paperInterval = null;
+let _paperMints = {};
+let _paperSortCol = 'score';
 
 async function loadPaper() {
   const bal = parseFloat(document.getElementById('paper-balance').value) || 1;
@@ -16584,82 +16643,171 @@ async function loadPaper() {
     const resp = await fetch(`/api/paper-trading?${qs}`);
     if (!resp.ok) {
       document.getElementById('paper-last-update').textContent = 'Error: ' + resp.status;
-      console.error('Paper API error', resp.status, await resp.text().catch(()=>''));
       return;
     }
     const r = await resp.json();
     _paperData = r;
-    renderPaper(r);
+    // Build mint lookup for scanner annotations
+    _paperMints = {};
+    (r.open_positions || []).forEach(p => {
+      if (p.mint) _paperMints[p.mint] = { status:'open', pnl_pct:p.pnl_pct, pnl_sol:p.pnl_sol, strategy:p.strategy, name:p.name };
+    });
+    (r.trade_log || []).forEach(t => {
+      if (t.mint) _paperMints[t.mint] = { status:'closed', pnl_pct:t.pnl_pct, pnl_sol:t.pnl_sol, strategy:t.strategy, name:t.name, exit_reason:t.exit_reason };
+    });
+    renderPaperStats(r);
+    renderPaperPositions(r);
+    renderPaperTradeLog(r);
+    renderPaperTokenRows();
+    drawEquityCurve(r.equity_curve, r.start_balance);
     document.getElementById('paper-last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
-    // Auto-refresh every 45s
+    document.getElementById('paper-sync-badge').textContent = r.total_trades + ' trades \u00b7 ' + r.open_positions.length + ' open';
     if (_paperInterval) clearInterval(_paperInterval);
-    _paperInterval = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 45000);
+    _paperInterval = setInterval(() => { if (_activeTab === 'paper') loadPaper(); }, 30000);
   } catch(e) {
     document.getElementById('paper-last-update').textContent = 'Error: ' + (e.message || e);
-    console.error('Paper trading error', e);
   }
 }
 
-function renderPaper(d) {
+function renderPaperStats(d) {
   const pnlColor = d.total_pnl_sol >= 0 ? '#4ade80' : '#f87171';
-  document.getElementById('paper-current-bal').textContent = d.total_balance.toFixed(4) + ' SOL';
+  document.getElementById('paper-current-bal').textContent = d.total_balance.toFixed(4);
   const pctEl = document.getElementById('paper-pnl-pct');
   pctEl.textContent = (d.total_pnl_pct >= 0 ? '+' : '') + d.total_pnl_pct.toFixed(2) + '%';
   pctEl.style.color = pnlColor;
-
   const wr = document.getElementById('paper-winrate');
   wr.textContent = d.win_rate.toFixed(1) + '%';
   wr.style.color = d.win_rate >= 50 ? '#4ade80' : '#fbbf24';
-  document.getElementById('paper-wl').textContent = d.wins + 'W / ' + d.losses + 'L (' + d.total_trades + ')';
-
+  document.getElementById('paper-wl').textContent = d.wins + 'W / ' + d.losses + 'L';
   const tpnl = document.getElementById('paper-total-pnl');
   tpnl.textContent = (d.total_pnl_sol >= 0 ? '+' : '') + d.total_pnl_sol.toFixed(4);
   tpnl.style.color = pnlColor;
-
   document.getElementById('paper-max-dd').textContent = d.max_drawdown_pct.toFixed(2) + '%';
   document.getElementById('paper-open-count').textContent = d.open_positions.length;
   const unrEl = document.getElementById('paper-unrealized');
   unrEl.textContent = (d.unrealized_sol >= 0 ? '+' : '') + d.unrealized_sol.toFixed(4) + ' SOL';
   unrEl.style.color = d.unrealized_sol >= 0 ? '#4ade80' : '#f87171';
+}
 
-  // Equity curve
-  drawEquityCurve(d.equity_curve, d.start_balance);
-
-  // Open positions
-  const openEl = document.getElementById('paper-open-list');
+function renderPaperPositions(d) {
+  const el = document.getElementById('paper-open-list');
   if (!d.open_positions.length) {
-    openEl.innerHTML = '<div style="color:var(--t3);padding:12px 0">No open positions</div>';
-  } else {
-    openEl.innerHTML = '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:4px;font-size:11px;color:var(--t3);padding:4px 0;border-bottom:1px solid var(--bdr)"><span>Token</span><span>Strategy</span><span>P&L</span><span>Age</span></div>' +
-      d.open_positions.map(p => {
-        const c = p.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:4px;font-size:12px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03)">
-          <span style="color:var(--t1);font-weight:600">${p.name}</span>
-          <span style="color:var(--t3)">${p.strategy}</span>
-          <span style="color:${c};font-weight:600">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}% (${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)})</span>
-          <span style="color:var(--t3)">${p.age_min.toFixed(0)}m</span>
-        </div>`;
-      }).join('');
+    el.innerHTML = '<div style="color:var(--t3);padding:12px 0;font-size:12px">No open shadow positions</div>';
+    return;
   }
+  el.innerHTML = d.open_positions.map(p => {
+    const c = p.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+    return `<div style="padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.04)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-size:12px;font-weight:600;color:var(--t1)">${p.name}</div>
+          <div style="font-size:10px;color:var(--t3)">${p.strategy} \u00b7 ${p.age_min.toFixed(0)}m</div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:12px;font-weight:700;color:${c}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(1)}%</div>
+          <div style="font-size:10px;color:${c}">${p.pnl_sol >= 0 ? '+' : ''}${p.pnl_sol.toFixed(4)} SOL</div>
+        </div>
+      </div>
+      ${p.peak_up_pct > 0 ? `<div style="font-size:9px;color:var(--t3);margin-top:3px">Peak: +${p.peak_up_pct.toFixed(1)}%</div>` : ''}
+    </div>`;
+  }).join('');
+}
 
-  // Trade log (most recent first)
-  const logEl = document.getElementById('paper-trade-log');
-  const trades = [...d.trade_log].reverse();
+function renderPaperTradeLog(d) {
+  const el = document.getElementById('paper-trade-log');
+  const trades = [...d.trade_log].reverse().slice(0, 40);
   if (!trades.length) {
-    logEl.innerHTML = '<div style="color:var(--t3);padding:12px 0">No closed trades yet — shadow positions are being tracked</div>';
-  } else {
-    logEl.innerHTML = '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:4px;font-size:11px;color:var(--t3);padding:4px 0;border-bottom:1px solid var(--bdr)"><span>Token</span><span>P&L</span><span>SOL</span><span>Balance</span><span>Exit</span></div>' +
-      trades.slice(0, 50).map(t => {
-        const c = t.pnl_pct >= 0 ? '#4ade80' : '#f87171';
-        return `<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:4px;font-size:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.03)">
-          <span style="color:var(--t1)">${t.name}</span>
-          <span style="color:${c};font-weight:600">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(1)}%</span>
-          <span style="color:${c}">${t.pnl_sol >= 0 ? '+' : ''}${t.pnl_sol.toFixed(4)}</span>
-          <span style="color:var(--t2)">${t.balance_after.toFixed(4)}</span>
-          <span style="color:var(--t3);font-size:11px">${t.exit_reason || '—'}</span>
-        </div>`;
-      }).join('');
+    el.innerHTML = '<div style="color:var(--t3);padding:12px 0;font-size:12px">No closed trades yet \u2014 shadow positions are being tracked</div>';
+    return;
   }
+  el.innerHTML = trades.map(t => {
+    const c = t.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+    return `<div style="display:flex;justify-content:space-between;padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.03);font-size:11px">
+      <div>
+        <span style="color:var(--t1);font-weight:600">${t.name}</span>
+        <span style="color:var(--t3)"> \u00b7 ${t.strategy || ''}</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="color:${c};font-weight:700">${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(1)}%</span>
+        <span style="color:${c};font-size:10px">${t.pnl_sol >= 0 ? '+' : ''}${t.pnl_sol.toFixed(4)}</span>
+        <span style="color:var(--t3);font-size:9px">${t.exit_reason || ''}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function setPaperSort(col, btn) {
+  _paperSortCol = col;
+  btn.parentElement.querySelectorAll('.sort-pill').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderPaperTokenRows();
+}
+
+function renderPaperTokenRows() {
+  const q = (document.getElementById('paper-scan-search')?.value || '').toLowerCase();
+  let tokens = allTokens.filter(t =>
+    !q || (t.name||'').toLowerCase().includes(q) || (t.symbol||'').toLowerCase().includes(q)
+  );
+  tokens = [...tokens].sort((a, b) => {
+    if (_paperSortCol === 'score') return (b.score||0) - (a.score||0);
+    if (_paperSortCol === 'vol')   return (b.vol||0)   - (a.vol||0);
+    if (_paperSortCol === 'chg')   return (b.change||0) - (a.change||0);
+    if (_paperSortCol === 'age')   return (a.age_min||0) - (b.age_min||0);
+    return 0;
+  }).slice(0, 80);
+  const countEl = document.getElementById('paper-token-count');
+  if (countEl) countEl.textContent = tokens.length + ' tokens';
+  const container = document.getElementById('paper-token-rows');
+  if (!container) return;
+  if (!tokens.length) {
+    container.innerHTML = '<div style="padding:28px;text-align:center;color:var(--t3);font-size:13px">No tokens yet \u2014 start the bot to begin scanning</div>';
+    return;
+  }
+  container.innerHTML = tokens.map((t, i) => {
+    const chg = t.change || 0;
+    const sc  = t.score  || 0;
+    const col = tokColor(t.name || '?');
+    const sym = (t.symbol || t.name || '?').slice(0, 7);
+    const nameSafe = (t.name||'').replace(/'/g, '');
+    // Shadow status annotation
+    const shadow = _paperMints[t.mint];
+    let shadowCell = '<span style="color:var(--t3);font-size:10px">\u2014</span>';
+    if (shadow) {
+      const sc2 = shadow.pnl_pct >= 0 ? '#4ade80' : '#f87171';
+      if (shadow.status === 'open') {
+        shadowCell = `<span style="color:${sc2};font-weight:700;font-size:11px">\u25cf ${shadow.pnl_pct >= 0 ? '+' : ''}${shadow.pnl_pct.toFixed(1)}%</span>`;
+      } else {
+        shadowCell = `<span style="color:${sc2};font-size:11px;opacity:.7">${shadow.pnl_pct >= 0 ? '+' : ''}${shadow.pnl_pct.toFixed(1)}%</span>`;
+      }
+    }
+    return `<table style="width:100%;border-collapse:collapse"><tbody>
+      <tr class="dex-row${shadow && shadow.status==='open' ? ' selected' : ''}">
+        <td style="width:30px;color:var(--t3);font-size:10px;font-family:monospace">${i+1}</td>
+        <td>
+          <div style="display:flex;align-items:center">
+            <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
+            <div>
+              <div class="tok-name">${t.name||sym}${sc>=80?' \u{1f525}':''}</div>
+              <div class="tok-sym">${sym}${t.whale?' \u{1f40b}':''} \u00b7 ${(t.green_lights||0)}/3 GL \u00b7 N${t.narrative_score||0}</div>
+            </div>
+          </div>
+        </td>
+        <td><span class="price-val">${fmtPrice(t.price)}</span></td>
+        <td><span class="${chgClass(chg)}">${chgStr(chg)}</span></td>
+        <td><span class="num-val">${fmtK(t.vol)}</span></td>
+        <td><span class="num-val">${fmtK(t.mc)}</span></td>
+        <td><span class="num-val">${fmtK(t.liq)}</span></td>
+        <td><span class="num-val">${fmtAge(t.age_min||0)}</span></td>
+        <td>
+          <div style="display:flex;align-items:center;gap:5px">
+            <div class="score-mini"><div class="score-fill" style="width:${sc}%;background:${scoreColor(sc)}"></div></div>
+            <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
+          </div>
+        </td>
+        <td>${shadowCell}</td>
+      </tr>
+    </tbody></table>`;
+  }).join('');
 }
 
 function drawEquityCurve(curve, startBal) {
@@ -16673,28 +16821,21 @@ function drawEquityCurve(curve, startBal) {
   ctx.scale(dpr, dpr);
   const W = rect.width, H = rect.height;
   ctx.clearRect(0, 0, W, H);
-
   const vals = [startBal, ...curve.map(c => c.balance)];
   const mn = Math.min(...vals) * 0.98;
   const mx = Math.max(...vals) * 1.02;
   const range = mx - mn || 1;
-
-  // Grid lines
   ctx.strokeStyle = 'rgba(255,255,255,.04)';
   ctx.lineWidth = 1;
   for (let i = 0; i < 4; i++) {
     const y = H * i / 3;
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
   }
-
-  // Start line
   const startY = H - ((startBal - mn) / range) * H;
   ctx.strokeStyle = 'rgba(255,255,255,.15)';
   ctx.setLineDash([4, 4]);
   ctx.beginPath(); ctx.moveTo(0, startY); ctx.lineTo(W, startY); ctx.stroke();
   ctx.setLineDash([]);
-
-  // Equity line
   ctx.beginPath();
   ctx.strokeStyle = vals[vals.length-1] >= startBal ? '#4ade80' : '#f87171';
   ctx.lineWidth = 2;
@@ -16704,8 +16845,6 @@ function drawEquityCurve(curve, startBal) {
     if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
   }
   ctx.stroke();
-
-  // Fill
   const lastX = W, lastY = H - ((vals[vals.length-1] - mn) / range) * H;
   ctx.lineTo(lastX, H); ctx.lineTo(0, H); ctx.closePath();
   const grad = ctx.createLinearGradient(0, 0, 0, H);
