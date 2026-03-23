@@ -172,6 +172,14 @@ _dex_limiter = _RateLimiter(rate_per_sec=4)
 _dex_backoff_until = 0  # epoch timestamp — skip requests until this time
 _rpc_health = deque(maxlen=600)
 
+# ── RPC fallback chain ─────────────────────────────────────────────────────
+# Helius is primary; public RPCs are free but heavily rate-limited — last resort
+_PUBLIC_RPCS = [
+    "https://solana-rpc.publicnode.com",
+    "https://api.mainnet-beta.solana.com",
+]
+_helius_backoff_until = 0.0   # epoch — skip Helius until this time after 429
+
 
 def record_rpc_health(source, ok, latency_ms, method=""):
     _rpc_health.appendleft({
@@ -1913,16 +1921,14 @@ def ai_score(info):
 def check_holder_concentration(mint):
     """Returns True if top holders don't own >50% of supply."""
     try:
-        r = requests.post(HELIUS_RPC, json={
-            "jsonrpc":"2.0","id":1,
-            "method":"getTokenLargestAccounts",
-            "params":[mint]
-        }, timeout=6).json()
-        accounts = r.get("result",{}).get("value",[])
-        if not accounts: return True
+        result = rpc_call("getTokenLargestAccounts", [mint], timeout=6)
+        accounts = (result or {}).get("value", []) if isinstance(result, dict) else []
+        if not accounts:
+            return True
         total = sum(float(a.get("uiAmount") or 0) for a in accounts)
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
-        if total <= 0: return True
+        if total <= 0:
+            return True
         return (top5 / total) < 0.50
     except Exception as _e:
         print(f"[ERROR] Holder check failed: {_e}", flush=True)
@@ -2024,21 +2030,21 @@ def send_sol(keypair, to_address, amount_sol):
         from solders.hash import Hash as SolHash
         lamports = int(amount_sol * 1e9)
         # get recent blockhash
-        bh_r = requests.post(HELIUS_RPC, json={
-            "jsonrpc":"2.0","id":1,"method":"getLatestBlockhash",
-            "params":[{"commitment":"confirmed"}]
-        }, timeout=8).json()
-        blockhash = SolHash.from_string(bh_r["result"]["value"]["blockhash"])
+        bh_result = rpc_call("getLatestBlockhash", [{"commitment": "confirmed"}], timeout=8) or {}
+        bh_value = bh_result.get("value", {}) if isinstance(bh_result, dict) else {}
+        if not bh_value or not bh_value.get("blockhash"):
+            print("[send_sol] Failed to get blockhash from any RPC", flush=True)
+            return None
+        blockhash = SolHash.from_string(bh_value["blockhash"])
         to_pk = Pubkey.from_string(to_address)
         ix    = transfer(TransferParams(from_pubkey=keypair.pubkey(), to_pubkey=to_pk, lamports=lamports))
         msg   = MessageV0.try_compile(keypair.pubkey(), [ix], [], blockhash)
         tx    = VersionedTransaction(msg, [keypair])
         enc   = base64.b64encode(bytes(tx)).decode()
-        res   = requests.post(HELIUS_RPC, json={
-            "jsonrpc":"2.0","id":1,"method":"sendTransaction",
-            "params":[enc,{"encoding":"base64","skipPreflight":False,"preflightCommitment":"confirmed"}]
-        }, timeout=15).json()
-        return res.get("result")
+        result = rpc_call("sendTransaction",
+                          [enc, {"encoding": "base64", "skipPreflight": False, "preflightCommitment": "confirmed"}],
+                          timeout=15)
+        return result
     except Exception as e:
         print(f"send_sol error: {e}")
         return None
@@ -2445,27 +2451,13 @@ class BotInstance:
         return False
 
     def refresh_balance(self):
-        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
-        _fallbacks = [HELIUS_RPC]
-        if ANKR_RPC:
-            _fallbacks.append(ANKR_RPC)
-        _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
-        for rpc_url in _fallbacks:
-            try:
-                r = requests.post(rpc_url, json=payload, timeout=5)
-                data = safe_json_response(r)
-                if not data:
-                    continue
-                if "error" in data:
-                    print(f"[WARN] Balance RPC error from {rpc_url[:40]}: {data['error']}", flush=True)
-                    continue
-                val = data.get("result",{}).get("value",0)
-                self.sol_balance = val / 1e9
-                if self.sol_balance > self.peak_balance:
-                    self.peak_balance = self.sol_balance
-                return
-            except Exception as _e:
-                print(f"[ERROR] Balance fetch failed ({rpc_url[:40]}): {_e}", flush=True)
+        result = rpc_call("getBalance", [self.wallet], timeout=5)
+        if result and isinstance(result, dict):
+            val = result.get("value", 0)
+            self.sol_balance = val / 1e9
+            if self.sol_balance > self.peak_balance:
+                self.peak_balance = self.sol_balance
+            return
         print(f"[ERROR] All RPCs failed for balance check, wallet={self.wallet}", flush=True)
 
     # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
@@ -2695,33 +2687,38 @@ class BotInstance:
         except Exception as e:
             region_errors.append(str(e))
 
-        # ── fallback: regular Helius RPC ────────────────────────────────────
-        try:
-            r   = requests.post(HELIUS_RPC, json={
-                "jsonrpc":"2.0","id":1,"method":"sendTransaction",
-                "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]
-            }, timeout=15)
-            res = r.json()
-            if res.get("result"):
-                return {
-                    "sig": res["result"],
-                    "source": "helius-rpc-fallback",
-                    "error": None,
-                }
-            error_text = ""
-            if res.get("error"):
-                error_text = res["error"].get("message", "")
-            return {
-                "sig": None,
-                "source": "helius-rpc-fallback",
-                "error": error_text or "; ".join(region_errors[:3]) or "transaction-send-failed",
-            }
-        except Exception as e:
-            return {
-                "sig": None,
-                "source": "helius-rpc-fallback",
-                "error": str(e) or "; ".join(region_errors[:3]) or "transaction-send-failed",
-            }
+        # ── fallback: try all RPC endpoints for sendTransaction ────────────
+        send_payload = {"jsonrpc":"2.0","id":1,"method":"sendTransaction",
+                        "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]}
+        for fb_label, fb_url in _build_rpc_endpoints():
+            try:
+                r   = requests.post(fb_url, json=send_payload, timeout=15)
+                if r.status_code == 429:
+                    continue
+                res = r.json()
+                if res.get("result"):
+                    return {
+                        "sig": res["result"],
+                        "source": f"{fb_label}-rpc-fallback",
+                        "error": None,
+                    }
+                error_text = ""
+                if res.get("error"):
+                    error_text = res["error"].get("message", "")
+                # If it's a real error (not rate limit), return it
+                if error_text:
+                    return {
+                        "sig": None,
+                        "source": f"{fb_label}-rpc-fallback",
+                        "error": error_text,
+                    }
+            except Exception:
+                continue
+        return {
+            "sig": None,
+            "source": "all-rpc-fallback",
+            "error": "; ".join(region_errors[:3]) or "transaction-send-failed",
+        }
 
     def sign_and_send(self, swap_tx_b64):
         raw = base64.b64decode(swap_tx_b64)
@@ -2849,14 +2846,15 @@ class BotInstance:
         return None
 
     def get_token_balance(self, mint):
-        r = requests.post(HELIUS_RPC, json={
-            "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-            "params":[self.wallet,{"mint":mint},{"encoding":"jsonParsed"}]
-        }, timeout=5)
-        accounts = r.json().get("result",{}).get("value",[])
+        result = rpc_call("getTokenAccountsByOwner",
+                          [self.wallet, {"mint": mint}, {"encoding": "jsonParsed"}], timeout=5)
+        accounts = (result or {}).get("value", []) if isinstance(result, dict) else []
         if not accounts:
             return 0
-        return int(accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+        try:
+            return int(accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+        except (KeyError, IndexError, TypeError):
+            return 0
 
     def get_token_price(self, mint):
         try:
@@ -2883,14 +2881,11 @@ class BotInstance:
 
     def is_safe_token(self, mint):
         try:
-            r = requests.post(HELIUS_RPC, json={
-                "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
-                "params":[mint,{"encoding":"jsonParsed"}]
-            }, timeout=5).json()
-            info = r.get("result",{}).get("value",{})
+            result = rpc_call("getAccountInfo", [mint, {"encoding": "jsonParsed"}], timeout=5)
+            info = (result or {}).get("value", {}) if isinstance(result, dict) else {}
             if not info:
                 return True
-            parsed      = info.get("data",{}).get("parsed",{}).get("info",{})
+            parsed      = info.get("data", {}).get("parsed", {}).get("info", {})
             mint_auth   = parsed.get("mintAuthority")
             freeze_auth = parsed.get("freezeAuthority")
             if mint_auth is not None and mint_auth != PUMP_PROGRAM:
@@ -4305,23 +4300,69 @@ def get_helius_api_key():
     return "" if "?" in tail else tail
 
 
+def _build_rpc_endpoints():
+    """Build ordered list of (label, url) RPC endpoints for fallback."""
+    global _helius_backoff_until
+    eps = []
+    now = time.time()
+    if now >= _helius_backoff_until:
+        eps.append(("helius", HELIUS_RPC))
+    else:
+        # Helius is in backoff — push to end so fallbacks get tried first
+        pass
+    if ANKR_RPC:
+        eps.append(("ankr", ANKR_RPC))
+    for pub_url in _PUBLIC_RPCS:
+        label = "publicnode" if "publicnode" in pub_url else "solana-mainnet"
+        eps.append((label, pub_url))
+    # If Helius was in backoff, still add it last as ultimate fallback
+    if now < _helius_backoff_until:
+        eps.append(("helius", HELIUS_RPC))
+    return eps
+
+
 def rpc_call(method, params=None, timeout=10):
-    started = time.perf_counter()
-    try:
-        resp = requests.post(HELIUS_RPC, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params or [],
-        }, headers=HEADERS, timeout=timeout)
-        if resp.ok:
-            body = resp.json()
-            record_rpc_health("helius", True, round((time.perf_counter() - started) * 1000), method)
-            return body.get("result")
-        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
-    except Exception as e:
-        record_rpc_health("helius", False, round((time.perf_counter() - started) * 1000), method)
-        print(f"[RPC] {method} failed: {e}", flush=True)
+    """RPC call with automatic fallback chain: Helius → ANKR → public RPCs."""
+    global _helius_backoff_until
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
+    last_err = None
+
+    for label, url in _build_rpc_endpoints():
+        started = time.perf_counter()
+        try:
+            resp = requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
+            latency = round((time.perf_counter() - started) * 1000)
+
+            # Handle 429 rate-limit
+            if resp.status_code == 429:
+                record_rpc_health(label, False, latency, method)
+                if label == "helius":
+                    _helius_backoff_until = time.time() + 10  # back off Helius for 10s
+                    print(f"[RPC] Helius 429 on {method} — backing off 10s, trying fallback", flush=True)
+                continue
+
+            if resp.ok:
+                body = safe_json_response(resp)
+                if body and "error" not in body:
+                    record_rpc_health(label, True, latency, method)
+                    return body.get("result")
+                # RPC-level error (e.g. method not found, invalid params)
+                err_msg = (body or {}).get("error", {})
+                if isinstance(err_msg, dict):
+                    err_msg = err_msg.get("message", str(err_msg))
+                record_rpc_health(label, False, latency, method)
+                last_err = f"{label}: {err_msg}"
+                continue
+
+            record_rpc_health(label, False, latency, method)
+            last_err = f"{label}: HTTP {resp.status_code}"
+        except Exception as e:
+            latency = round((time.perf_counter() - started) * 1000)
+            record_rpc_health(label, False, latency, method)
+            last_err = f"{label}: {e}"
+
+    if last_err:
+        print(f"[RPC] {method} failed (all endpoints): {last_err}", flush=True)
     return None
 
 
@@ -5407,23 +5448,16 @@ def _poll_single_whale(wallet):
                     return
             except Exception as _me:
                 print(f"[WHALE] Moralis fallback error for {wallet[:8]}...: {_me}", flush=True)
-        # Fallback 2: raw RPC signatures
-        r = requests.post(HELIUS_RPC, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [wallet, {"limit": 5}]
-        }, timeout=8)
-        sigs = safe_json_response(r, {}).get("result", [])
+        # Fallback 2: raw RPC signatures (with fallback chain)
+        sigs_result = rpc_call("getSignaturesForAddress", [wallet, {"limit": 5}], timeout=8)
+        sigs = sigs_result if isinstance(sigs_result, list) else []
         for sig_info in sigs:
             sig = sig_info.get("signature")
             if not sig or _whale_is_sig_seen(sig):
                 continue
-            tx_r = requests.post(HELIUS_RPC, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTransaction",
-                "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-            }, timeout=8)
-            tx = safe_json_response(tx_r, {}).get("result")
+            tx = rpc_call("getTransaction",
+                          [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+                          timeout=8)
             if not tx:
                 continue
             pre = {a["accountIndex"]: a for a in (tx.get("meta") or {}).get("preTokenBalances", [])}
