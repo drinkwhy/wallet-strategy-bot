@@ -8567,7 +8567,8 @@ def dashboard():
             .replace("{{PLAN}}", html.escape(plan_info.get("label", "")))
             .replace("{{WALLET}}", html.escape(wallet.get("public_key", "")))
             .replace("{{PRESET}}", html.escape(normalize_preset_name((bsettings or {}).get("preset", "balanced"))))
-            .replace("{{PRESET_SETTINGS}}", preset_settings_json),
+            .replace("{{PRESET_SETTINGS}}", preset_settings_json)
+            .replace("{{PRESET_DEFAULTS}}", preset_settings_json),
             mimetype="text/html"
         )
     except Exception as e:
