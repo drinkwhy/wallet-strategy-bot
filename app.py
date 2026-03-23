@@ -16927,8 +16927,8 @@ function renderPaperTokenRows() {
           <div style="display:flex;align-items:center">
             <div class="tok-icon" style="background:${col}1a;color:${col}">${sym.charAt(0)}</div>
             <div>
-              <div class="tok-name">${t.name||sym}${sc>=80?' \u{1f525}':''}</div>
-              <div class="tok-sym">${sym}${t.whale?' \u{1f40b}':''} \u00b7 ${(t.green_lights||0)}/3 GL \u00b7 N${t.narrative_score||0}</div>
+              <div class="tok-name">${t.name||sym}${sc>=80?' &#x1f525;':''}</div>
+              <div class="tok-sym">${sym}${t.whale?' &#x1f40b;':''} \u00b7 ${(t.green_lights||0)}/3 GL \u00b7 N${t.narrative_score||0}</div>
             </div>
           </div>
         </td>
