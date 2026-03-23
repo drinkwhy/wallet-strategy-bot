@@ -271,7 +271,7 @@ def safe_json_response(resp, default=None):
         return default
 
 # ── Moralis API ────────────────────────────────────────────────────────────────
-_moralis_limiter = _RateLimiter(rate=5, per=1.0)   # 5 req/s
+_moralis_limiter = _RateLimiter(rate_per_sec=5)   # 5 req/s
 _moralis_backoff_until = 0.0
 MORALIS_BASE = "https://solana-gateway.moralis.io"
 
