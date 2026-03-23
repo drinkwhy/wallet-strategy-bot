@@ -16699,7 +16699,7 @@ function renderPaper() {
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.currentPrice) + '</td>' +
           '<td style="text-align:center;font-weight:700;color:' + pnlCol + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%</td>' +
           '<td style="text-align:center;color:var(--t3)">' + fmtHold(Date.now() - p.entryTime) + '</td>' +
-          '<td><button onclick="paperSell(\'' + mint + '\',\'manual\')" style="background:var(--red);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">Sell</button></td></tr>';
+          '<td><button onclick="paperSell(&#39;' + mint + '&#39;,&#39;manual&#39;)" style="background:var(--red);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">Sell</button></td></tr>';
       }).join('') + '</table>';
   }
 
