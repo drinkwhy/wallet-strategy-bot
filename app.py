@@ -9566,25 +9566,47 @@ def api_quant_shadow_performance():
         sql += " GROUP BY strategy_name ORDER BY avg_pnl DESC NULLS LAST, closed_trades DESC"
         cur.execute(sql, tuple(params))
         rows = cur.fetchall()
-        # "Since fix" stats — only trades closed after TP1/TP2 logic was deployed
-        # These trades have tp1_hit column populated (non-null, either 0 or 1)
-        # We use tp1_pnl_pct IS DISTINCT FROM NULL as a proxy, but simpler: just use closed_at cutoff
-        cur.execute("""
-            SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
-                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
-                   ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct))::numeric, 2) AS median_pnl,
-                   ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best,
-                   SUM(CASE WHEN tp1_hit = 1 THEN 1 ELSE 0 END) AS tp1_hits
-            FROM shadow_positions
-            WHERE status='closed' AND tp1_pnl_pct IS NOT NULL AND tp1_pnl_pct != 0
-                  OR (status='closed' AND closed_at > NOW() - INTERVAL '1 hour')
-        """)
-        since_fix = cur.fetchone() or {}
+        # Before/After optimization comparison
+        # "before" = trades opened before the optimization deploy
+        # "after" = trades opened after (uses NOW() as baseline on first deploy, then real data accumulates)
+        optimize_cutoff = "2026-03-24 12:00:00"  # approximate time of optimization deploy
+        for label, where_clause in [
+            ("before", f"closed_at < '{optimize_cutoff}'"),
+            ("after",  f"opened_at >= '{optimize_cutoff}'"),
+        ]:
+            cur.execute(f"""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                       ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                       ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct))::numeric, 2) AS median_pnl,
+                       ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best,
+                       ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst,
+                       SUM(CASE WHEN tp1_hit = 1 THEN 1 ELSE 0 END) AS tp1_hits,
+                       ROUND(AVG(max_upside_pct)::numeric, 2) AS avg_upside,
+                       ROUND(AVG(max_drawdown_pct)::numeric, 2) AS avg_drawdown
+                FROM shadow_positions
+                WHERE status='closed' AND {where_clause}
+            """)
+            if label == "before":
+                before_stats = cur.fetchone() or {}
+            else:
+                after_stats = cur.fetchone() or {}
     finally:
         db_return(conn)
-    since_fix_total = int(since_fix.get("total") or 0)
-    since_fix_wins = int(since_fix.get("wins") or 0)
+    def _era_stats(s):
+        t = int(s.get("total") or 0)
+        w = int(s.get("wins") or 0)
+        return {
+            "total": t, "wins": w,
+            "win_rate": round(w / t * 100, 1) if t else 0,
+            "avg_pnl_pct": float(s.get("avg_pnl") or 0),
+            "median_pnl_pct": float(s.get("median_pnl") or 0),
+            "best_pct": float(s.get("best") or 0),
+            "worst_pct": float(s.get("worst") or 0),
+            "tp1_hits": int(s.get("tp1_hits") or 0),
+            "avg_upside_pct": float(s.get("avg_upside") or 0),
+            "avg_drawdown_pct": float(s.get("avg_drawdown") or 0),
+        }
     return jsonify({
         "strategies": [{
             "strategy_name": row.get("strategy_name"),
@@ -9598,15 +9620,8 @@ def api_quant_shadow_performance():
             "worst_trade_pct": float(row.get("worst_trade") or 0),
             "median_pnl_pct": float(row.get("median_pnl") or 0),
         } for row in rows],
-        "since_fix": {
-            "total": since_fix_total,
-            "wins": since_fix_wins,
-            "win_rate": round(since_fix_wins / since_fix_total * 100, 1) if since_fix_total else 0,
-            "avg_pnl_pct": float(since_fix.get("avg_pnl") or 0),
-            "median_pnl_pct": float(since_fix.get("median_pnl") or 0),
-            "best_pct": float(since_fix.get("best") or 0),
-            "tp1_hits": int(since_fix.get("tp1_hits") or 0),
-        },
+        "before_optimization": _era_stats(before_stats),
+        "after_optimization": _era_stats(after_stats),
     })
 
 
@@ -13228,6 +13243,12 @@ DASHBOARD_HTML = _CSS + """
     <div class="live-feed" id="live-feed">
       <div class="live-feed-item win"><span class="live-feed-icon">+</span><span style="color:var(--t3)">Waiting for trades...</span></div>
     </div>
+    <div id="lv-compare" style="display:none;border-top:1px solid rgba(255,255,255,.06);padding:8px 18px;font-size:11px">
+      <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
+        <span style="font-weight:800;color:var(--t3);text-transform:uppercase;letter-spacing:.06em;font-size:9px">Before vs After Optimization</span>
+        <div style="display:flex;gap:16px" id="lv-compare-stats"></div>
+      </div>
+    </div>
   </div>
   <!-- ═══════════ END LIVE BANNER ═══════════ -->
 
@@ -16832,6 +16853,31 @@ async function pollShadowBanner() {
         return '<div class="live-feed-item ' + cls + '"><span class="live-feed-icon">' + icon + '</span><span class="live-feed-name">' + name + '</span><span style="color:var(--t3)">' + (p.trades||0) + ' trades</span><span class="live-feed-pnl">' + pnl + '</span></div>';
       });
       feedEl.innerHTML = items.join('');
+    }
+    // Before/After comparison strip
+    var before = perf.before_optimization;
+    var after = perf.after_optimization;
+    var cmpEl = document.getElementById('lv-compare');
+    var cmpStats = document.getElementById('lv-compare-stats');
+    if (cmpEl && cmpStats && after && after.total > 0) {
+      cmpEl.style.display = 'block';
+      function cmpStat(label, bVal, aVal, suffix, better) {
+        var arrow = better === 'higher' ? (aVal > bVal ? '#14c784' : '#ef4444') : (aVal < bVal ? '#14c784' : '#ef4444');
+        if (bVal === 0 && aVal === 0) arrow = 'var(--t3)';
+        return '<div style="display:flex;flex-direction:column;align-items:center;gap:1px">' +
+          '<div style="color:var(--t3);font-size:9px;text-transform:uppercase">' + label + '</div>' +
+          '<div style="display:flex;gap:6px;align-items:center">' +
+            '<span style="color:var(--t3)">' + bVal + suffix + '</span>' +
+            '<span style="color:var(--t3)">→</span>' +
+            '<span style="color:' + arrow + ';font-weight:800">' + aVal + suffix + '</span>' +
+          '</div></div>';
+      }
+      cmpStats.innerHTML =
+        cmpStat('Trades', before.total, after.total, '', 'higher') +
+        cmpStat('Win Rate', before.win_rate, after.win_rate, '%', 'higher') +
+        cmpStat('Avg P&L', before.avg_pnl_pct, after.avg_pnl_pct, '%', 'higher') +
+        cmpStat('Median', before.median_pnl_pct, after.median_pnl_pct, '%', 'higher') +
+        cmpStat('TP1 Hits', before.tp1_hits, after.tp1_hits, '', 'higher');
     }
   } catch(e) {}
 }
