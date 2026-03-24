@@ -1147,7 +1147,9 @@ def init_db():
             observations INTEGER DEFAULT 1,
             last_seen_at TIMESTAMP DEFAULT NOW(),
             feature_json TEXT,
-            decision_json TEXT
+            decision_json TEXT,
+            tp1_hit INTEGER DEFAULT 0,
+            tp1_pnl_pct REAL DEFAULT 0
         )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -1309,6 +1311,8 @@ def migrate_db():
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS buy_sell_ratio REAL DEFAULT 0",
             "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS replay_mode TEXT DEFAULT 'snapshot'",
             "ALTER TABLE token_flow_snapshots ADD COLUMN IF NOT EXISTS regime_label TEXT DEFAULT 'neutral'",
+            "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
+            "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_pnl_pct REAL DEFAULT 0",
         ]
         for m in migrations:
             try:
@@ -5775,15 +5779,31 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                         SET status='closed', closed_at=NOW(), exit_price=%s,
                             exit_reason=%s, realized_pnl_pct=%s,
                             peak_price=%s, trough_price=%s,
-                            max_upside_pct=%s, max_drawdown_pct=%s
+                            max_upside_pct=%s, max_drawdown_pct=%s,
+                            tp1_hit=%s, tp1_pnl_pct=%s
                         WHERE id=%s
                     """, (
                         update["current_price"], update["exit_reason"], update["realized_pnl_pct"],
                         update["peak_price"], update["trough_price"],
                         update["max_upside_pct"], update["max_drawdown_pct"],
+                        1 if update.get("tp1_hit") else 0, update.get("tp1_pnl_pct", 0),
                         row["id"],
                     ))
                     closed_inline += 1
+                elif update.get("tp1_hit") and not row.get("tp1_hit"):
+                    # TP1 just triggered — update the flag but keep position open
+                    cur.execute("""
+                        UPDATE shadow_positions
+                        SET tp1_hit=1, tp1_pnl_pct=%s,
+                            peak_price=%s, trough_price=%s,
+                            max_upside_pct=%s, max_drawdown_pct=%s
+                        WHERE id=%s
+                    """, (
+                        update.get("tp1_pnl_pct", 0),
+                        update["peak_price"], update["trough_price"],
+                        update["max_upside_pct"], update["max_drawdown_pct"],
+                        row["id"],
+                    ))
             if closed_inline:
                 print(f"[SIM] inline-closed {closed_inline} position(s) for {info.get('name')}", flush=True)
 
@@ -5859,13 +5879,17 @@ def reconcile_shadow_positions(limit=40):
                     closed_at=CASE WHEN %s='closed' THEN NOW() ELSE closed_at END,
                     exit_price=CASE WHEN %s='closed' THEN %s ELSE exit_price END,
                     exit_reason=CASE WHEN %s='closed' THEN %s ELSE exit_reason END,
-                    realized_pnl_pct=CASE WHEN %s='closed' THEN %s ELSE realized_pnl_pct END
+                    realized_pnl_pct=CASE WHEN %s='closed' THEN %s ELSE realized_pnl_pct END,
+                    tp1_hit=CASE WHEN %s=1 THEN 1 ELSE tp1_hit END,
+                    tp1_pnl_pct=CASE WHEN %s=1 AND tp1_hit=0 THEN %s ELSE tp1_pnl_pct END
                 WHERE id=%s
             """, (
                 update["current_price"], update["peak_price"], update["trough_price"],
                 update["max_upside_pct"], update["max_drawdown_pct"], update["status"],
                 update["status"], update["status"], update["current_price"],
                 update["status"], update["exit_reason"], update["status"], update["realized_pnl_pct"],
+                1 if update.get("tp1_hit") else 0,
+                1 if update.get("tp1_hit") else 0, update.get("tp1_pnl_pct", 0),
                 row["id"],
             ))
         conn.commit()

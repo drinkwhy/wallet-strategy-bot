@@ -342,10 +342,15 @@ def shadow_position_update(position, current_price, settings, age_min):
     max_upside_pct = ((peak_price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
     max_drawdown_pct = ((trough_price / entry_price) - 1.0) * 100.0 if entry_price else 0.0
 
-    tp_mult = max(_safe_float(position.get("take_profit_mult"), settings.get("tp2_mult", 2.0)), 1.01)
+    tp1_mult = max(_safe_float(settings.get("tp1_mult"), 2.0), 1.01)
+    tp2_mult = max(_safe_float(position.get("take_profit_mult"), settings.get("tp2_mult", 2.0)), 1.01)
     stop_ratio = _safe_float(position.get("stop_loss_ratio"), settings.get("stop_loss", 0.7))
     time_stop_min = _safe_int(position.get("time_stop_min"), settings.get("time_stop_min", 30))
     peak_plateau_mode = bool(settings.get("peak_plateau_mode"))
+    tp1_sell_pct = _safe_float(settings.get("tp1_sell_pct"), 0.50)
+
+    tp1_hit = bool(position.get("tp1_hit"))
+    tp1_pnl_pct = _safe_float(position.get("tp1_pnl_pct"), 0.0)
 
     peak_ratio = peak_price / entry_price if entry_price else 1.0
     ratio = current_price / entry_price if entry_price else 1.0
@@ -371,28 +376,55 @@ def shadow_position_update(position, current_price, settings, age_min):
 
     status = "open"
     exit_reason = ""
+    new_tp1_hit = tp1_hit
+    new_tp1_pnl_pct = tp1_pnl_pct
 
     if stop_ratio > 0 and current_price <= entry_price * stop_ratio:
         status = "closed"
         exit_reason = "stop_loss"
     elif peak_plateau_mode:
-        # Peak Plateau Mode: no fixed TP2 — trailing stop is the primary exit
-        if age_min >= time_stop_min and ratio < 1.10:
+        # Peak Plateau Mode: TP1 skim, then trail to peak
+        if not tp1_hit and ratio >= tp1_mult:
+            # TP1 hit — record partial profit, keep position open
+            new_tp1_hit = True
+            new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
+            exit_reason = ""  # not closing yet
+        elif age_min >= time_stop_min and ratio < 1.10:
             status = "closed"
             exit_reason = "time_stop"
         elif (peak_ratio >= 1.5) and current_price < trail_line:
             status = "closed"
             exit_reason = f"peak_plateau_{effective_trail*100:.0f}pct_trail"
     else:
-        # Standard mode
-        if current_price >= entry_price * tp_mult:
+        # Standard mode with TP1/TP2
+        if not tp1_hit and ratio >= tp1_mult:
+            # TP1 hit — record partial profit, keep position open for TP2
+            new_tp1_hit = True
+            new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
+            exit_reason = ""
+        elif tp1_hit and ratio >= tp2_mult:
             status = "closed"
-            exit_reason = "take_profit"
-        elif age_min >= time_stop_min:
+            exit_reason = "take_profit_tp2"
+        elif tp1_hit and current_price < trail_line:
+            # After TP1, use trailing stop instead of waiting forever for TP2
+            status = "closed"
+            exit_reason = "trail_after_tp1"
+        elif not tp1_hit and age_min >= time_stop_min and ratio < 1.10:
             status = "closed"
             exit_reason = "time_stop"
 
-    realized_pnl_pct = ((current_price / entry_price) - 1.0) * 100.0 if entry_price and status == "closed" else None
+    # Calculate realized P&L on close
+    # Combine: TP1 partial profit (on the sold fraction) + remaining position P&L (on the unsold fraction)
+    realized_pnl_pct = None
+    if entry_price and status == "closed":
+        remaining_pct = (ratio - 1.0) * 100.0
+        if new_tp1_hit or tp1_hit:
+            # Weighted: tp1_sell_pct was sold at TP1, remainder sold now
+            remaining_fraction = 1.0 - tp1_sell_pct
+            realized_pnl_pct = new_tp1_pnl_pct + (remaining_pct * remaining_fraction)
+        else:
+            realized_pnl_pct = remaining_pct
+
     return {
         "status": status,
         "exit_reason": exit_reason,
@@ -402,6 +434,8 @@ def shadow_position_update(position, current_price, settings, age_min):
         "max_upside_pct": round(max_upside_pct, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "realized_pnl_pct": round(realized_pnl_pct, 2) if realized_pnl_pct is not None else None,
+        "tp1_hit": new_tp1_hit,
+        "tp1_pnl_pct": round(new_tp1_pnl_pct, 2),
     }
 
 
