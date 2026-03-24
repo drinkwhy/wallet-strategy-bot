@@ -3399,13 +3399,19 @@ class BotInstance:
                             self.risk_engine.rug_detector.mark_rugged(mint, "fast-loss-detected")
                         except Exception:
                             pass
-                if pnl_pct >= 0:
-                    self.stats["wins"] += 1
-                    self.consecutive_losses = 0
+                if pct >= 1.0:
+                    # Full exit — count combined P&L (partial TP1 + final sell)
+                    combined_pnl = pnl_sol + pos.get("partial_pnl_sol", 0)
+                    if combined_pnl >= 0:
+                        self.stats["wins"] += 1
+                        self.consecutive_losses = 0
+                    else:
+                        self.stats["losses"] += 1
+                        self.consecutive_losses += 1
+                        self.loss_mints[mint] = time.time()
                 else:
-                    self.stats["losses"] += 1
-                    self.consecutive_losses += 1
-                    self.loss_mints[mint] = time.time()
+                    # Partial sell — accumulate P&L for final win/loss determination
+                    self.positions[mint]["partial_pnl_sol"] = pos.get("partial_pnl_sol", 0) + pnl_sol
                 # Telegram alert
                 try:
                     conn = db()
@@ -11273,19 +11279,23 @@ def api_pnl_history():
     running_pnl = 0
     peak_pnl = 0
     max_dd = 0
-    wins = 0
-    losses = 0
     best_t = 0
     worst_t = 0
+    # Group sells by mint to count win/loss per trade, not per partial sell
+    mint_pnl = {}  # mint -> total pnl_sol across all partial + final sells
+    mint_closed = set()  # mints with a full exit (action contains TP2, SL, Trail, or 100%)
     for t in trades:
         pnl = t["pnl_sol"] or 0
         action = str(t.get("action") or "").upper()
+        mint = t.get("mint", "")
         if action.startswith("SELL"):
             running_pnl += pnl
-            if pnl > 0: wins += 1
-            else: losses += 1
+            mint_pnl[mint] = mint_pnl.get(mint, 0) + pnl
             best_t = max(best_t, pnl)
             worst_t = min(worst_t, pnl)
+            # Mark as fully closed if this is a full exit (not a TP1/SKIM partial)
+            if "TP1" not in action and "SKIM" not in action:
+                mint_closed.add(mint)
         peak_pnl = max(peak_pnl, running_pnl)
         dd = peak_pnl - running_pnl
         max_dd = max(max_dd, dd)
@@ -11294,6 +11304,14 @@ def api_pnl_history():
             "pnl": round(running_pnl, 4),
             "drawdown": round(dd, 4),
         })
+    # Count wins/losses per fully closed trade (combined partial + final P&L)
+    wins = 0
+    losses = 0
+    for mint in mint_closed:
+        if mint_pnl.get(mint, 0) >= 0:
+            wins += 1
+        else:
+            losses += 1
     total_t = wins + losses
     return jsonify({
         "cumulative": cumulative,
