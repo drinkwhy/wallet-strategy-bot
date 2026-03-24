@@ -13931,6 +13931,60 @@ DASHBOARD_HTML = _CSS + """
           <button onclick="paperReset()" style="background:var(--bg2);color:var(--t2);border:1px solid var(--b1);border-radius:6px;padding:6px 16px;font-size:12px;cursor:pointer">Reset</button>
           <span id="paper-status" style="font-size:11px;color:var(--t3)"></span>
         </div>
+        <!-- Strategy Settings -->
+        <div class="glass" style="padding:14px 16px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div style="font-size:13px;font-weight:700;color:var(--t1)">Strategy Settings</div>
+            <div style="display:flex;gap:6px">
+              <button id="paper-preset-degen" onclick="paperApplyPreset('degen')" style="padding:4px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid rgba(239,68,68,.4);background:rgba(239,68,68,.1);color:#f87171;transition:all .15s">Degen</button>
+              <button id="paper-preset-balanced" onclick="paperApplyPreset('balanced')" style="padding:4px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid rgba(20,199,132,.4);background:rgba(20,199,132,.1);color:#14c784;transition:all .15s">Balanced</button>
+              <button id="paper-preset-conservative" onclick="paperApplyPreset('conservative')" style="padding:4px 14px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid rgba(59,130,246,.4);background:rgba(59,130,246,.1);color:#60a5fa;transition:all .15s">Conservative</button>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px">
+            <div>
+              <label style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:4px">Take Profit 1</label>
+              <div style="display:flex;align-items:center;gap:4px">
+                <input id="paper-tp1" type="number" step="5" min="5" max="500" value="50" onchange="paperSettingsChanged()" style="width:60px;background:var(--bg2);border:1px solid var(--b1);color:var(--grn);border-radius:6px;padding:4px 8px;font-size:13px;font-weight:700">
+                <span style="font-size:11px;color:var(--t3)">%</span>
+              </div>
+              <div style="font-size:9px;color:var(--t3);margin-top:2px">Sell 50% at this target</div>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:4px">Take Profit 2</label>
+              <div style="display:flex;align-items:center;gap:4px">
+                <input id="paper-tp2" type="number" step="10" min="10" max="2000" value="150" onchange="paperSettingsChanged()" style="width:60px;background:var(--bg2);border:1px solid var(--b1);color:var(--grn);border-radius:6px;padding:4px 8px;font-size:13px;font-weight:700">
+                <span style="font-size:11px;color:var(--t3)">%</span>
+              </div>
+              <div style="font-size:9px;color:var(--t3);margin-top:2px">Sell remainder here</div>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:4px">Stop Loss</label>
+              <div style="display:flex;align-items:center;gap:4px">
+                <span style="font-size:11px;color:var(--red)">-</span>
+                <input id="paper-sl" type="number" step="5" min="5" max="90" value="30" onchange="paperSettingsChanged()" style="width:60px;background:var(--bg2);border:1px solid var(--b1);color:var(--red);border-radius:6px;padding:4px 8px;font-size:13px;font-weight:700">
+                <span style="font-size:11px;color:var(--t3)">%</span>
+              </div>
+              <div style="font-size:9px;color:var(--t3);margin-top:2px">Exit to cut losses</div>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:4px">Trail Stop</label>
+              <div style="display:flex;align-items:center;gap:4px">
+                <input id="paper-trail" type="number" step="5" min="10" max="80" value="40" onchange="paperSettingsChanged()" style="width:60px;background:var(--bg2);border:1px solid var(--b1);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px;font-weight:700">
+                <span style="font-size:11px;color:var(--t3)">%</span>
+              </div>
+              <div style="font-size:9px;color:var(--t3);margin-top:2px">% drop from peak</div>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:4px">Max Open</label>
+              <div style="display:flex;align-items:center;gap:4px">
+                <input id="paper-max-pos" type="number" step="1" min="1" max="50" value="10" onchange="paperSettingsChanged()" style="width:60px;background:var(--bg2);border:1px solid var(--b1);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px;font-weight:700">
+              </div>
+              <div style="font-size:9px;color:var(--t3);margin-top:2px">Max simultaneous</div>
+            </div>
+          </div>
+          <div id="paper-preset-label" style="font-size:10px;color:var(--t3);margin-top:10px;font-style:italic">Custom settings</div>
+        </div>
         <!-- Summary cards -->
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:12px">
           <div class="glass" style="text-align:center;padding:12px">
@@ -16826,10 +16880,17 @@ let _paperActive = false;
 let _paperBal = 10;
 let _paperStartBal = 10;
 let _paperTradeSize = 0.1;
-let _paperPositions = {};  // mint -> {name, symbol, entryPrice, entryTime, solSize, tokensHeld, currentPrice, peakPrice}
+let _paperPositions = {};  // mint -> {name, symbol, entryPrice, entryTime, solSize, tokensHeld, currentPrice, peakPrice, tp1Hit}
 let _paperHistory = [];    // closed trades
 let _paperSeenMints = {};  // mint -> true, prevent re-buying same token
 let _paperStats = { wins: 0, losses: 0, totalPnl: 0 };
+let _paperSettings = { tp1: 50, tp2: 150, sl: 30, trail: 40, maxPos: 10, preset: 'balanced' };
+
+const PAPER_PRESETS = {
+  degen:        { tp1: 80,  tp2: 300, sl: 50, trail: 35, maxPos: 20, label: 'Degen \u2014 High risk, big swings. Wide SL, aggressive targets, many positions.' },
+  balanced:     { tp1: 50,  tp2: 150, sl: 30, trail: 40, maxPos: 10, label: 'Balanced \u2014 Moderate risk. Reasonable TP/SL, controlled exposure.' },
+  conservative: { tp1: 25,  tp2: 60,  sl: 15, trail: 50, maxPos: 5,  label: 'Conservative \u2014 Tight stops, quick profits, limited positions.' },
+};
 
 function paperLoadState() {
   try {
@@ -16844,8 +16905,10 @@ function paperLoadState() {
     _paperHistory = d.history || [];
     _paperSeenMints = d.seen || {};
     _paperStats = d.stats || { wins: 0, losses: 0, totalPnl: 0 };
+    if (d.settings) _paperSettings = d.settings;
     document.getElementById('paper-balance-input').value = _paperStartBal;
     document.getElementById('paper-trade-size').value = _paperTradeSize;
+    paperSyncSettingsUI();
   } catch(e) {}
 }
 
@@ -16854,9 +16917,59 @@ function paperSaveState() {
     localStorage.setItem('paperState', JSON.stringify({
       active: _paperActive, bal: _paperBal, startBal: _paperStartBal,
       tradeSize: _paperTradeSize, positions: _paperPositions,
-      history: _paperHistory, seen: _paperSeenMints, stats: _paperStats
+      history: _paperHistory, seen: _paperSeenMints, stats: _paperStats,
+      settings: _paperSettings
     }));
   } catch(e) {}
+}
+
+function paperSyncSettingsUI() {
+  document.getElementById('paper-tp1').value = _paperSettings.tp1;
+  document.getElementById('paper-tp2').value = _paperSettings.tp2;
+  document.getElementById('paper-sl').value = _paperSettings.sl;
+  document.getElementById('paper-trail').value = _paperSettings.trail;
+  document.getElementById('paper-max-pos').value = _paperSettings.maxPos;
+  paperUpdatePresetHighlight();
+}
+
+function paperSettingsChanged() {
+  _paperSettings.tp1 = parseFloat(document.getElementById('paper-tp1').value) || 50;
+  _paperSettings.tp2 = parseFloat(document.getElementById('paper-tp2').value) || 150;
+  _paperSettings.sl = parseFloat(document.getElementById('paper-sl').value) || 30;
+  _paperSettings.trail = parseFloat(document.getElementById('paper-trail').value) || 40;
+  _paperSettings.maxPos = parseInt(document.getElementById('paper-max-pos').value) || 10;
+  _paperSettings.preset = 'custom';
+  paperUpdatePresetHighlight();
+  paperSaveState();
+}
+
+function paperApplyPreset(name) {
+  const p = PAPER_PRESETS[name];
+  if (!p) return;
+  _paperSettings = { tp1: p.tp1, tp2: p.tp2, sl: p.sl, trail: p.trail, maxPos: p.maxPos, preset: name };
+  paperSyncSettingsUI();
+  paperSaveState();
+  showToast(name.charAt(0).toUpperCase() + name.slice(1) + ' preset applied');
+}
+
+function paperUpdatePresetHighlight() {
+  var presetName = _paperSettings.preset || 'custom';
+  ['degen', 'balanced', 'conservative'].forEach(function(n) {
+    var btn = document.getElementById('paper-preset-' + n);
+    if (!btn) return;
+    if (n === presetName) {
+      btn.style.boxShadow = '0 0 12px ' + (n === 'degen' ? 'rgba(239,68,68,.4)' : n === 'balanced' ? 'rgba(20,199,132,.4)' : 'rgba(59,130,246,.4)');
+      btn.style.fontWeight = '800';
+    } else {
+      btn.style.boxShadow = 'none';
+      btn.style.fontWeight = '700';
+    }
+  });
+  var label = document.getElementById('paper-preset-label');
+  if (label) {
+    var p = PAPER_PRESETS[presetName];
+    label.textContent = p ? p.label : 'Custom settings \u2014 manually configured TP/SL values.';
+  }
 }
 
 function paperStart() {
@@ -16892,6 +17005,7 @@ function paperReset() {
 function paperBuy(mint, name, symbol, price) {
   if (!_paperActive || !price || price <= 0) return;
   if (_paperPositions[mint] || _paperSeenMints[mint]) return;
+  if (Object.keys(_paperPositions).length >= (_paperSettings.maxPos || 10)) return;
   const size = Math.min(_paperTradeSize, _paperBal);
   if (size < 0.001) return;
   _paperBal -= size;
@@ -16899,9 +17013,38 @@ function paperBuy(mint, name, symbol, price) {
   _paperPositions[mint] = {
     name: name || symbol || '?', symbol: symbol || '?',
     entryPrice: price, entryTime: Date.now(), solSize: size,
-    tokensHeld: tokens, currentPrice: price, peakPrice: price
+    tokensHeld: tokens, currentPrice: price, peakPrice: price,
+    tp1Hit: false
   };
   _paperSeenMints[mint] = true;
+  paperSaveState();
+  if (_activeTab === 'paper') renderPaper();
+}
+
+function paperSellPartial(mint, fraction, reason) {
+  // Sell a fraction (0-1) of a position — used for TP1
+  const pos = _paperPositions[mint];
+  if (!pos) return;
+  const exitPrice = pos.currentPrice || pos.entryPrice;
+  const sellTokens = pos.tokensHeld * fraction;
+  const sellValue = sellTokens * exitPrice;
+  const sellCost = pos.solSize * fraction;
+  const pnl = sellValue - sellCost;
+  _paperBal += sellValue;
+  _paperStats.totalPnl += pnl;
+  // Reduce position
+  pos.tokensHeld -= sellTokens;
+  pos.solSize -= sellCost;
+  pos.tp1Hit = true;
+  _paperHistory.unshift({
+    name: pos.name, symbol: pos.symbol, mint: mint,
+    entryPrice: pos.entryPrice, exitPrice: exitPrice,
+    solSize: sellCost, pnl: pnl,
+    pnlPct: ((exitPrice / pos.entryPrice) - 1) * 100,
+    holdTime: Date.now() - pos.entryTime,
+    reason: reason || 'TP1 partial', ts: Date.now()
+  });
+  if (_paperHistory.length > 50) _paperHistory.pop();
   paperSaveState();
   if (_activeTab === 'paper') renderPaper();
 }
@@ -16929,6 +17072,29 @@ function paperSell(mint, reason) {
   if (_activeTab === 'paper') renderPaper();
 }
 
+function paperCheckExits(mint, price) {
+  // Centralized exit logic using custom settings
+  const pos = _paperPositions[mint];
+  if (!pos || !price || price <= 0) return;
+  pos.currentPrice = price;
+  if (price > pos.peakPrice) pos.peakPrice = price;
+  const gainPct = ((price / pos.entryPrice) - 1) * 100;
+  const dropFromPeak = (1 - price / pos.peakPrice) * 100;
+  var tp1 = _paperSettings.tp1 || 50;
+  var tp2 = _paperSettings.tp2 || 150;
+  var sl = _paperSettings.sl || 30;
+  var trail = _paperSettings.trail || 40;
+  // Stop loss
+  if (gainPct <= -sl) { paperSell(mint, 'SL -' + sl + '%'); return; }
+  // TP2 — full exit
+  if (gainPct >= tp2) { paperSell(mint, 'TP2 +' + tp2 + '%'); return; }
+  // TP1 — sell 50% if not already hit
+  if (!pos.tp1Hit && gainPct >= tp1) { paperSellPartial(mint, 0.5, 'TP1 +' + tp1 + '%'); return; }
+  // Trailing stop — only after TP1 hit (or if gain > 10%)
+  if (pos.tp1Hit && dropFromPeak >= trail) { paperSell(mint, 'Trail -' + trail + '%'); return; }
+  if (!pos.tp1Hit && gainPct > 10 && dropFromPeak >= trail) { paperSell(mint, 'Trail -' + trail + '%'); return; }
+}
+
 function paperProcessFilterLog(logs) {
   if (!_paperActive || !logs || !logs.length) return;
   logs.forEach(f => {
@@ -16948,15 +17114,7 @@ function paperUpdatePrices() {
   openMints.forEach(mint => {
     const tok = allTokens.find(t => t.mint === mint);
     if (tok && tok.price > 0) {
-      _paperPositions[mint].currentPrice = tok.price;
-      if (tok.price > _paperPositions[mint].peakPrice)
-        _paperPositions[mint].peakPrice = tok.price;
-      // Auto TP at 2x, auto SL at -30%, trailing stop at 50% from peak
-      const ratio = tok.price / _paperPositions[mint].entryPrice;
-      const fromPeak = tok.price / _paperPositions[mint].peakPrice;
-      if (ratio >= 2.0) paperSell(mint, 'TP +100%');
-      else if (ratio <= 0.70) paperSell(mint, 'SL -30%');
-      else if (fromPeak <= 0.50 && ratio > 1.1) paperSell(mint, 'Trail stop');
+      paperCheckExits(mint, tok.price);
     }
   });
   paperSaveState();
@@ -16975,14 +17133,7 @@ async function paperTick() {
     openMints.forEach(mint => {
       const p = prices[mint];
       if (p && p.price > 0) {
-        _paperPositions[mint].currentPrice = p.price;
-        if (p.price > _paperPositions[mint].peakPrice)
-          _paperPositions[mint].peakPrice = p.price;
-        const ratio = p.price / _paperPositions[mint].entryPrice;
-        const fromPeak = p.price / _paperPositions[mint].peakPrice;
-        if (ratio >= 2.0) paperSell(mint, 'TP +100%');
-        else if (ratio <= 0.70) paperSell(mint, 'SL -30%');
-        else if (fromPeak <= 0.50 && ratio > 1.1) paperSell(mint, 'Trail stop');
+        paperCheckExits(mint, p.price);
       }
     });
     paperSaveState();
@@ -17001,7 +17152,7 @@ function renderPaper() {
   // Status
   const status = document.getElementById('paper-status');
   if (_paperActive) {
-    status.innerHTML = '<span style="color:var(--grn)">&#x25cf; Session active</span>';
+    status.innerHTML = '<span style="color:var(--grn)">&#x25cf; Session active</span> <span style="font-size:10px;color:var(--t3)">(' + Object.keys(_paperPositions).length + '/' + (_paperSettings.maxPos||10) + ' positions)</span>';
   } else {
     status.textContent = 'Click Start to begin';
   }
@@ -17019,19 +17170,22 @@ function renderPaper() {
   const posDiv = document.getElementById('paper-positions');
   const openEntries = Object.entries(_paperPositions);
   if (!openEntries.length) {
-    posDiv.innerHTML = '<div style="color:var(--t3);font-size:12px">No open positions' + (_paperActive ? ' &#8212; waiting for signals' : '') + '</div>';
+    posDiv.innerHTML = '<div style="color:var(--t3);font-size:12px">No open positions' + (_paperActive ? ' &#8212; waiting for signals (' + Object.keys(_paperPositions).length + '/' + (_paperSettings.maxPos||10) + ' slots)' : '') + '</div>';
   } else {
     posDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--b1)">' +
-      '<th style="text-align:left;padding:4px">Token</th><th>Entry</th><th>Current</th><th>P&L</th><th>Hold</th><th></th></tr>' +
+      '<th style="text-align:left;padding:4px">Token</th><th>Entry</th><th>Current</th><th>P&L</th><th>Hold</th><th>Status</th><th></th></tr>' +
       openEntries.map(([mint, p]) => {
         const pnl = ((p.currentPrice / p.entryPrice) - 1) * 100;
         const pnlCol = pnl >= 0 ? 'var(--grn)' : 'var(--red)';
+        const tp1Tag = p.tp1Hit ? '<span style="color:var(--grn);font-size:9px;margin-left:4px">TP1&#10003;</span>' : '';
+        const statusText = p.tp1Hit ? '<span style="font-size:10px;color:var(--grn)">50% sold</span>' : '<span style="font-size:10px;color:var(--t3)">holding</span>';
         return '<tr style="border-bottom:1px solid var(--b1)">' +
-          '<td style="padding:4px;font-weight:600;color:var(--t1)">' + (p.symbol || p.name) + '</td>' +
+          '<td style="padding:4px;font-weight:600;color:var(--t1)">' + (p.symbol || p.name) + tp1Tag + '</td>' +
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.entryPrice) + '</td>' +
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.currentPrice) + '</td>' +
           '<td style="text-align:center;font-weight:700;color:' + pnlCol + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%</td>' +
           '<td style="text-align:center;color:var(--t3)">' + fmtHold(Date.now() - p.entryTime) + '</td>' +
+          '<td style="text-align:center">' + statusText + '</td>' +
           '<td><button onclick="paperSell(&#39;' + mint + '&#39;,&#39;manual&#39;)" style="background:var(--red);color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">Sell</button></td></tr>';
       }).join('') + '</table>';
   }
