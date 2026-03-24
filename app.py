@@ -282,8 +282,8 @@ PRESETS = {
     "safe": {
         "label":"Safe — Low Risk / Consistent",
         "description":"Small positions, tight stops. Capital preservation first.",
-        "max_buy_sol":0.02,"tp1_mult":2.0,"tp2_mult":3.0,
-        "trail_pct":0.15,"stop_loss":0.70,"max_age_min":720,"time_stop_min":20,
+        "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":3.0,
+        "trail_pct":0.15,"stop_loss":0.80,"max_age_min":720,"time_stop_min":15,
         "min_liq":5000,"min_mc":3000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":20,"cooldown_min":15,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":8,
@@ -292,15 +292,15 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
         "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
-        "listing_sniper":True,
+        "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.50,
         "min_composite_score":20,"min_confidence":0.45,"min_buy_sell_ratio":1.2,
         "min_smart_wallet_buys":1,"min_net_flow_sol":0.5,"min_unique_buyers":3,
     },
     "balanced": {
         "label":"Balanced — Medium Risk / Steady Profit",
         "description":"Moderate positions, balanced take-profits. Best for most markets.",
-        "max_buy_sol":0.04,"tp1_mult":2.0,"tp2_mult":4.0,
-        "trail_pct":0.20,"stop_loss":0.70,"max_age_min":480,"time_stop_min":30,
+        "max_buy_sol":0.04,"tp1_mult":1.3,"tp2_mult":4.0,
+        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":480,"time_stop_min":20,
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":10,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":6,
@@ -309,15 +309,15 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
         "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
-        "listing_sniper":True,
+        "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.50,
         "min_composite_score":15,"min_confidence":0.35,"min_buy_sell_ratio":1.0,
         "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
     },
     "aggressive": {
         "label":"Aggressive — Higher Risk / Bigger Swings",
         "description":"Larger positions, wider stops. More exposure for trending markets.",
-        "max_buy_sol":0.07,"tp1_mult":2.0,"tp2_mult":6.0,
-        "trail_pct":0.25,"stop_loss":0.70,"max_age_min":360,"time_stop_min":45,
+        "max_buy_sol":0.07,"tp1_mult":1.3,"tp2_mult":6.0,
+        "trail_pct":0.25,"stop_loss":0.75,"max_age_min":360,"time_stop_min":25,
         "min_liq":1000,"min_mc":2000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":15,"cooldown_min":7,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":25,"min_narrative_score":4,
@@ -326,15 +326,15 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
         "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.8,
-        "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.25,
+        "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.50,
         "min_composite_score":15,"min_confidence":0.25,"min_buy_sell_ratio":0.8,
         "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
     },
     "degen": {
         "label":"Degen — High Risk / Max Profit",
         "description":"Larger positions, wide stops. For hot markets only.",
-        "max_buy_sol":0.10,"tp1_mult":2.0,"tp2_mult":10.0,
-        "trail_pct":0.30,"stop_loss":0.70,"max_age_min":240,"time_stop_min":60,
+        "max_buy_sol":0.10,"tp1_mult":1.3,"tp2_mult":10.0,
+        "trail_pct":0.30,"stop_loss":0.75,"max_age_min":240,"time_stop_min":30,
         "min_liq":500,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "min_vol":500,"min_score":15,"cooldown_min":5,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":0,
@@ -343,15 +343,15 @@ PRESETS = {
         "max_hot_change":400.0,
         "nuclear_narrative_score":35,
         "anti_rug":True,"check_holders":False,"max_correlated":5,"drawdown_limit_sol":1.0,
-        "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.25,
+        "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.50,
         "min_composite_score":15,"min_confidence":0.15,"min_buy_sell_ratio":0.5,
         "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
     },
     "custom": {
         "label":"Custom — Manual Exit Tuning",
         "description":"Balanced entry filters with your own take-profit and stop rules.",
-        "max_buy_sol":0.04,"tp1_mult":2.0,"tp2_mult":4.0,
-        "trail_pct":0.20,"stop_loss":0.70,"max_age_min":480,"time_stop_min":30,
+        "max_buy_sol":0.04,"tp1_mult":1.3,"tp2_mult":4.0,
+        "trail_pct":0.20,"stop_loss":0.75,"max_age_min":480,"time_stop_min":20,
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":10,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":6,
@@ -3586,17 +3586,21 @@ class BotInstance:
 
             if ratio <= s["stop_loss"]:
                 self.sell(mint, 1.0, f"SL {ratio:.2f}x")
-            elif age_min >= s["time_stop_min"] and ratio < 1.10:
-                self.sell(mint, 1.0, f"TIME {age_min:.0f}m")
             elif s.get("peak_plateau_mode"):
                 # ── Peak Plateau Mode: ride to the top, let trailing stop decide ──
-                tp1_sell_pct = s.get("tp1_sell_pct", 0.25)
+                tp1_sell_pct = s.get("tp1_sell_pct", 0.50)
                 if not pos["tp1_hit"] and ratio >= s["tp1_mult"]:
-                    # Skim a small portion at TP1 to secure some profit
+                    # Skim at TP1 to lock in profit
                     self.sell(mint, tp1_sell_pct, f"SKIM {ratio:.2f}x ({int(tp1_sell_pct*100)}%)")
                 elif (pos["tp1_hit"] or peak_ratio >= 1.5) and cur < trail_line:
-                    # Progressive trailing stop is the primary exit — rides to peak plateau
+                    # Progressive trailing stop — rides to peak plateau
                     self.sell(mint, 1.0, f"PEAK EXIT {ratio:.2f}x (peak {peak_ratio:.1f}x, trail {effective_trail*100:.0f}%)")
+                elif age_min >= s["time_stop_min"] and ratio < 1.05:
+                    # Time stop: flat or losing after time limit
+                    self.sell(mint, 1.0, f"TIME {age_min:.0f}m")
+                elif age_min >= s["time_stop_min"] and ratio >= 1.05 and cur < trail_line:
+                    # In profit past time limit but dropping — trail out with profit
+                    self.sell(mint, 1.0, f"TIME-TRAIL {ratio:.2f}x ({age_min:.0f}m)")
             else:
                 # ── Standard TP mode ──
                 if not pos["tp1_hit"] and ratio >= s["tp1_mult"]:
@@ -3605,6 +3609,10 @@ class BotInstance:
                     self.sell(mint, 1.0, f"TP2 {ratio:.2f}x")
                 elif (pos["tp1_hit"] or peak_ratio >= 1.3) and cur < trail_line:
                     self.sell(mint, 1.0, f"TRAIL {ratio:.2f}x")
+                elif age_min >= s["time_stop_min"] and ratio < 1.05:
+                    self.sell(mint, 1.0, f"TIME {age_min:.0f}m")
+                elif age_min >= s["time_stop_min"] and ratio >= 1.05 and cur < trail_line:
+                    self.sell(mint, 1.0, f"TIME-TRAIL {ratio:.2f}x ({age_min:.0f}m)")
         # Batch-write all peak_price updates in one DB round-trip
         if _peak_updates:
             try:
