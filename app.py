@@ -1838,15 +1838,37 @@ def ai_score(info):
     """Score a token 0-100 based on multiple signals."""
     return ai_score_detailed(info)["total"]
 
+_largest_accounts_cache = {}   # mint -> (timestamp, accounts_list)
+_LARGEST_ACCOUNTS_TTL = 120    # seconds
+
+def _fetch_largest_accounts(mint):
+    """Fetch getTokenLargestAccounts with TTL cache to avoid duplicate RPC calls."""
+    now = time.time()
+    cached = _largest_accounts_cache.get(mint)
+    if cached and now - cached[0] < _LARGEST_ACCOUNTS_TTL:
+        return cached[1]
+    accounts = None
+    try:
+        result = rpc_call("getTokenLargestAccounts", [mint], timeout=8)
+        if isinstance(result, dict):
+            accounts = result.get("value", [])
+    except Exception:
+        pass
+    if accounts is None:
+        accounts = []
+    _largest_accounts_cache[mint] = (now, accounts)
+    # Prune old entries
+    if len(_largest_accounts_cache) > 500:
+        cutoff = now - _LARGEST_ACCOUNTS_TTL * 2
+        for k in list(_largest_accounts_cache):
+            if _largest_accounts_cache[k][0] < cutoff:
+                del _largest_accounts_cache[k]
+    return accounts
+
 def check_holder_concentration(mint):
     """Returns True if top holders don't own >50% of supply."""
     try:
-        r = requests.post(HELIUS_RPC, json={
-            "jsonrpc":"2.0","id":1,
-            "method":"getTokenLargestAccounts",
-            "params":[mint]
-        }, timeout=6).json()
-        accounts = r.get("result",{}).get("value",[])
+        accounts = _fetch_largest_accounts(mint)
         if not accounts: return True
         total = sum(float(a.get("uiAmount") or 0) for a in accounts)
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
@@ -4251,7 +4273,7 @@ def rpc_call(method, params=None, timeout=10):
     _rpc_endpoints.append(("public", "https://solana-rpc.publicnode.com"))
 
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
-    last_err = None
+    errors = []
     for label, url in _rpc_endpoints:
         started = time.perf_counter()
         try:
@@ -4262,17 +4284,17 @@ def rpc_call(method, params=None, timeout=10):
                 if "error" not in body:
                     record_rpc_health(label, True, latency, method)
                     return body.get("result")
-                last_err = f"{label}: {body.get('error')}"
+                errors.append(f"{label}: {body.get('error')}")
                 record_rpc_health(label, False, latency, method)
             else:
-                last_err = f"{label}: HTTP {resp.status_code}"
+                errors.append(f"{label}: HTTP {resp.status_code}")
                 record_rpc_health(label, False, latency, method)
         except Exception as e:
             latency = round((time.perf_counter() - started) * 1000)
             record_rpc_health(label, False, latency, method)
-            last_err = f"{label}: {e}"
-    if last_err:
-        print(f"[RPC] {method} all failed — last: {last_err}", flush=True)
+            errors.append(f"{label}: {e}")
+    if errors:
+        print(f"[RPC] {method} all failed — {' | '.join(errors)}", flush=True)
     return None
 
 
@@ -4426,8 +4448,7 @@ def resolve_deployer_wallet(mint, txns=None):
 def get_token_holder_count(mint, txns=None):
     count = 0
     try:
-        largest = rpc_call("getTokenLargestAccounts", [mint], timeout=8) or {}
-        rows = largest.get("value", []) if isinstance(largest, dict) else []
+        rows = _fetch_largest_accounts(mint)
         count = len([row for row in rows if float(row.get("uiAmount") or 0) > 0])
     except Exception:
         pass
