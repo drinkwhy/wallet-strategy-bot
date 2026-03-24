@@ -13662,15 +13662,15 @@ DASHBOARD_HTML = _CSS + """
         <div class="glass" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:12px 16px;margin-bottom:12px">
           <div style="display:flex;align-items:center;gap:6px">
             <label style="font-size:12px;color:var(--t2)">Starting SOL</label>
-            <input id="paper-balance-input" type="number" step="0.1" min="0.1" value="10" style="width:80px;background:var(--bg2);border:1px solid var(--border);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px">
+            <input id="paper-balance-input" type="number" step="0.1" min="0.1" value="10" style="width:80px;background:var(--bg2);border:1px solid var(--b1);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px">
           </div>
           <div style="display:flex;align-items:center;gap:6px">
             <label style="font-size:12px;color:var(--t2)">Per trade</label>
-            <input id="paper-trade-size" type="number" step="0.01" min="0.01" value="0.1" style="width:70px;background:var(--bg2);border:1px solid var(--border);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px">
+            <input id="paper-trade-size" type="number" step="0.01" min="0.01" value="0.1" style="width:70px;background:var(--bg2);border:1px solid var(--b1);color:var(--t1);border-radius:6px;padding:4px 8px;font-size:13px">
             <span style="font-size:11px;color:var(--t3)">SOL</span>
           </div>
           <button onclick="paperStart()" style="background:var(--grn);color:#000;border:none;border-radius:6px;padding:6px 16px;font-size:12px;font-weight:700;cursor:pointer">Start Session</button>
-          <button onclick="paperReset()" style="background:var(--bg2);color:var(--t2);border:1px solid var(--border);border-radius:6px;padding:6px 16px;font-size:12px;cursor:pointer">Reset</button>
+          <button onclick="paperReset()" style="background:var(--bg2);color:var(--t2);border:1px solid var(--b1);border-radius:6px;padding:6px 16px;font-size:12px;cursor:pointer">Reset</button>
           <span id="paper-status" style="font-size:11px;color:var(--t3)"></span>
         </div>
         <!-- Summary cards -->
@@ -13704,8 +13704,6 @@ DASHBOARD_HTML = _CSS + """
         </div>
       </div>
     </div>
-
-  </div>
 
 </div>
 
@@ -16693,12 +16691,12 @@ function renderPaper() {
   if (!openEntries.length) {
     posDiv.innerHTML = '<div style="color:var(--t3);font-size:12px">No open positions' + (_paperActive ? ' &#8212; waiting for signals' : '') + '</div>';
   } else {
-    posDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--border)">' +
+    posDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--b1)">' +
       '<th style="text-align:left;padding:4px">Token</th><th>Entry</th><th>Current</th><th>P&L</th><th>Hold</th><th></th></tr>' +
       openEntries.map(([mint, p]) => {
         const pnl = ((p.currentPrice / p.entryPrice) - 1) * 100;
         const pnlCol = pnl >= 0 ? 'var(--grn)' : 'var(--red)';
-        return '<tr style="border-bottom:1px solid var(--border)">' +
+        return '<tr style="border-bottom:1px solid var(--b1)">' +
           '<td style="padding:4px;font-weight:600;color:var(--t1)">' + (p.symbol || p.name) + '</td>' +
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.entryPrice) + '</td>' +
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(p.currentPrice) + '</td>' +
@@ -16713,11 +16711,11 @@ function renderPaper() {
   if (!_paperHistory.length) {
     histDiv.innerHTML = '<div style="color:var(--t3);font-size:12px">No trades yet</div>';
   } else {
-    histDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--border)">' +
+    histDiv.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:12px"><tr style="color:var(--t3);border-bottom:1px solid var(--b1)">' +
       '<th style="text-align:left;padding:4px">Token</th><th>Entry</th><th>Exit</th><th>P&L</th><th>SOL</th><th>Hold</th><th>Exit</th></tr>' +
       _paperHistory.slice(0, 20).map(t => {
         const pnlCol = t.pnl >= 0 ? 'var(--grn)' : 'var(--red)';
-        return '<tr style="border-bottom:1px solid var(--border)">' +
+        return '<tr style="border-bottom:1px solid var(--b1)">' +
           '<td style="padding:4px;font-weight:600;color:var(--t1)">' + (t.symbol || t.name) + '</td>' +
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(t.entryPrice) + '</td>' +
           '<td style="text-align:center;font-family:monospace">' + fmtPrice(t.exitPrice) + '</td>' +
