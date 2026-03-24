@@ -11393,6 +11393,36 @@ def api_dev_blacklist():
         db_return(conn)
     return jsonify([dict(r) for r in rows])
 
+@app.route("/api/admin/change-plan", methods=["POST"])
+@admin_required
+def api_admin_change_plan():
+    """Admin: change a user's plan directly."""
+    data = request.get_json(silent=True) or {}
+    target_user_id = data.get("user_id")
+    new_plan = (data.get("plan") or "").strip().lower()
+    if not target_user_id or new_plan not in ("free", "trial", "basic", "pro", "elite"):
+        return jsonify({"ok": False, "msg": "Invalid user_id or plan"})
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, plan FROM users WHERE id=%s", (int(target_user_id),))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"ok": False, "msg": "User not found"})
+        old_plan = user.get("plan", "")
+        cur.execute("UPDATE users SET plan=%s WHERE id=%s", (new_plan, int(target_user_id)))
+        conn.commit()
+    finally:
+        db_return(conn)
+    # If the user has a running bot, update their max_buy_sol live
+    bot = user_bots.get(int(target_user_id))
+    if bot:
+        max_sol = PLAN_LIMITS.get(new_plan, PLAN_LIMITS["free"])["max_buy_sol"]
+        bot.settings["max_buy_sol"] = min(bot.settings.get("max_buy_sol", max_sol), max_sol)
+    print(f"[ADMIN] Plan change: user {target_user_id} ({user.get('email')}) {old_plan} -> {new_plan}", flush=True)
+    return jsonify({"ok": True, "msg": f"Changed {user.get('email')} from {old_plan} to {new_plan}"})
+
+
 @app.route("/api/admin/override-preset", methods=["POST"])
 @admin_required
 def api_override_preset():
@@ -17066,9 +17096,9 @@ ADMIN_HTML = _CSS + """
     <div style="overflow-x:auto;max-height:600px;overflow-y:auto">
       <table class="adm-tbl" id="adm-user-table">
         <thead><tr>
-          <th>Status</th><th>Email</th><th>Plan</th><th>Stripe</th><th>Trades</th><th>P&L (SOL)</th><th>Win Rate</th><th>Joined</th><th>Last Active</th>
+          <th>Status</th><th>Email</th><th>Plan</th><th>Change Plan</th><th>Stripe</th><th>Trades</th><th>P&L (SOL)</th><th>Win Rate</th><th>Joined</th><th>Last Active</th>
         </tr></thead>
-        <tbody id="adm-user-rows"><tr><td colspan="9" style="text-align:center;color:var(--t3);padding:30px">Loading users...</td></tr></tbody>
+        <tbody id="adm-user-rows"><tr><td colspan="10" style="text-align:center;color:var(--t3);padding:30px">Loading users...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -17153,10 +17183,15 @@ async function loadAdminData() {
       const pnl = u.total_pnl_sol || 0;
       const pnlClass = pnl > 0 ? 'adm-pnl-pos' : pnl < 0 ? 'adm-pnl-neg' : 'adm-pnl-zero';
       const wr = (u.wins + u.losses) > 0 ? ((u.wins / (u.wins + u.losses)) * 100).toFixed(1) + '%' : '—';
+      const plans = ['free','trial','basic','pro','elite'];
+      const planSelect = '<select class="finput" style="font-size:11px;padding:3px 6px;min-width:80px" onchange="changePlan(' + u.id + ',this.value,this)" data-original="' + u.plan + '">' +
+        plans.map(p => '<option value="' + p + '"' + (p === u.plan ? ' selected' : '') + '>' + p + '</option>').join('') +
+        '</select>';
       return '<tr>' +
         '<td><span class="adm-dot ' + (u.is_active ? 'on' : 'off') + '"></span>' + (u.is_active ? 'Live' : 'Off') + '</td>' +
         '<td style="font-weight:600;color:var(--t1)">' + u.email + '</td>' +
         '<td><span class="adm-badge ' + u.plan + '">' + u.plan + '</span></td>' +
+        '<td>' + planSelect + '</td>' +
         '<td>' + (u.has_stripe ? '<span style="color:#14c784">Paying</span>' : '<span style="color:var(--t3)">No</span>') + '</td>' +
         '<td>' + u.trade_count + '</td>' +
         '<td class="' + pnlClass + '" style="font-weight:700;font-family:monospace">' + (pnl > 0 ? '+' : '') + pnl.toFixed(4) + '</td>' +
@@ -17164,7 +17199,7 @@ async function loadAdminData() {
         '<td style="font-size:11px;color:var(--t3)">' + fmtDate(u.created_at) + '</td>' +
         '<td style="font-size:11px;color:var(--t3)">' + fmtDate(u.last_active) + '</td>' +
       '</tr>';
-    }).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--t3);padding:20px">No users yet</td></tr>';
+    }).join('') || '<tr><td colspan="10" style="text-align:center;color:var(--t3);padding:20px">No users yet</td></tr>';
 
     // Fees table
     const fees = data.recent_fees || [];
@@ -17182,6 +17217,37 @@ async function loadAdminData() {
   } catch(e) {
     console.error('Admin data load error:', e);
   }
+}
+
+async function changePlan(userId, newPlan, selectEl) {
+  const original = selectEl.getAttribute('data-original');
+  if (newPlan === original) return;
+  if (!confirm('Change user #' + userId + ' to ' + newPlan.toUpperCase() + ' plan?')) {
+    selectEl.value = original;
+    return;
+  }
+  selectEl.disabled = true;
+  selectEl.style.opacity = '0.5';
+  try {
+    const r = await fetch('/api/admin/change-plan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_id: userId, plan: newPlan})
+    }).then(r => r.json());
+    if (r.ok) {
+      selectEl.setAttribute('data-original', newPlan);
+      selectEl.style.background = 'rgba(20,199,132,.15)';
+      setTimeout(() => { selectEl.style.background = ''; }, 1500);
+      loadAdminData();
+    } else {
+      alert('Failed: ' + (r.msg || 'Unknown error'));
+      selectEl.value = original;
+    }
+  } catch(e) {
+    alert('Error changing plan');
+    selectEl.value = original;
+  }
+  selectEl.disabled = false;
+  selectEl.style.opacity = '1';
 }
 
 async function addBlacklist() {
