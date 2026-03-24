@@ -14398,7 +14398,7 @@ function renderTokenRows() {
             <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
           </div>
         </td>
-        ${planAtLeast('basic') ? '<td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy(\''+t.mint+'\',\''+nameSafe+'\',this)">&#9889; Buy</button></td>' : '<td><span style="font-size:9px;color:var(--t3)">Basic+</span></td>'}
+        ${planAtLeast('basic') ? '<td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy(\\x27'+t.mint+'\\x27,\\x27'+nameSafe+'\\x27,this)">&#9889; Buy</button></td>' : '<td><span style="font-size:9px;color:var(--t3)">Basic+</span></td>'}
       </tr>
     </tbody></table>`;
   }).join('');
@@ -17087,7 +17087,7 @@ paperLoadState();
     {
       target: '.tab-btn[data-tab="positions"]',
       title: 'Active Positions',
-      desc: 'Track all <strong>open trades</strong> here. You\'ll see entry price, current P&L, hold time, and can manually close any position. The bot also auto-sells based on your TP/SL settings.',
+      desc: 'Track all <strong>open trades</strong> here. See entry price, current P&L, hold time, and manually close any position. The bot also auto-sells based on your TP/SL settings.',
       arrow: 'top'
     },
     {
@@ -17110,8 +17110,8 @@ paperLoadState();
     },
     {
       target: null,
-      title: 'You\'re All Set! 🚀',
-      desc: 'Here\'s the recommended flow:<br><br><strong>1.</strong> Go to <strong>Settings</strong> and configure your buy size & filters<br><strong>2.</strong> Try <strong>Paper Trading</strong> to test your strategy<br><strong>3.</strong> When confident, hit <strong>Start Bot</strong> to go live<br><br>Good luck, and trade safe!',
+      title: 'All Set! \\u{1F680}',
+      desc: 'Recommended flow:<br><br><strong>1.</strong> Go to <strong>Settings</strong> and configure your buy size &amp; filters<br><strong>2.</strong> Try <strong>Paper Trading</strong> to test your strategy<br><strong>3.</strong> When confident, hit <strong>Start Bot</strong> to go live<br><br>Good luck, and trade safe!',
       arrow: 'none',
       center: true
     }
@@ -17156,7 +17156,7 @@ paperLoadState();
         '<div style="display:flex;gap:8px">' +
           (isLast ? '' : '<button class="tour-btn tour-btn-skip" onclick="window._tourSkip()">Skip Tour</button>') +
           (isLast
-            ? '<button class="tour-btn tour-btn-done" onclick="window._tourDone()">Let\'s Go!</button>'
+            ? '<button class="tour-btn tour-btn-done" onclick="window._tourDone()">Let\\x27s Go!</button>'
             : '<button class="tour-btn tour-btn-next" onclick="window._tourNext()">Next →</button>') +
         '</div>' +
       '</div>';
