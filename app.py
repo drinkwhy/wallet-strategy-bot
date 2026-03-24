@@ -9017,36 +9017,22 @@ def api_market_feed():
 @app.route("/api/paper-prices", methods=["POST"])
 @login_required
 def api_paper_prices():
-    """Return current prices for a list of mints — scanner cache first, DexScreener fallback."""
+    """Return LIVE prices for paper positions via DexScreener (not cached scanner feed)."""
     mints = (request.json or {}).get("mints", [])
     if not isinstance(mints, list) or len(mints) > 30:
         return jsonify({})
     wanted = set(mints)
     prices = {}
-    # 1) Check in-memory scanner feed first (fast)
-    for item in list(market_feed):
-        m = item.get("mint")
-        if m in wanted and m not in prices:
-            p = item.get("price", 0)
-            if p and p > 0:
-                prices[m] = {
-                    "price": p,
-                    "mc": item.get("mc", 0),
-                    "name": item.get("name", ""),
-                    "symbol": item.get("symbol", ""),
-                }
-    # 2) Fallback: fetch missing mints from DexScreener
-    missing = wanted - set(prices.keys())
-    if missing:
+    # Always fetch live prices from DexScreener for paper trading accuracy
+    if wanted:
         try:
-            # DexScreener supports comma-separated mints (max ~30)
-            mint_str = ",".join(list(missing)[:30])
+            mint_str = ",".join(list(wanted)[:30])
             resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint_str}", timeout=6)
             if resp.status_code == 200:
                 pairs = resp.json().get("pairs") or []
                 for pair in pairs:
                     ba = pair.get("baseToken", {}).get("address", "")
-                    if ba in missing and ba not in prices:
+                    if ba in wanted and ba not in prices:
                         p = float(pair.get("priceUsd") or 0)
                         if p > 0:
                             prices[ba] = {
@@ -9056,7 +9042,21 @@ def api_paper_prices():
                                 "symbol": pair.get("baseToken", {}).get("symbol", ""),
                             }
         except Exception:
-            pass  # best-effort fallback
+            pass
+    # Fallback: fill any mints DexScreener missed from scanner cache
+    missing = wanted - set(prices.keys())
+    if missing:
+        for item in list(market_feed):
+            m = item.get("mint")
+            if m in missing and m not in prices:
+                p = item.get("price", 0)
+                if p and p > 0:
+                    prices[m] = {
+                        "price": p,
+                        "mc": item.get("mc", 0),
+                        "name": item.get("name", ""),
+                        "symbol": item.get("symbol", ""),
+                    }
     return jsonify(prices)
 
 @app.route("/api/manual-buy", methods=["POST"])
