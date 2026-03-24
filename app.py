@@ -8628,6 +8628,7 @@ def dashboard():
             .replace("{{PLAN}}", html.escape(plan_info.get("label", "")))
             .replace("{{WALLET}}", html.escape(wallet.get("public_key", "")))
             .replace("{{PRESET}}", html.escape(normalize_preset_name((bsettings or {}).get("preset", "balanced"))))
+            .replace("{{PLAN_NAME}}", html.escape(plan))
             .replace("{{PRESET_SETTINGS}}", preset_settings_json),
             mimetype="text/html"
         )
@@ -9037,6 +9038,15 @@ def api_paper_prices():
 @login_required
 def api_manual_buy():
     uid  = session["user_id"]
+    conn_check = db()
+    try:
+        cur_check = conn_check.cursor()
+        cur_check.execute("SELECT plan, email FROM users WHERE id=%s", (uid,))
+        u_check = cur_check.fetchone()
+    finally:
+        db_return(conn_check)
+    if u_check and effective_plan(u_check["plan"], u_check.get("email")) == "free":
+        return jsonify({"ok": False, "msg": "Quick Buy requires a Basic plan or higher. Upgrade at /subscribe/basic"})
     mint = (request.json or {}).get("mint", "").strip()
     name = (request.json or {}).get("name", "Unknown").strip()[:64]
     if not mint or len(mint) < 32 or len(mint) > 64:
@@ -9481,7 +9491,8 @@ def api_quant_shadow_performance():
                    ROUND(AVG(max_upside_pct)::numeric, 2) AS avg_upside,
                    ROUND(AVG(max_drawdown_pct)::numeric, 2) AS avg_drawdown,
                    ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_trade,
-                   ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_trade
+                   ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_trade,
+                   ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct))::numeric, 2) AS median_pnl
             FROM shadow_positions
             WHERE status='closed'
         """
@@ -9504,6 +9515,7 @@ def api_quant_shadow_performance():
         "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
         "best_trade_pct": float(row.get("best_trade") or 0),
         "worst_trade_pct": float(row.get("worst_trade") or 0),
+        "median_pnl_pct": float(row.get("median_pnl") or 0),
     } for row in rows])
 
 
@@ -9588,10 +9600,23 @@ def api_quant_shadow_activity():
                    ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
                    ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_pnl,
                    ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_pnl,
-                   ROUND(SUM(realized_pnl_pct)::numeric, 2) AS total_pnl
+                   ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct)::numeric, 2) AS median_pnl
             FROM shadow_positions WHERE status='closed'
         """)
         agg = cur.fetchone() or {}
+        # Stats excluding the single best trade (to show how concentrated returns are)
+        cur.execute("""
+            WITH ranked AS (
+                SELECT realized_pnl_pct,
+                       ROW_NUMBER() OVER (ORDER BY realized_pnl_pct DESC) AS rn
+                FROM shadow_positions WHERE status='closed'
+            )
+            SELECT ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_excl_best,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins_excl_best,
+                   COUNT(*) AS count_excl_best
+            FROM ranked WHERE rn > 1
+        """)
+        excl = cur.fetchone() or {}
     finally:
         db_return(conn)
 
@@ -9633,9 +9658,12 @@ def api_quant_shadow_activity():
             "total_wins": total_wins,
             "win_rate": round((total_wins / total_closed) * 100, 1) if total_closed > 0 else 0,
             "avg_pnl_pct": float(agg.get("avg_pnl") or 0),
+            "median_pnl_pct": float(agg.get("median_pnl") or 0),
             "best_pnl_pct": float(agg.get("best_pnl") or 0),
             "worst_pnl_pct": float(agg.get("worst_pnl") or 0),
-            "total_pnl_pct": float(agg.get("total_pnl") or 0),
+            "avg_excl_best_pct": float(excl.get("avg_excl_best") or 0),
+            "wins_excl_best": int(excl.get("wins_excl_best") or 0),
+            "disclaimer": "Shadow results are simulated. They do not include slippage, fees, or real execution constraints.",
         },
     })
 
@@ -11553,11 +11581,153 @@ def subscribe_success():
     )
     return redirect(url_for("dashboard"))
 
+@app.route("/manage-subscription")
+@login_required
+def manage_subscription():
+    uid = session["user_id"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT stripe_customer_id FROM users WHERE id=%s", (uid,))
+        user = cur.fetchone()
+    finally:
+        db_return(conn)
+    customer_id = (user or {}).get("stripe_customer_id")
+    if not customer_id:
+        return redirect(url_for("dashboard"))
+    try:
+        portal = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=request.host_url.rstrip("/") + url_for("dashboard"),
+        )
+        return redirect(portal.url)
+    except Exception as e:
+        print(f"[ERROR] Stripe portal: {e}", flush=True)
+        return redirect(url_for("dashboard"))
+
 # ── Admin ──────────────────────────────────────────────────────────────────────
+
+@app.route("/api/admin/revenue")
+@admin_required
+def api_admin_revenue():
+    """Live revenue and user stats for admin dashboard."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # All users with plan info
+        cur.execute("""
+            SELECT u.id, u.email, u.plan, u.created_at, u.trial_ends,
+                   u.stripe_customer_id, u.stripe_subscription_id,
+                   COALESCE(t.trade_count, 0) AS trade_count,
+                   COALESCE(t.total_pnl, 0) AS total_pnl_sol,
+                   COALESCE(t.wins, 0) AS wins,
+                   COALESCE(t.losses, 0) AS losses,
+                   COALESCE(t.last_trade, u.created_at) AS last_active
+            FROM users u
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS trade_count,
+                       ROUND(SUM(COALESCE(pnl_sol, 0))::numeric, 4) AS total_pnl,
+                       SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN pnl_sol < 0 THEN 1 ELSE 0 END) AS losses,
+                       MAX(timestamp) AS last_trade
+                FROM trades WHERE trades.user_id = u.id
+            ) t ON true
+            ORDER BY u.created_at DESC
+        """)
+        users = cur.fetchall()
+
+        # Revenue from subscriptions (count by plan)
+        cur.execute("""
+            SELECT plan, COUNT(*) AS cnt
+            FROM users
+            WHERE plan IN ('basic', 'pro', 'elite')
+              AND stripe_subscription_id IS NOT NULL
+            GROUP BY plan
+        """)
+        sub_rows = cur.fetchall()
+
+        # Performance fees
+        cur.execute("""
+            SELECT COALESCE(SUM(fee_sol), 0) AS total_fees,
+                   COALESCE(SUM(CASE WHEN charged = 1 THEN fee_sol ELSE 0 END), 0) AS collected_fees,
+                   COALESCE(SUM(CASE WHEN charged = 0 OR charged IS NULL THEN fee_sol ELSE 0 END), 0) AS pending_fees,
+                   COUNT(*) AS fee_count
+            FROM perf_fees
+        """)
+        fee_agg = cur.fetchone() or {}
+
+        # Recent performance fees (last 50)
+        cur.execute("""
+            SELECT pf.id, pf.user_id, u.email, pf.pnl_sol, pf.fee_sol, pf.charged, pf.created_at
+            FROM perf_fees pf
+            LEFT JOIN users u ON u.id = pf.user_id
+            ORDER BY pf.created_at DESC
+            LIMIT 50
+        """)
+        recent_fees = cur.fetchall()
+
+        # Platform totals
+        cur.execute("SELECT COUNT(*) AS total FROM users")
+        total_users = int((cur.fetchone() or {}).get("total", 0))
+
+    finally:
+        db_return(conn)
+
+    # Calculate MRR from active subscriptions
+    price_map = {"basic": 49, "pro": 99, "elite": 199}
+    mrr = 0
+    sub_counts = {}
+    for r in sub_rows:
+        plan_name = r.get("plan", "")
+        cnt = int(r.get("cnt", 0))
+        sub_counts[plan_name] = cnt
+        mrr += price_map.get(plan_name, 0) * cnt
+
+    # Active bots right now
+    active_bot_count = sum(1 for b in user_bots.values() if b.running)
+
+    return jsonify({
+        "mrr": mrr,
+        "total_users": total_users,
+        "active_bots": active_bot_count,
+        "subscriptions": sub_counts,
+        "fees": {
+            "total": round(float(fee_agg.get("total_fees", 0)), 4),
+            "collected": round(float(fee_agg.get("collected_fees", 0)), 4),
+            "pending": round(float(fee_agg.get("pending_fees", 0)), 4),
+            "count": int(fee_agg.get("fee_count", 0)),
+        },
+        "users": [{
+            "id": u["id"],
+            "email": u["email"],
+            "plan": u["plan"],
+            "is_active": u["id"] in user_bots and user_bots[u["id"]].running,
+            "trade_count": int(u.get("trade_count", 0)),
+            "total_pnl_sol": float(u.get("total_pnl_sol", 0)),
+            "wins": int(u.get("wins", 0)),
+            "losses": int(u.get("losses", 0)),
+            "has_stripe": bool(u.get("stripe_subscription_id")),
+            "created_at": u["created_at"].isoformat() if u.get("created_at") else None,
+            "last_active": u["last_active"].isoformat() if u.get("last_active") else None,
+        } for u in users],
+        "recent_fees": [{
+            "user_id": f["user_id"],
+            "email": f.get("email"),
+            "pnl_sol": round(float(f.get("pnl_sol", 0)), 4),
+            "fee_sol": round(float(f.get("fee_sol", 0)), 4),
+            "charged": bool(f.get("charged")),
+            "created_at": f["created_at"].isoformat() if f.get("created_at") else None,
+        } for f in recent_fees],
+    })
+
+
 @app.route("/admin")
 @login_required
 def admin():
-    return redirect(url_for("dashboard"))
+    if not is_admin():
+        return redirect(url_for("dashboard"))
+    # Render admin page — data loaded via /api/admin/revenue
+    return Response(ADMIN_HTML, mimetype="text/html")
 
 # ── HTML Templates ─────────────────────────────────────────────────────────────
 _CSS = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -12266,6 +12436,14 @@ DASHBOARD_HTML = _CSS + """
 }
 .hero-panel{padding:22px}
 .glass{padding:18px}
+.plan-gate-overlay{position:absolute;top:0;left:0;right:0;bottom:0;z-index:80;display:flex;align-items:center;justify-content:center;background:rgba(7,14,23,.75);backdrop-filter:blur(6px);border-radius:16px;min-height:400px}
+.plan-gate-card{text-align:center;padding:40px 32px;border-radius:20px;background:linear-gradient(180deg,rgba(17,31,51,.98),rgba(10,19,32,.95));border:1px solid rgba(47,107,255,.2);max-width:420px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.plan-gate-card h3{font-size:20px;font-weight:800;margin:0 0 8px;color:var(--t1)}
+.plan-gate-card p{font-size:13px;color:var(--t2);margin:0 0 20px;line-height:1.6}
+.plan-gate-btn{display:inline-block;padding:12px 32px;font-size:14px;font-weight:700;color:#fff;background:linear-gradient(135deg,#2F6BFF,#14C784);border:none;border-radius:12px;cursor:pointer;text-decoration:none;transition:transform .15s,box-shadow .15s}
+.plan-gate-btn:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(47,107,255,.3)}
+.plan-features{display:flex;flex-direction:column;gap:6px;text-align:left;margin:16px 0 20px;padding:12px;border-radius:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06)}
+.plan-features span{font-size:12px;color:var(--t2)}
 .hero-panel-primary{position:relative;overflow:hidden}
 .hero-panel-primary::after{content:"";position:absolute;right:-60px;top:-60px;width:220px;height:220px;border-radius:50%;background:radial-gradient(circle, rgba(96,165,250,.18), transparent 65%)}
 .hero-kicker,.tab-kicker,.panel-kicker{font-size:10px;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:var(--blue2);margin-bottom:10px}
@@ -12641,6 +12819,7 @@ DASHBOARD_HTML = _CSS + """
         <div class="panel-actions" style="margin-top:14px">
           {{UPGRADE_BTN}}
           <a href="/setup" class="btn btn-ghost">Wallet Setup</a>
+          <a href="/manage-subscription" style="display:inline-block;margin-top:6px;font-size:11px;color:var(--t3);text-decoration:underline">Manage Subscription</a>
         </div>
         <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--b1)">
           <div style="font-size:12px;font-weight:700;color:var(--t1);margin-bottom:6px">Telegram Alerts</div>
@@ -12815,9 +12994,12 @@ DASHBOARD_HTML = _CSS + """
         <div class="shadow-stat-card"><div class="val neu" id="sa-avg-pnl">—</div><div class="lbl">Avg P&L</div></div>
         <div class="shadow-stat-card"><div class="val c-grn" id="sa-best">—</div><div class="lbl">Best Trade</div></div>
         <div class="shadow-stat-card"><div class="val c-red" id="sa-worst">—</div><div class="lbl">Worst Trade</div></div>
-        <div class="shadow-stat-card"><div class="val neu" id="sa-total-pnl">—</div><div class="lbl">Total P&L</div></div>
+        <div class="shadow-stat-card"><div class="val neu" id="sa-total-pnl">—</div><div class="lbl">Median P&L</div></div>
         <div class="shadow-stat-card"><div class="val neu" id="sa-total-closed">0</div><div class="lbl">Trades Closed</div></div>
       </div>
+        <div style="font-size:10px;color:var(--t3);padding:4px 0 10px;line-height:1.5;font-style:italic">
+          * Shadow results are simulated — no slippage, fees, or execution constraints. Not indicative of real trading performance.
+        </div>
       <div class="shadow-activity-tabs">
         <div class="shadow-activity-tab active" onclick="switchShadowTab('open')">Open Positions</div>
         <div class="shadow-activity-tab" onclick="switchShadowTab('closed')">Recent Closed</div>
@@ -13764,6 +13946,17 @@ DASHBOARD_HTML = _CSS + """
 </style>
 
 <script>
+// Plan-based feature gating
+window.__PLAN = '{{PLAN_NAME}}';
+const PLAN_TIER = {free: 0, trial: 0, basic: 1, pro: 2, elite: 3};
+function planAtLeast(required) {
+  return (PLAN_TIER[window.__PLAN] || 0) >= (PLAN_TIER[required] || 0);
+}
+const TAB_PLAN_GATES = {
+  scanner: 'free', settings: 'free', signals: 'basic', whales: 'pro',
+  positions: 'free', pnl: 'free', quant: 'pro', paper: 'basic',
+};
+
 document.querySelector('.wrap').style.paddingBottom = '214px';
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -13786,7 +13979,42 @@ function activateTab(tab) {
   const btn = document.querySelector(`.tab-btn[data-tab="${tab}"]`);
   switchTab(tab, btn);
 }
+function showUpgradeOverlay(tab, requiredPlan) {
+  const pane = document.getElementById('tab-' + tab);
+  if (!pane) return;
+  // Show the tab pane (blurred content visible behind overlay)
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  pane.classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset && b.dataset.tab === tab));
+  if (pane.querySelector('.plan-gate-overlay')) return;
+  const labels = {basic: 'Basic', pro: 'Pro', elite: 'Elite'};
+  const prices = {basic: '$49/mo', pro: '$99/mo', elite: '$199/mo'};
+  const features = {
+    basic: ['Signal Explorer — see why tokens pass or fail', 'Paper Trading — practice risk-free', 'Quick Buy — one-click entries from scanner', 'Full settings control'],
+    pro: ['Whale Tracking — follow smart money', 'Quant Replay Lab — backtest strategies', 'Flow Regime Analytics', 'Everything in Basic'],
+    elite: ['Advanced Optimizer & Model Desk', 'Edge Reports & Scorecards', 'Full Telemetry Dashboard', 'Everything in Pro'],
+  };
+  const planFeats = features[requiredPlan] || features.basic;
+  const overlay = document.createElement('div');
+  overlay.className = 'plan-gate-overlay';
+  overlay.innerHTML =
+    '<div class="plan-gate-card">' +
+      '<div style="font-size:36px;margin-bottom:12px">&#128274;</div>' +
+      '<h3>Unlock ' + (labels[requiredPlan] || 'Premium') + ' Features</h3>' +
+      '<p>Upgrade to the ' + (labels[requiredPlan] || '') + ' plan (' + (prices[requiredPlan] || '') + ') to access this section.</p>' +
+      '<div class="plan-features">' + planFeats.map(f => '<span>&#10003; ' + f + '</span>').join('') + '</div>' +
+      '<a href="/subscribe/' + requiredPlan + '" class="plan-gate-btn">Upgrade to ' + (labels[requiredPlan] || 'Premium') + '</a>' +
+      '<div style="margin-top:12px;font-size:11px;color:var(--t3)">Cancel anytime · Instant activation</div>' +
+    '</div>';
+  pane.style.position = 'relative';
+  pane.appendChild(overlay);
+}
 function switchTab(tab, btn) {
+  var requiredPlan = TAB_PLAN_GATES[tab] || 'free';
+  if (!planAtLeast(requiredPlan)) {
+    showUpgradeOverlay(tab, requiredPlan);
+    return;
+  }
   _activeTab = tab;
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
@@ -14089,7 +14317,7 @@ function renderTokenRows() {
             <span style="font-size:10px;color:${scoreColor(sc)};font-family:monospace;font-weight:700">${sc}</span>
           </div>
         </td>
-        <td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy('${t.mint}','${nameSafe}',this)">\u26a1 Buy</button></td>
+        ${planAtLeast('basic') ? '<td><button class="buy-btn-mini" onclick="event.stopPropagation();quickBuy(\''+t.mint+'\',\''+nameSafe+'\',this)">&#9889; Buy</button></td>' : '<td><span style="font-size:9px;color:var(--t3)">Basic+</span></td>'}
       </tr>
     </tbody></table>`;
   }).join('');
@@ -16354,7 +16582,7 @@ async function updatePromoBanner() {
     const dpBest = document.getElementById('dp-best');
     if (dpTrades) dpTrades.textContent = totalTrades;
     if (dpWr) dpWr.textContent = wr;
-    if (dpBest) dpBest.textContent = bestTrade > 0 ? '+' + bestTrade.toFixed(0) + '%' : '—';
+    if (dpBest) dpBest.textContent = bestTrade > 5000 ? '+5,000%+' : bestTrade > 0 ? '+' + bestTrade.toFixed(0) + '%' : '—';
   } catch(e){}
 }
 updatePromoBanner(); setInterval(updatePromoBanner, 12000);
@@ -16406,7 +16634,7 @@ async function pollShadowActivity() {
     const worstEl = document.getElementById('sa-worst');
     if (worstEl) worstEl.textContent = stats.worst_pnl_pct ? stats.worst_pnl_pct + '%' : '—';
     const totalPnlEl = document.getElementById('sa-total-pnl');
-    if (totalPnlEl) { totalPnlEl.textContent = stats.total_pnl_pct ? (stats.total_pnl_pct > 0 ? '+' : '') + stats.total_pnl_pct + '%' : '—'; totalPnlEl.className = 'val ' + (stats.total_pnl_pct > 0 ? 'c-grn' : stats.total_pnl_pct < 0 ? 'c-red' : 'neu'); }
+    if (totalPnlEl) { totalPnlEl.textContent = stats.median_pnl_pct ? (stats.median_pnl_pct > 0 ? '+' : '') + stats.median_pnl_pct + '%' : '—'; totalPnlEl.className = 'val ' + (stats.median_pnl_pct > 0 ? 'c-grn' : stats.median_pnl_pct < 0 ? 'c-red' : 'neu'); }
     const totalClosedEl = document.getElementById('sa-total-closed');
     if (totalClosedEl) totalClosedEl.textContent = stats.total_closed || 0;
 
@@ -16752,6 +16980,15 @@ function renderPaper() {
 paperLoadState();
 
 </script>
+  <div style="max-width:1520px;margin:40px auto 0;padding:20px;text-align:center;border-top:1px solid rgba(255,255,255,.06)">
+    <p style="font-size:11px;color:var(--t3);line-height:1.6;max-width:800px;margin:0 auto">
+      <strong>Risk Disclaimer:</strong> SolTrader is an automated trading tool. Cryptocurrency trading carries substantial risk of loss.
+      Past performance, including simulated shadow trading results, does not guarantee future results.
+      Shadow trading metrics do not account for slippage, transaction fees, or real execution constraints.
+      This is not financial advice. Only trade with funds you can afford to lose.
+    </p>
+    <p style="font-size:10px;color:var(--t3);margin-top:8px">&copy; 2026 SolTrader. All rights reserved.</p>
+  </div>
 </body></html>
 """
 
@@ -16759,22 +16996,35 @@ paperLoadState();
 # ── Admin Page ─────────────────────────────────────────────────────────────────
 ADMIN_HTML = _CSS + """
 <style>
-.ai-suggest{background:linear-gradient(135deg,rgba(20,199,132,.12),rgba(123,97,255,.08));border:1px solid rgba(20,199,132,.3);border-radius:12px;padding:20px;margin-bottom:20px}
-.ai-suggest h3{color:#14c784;margin:0 0 8px}
-.ai-suggest p{margin:0 0 12px;color:var(--t2);font-size:13px}
-.setting-row{display:grid;grid-template-columns:1fr 140px 80px;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--bdr)}
-.setting-row:last-child{border-bottom:none}
-.setting-label{font-size:13px;color:var(--t2)}
-.setting-desc{font-size:10px;color:var(--t3);margin-top:2px}
-.setting-input{background:var(--bg3);border:1px solid var(--bdr);color:var(--t1);padding:6px 10px;border-radius:6px;font-size:12px;width:100%;font-family:monospace}
-.setting-unit{font-size:11px;color:var(--t3)}
+.adm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}
+.adm-card{background:var(--card);border:1px solid var(--bdr);border-radius:14px;padding:18px 16px;text-align:center}
+.adm-card .val{font-family:'Space Grotesk','Manrope',sans-serif;font-size:28px;font-weight:800;letter-spacing:-.5px}
+.adm-card .lbl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-top:4px}
+.adm-card .sub{font-size:11px;color:var(--t3);margin-top:2px}
+.adm-tbl{width:100%;border-collapse:collapse;font-size:12px}
+.adm-tbl th{text-align:left;padding:8px 10px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);border-bottom:1px solid var(--bdr)}
+.adm-tbl td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.04);color:var(--t2)}
+.adm-tbl tr:hover td{background:rgba(47,107,255,.04)}
+.adm-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.adm-badge.free{background:rgba(100,116,139,.15);color:#94a3b8}.adm-badge.trial{background:rgba(217,119,6,.15);color:#fbbf24}
+.adm-badge.basic{background:rgba(47,107,255,.15);color:#60a5fa}.adm-badge.pro{background:rgba(20,199,132,.15);color:#14c784}
+.adm-badge.elite{background:rgba(168,85,247,.15);color:#c084fc}
+.adm-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+.adm-dot.on{background:#14c784}.adm-dot.off{background:#475569}
+.adm-section{background:var(--card);border:1px solid var(--bdr);border-radius:16px;padding:20px;margin-bottom:16px}
+.adm-section-title{font-size:14px;font-weight:800;color:var(--t1);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.adm-pnl-pos{color:#14c784}.adm-pnl-neg{color:#dc2626}.adm-pnl-zero{color:var(--t3)}
+.adm-tabs{display:flex;gap:0;border-bottom:1px solid var(--bdr);margin-bottom:16px}
+.adm-tab{padding:10px 18px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);cursor:pointer;border-bottom:2px solid transparent}
+.adm-tab.active{color:#14c784;border-bottom-color:#14c784}
+.adm-tab:hover{color:var(--t1)}
 </style>
 </head><body>
 
 <nav class="nav">
   <a href="/" class="logo"><div class="logo-mark">S</div>SolTrader</a>
   <div class="nav-r">
-    <span class="badge bg-gold">Admin</span>
+    <span class="badge bg-gold" style="font-size:11px;padding:4px 12px">Admin</span>
     <a href="/dashboard">My Dashboard</a>
     <a href="/logout" style="color:var(--t3)!important">Sign Out</a>
   </div>
@@ -16782,290 +17032,156 @@ ADMIN_HTML = _CSS + """
 
 <div class="wrap">
   <div style="margin-bottom:24px">
-    <div class="page-title">Admin Panel</div>
+    <div style="font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--t3);margin-bottom:4px">Operator Console</div>
+    <div class="page-title" style="font-size:28px;font-weight:800">Revenue & Users</div>
+    <div style="font-size:12px;color:var(--t3);margin-top:4px">Last refreshed: <span id="adm-refresh-time">loading...</span></div>
   </div>
 
-  <!-- AI Suggestion Box -->
-  <div class="ai-suggest" id="ai-box">
-    <h3>🤖 AI Market Analysis</h3>
-    <p id="ai-reason">Loading market analysis…</p>
-    <div id="ai-stats" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px"></div>
-    <button class="btn btn-primary" onclick="applyAISuggestion()" id="ai-apply-btn">Apply AI Recommendation</button>
+  <!-- Revenue Cards -->
+  <div class="adm-grid" id="adm-stats">
+    <div class="adm-card"><div class="val c-grn" id="adm-mrr">$0</div><div class="lbl">Monthly Recurring</div><div class="sub" id="adm-mrr-sub">0 subscribers</div></div>
+    <div class="adm-card"><div class="val" style="color:var(--gold2)" id="adm-fees-total">0 SOL</div><div class="lbl">Perf Fees Earned</div><div class="sub" id="adm-fees-sub">0 collected, 0 pending</div></div>
+    <div class="adm-card"><div class="val" style="color:var(--blue2)" id="adm-users">0</div><div class="lbl">Total Users</div><div class="sub" id="adm-users-sub">0 active bots</div></div>
+    <div class="adm-card"><div class="val c-grn" id="adm-active">0</div><div class="lbl">Active Bots</div><div class="sub">running right now</div></div>
   </div>
 
-  <!-- Platform Stats -->
-  <div class="stats" style="margin-bottom:24px">
-    <div class="stat"><div class="slabel">Total Users</div><div class="sval">{{USERS}}</div></div>
-    <div class="stat"><div class="slabel">Active Bots</div><div class="sval c-grn">{{ACTIVE}}</div></div>
-    <div class="stat"><div class="slabel">Perf Fees Owed</div><div class="sval c-gold">{{FEE_SOL}} SOL</div></div>
+  <!-- Plan Breakdown -->
+  <div class="adm-grid" style="grid-template-columns:repeat(4,1fr)">
+    <div class="adm-card"><div class="val" style="font-size:22px;color:#94a3b8" id="adm-plan-free">0</div><div class="lbl">Free</div><div class="sub">$0/mo each</div></div>
+    <div class="adm-card"><div class="val" style="font-size:22px;color:#60a5fa" id="adm-plan-basic">0</div><div class="lbl">Basic</div><div class="sub">$49/mo each</div></div>
+    <div class="adm-card"><div class="val" style="font-size:22px;color:#14c784" id="adm-plan-pro">0</div><div class="lbl">Pro</div><div class="sub">$99/mo each</div></div>
+    <div class="adm-card"><div class="val" style="font-size:22px;color:#c084fc" id="adm-plan-elite">0</div><div class="lbl">Elite</div><div class="sub">$199/mo each</div></div>
   </div>
 
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-    <!-- Global Preset Tuner -->
-    <div class="panel">
-      <div class="sec-label">Global Preset Overrides <span style="font-size:10px;color:var(--t3);font-weight:400">— affects all users on this preset</span></div>
+  <!-- Tabs: Users | Fees | Tools -->
+  <div class="adm-tabs">
+    <div class="adm-tab active" onclick="switchAdminTab('users',this)">Users</div>
+    <div class="adm-tab" onclick="switchAdminTab('fees',this)">Performance Fees</div>
+    <div class="adm-tab" onclick="switchAdminTab('tools',this)">Tools</div>
+  </div>
 
-      <div style="margin:12px 0">
-        <label class="flabel">Preset to Edit</label>
-        <select class="finput" id="edit-preset" onchange="loadPreset(this.value)">
-          <option value="safe">Safe</option>
-          <option value="balanced" selected>Balanced</option>
-          <option value="aggressive">Aggressive</option>
-          <option value="degen">Degen</option>
-        </select>
-      </div>
-
-      <div id="preset-settings">
-        <div class="setting-row">
-          <div><div class="setting-label">Max Buy (SOL)</div><div class="setting-desc">SOL spent per trade</div></div>
-          <input class="setting-input" id="s-max-buy" type="number" step="0.01" value="0.04">
-          <div class="setting-unit">SOL</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Take Profit 1</div><div class="setting-desc">Sell 50% at this multiplier</div></div>
-          <input class="setting-input" id="s-tp1" type="number" step="0.1" value="1.5">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Take Profit 2</div><div class="setting-desc">Sell rest at this multiplier</div></div>
-          <input class="setting-input" id="s-tp2" type="number" step="0.1" value="3.0">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Stop Loss</div><div class="setting-desc">Exit if drops below this ratio</div></div>
-          <input class="setting-input" id="s-sl" type="number" step="0.05" value="0.75">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Trailing Stop</div><div class="setting-desc">% drop from peak to exit</div></div>
-          <input class="setting-input" id="s-trail" type="number" step="0.05" value="0.20">
-          <div class="setting-unit">%</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Max Token Age</div><div class="setting-desc">Skip tokens older than this</div></div>
-          <input class="setting-input" id="s-age" type="number" step="1" value="30">
-          <div class="setting-unit">min</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Time Stop</div><div class="setting-desc">Exit if not profitable after</div></div>
-          <input class="setting-input" id="s-tstop" type="number" step="1" value="30">
-          <div class="setting-unit">min</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Liquidity</div><div class="setting-desc">Skip pools below this</div></div>
-          <input class="setting-input" id="s-liq" type="number" step="1000" value="10000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Market Cap</div><div class="setting-desc">Skip tokens below this MC</div></div>
-          <input class="setting-input" id="s-minmc" type="number" step="1000" value="5000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Max Market Cap</div><div class="setting-desc">Skip tokens above this MC</div></div>
-          <input class="setting-input" id="s-maxmc" type="number" step="10000" value="150000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Priority Fee</div><div class="setting-desc">Lamports to outbid bots</div></div>
-          <input class="setting-input" id="s-prio" type="number" step="10000" value="30000">
-          <div class="setting-unit">λ</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Drawdown Limit</div><div class="setting-desc">Stop bot after losing this</div></div>
-          <input class="setting-input" id="s-dd" type="number" step="0.1" value="0.5">
-          <div class="setting-unit">SOL</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Max Positions</div><div class="setting-desc">Max simultaneous trades</div></div>
-          <input class="setting-input" id="s-maxpos" type="number" step="1" value="3">
-          <div class="setting-unit">#</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Volume</div><div class="setting-desc">Skip tokens below this 24h volume</div></div>
-          <input class="setting-input" id="s-minvol" type="number" step="100" value="3000">
-          <div class="setting-unit">USD</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min AI Score</div><div class="setting-desc">Skip tokens scoring below this (0-100)</div></div>
-          <input class="setting-input" id="s-minscore" type="number" min="0" max="100" step="5" value="30">
-          <div class="setting-unit">/100</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Risk Per Trade</div><div class="setting-desc">Caps entry size as % of wallet</div></div>
-          <input class="setting-input" id="s-risk" type="number" step="0.1" value="2.0">
-          <div class="setting-unit">%</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Holder Growth (1h)</div><div class="setting-desc">Minimum holder growth for acceleration</div></div>
-          <input class="setting-input" id="s-holders" type="number" step="5" value="50">
-          <div class="setting-unit">%</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Min Narrative Score</div><div class="setting-desc">Required narrative timing score</div></div>
-          <input class="setting-input" id="s-narr" type="number" step="1" value="20">
-          <div class="setting-unit">pts</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Green Lights Required</div><div class="setting-desc">Minimum checklist confirmations before buy</div></div>
-          <input class="setting-input" id="s-lights" type="number" min="1" max="3" step="1" value="3">
-          <div class="setting-unit">#</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Volume Spike Multiple</div><div class="setting-desc">Minimum volume expansion for signal strength</div></div>
-          <input class="setting-input" id="s-volspike" type="number" step="0.5" value="10">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Late Entry Limit</div><div class="setting-desc">Reject coins already extended beyond this multiple</div></div>
-          <input class="setting-input" id="s-latemult" type="number" step="0.5" value="5.0">
-          <div class="setting-unit">×</div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Nuclear Narrative Score</div><div class="setting-desc">Narrative score needed to override late-entry guard</div></div>
-          <input class="setting-input" id="s-nuclear" type="number" step="1" value="40">
-          <div class="setting-unit">pts</div>
-        </div>
-      </div>
-      <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="savePreset()">💾 Save Preset Override</button>
+  <!-- Users Tab -->
+  <div id="adm-tab-users" class="adm-section">
+    <div class="adm-section-title">All Users <span style="font-size:11px;color:var(--t3);font-weight:400" id="adm-user-count-label"></span></div>
+    <div style="overflow-x:auto;max-height:600px;overflow-y:auto">
+      <table class="adm-tbl" id="adm-user-table">
+        <thead><tr>
+          <th>Status</th><th>Email</th><th>Plan</th><th>Stripe</th><th>Trades</th><th>P&L (SOL)</th><th>Win Rate</th><th>Joined</th><th>Last Active</th>
+        </tr></thead>
+        <tbody id="adm-user-rows"><tr><td colspan="9" style="text-align:center;color:var(--t3);padding:30px">Loading users...</td></tr></tbody>
+      </table>
     </div>
+  </div>
 
-    <!-- Users + Dev Blacklist -->
-    <div>
-      <div class="panel" style="margin-bottom:16px">
-        <div class="sec-label">Registered Users</div>
-        <table class="tbl">
-          <thead><tr><th>Email</th><th>Plan</th><th>Bot</th><th>Joined</th></tr></thead>
-          <tbody>{{USER_ROWS}}</tbody>
-        </table>
-      </div>
+  <!-- Fees Tab -->
+  <div id="adm-tab-fees" class="adm-section" style="display:none">
+    <div class="adm-section-title">Recent Performance Fees</div>
+    <div style="overflow-x:auto;max-height:500px;overflow-y:auto">
+      <table class="adm-tbl">
+        <thead><tr><th>User</th><th>Session PnL</th><th>Fee Owed</th><th>Status</th><th>Date</th></tr></thead>
+        <tbody id="adm-fee-rows"><tr><td colspan="5" style="text-align:center;color:var(--t3);padding:30px">Loading fees...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 
-      <div class="panel" style="margin-bottom:16px">
-        <div class="sec-label">Dev Blacklist <span style="font-size:10px;color:var(--t3);font-weight:400">— auto-populated on rug detection</span></div>
-        <div id="blacklist-tbl"><div style="font-size:13px;color:var(--t3)">Loading…</div></div>
+  <!-- Tools Tab -->
+  <div id="adm-tab-tools" style="display:none">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div class="adm-section">
+        <div class="adm-section-title">Dev Blacklist</div>
+        <div id="blacklist-tbl"><div style="font-size:13px;color:var(--t3)">Loading...</div></div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <input class="finput" id="bl-wallet" placeholder="Paste dev wallet address" style="flex:1">
           <button class="btn btn-danger" onclick="addBlacklist()">Block</button>
         </div>
       </div>
-
-      <div class="panel">
-        <div class="sec-label">Performance Fees</div>
-        <table class="tbl">
-          <thead><tr><th>User ID</th><th>Session PnL</th><th>Fee Owed</th><th>Date</th></tr></thead>
-          <tbody>{{FEE_ROWS}}</tbody>
-        </table>
+      <div class="adm-section">
+        <div class="adm-section-title">Database Cleanup</div>
+        <p style="font-size:12px;color:var(--t3);margin-bottom:12px">Delete old shadow decisions, market events, and expired data to free Postgres disk.</p>
+        <button class="btn btn-primary" onclick="runCleanup()">Run Cleanup Now</button>
+        <div id="cleanup-result" style="margin-top:8px;font-size:11px;color:var(--t3)"></div>
       </div>
     </div>
   </div>
+
 </div>
 
 <script>
-const PRESET_DEFAULTS = {{PRESET_DEFAULTS}};
-let aiSuggestion = null;
-
-function loadPreset(name) {
-  const p = PRESET_DEFAULTS[name];
-  if (!p) return;
-  document.getElementById('s-max-buy').value  = p.buy;
-  document.getElementById('s-tp1').value      = p.tp1;
-  document.getElementById('s-tp2').value      = p.tp2;
-  document.getElementById('s-sl').value       = p.sl;
-  document.getElementById('s-trail').value    = p.trail;
-  document.getElementById('s-age').value      = p.age;
-  document.getElementById('s-tstop').value    = p.tstop;
-  document.getElementById('s-liq').value      = p.liq;
-  document.getElementById('s-minmc').value    = p.minmc;
-  document.getElementById('s-maxmc').value    = p.maxmc;
-  document.getElementById('s-prio').value     = p.prio;
-  document.getElementById('s-dd').value       = p.dd;
-  document.getElementById('s-maxpos').value   = p.maxpos;
-  document.getElementById('s-minvol').value   = p.minvol;
-  document.getElementById('s-minscore').value = p.minscore;
-  document.getElementById('s-risk').value     = p.risk;
-  document.getElementById('s-holders').value  = p.holders;
-  document.getElementById('s-narr').value     = p.narr;
-  document.getElementById('s-lights').value   = p.lights;
-  document.getElementById('s-volspike').value = p.volspike;
-  document.getElementById('s-latemult').value = p.latemult;
-  document.getElementById('s-nuclear').value  = p.nuclear;
+function switchAdminTab(tab, btn) {
+  document.querySelectorAll('.adm-tab').forEach(t => t.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  ['users','fees','tools'].forEach(t => {
+    const el = document.getElementById('adm-tab-' + t);
+    if (el) el.style.display = t === tab ? '' : 'none';
+  });
 }
 
-function collectPresetSettings(preset) {
-  return {
-    preset,
-    max_buy_sol:      parseFloat(document.getElementById('s-max-buy').value),
-    tp1_mult:         parseFloat(document.getElementById('s-tp1').value),
-    tp2_mult:         parseFloat(document.getElementById('s-tp2').value),
-    stop_loss:        parseFloat(document.getElementById('s-sl').value),
-    trail_pct:        parseFloat(document.getElementById('s-trail').value),
-    max_age_min:      parseInt(document.getElementById('s-age').value),
-    time_stop_min:    parseInt(document.getElementById('s-tstop').value),
-    min_liq:          parseFloat(document.getElementById('s-liq').value),
-    min_mc:           parseFloat(document.getElementById('s-minmc').value),
-    max_mc:           parseFloat(document.getElementById('s-maxmc').value),
-    priority_fee:     parseInt(document.getElementById('s-prio').value),
-    drawdown_limit_sol: parseFloat(document.getElementById('s-dd').value),
-    max_correlated:   parseInt(document.getElementById('s-maxpos').value),
-    min_vol:          parseFloat(document.getElementById('s-minvol').value),
-    min_score:        parseInt(document.getElementById('s-minscore').value),
-    risk_per_trade_pct: parseFloat(document.getElementById('s-risk').value),
-    min_holder_growth_pct: parseFloat(document.getElementById('s-holders').value),
-    min_narrative_score: parseInt(document.getElementById('s-narr').value),
-    min_green_lights: parseInt(document.getElementById('s-lights').value),
-    min_volume_spike_mult: parseFloat(document.getElementById('s-volspike').value),
-    late_entry_mult:  parseFloat(document.getElementById('s-latemult').value),
-    nuclear_narrative_score: parseInt(document.getElementById('s-nuclear').value),
-  };
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US', {month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString('en-US', {hour:'2-digit',minute:'2-digit'});
 }
 
-async function savePreset() {
-  const preset = document.getElementById('edit-preset').value;
-  const settings = collectPresetSettings(preset);
-  const r = await fetch('/api/admin/override-preset', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(settings)
-  }).then(r=>r.json()).catch(()=>({ok:false}));
-  alert(r.ok ? '✅ Preset saved and applied to active bots!' : '❌ Save failed');
-}
+async function loadAdminData() {
+  try {
+    const data = await fetch('/api/admin/revenue').then(r => r.json());
 
-async function loadAI() {
-  const r = await fetch('/api/admin/suggest-settings').then(r=>r.json()).catch(()=>null);
-  if (!r) return;
-  aiSuggestion = r.suggestion;
-  document.getElementById('ai-reason').textContent = r.suggestion.reason;
-  const s = r.stats;
-  if (s && s.total_trades) {
-    document.getElementById('ai-stats').innerHTML = `
-      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
-        <div style="font-size:20px;font-weight:800;color:var(--t1)">${s.total_trades}</div>
-        <div style="font-size:10px;color:var(--t3)">Trades (24h)</div>
-      </div>
-      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
-        <div style="font-size:20px;font-weight:800;color:#14c784">${s.win_rate}%</div>
-        <div style="font-size:10px;color:var(--t3)">Win Rate</div>
-      </div>
-      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
-        <div style="font-size:20px;font-weight:800;color:#14c784">+${s.avg_win_sol}</div>
-        <div style="font-size:10px;color:var(--t3)">Avg Win (SOL)</div>
-      </div>
-      <div style="background:var(--bg3);border-radius:8px;padding:10px;text-align:center">
-        <div style="font-size:20px;font-weight:800;color:#f23645">${s.avg_loss_sol}</div>
-        <div style="font-size:10px;color:var(--t3)">Avg Loss (SOL)</div>
-      </div>`;
+    // Revenue cards
+    document.getElementById('adm-mrr').textContent = '$' + data.mrr.toLocaleString();
+    const totalSubs = Object.values(data.subscriptions || {}).reduce((a,b) => a + b, 0);
+    document.getElementById('adm-mrr-sub').textContent = totalSubs + ' active subscriber' + (totalSubs !== 1 ? 's' : '');
+
+    document.getElementById('adm-fees-total').textContent = data.fees.total.toFixed(4) + ' SOL';
+    document.getElementById('adm-fees-sub').textContent = data.fees.collected.toFixed(4) + ' collected, ' + data.fees.pending.toFixed(4) + ' pending';
+
+    document.getElementById('adm-users').textContent = data.total_users;
+    document.getElementById('adm-users-sub').textContent = data.active_bots + ' active bot' + (data.active_bots !== 1 ? 's' : '');
+    document.getElementById('adm-active').textContent = data.active_bots;
+
+    // Plan breakdown
+    const planCounts = {free: 0, basic: 0, pro: 0, elite: 0, trial: 0};
+    (data.users || []).forEach(u => { planCounts[u.plan] = (planCounts[u.plan] || 0) + 1; });
+    document.getElementById('adm-plan-free').textContent = (planCounts.free || 0) + (planCounts.trial || 0);
+    document.getElementById('adm-plan-basic').textContent = planCounts.basic || 0;
+    document.getElementById('adm-plan-pro').textContent = planCounts.pro || 0;
+    document.getElementById('adm-plan-elite').textContent = planCounts.elite || 0;
+
+    // Users table
+    const users = data.users || [];
+    document.getElementById('adm-user-count-label').textContent = '(' + users.length + ' total)';
+    document.getElementById('adm-user-rows').innerHTML = users.map(u => {
+      const pnl = u.total_pnl_sol || 0;
+      const pnlClass = pnl > 0 ? 'adm-pnl-pos' : pnl < 0 ? 'adm-pnl-neg' : 'adm-pnl-zero';
+      const wr = (u.wins + u.losses) > 0 ? ((u.wins / (u.wins + u.losses)) * 100).toFixed(1) + '%' : '—';
+      return '<tr>' +
+        '<td><span class="adm-dot ' + (u.is_active ? 'on' : 'off') + '"></span>' + (u.is_active ? 'Live' : 'Off') + '</td>' +
+        '<td style="font-weight:600;color:var(--t1)">' + u.email + '</td>' +
+        '<td><span class="adm-badge ' + u.plan + '">' + u.plan + '</span></td>' +
+        '<td>' + (u.has_stripe ? '<span style="color:#14c784">Paying</span>' : '<span style="color:var(--t3)">No</span>') + '</td>' +
+        '<td>' + u.trade_count + '</td>' +
+        '<td class="' + pnlClass + '" style="font-weight:700;font-family:monospace">' + (pnl > 0 ? '+' : '') + pnl.toFixed(4) + '</td>' +
+        '<td>' + wr + '</td>' +
+        '<td style="font-size:11px;color:var(--t3)">' + fmtDate(u.created_at) + '</td>' +
+        '<td style="font-size:11px;color:var(--t3)">' + fmtDate(u.last_active) + '</td>' +
+      '</tr>';
+    }).join('') || '<tr><td colspan="9" style="text-align:center;color:var(--t3);padding:20px">No users yet</td></tr>';
+
+    // Fees table
+    const fees = data.recent_fees || [];
+    document.getElementById('adm-fee-rows').innerHTML = fees.map(f => {
+      return '<tr>' +
+        '<td style="font-weight:600;color:var(--t1)">' + (f.email || 'User #' + f.user_id) + '</td>' +
+        '<td style="font-family:monospace">' + (f.pnl_sol > 0 ? '+' : '') + f.pnl_sol.toFixed(4) + ' SOL</td>' +
+        '<td style="font-family:monospace;color:var(--gold2);font-weight:700">' + f.fee_sol.toFixed(4) + ' SOL</td>' +
+        '<td>' + (f.charged ? '<span style="color:#14c784">Collected</span>' : '<span style="color:var(--gold)">Pending</span>') + '</td>' +
+        '<td style="font-size:11px;color:var(--t3)">' + fmtDate(f.created_at) + '</td>' +
+      '</tr>';
+    }).join('') || '<tr><td colspan="5" style="text-align:center;color:var(--t3);padding:20px">No fees recorded yet</td></tr>';
+
+    document.getElementById('adm-refresh-time').textContent = new Date().toLocaleTimeString();
+  } catch(e) {
+    console.error('Admin data load error:', e);
   }
-}
-
-async function applyAISuggestion() {
-  if (!aiSuggestion) return;
-  document.getElementById('edit-preset').value = aiSuggestion.preset;
-  loadPreset(aiSuggestion.preset);
-  const r = await fetch('/api/admin/override-preset', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(collectPresetSettings(aiSuggestion.preset))
-  }).then(r => r.json()).catch(() => ({ok:false}));
-  alert(r.ok ? '✅ AI recommendation applied globally to that preset.' : '❌ Could not apply AI recommendation');
 }
 
 async function addBlacklist() {
@@ -17085,15 +17201,21 @@ async function loadBlacklist() {
     return;
   }
   document.getElementById('blacklist-tbl').innerHTML = r.map(w =>
-    `<div style="font-size:11px;color:var(--t2);padding:4px 0;border-bottom:1px solid var(--bdr);font-family:monospace">
-      ${w.dev_wallet} <span style="color:var(--t3)">— ${w.reason}</span>
-    </div>`
+    '<div style="font-size:11px;color:var(--t2);padding:4px 0;border-bottom:1px solid var(--bdr);font-family:monospace">' +
+      w.dev_wallet + ' <span style="color:var(--t3)"> — ' + w.reason + '</span></div>'
   ).join('');
 }
 
-loadPreset('balanced');
-loadAI();
+async function runCleanup() {
+  const el = document.getElementById('cleanup-result');
+  el.textContent = 'Running...';
+  const r = await fetch('/api/db-cleanup', {method:'POST'}).then(r=>r.json()).catch(()=>({ok:false}));
+  el.textContent = r.ok ? 'Cleanup complete: ' + JSON.stringify(r.freed || {}) : 'Cleanup failed';
+}
+
+loadAdminData();
 loadBlacklist();
+setInterval(loadAdminData, 15000);
 </script>
 </body></html>
 """
