@@ -5416,11 +5416,7 @@ def check_whale_wallets():
     time.sleep(15)  # let app fully start first
     while True:
         try:
-            with user_bots_lock:
-                active_bots = [b for b in user_bots.values() if b.running]
-            if not active_bots:
-                time.sleep(30)
-                continue
+            # Always poll whale wallets — dashboard shows activity even without active bots
             # Process all wallets in parallel (cuts 32s serial down to ~8s)
             with ThreadPoolExecutor(max_workers=min(len(WHALE_WALLETS), 4)) as pool:
                 pool.map(_poll_single_whale, WHALE_WALLETS)
@@ -12025,7 +12021,23 @@ def admin():
     return Response(ADMIN_HTML, mimetype="text/html")
 
 # ── HTML Templates ─────────────────────────────────────────────────────────────
-_CSS = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+_CSS = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SolTrader — AI-Powered Solana Trading Bot | Signal Explorer, Whale Tracking & Paper Trading</title>
+<meta name="description" content="The most transparent Solana trading bot. See exactly why every token is accepted or rejected. Whale copy trading, multi-stage take profits, paper trading, and AI-driven strategies. Free to start.">
+<meta name="keywords" content="solana trading bot, solana sniper bot, meme coin bot, whale tracking, paper trading, AI trading, crypto bot, jupiter swap, helius, jito, CEX listing sniper">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://soltrader.trade/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://soltrader.trade/">
+<meta property="og:title" content="SolTrader — AI Solana Trading Bot">
+<meta property="og:description" content="See WHY every token passes or fails. Whale copy trading, paper trading, multi-stage TP, and 4 AI strategies. Free tier available.">
+<meta property="og:image" content="https://soltrader.trade/static/og-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="SolTrader — AI Solana Trading Bot">
+<meta name="twitter:description" content="The only bot that shows you WHY. Signal Explorer, Whale Tracking, Paper Trading. Free to start.">
+<meta name="twitter:image" content="https://soltrader.trade/static/og-card.png">
 <meta name="theme-color" content="#07101E">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -12320,7 +12332,7 @@ LANDING_HTML = _CSS + """
 
 <!-- Animated Top Bar -->
 <div class="promo-topbar">
-  <div class="promo-topbar-text">AI-Powered Solana Trading &nbsp;·&nbsp; Peak Plateau Rider &nbsp;·&nbsp; Ride 2000%+ Runners &nbsp;·&nbsp; <a href="/signup">Start Free</a></div>
+  <div class="promo-topbar-text">AI-Powered Solana Trading &nbsp;·&nbsp; See Why Every Trade Happens &nbsp;·&nbsp; Paper Trade Risk-Free &nbsp;·&nbsp; <a href="/signup">Start Free</a></div>
 </div>
 
 <nav class="nav">
@@ -12336,28 +12348,28 @@ LANDING_HTML = _CSS + """
 <div style="padding:60px 24px 0;max-width:960px;margin:0 auto">
   <div class="promo-hero-banner">
     <div class="promo-hero-inner">
-      <div class="promo-hero-kicker">AI Quant Trading Engine</div>
+      <div class="promo-hero-kicker">Transparent AI Trading</div>
       <div class="promo-hero-title">
-        Stop Selling at 10x.<br>
-        <span class="promo-fire">Ride to the Peak.</span>
+        The Only Bot That Shows You<br>
+        <span class="promo-fire">Why.</span>
       </div>
-      <div class="promo-hero-subtitle">Peak Plateau Rider holds until momentum dies. Progressive trailing locks in moonshot gains.</div>
+      <div class="promo-hero-subtitle">Every token scored. Every rejection explained. Paper trade first, go live when ready.</div>
       <div class="promo-hero-stats">
         <div class="promo-hero-stat">
-          <div class="promo-hero-stat-val" style="color:#14c784" id="promo-stat-1">2000%+</div>
-          <div class="promo-hero-stat-lbl">Runner Capacity</div>
-        </div>
-        <div class="promo-hero-stat">
-          <div class="promo-hero-stat-val" style="color:#3b82f6" id="promo-stat-2">48h</div>
-          <div class="promo-hero-stat-lbl">Regime Analysis</div>
-        </div>
-        <div class="promo-hero-stat">
-          <div class="promo-hero-stat-val" style="color:#a855f7" id="promo-stat-3">4</div>
+          <div class="promo-hero-stat-val" style="color:#14c784" id="promo-stat-1">4</div>
           <div class="promo-hero-stat-lbl">AI Strategies</div>
         </div>
         <div class="promo-hero-stat">
-          <div class="promo-hero-stat-val" style="color:#f59e0b" id="promo-stat-4">24/7</div>
+          <div class="promo-hero-stat-val" style="color:#3b82f6" id="promo-stat-2">24/7</div>
           <div class="promo-hero-stat-lbl">Shadow Testing</div>
+        </div>
+        <div class="promo-hero-stat">
+          <div class="promo-hero-stat-val" style="color:#a855f7" id="promo-stat-3">12+</div>
+          <div class="promo-hero-stat-lbl">Safety Filters</div>
+        </div>
+        <div class="promo-hero-stat">
+          <div class="promo-hero-stat-val" style="color:#f59e0b" id="promo-stat-4">$0</div>
+          <div class="promo-hero-stat-lbl">To Start</div>
         </div>
       </div>
       <div class="promo-feat-strip">
