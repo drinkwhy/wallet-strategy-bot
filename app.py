@@ -11518,6 +11518,81 @@ def api_admin_change_plan():
     return jsonify({"ok": True, "msg": f"Changed {user.get('email')} from {old_plan} to {new_plan}"})
 
 
+@app.route("/api/admin/shadow-analysis")
+@admin_required
+def api_admin_shadow_analysis():
+    """Deep analysis of shadow trade performance for optimization."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Exit reason distribution
+        cur.execute("""
+            SELECT exit_reason, COUNT(*) AS cnt,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins
+            FROM shadow_positions WHERE status='closed'
+            GROUP BY exit_reason ORDER BY cnt DESC
+        """)
+        exit_reasons = [dict(r) for r in cur.fetchall()]
+        # Peak upside distribution (how high did tokens go before exit?)
+        cur.execute("""
+            SELECT
+                SUM(CASE WHEN max_upside_pct < 10 THEN 1 ELSE 0 END) AS pct_0_10,
+                SUM(CASE WHEN max_upside_pct >= 10 AND max_upside_pct < 25 THEN 1 ELSE 0 END) AS pct_10_25,
+                SUM(CASE WHEN max_upside_pct >= 25 AND max_upside_pct < 50 THEN 1 ELSE 0 END) AS pct_25_50,
+                SUM(CASE WHEN max_upside_pct >= 50 AND max_upside_pct < 100 THEN 1 ELSE 0 END) AS pct_50_100,
+                SUM(CASE WHEN max_upside_pct >= 100 AND max_upside_pct < 200 THEN 1 ELSE 0 END) AS pct_100_200,
+                SUM(CASE WHEN max_upside_pct >= 200 AND max_upside_pct < 500 THEN 1 ELSE 0 END) AS pct_200_500,
+                SUM(CASE WHEN max_upside_pct >= 500 THEN 1 ELSE 0 END) AS pct_500plus,
+                COUNT(*) AS total
+            FROM shadow_positions WHERE status='closed'
+        """)
+        peak = dict(cur.fetchone() or {})
+        # Max drawdown distribution (how low did they go?)
+        cur.execute("""
+            SELECT
+                SUM(CASE WHEN max_drawdown_pct > -10 THEN 1 ELSE 0 END) AS dd_0_10,
+                SUM(CASE WHEN max_drawdown_pct <= -10 AND max_drawdown_pct > -20 THEN 1 ELSE 0 END) AS dd_10_20,
+                SUM(CASE WHEN max_drawdown_pct <= -20 AND max_drawdown_pct > -30 THEN 1 ELSE 0 END) AS dd_20_30,
+                SUM(CASE WHEN max_drawdown_pct <= -30 AND max_drawdown_pct > -50 THEN 1 ELSE 0 END) AS dd_30_50,
+                SUM(CASE WHEN max_drawdown_pct <= -50 THEN 1 ELSE 0 END) AS dd_50plus,
+                COUNT(*) AS total
+            FROM shadow_positions WHERE status='closed'
+        """)
+        dd = dict(cur.fetchone() or {})
+        # What if TP1 was lower? Simulate different TP1 levels
+        cur.execute("""
+            SELECT
+                SUM(CASE WHEN max_upside_pct >= 30 THEN 1 ELSE 0 END) AS would_hit_1_3x,
+                SUM(CASE WHEN max_upside_pct >= 50 THEN 1 ELSE 0 END) AS would_hit_1_5x,
+                SUM(CASE WHEN max_upside_pct >= 75 THEN 1 ELSE 0 END) AS would_hit_1_75x,
+                SUM(CASE WHEN max_upside_pct >= 100 THEN 1 ELSE 0 END) AS would_hit_2x,
+                SUM(CASE WHEN max_upside_pct >= 200 THEN 1 ELSE 0 END) AS would_hit_3x,
+                SUM(CASE WHEN max_upside_pct >= 500 THEN 1 ELSE 0 END) AS would_hit_6x,
+                COUNT(*) AS total
+            FROM shadow_positions WHERE status='closed'
+        """)
+        tp_sim = dict(cur.fetchone() or {})
+        # Avg hold time for winners vs losers
+        cur.execute("""
+            SELECT
+                ROUND(AVG(CASE WHEN realized_pnl_pct > 0 THEN EXTRACT(EPOCH FROM (closed_at - opened_at))/60.0 END)::numeric, 1) AS avg_win_hold_min,
+                ROUND(AVG(CASE WHEN realized_pnl_pct <= 0 THEN EXTRACT(EPOCH FROM (closed_at - opened_at))/60.0 END)::numeric, 1) AS avg_loss_hold_min,
+                ROUND(AVG(EXTRACT(EPOCH FROM (closed_at - opened_at))/60.0)::numeric, 1) AS avg_hold_min
+            FROM shadow_positions WHERE status='closed' AND closed_at IS NOT NULL AND opened_at IS NOT NULL
+        """)
+        hold = dict(cur.fetchone() or {})
+    finally:
+        db_return(conn)
+    return jsonify({
+        "exit_reasons": exit_reasons,
+        "peak_distribution": peak,
+        "drawdown_distribution": dd,
+        "tp_level_simulation": tp_sim,
+        "hold_times": hold,
+    })
+
+
 @app.route("/api/admin/recalc-shadow", methods=["POST"])
 @admin_required
 def api_admin_recalc_shadow():
