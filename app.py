@@ -17036,6 +17036,7 @@ function paperSellPartial(mint, fraction, reason) {
   pos.tokensHeld -= sellTokens;
   pos.solSize -= sellCost;
   pos.tp1Hit = true;
+  pos.tp1Pnl = pnl;
   _paperHistory.unshift({
     name: pos.name, symbol: pos.symbol, mint: mint,
     entryPrice: pos.entryPrice, exitPrice: exitPrice,
@@ -17056,7 +17057,9 @@ function paperSell(mint, reason) {
   const exitValue = pos.tokensHeld * exitPrice;
   const pnl = exitValue - pos.solSize;
   _paperBal += exitValue;
-  if (pnl >= 0) _paperStats.wins++; else _paperStats.losses++;
+  // Win/loss based on combined P&L (TP1 partial + final exit)
+  const combinedPnl = pnl + (pos.tp1Pnl || 0);
+  if (combinedPnl >= 0) _paperStats.wins++; else _paperStats.losses++;
   _paperStats.totalPnl += pnl;
   _paperHistory.unshift({
     name: pos.name, symbol: pos.symbol, mint: mint,
