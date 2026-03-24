@@ -9017,21 +9017,46 @@ def api_market_feed():
 @app.route("/api/paper-prices", methods=["POST"])
 @login_required
 def api_paper_prices():
-    """Return current prices for a list of mints from the market feed cache."""
+    """Return current prices for a list of mints — scanner cache first, DexScreener fallback."""
     mints = (request.json or {}).get("mints", [])
     if not isinstance(mints, list) or len(mints) > 30:
         return jsonify({})
     wanted = set(mints)
     prices = {}
+    # 1) Check in-memory scanner feed first (fast)
     for item in list(market_feed):
         m = item.get("mint")
         if m in wanted and m not in prices:
-            prices[m] = {
-                "price": item.get("price", 0),
-                "mc": item.get("mc", 0),
-                "name": item.get("name", ""),
-                "symbol": item.get("symbol", ""),
-            }
+            p = item.get("price", 0)
+            if p and p > 0:
+                prices[m] = {
+                    "price": p,
+                    "mc": item.get("mc", 0),
+                    "name": item.get("name", ""),
+                    "symbol": item.get("symbol", ""),
+                }
+    # 2) Fallback: fetch missing mints from DexScreener
+    missing = wanted - set(prices.keys())
+    if missing:
+        try:
+            # DexScreener supports comma-separated mints (max ~30)
+            mint_str = ",".join(list(missing)[:30])
+            resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint_str}", timeout=6)
+            if resp.status_code == 200:
+                pairs = resp.json().get("pairs") or []
+                for pair in pairs:
+                    ba = pair.get("baseToken", {}).get("address", "")
+                    if ba in missing and ba not in prices:
+                        p = float(pair.get("priceUsd") or 0)
+                        if p > 0:
+                            prices[ba] = {
+                                "price": p,
+                                "mc": float(pair.get("marketCap") or pair.get("fdv") or 0),
+                                "name": pair.get("baseToken", {}).get("name", ""),
+                                "symbol": pair.get("baseToken", {}).get("symbol", ""),
+                            }
+        except Exception:
+            pass  # best-effort fallback
     return jsonify(prices)
 
 @app.route("/api/manual-buy", methods=["POST"])
@@ -13973,6 +13998,29 @@ DASHBOARD_HTML = _CSS + """
 .lbuy{color:#4ade80!important;font-weight:600}.lsell{color:#f87171!important;font-weight:600}
 .lsig{color:#fbbf24!important;font-weight:600}.linfo{color:#60a5fa!important}.lscan{color:#818cf8}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── Onboarding Tour ───────────────────────────────────────────── */
+.tour-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9998;transition:opacity .3s}
+.tour-highlight{position:absolute;z-index:9999;box-shadow:0 0 0 4000px rgba(0,0,0,.6);border-radius:12px;border:2px solid #14c784;pointer-events:none;transition:all .35s cubic-bezier(.4,0,.2,1)}
+.tour-tooltip{position:absolute;z-index:10000;background:linear-gradient(145deg,rgba(18,28,48,.98),rgba(12,20,38,.98));border:1px solid rgba(20,199,132,.35);border-radius:16px;padding:20px 22px;max-width:340px;min-width:260px;box-shadow:0 20px 60px rgba(0,0,0,.5),0 0 30px rgba(20,199,132,.15);transition:all .35s cubic-bezier(.4,0,.2,1);animation:tourFadeIn .35s ease}
+@keyframes tourFadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.tour-tooltip::before{content:"";position:absolute;width:12px;height:12px;background:linear-gradient(145deg,rgba(18,28,48,.98),rgba(12,20,38,.98));border:1px solid rgba(20,199,132,.35);transform:rotate(45deg)}
+.tour-tooltip.arrow-top::before{top:-7px;left:28px;border-right:none;border-bottom:none}
+.tour-tooltip.arrow-bottom::before{bottom:-7px;left:28px;border-left:none;border-top:none}
+.tour-tooltip.arrow-left::before{left:-7px;top:20px;border-right:none;border-top:none}
+.tour-step-num{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:rgba(20,199,132,.2);border:1px solid rgba(20,199,132,.4);color:#14c784;font-size:11px;font-weight:800;margin-right:8px}
+.tour-title{font-size:15px;font-weight:800;color:var(--t1);margin-bottom:8px;display:flex;align-items:center}
+.tour-desc{font-size:12.5px;color:var(--t2);line-height:1.6;margin-bottom:16px}
+.tour-desc strong{color:#14c784}
+.tour-actions{display:flex;justify-content:space-between;align-items:center}
+.tour-btn{padding:7px 18px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;border:none;transition:all .15s}
+.tour-btn-next{background:#14c784;color:#000}.tour-btn-next:hover{background:#12b575;transform:scale(1.02)}
+.tour-btn-skip{background:transparent;color:var(--t3);border:1px solid rgba(255,255,255,.1)}.tour-btn-skip:hover{color:var(--t1);border-color:rgba(255,255,255,.2)}
+.tour-btn-done{background:linear-gradient(135deg,#14c784,#0ea5e9);color:#000;padding:9px 24px;font-size:13px}.tour-btn-done:hover{transform:scale(1.03)}
+.tour-progress{display:flex;gap:4px;align-items:center}
+.tour-dot{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,.15);transition:all .2s}
+.tour-dot.active{background:#14c784;width:18px;border-radius:3px}
+.tour-dot.done{background:rgba(20,199,132,.4)}
 </style>
 
 <script>
@@ -13987,7 +14035,10 @@ const TAB_PLAN_GATES = {
   positions: 'free', pnl: 'free', quant: 'pro', paper: 'basic',
 };
 
-document.querySelector('.wrap').style.paddingBottom = '214px';
+// Deferred — .wrap doesn't exist yet at parse time
+document.addEventListener('DOMContentLoaded', function() {
+  var w = document.querySelector('.wrap'); if (w) w.style.paddingBottom = '214px';
+});
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let running = false, allTokens = [], sortCol = 'score', feedSince = 0;
@@ -14063,7 +14114,7 @@ function switchTab(tab, btn) {
     loadPnl(activeRange);
   }
   if (tab === 'quant') { pollQuant(); _tabPollers.quant = setInterval(pollQuant, 12000); }
-  if (tab === 'paper') { renderPaper(); _tabPollers.paper = setInterval(paperTick, 5000); }
+  if (tab === 'paper') { paperTick(); _tabPollers.paper = setInterval(paperTick, 3000); }
 }
 
 // ── Activity bar ──────────────────────────────────────────────────────────────
@@ -17008,6 +17059,176 @@ function renderPaper() {
 
 // Load paper state on page load
 paperLoadState();
+
+// ── Onboarding Tour ───────────────────────────────────────────────────────────
+(function() {
+  const TOUR_KEY = 'soltrader_tour_v1';
+  if (localStorage.getItem(TOUR_KEY)) return; // already completed
+
+  const steps = [
+    {
+      target: '#toggle-btn',
+      title: 'Start Your Bot',
+      desc: 'This is your <strong>main control</strong>. Click here to start or stop the trading bot. When running, it scans Solana tokens in real-time using your configured strategy.',
+      arrow: 'top'
+    },
+    {
+      target: '.tab-btn[data-tab="scanner"]',
+      title: 'Scanner Feed',
+      desc: 'The <strong>Scanner</strong> shows every new token the bot discovers. You can see scores, market cap, volume, and age — all updating live. This is your discovery hub.',
+      arrow: 'top'
+    },
+    {
+      target: '.tab-btn[data-tab="settings"]',
+      title: 'Tune Your Strategy',
+      desc: '<strong>Settings</strong> let you control buy size, score thresholds, filters, take-profit, stop-loss, and more. Tweak these to match your risk tolerance before going live.',
+      arrow: 'top'
+    },
+    {
+      target: '.tab-btn[data-tab="positions"]',
+      title: 'Active Positions',
+      desc: 'Track all <strong>open trades</strong> here. You\'ll see entry price, current P&L, hold time, and can manually close any position. The bot also auto-sells based on your TP/SL settings.',
+      arrow: 'top'
+    },
+    {
+      target: '.tab-btn[data-tab="paper"]',
+      title: 'Practice Risk-Free',
+      desc: '<strong>Paper Trading</strong> lets you simulate trades with fake SOL. Start a session, and the bot will paper-buy tokens that pass your filters — watch results without risking real money.',
+      arrow: 'top'
+    },
+    {
+      target: '.tab-btn[data-tab="pnl"]',
+      title: 'Track Performance',
+      desc: 'The <strong>P&L tab</strong> shows your equity curve, drawdown, and trade history. Use it to see if your strategy is profitable over time.',
+      arrow: 'top'
+    },
+    {
+      target: '#activity-bar',
+      title: 'Activity Log',
+      desc: 'The <strong>activity bar</strong> at the bottom shows live bot events — scans, buys, sells, rejections. Expand it to see what the bot is doing in real-time.',
+      arrow: 'bottom'
+    },
+    {
+      target: null,
+      title: 'You\'re All Set! 🚀',
+      desc: 'Here\'s the recommended flow:<br><br><strong>1.</strong> Go to <strong>Settings</strong> and configure your buy size & filters<br><strong>2.</strong> Try <strong>Paper Trading</strong> to test your strategy<br><strong>3.</strong> When confident, hit <strong>Start Bot</strong> to go live<br><br>Good luck, and trade safe!',
+      arrow: 'none',
+      center: true
+    }
+  ];
+
+  let currentStep = 0;
+  let overlayEl, highlightEl, tooltipEl;
+
+  function createElements() {
+    overlayEl = document.createElement('div');
+    overlayEl.className = 'tour-overlay';
+    overlayEl.onclick = function() {}; // block clicks
+    document.body.appendChild(overlayEl);
+
+    highlightEl = document.createElement('div');
+    highlightEl.className = 'tour-highlight';
+    document.body.appendChild(highlightEl);
+
+    tooltipEl = document.createElement('div');
+    tooltipEl.className = 'tour-tooltip';
+    document.body.appendChild(tooltipEl);
+  }
+
+  function positionTooltip(step) {
+    const s = steps[step];
+
+    // Progress dots
+    var dots = '';
+    for (var i = 0; i < steps.length; i++) {
+      var cls = 'tour-dot';
+      if (i < step) cls += ' done';
+      if (i === step) cls += ' active';
+      dots += '<div class="' + cls + '"></div>';
+    }
+
+    var isLast = step === steps.length - 1;
+    tooltipEl.innerHTML =
+      '<div class="tour-title"><span class="tour-step-num">' + (step + 1) + '</span>' + s.title + '</div>' +
+      '<div class="tour-desc">' + s.desc + '</div>' +
+      '<div class="tour-actions">' +
+        '<div class="tour-progress">' + dots + '</div>' +
+        '<div style="display:flex;gap:8px">' +
+          (isLast ? '' : '<button class="tour-btn tour-btn-skip" onclick="window._tourSkip()">Skip Tour</button>') +
+          (isLast
+            ? '<button class="tour-btn tour-btn-done" onclick="window._tourDone()">Let\'s Go!</button>'
+            : '<button class="tour-btn tour-btn-next" onclick="window._tourNext()">Next →</button>') +
+        '</div>' +
+      '</div>';
+
+    tooltipEl.className = 'tour-tooltip';
+
+    if (s.center || !s.target) {
+      // Centered overlay — no target element
+      highlightEl.style.display = 'none';
+      tooltipEl.style.top = '50%';
+      tooltipEl.style.left = '50%';
+      tooltipEl.style.transform = 'translate(-50%, -50%)';
+      tooltipEl.style.maxWidth = '400px';
+      return;
+    }
+
+    tooltipEl.style.transform = '';
+    highlightEl.style.display = 'block';
+
+    var el = document.querySelector(s.target);
+    if (!el) { nextStep(); return; }
+
+    // Scroll into view
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    setTimeout(function() {
+      var rect = el.getBoundingClientRect();
+      var pad = 8;
+      highlightEl.style.top = (rect.top + window.scrollY - pad) + 'px';
+      highlightEl.style.left = (rect.left + window.scrollX - pad) + 'px';
+      highlightEl.style.width = (rect.width + pad * 2) + 'px';
+      highlightEl.style.height = (rect.height + pad * 2) + 'px';
+
+      tooltipEl.classList.add('arrow-' + (s.arrow || 'top'));
+
+      if (s.arrow === 'bottom') {
+        tooltipEl.style.bottom = (window.innerHeight - rect.top - window.scrollY + 16) + 'px';
+        tooltipEl.style.top = 'auto';
+        tooltipEl.style.left = Math.max(16, rect.left + window.scrollX - 20) + 'px';
+      } else {
+        tooltipEl.style.top = (rect.bottom + window.scrollY + 16) + 'px';
+        tooltipEl.style.bottom = 'auto';
+        tooltipEl.style.left = Math.max(16, Math.min(rect.left + window.scrollX - 20, window.innerWidth - 370)) + 'px';
+      }
+    }, 350);
+  }
+
+  function nextStep() {
+    currentStep++;
+    if (currentStep >= steps.length) { finishTour(); return; }
+    positionTooltip(currentStep);
+  }
+
+  function finishTour() {
+    localStorage.setItem(TOUR_KEY, '1');
+    if (overlayEl) overlayEl.remove();
+    if (highlightEl) highlightEl.remove();
+    if (tooltipEl) tooltipEl.remove();
+  }
+
+  window._tourNext = nextStep;
+  window._tourSkip = finishTour;
+  window._tourDone = finishTour;
+
+  // Start tour after DOM is ready and a brief delay
+  document.addEventListener('DOMContentLoaded', function() {
+    setTimeout(function() {
+      createElements();
+      positionTooltip(0);
+    }, 1200);
+  });
+})();
 
 </script>
   <div style="max-width:1520px;margin:40px auto 0;padding:20px;text-align:center;border-top:1px solid rgba(255,255,255,.06)">
