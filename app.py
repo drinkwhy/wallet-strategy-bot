@@ -9558,20 +9558,48 @@ def api_quant_shadow_performance():
         sql += " GROUP BY strategy_name ORDER BY avg_pnl DESC NULLS LAST, closed_trades DESC"
         cur.execute(sql, tuple(params))
         rows = cur.fetchall()
+        # "Since fix" stats — only trades closed after TP1/TP2 logic was deployed
+        # These trades have tp1_hit column populated (non-null, either 0 or 1)
+        # We use tp1_pnl_pct IS DISTINCT FROM NULL as a proxy, but simpler: just use closed_at cutoff
+        cur.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct))::numeric, 2) AS median_pnl,
+                   ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best,
+                   SUM(CASE WHEN tp1_hit = 1 THEN 1 ELSE 0 END) AS tp1_hits
+            FROM shadow_positions
+            WHERE status='closed' AND tp1_pnl_pct IS NOT NULL AND tp1_pnl_pct != 0
+                  OR (status='closed' AND closed_at > NOW() - INTERVAL '1 hour')
+        """)
+        since_fix = cur.fetchone() or {}
     finally:
         db_return(conn)
-    return jsonify([{
-        "strategy_name": row.get("strategy_name"),
-        "closed_trades": int(row.get("closed_trades") or 0),
-        "wins": int(row.get("wins") or 0),
-        "win_rate": round((int(row.get("wins") or 0) / int(row.get("closed_trades") or 1)) * 100, 1) if int(row.get("closed_trades") or 0) else 0,
-        "avg_pnl_pct": float(row.get("avg_pnl") or 0),
-        "avg_upside_pct": float(row.get("avg_upside") or 0),
-        "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
-        "best_trade_pct": float(row.get("best_trade") or 0),
-        "worst_trade_pct": float(row.get("worst_trade") or 0),
-        "median_pnl_pct": float(row.get("median_pnl") or 0),
-    } for row in rows])
+    since_fix_total = int(since_fix.get("total") or 0)
+    since_fix_wins = int(since_fix.get("wins") or 0)
+    return jsonify({
+        "strategies": [{
+            "strategy_name": row.get("strategy_name"),
+            "closed_trades": int(row.get("closed_trades") or 0),
+            "wins": int(row.get("wins") or 0),
+            "win_rate": round((int(row.get("wins") or 0) / int(row.get("closed_trades") or 1)) * 100, 1) if int(row.get("closed_trades") or 0) else 0,
+            "avg_pnl_pct": float(row.get("avg_pnl") or 0),
+            "avg_upside_pct": float(row.get("avg_upside") or 0),
+            "avg_drawdown_pct": float(row.get("avg_drawdown") or 0),
+            "best_trade_pct": float(row.get("best_trade") or 0),
+            "worst_trade_pct": float(row.get("worst_trade") or 0),
+            "median_pnl_pct": float(row.get("median_pnl") or 0),
+        } for row in rows],
+        "since_fix": {
+            "total": since_fix_total,
+            "wins": since_fix_wins,
+            "win_rate": round(since_fix_wins / since_fix_total * 100, 1) if since_fix_total else 0,
+            "avg_pnl_pct": float(since_fix.get("avg_pnl") or 0),
+            "median_pnl_pct": float(since_fix.get("median_pnl") or 0),
+            "best_pct": float(since_fix.get("best") or 0),
+            "tp1_hits": int(since_fix.get("tp1_hits") or 0),
+        },
+    })
 
 
 @app.route("/api/quant/shadow-equity")
@@ -11488,6 +11516,78 @@ def api_admin_change_plan():
         bot.settings["max_buy_sol"] = min(bot.settings.get("max_buy_sol", max_sol), max_sol)
     print(f"[ADMIN] Plan change: user {target_user_id} ({user.get('email')}) {old_plan} -> {new_plan}", flush=True)
     return jsonify({"ok": True, "msg": f"Changed {user.get('email')} from {old_plan} to {new_plan}"})
+
+
+@app.route("/api/admin/recalc-shadow", methods=["POST"])
+@admin_required
+def api_admin_recalc_shadow():
+    """Retroactively apply TP1/TP2 logic to all closed shadow trades.
+    For each trade: if peak_price hit TP1 threshold, the trade would have
+    partially sold at TP1, so recalculate realized_pnl_pct as weighted combo."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, strategy_name, entry_price, exit_price, peak_price,
+                   realized_pnl_pct, exit_reason, tp1_hit, tp1_pnl_pct
+            FROM shadow_positions WHERE status='closed' AND entry_price > 0
+        """)
+        rows = cur.fetchall()
+        updated = 0
+        tp1_applied = 0
+        for row in rows:
+            entry = float(row.get("entry_price") or 0)
+            exit_p = float(row.get("exit_price") or 0)
+            peak = float(row.get("peak_price") or 0)
+            if entry <= 0 or exit_p <= 0:
+                continue
+            strat = row.get("strategy_name") or "balanced"
+            s = PRESETS.get(strat, PRESETS["balanced"])
+            tp1_mult = float(s.get("tp1_mult", 2.0))
+            tp1_sell_pct = float(s.get("tp1_sell_pct", 0.50))
+            peak_hit_tp1 = peak >= entry * tp1_mult
+            if peak_hit_tp1:
+                # TP1 would have triggered — calc what partial sell captured
+                tp1_price = entry * tp1_mult  # conservative: assume sold exactly at TP1
+                tp1_pnl = ((tp1_price / entry) - 1.0) * 100.0 * tp1_sell_pct
+                remaining_pnl = ((exit_p / entry) - 1.0) * 100.0 * (1.0 - tp1_sell_pct)
+                new_pnl = round(tp1_pnl + remaining_pnl, 2)
+                cur.execute("""
+                    UPDATE shadow_positions
+                    SET realized_pnl_pct=%s, tp1_hit=1, tp1_pnl_pct=%s
+                    WHERE id=%s
+                """, (new_pnl, round(tp1_pnl, 2), row["id"]))
+                tp1_applied += 1
+            updated += 1
+        conn.commit()
+        # Get new aggregate stats
+        cur.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(realized_pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct))::numeric, 2) AS median_pnl,
+                   SUM(CASE WHEN tp1_hit = 1 THEN 1 ELSE 0 END) AS tp1_hits
+            FROM shadow_positions WHERE status='closed'
+        """)
+        agg = cur.fetchone() or {}
+    finally:
+        db_return(conn)
+    total = int(agg.get("total") or 0)
+    wins = int(agg.get("wins") or 0)
+    return jsonify({
+        "ok": True,
+        "trades_checked": updated,
+        "tp1_retroactively_applied": tp1_applied,
+        "new_stats": {
+            "total": total,
+            "wins": wins,
+            "win_rate": round(wins / total * 100, 1) if total else 0,
+            "avg_pnl_pct": float(agg.get("avg_pnl") or 0),
+            "median_pnl_pct": float(agg.get("median_pnl") or 0),
+            "tp1_hits": int(agg.get("tp1_hits") or 0),
+        },
+        "msg": f"Recalculated {updated} trades. TP1 applied to {tp1_applied} trades that hit peak >= tp1_mult."
+    })
 
 
 @app.route("/api/admin/override-preset", methods=["POST"])
@@ -16599,9 +16699,11 @@ async function pollShadowBanner() {
       fetch('/api/quant/shadow-performance').then(r=>r.json()).catch(()=>[]),
       fetch('/api/quant/shadow-equity').then(r=>r.json()).catch(()=>({})),
     ]);
-    if (!Array.isArray(perf) || perf.length === 0) return;
+    // Handle both old array format and new {strategies, since_fix} format
+    var strategies = Array.isArray(perf) ? perf : (perf.strategies || []);
+    if (!strategies.length) return;
     let totalTrades = 0, totalWins = 0, totalPnl = 0, bestStrat = '', bestScore = -999;
-    perf.forEach(s => {
+    strategies.forEach(s => {
       const t = s.closed_trades || 0;
       totalTrades += t;
       totalWins += s.wins || 0;
@@ -16745,10 +16847,11 @@ updateAutoTuneStatus(); setInterval(updateAutoTuneStatus, 30000);
 // ═══════════ DASHBOARD PROMO BANNER STATS ═══════════
 async function updatePromoBanner() {
   try {
-    const perf = await fetch('/api/quant/shadow-performance').then(r=>r.json()).catch(()=>[]);
-    if (!Array.isArray(perf) || perf.length === 0) return;
+    const perfRaw = await fetch('/api/quant/shadow-performance').then(r=>r.json()).catch(()=>[]);
+    var perfArr = Array.isArray(perfRaw) ? perfRaw : (perfRaw.strategies || []);
+    if (!perfArr.length) return;
     let totalTrades = 0, totalWins = 0, bestTrade = 0;
-    perf.forEach(s => {
+    perfArr.forEach(s => {
       totalTrades += s.closed_trades || 0;
       totalWins += s.wins || 0;
       if ((s.best_trade_pct || 0) > bestTrade) bestTrade = s.best_trade_pct || 0;
