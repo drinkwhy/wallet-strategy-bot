@@ -16795,7 +16795,7 @@ async function runQuantBacktest() {
       days,
       name,
       replay_mode: replayMode,
-      strategies: ['safe', 'balanced', 'aggressive', 'degen'],
+      strategies: ['safe', 'balanced', 'aggressive', 'degen', 'safe_v2', 'balanced_v2', 'aggressive_v2', 'degen_v2'],
     }),
   }).then(r => r.json()).catch(() => null);
   if (!res || !res.ok) {
