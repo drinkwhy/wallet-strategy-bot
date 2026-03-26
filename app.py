@@ -6581,10 +6581,11 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
         db_return(conn)
 
     try:
+        all_presets = _all_known_presets()
         strategies = {
-            strategy_name: dict(PRESETS.get(strategy_name, PRESETS["balanced"]))
-            for strategy_name in (strategy_names or CANONICAL_STRATEGIES)
-            if strategy_name in PRESETS
+            strategy_name: dict(all_presets.get(strategy_name, PRESETS["balanced"]))
+            for strategy_name in (strategy_names or list(all_presets.keys()))
+            if strategy_name in all_presets
         }
         normalized_mode = "event_tape" if str(replay_mode).strip().lower() in {"event_tape", "tape", "events"} else "snapshot"
         if normalized_mode == "event_tape":
@@ -6764,7 +6765,8 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
         db_return(conn)
 
     try:
-        strategy_names = strategy_names or list(CANONICAL_STRATEGIES)
+        all_presets = _all_known_presets()
+        strategy_names = strategy_names or (list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES)
         # Load snapshots ONCE — reuse for all 20 runs
         rows = _load_backtest_snapshots(days=days)
         print(f"[OPTIMIZE] run {run_id}: loaded {len(rows)} snapshots over {days}d", flush=True)
@@ -6778,9 +6780,9 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
         total_tokens = 0
 
         for strat_name in strategy_names:
-            if strat_name not in PRESETS:
+            if strat_name not in all_presets:
                 continue
-            base = dict(PRESETS[strat_name])
+            base = dict(all_presets[strat_name])
             levels = _generate_sweep_levels(base, num_levels=5)
             level_results = []
             level_trades = {}  # level_idx -> trades list (kept temporarily)
@@ -6947,8 +6949,17 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
         print(f"[OPTIMIZE] run {run_id} failed: {e}", flush=True)
 
 
+def _all_known_presets():
+    """Return merged dict of live presets + V2 shadow-test presets."""
+    merged = dict(PRESETS)
+    merged.update(SHADOW_V2_PRESETS)
+    return merged
+
+
 def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="snapshot"):
-    strategy_names = [s for s in (strategy_names or list(CANONICAL_STRATEGIES)) if s in PRESETS]
+    all_presets = _all_known_presets()
+    all_strategy_names = list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES
+    strategy_names = [s for s in (strategy_names or all_strategy_names) if s in all_presets]
     if not strategy_names:
         strategy_names = ["balanced"]
     is_optimize = str(replay_mode).strip().lower() in {"optimize", "find_best", "sweep"}
@@ -10066,7 +10077,7 @@ def api_quant_backtests():
         data = request.get_json(force=True) or {}
         days = int(data.get("days") or 7)
         replay_mode = (data.get("replay_mode") or "snapshot").strip().lower()
-        strategies = data.get("strategies") or list(CANONICAL_STRATEGIES)
+        strategies = data.get("strategies") or (list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES)
         if not isinstance(strategies, list):
             strategies = [str(strategies)]
         run_id, config = launch_backtest_run(
