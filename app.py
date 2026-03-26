@@ -442,7 +442,7 @@ def normalize_preset_name(preset):
         "max": "degen",
     }
     preset = aliases.get(preset, preset)
-    return preset if preset in PRESETS else "balanced"
+    return preset if (preset in PRESETS or preset in SHADOW_V2_PRESETS) else "balanced"
 
 
 def strip_auto_relax_state(settings):
@@ -5836,8 +5836,9 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
             cur.execute("SELECT * FROM shadow_positions WHERE mint=%s AND status='open'", (mint,))
             open_rows = cur.fetchall()
             closed_inline = 0
+            _all_p = _all_known_presets()
             for row in open_rows:
-                settings = PRESETS.get(row.get("strategy_name") or "balanced", PRESETS["balanced"])
+                settings = _all_p.get(row.get("strategy_name") or "balanced", PRESETS["balanced"])
                 opened_at = row.get("opened_at")
                 age_min = ((time.time() - opened_at.timestamp()) / 60.0) if opened_at else 0.0
                 update = shadow_position_update(row, price, settings, age_min)
@@ -5907,6 +5908,7 @@ def reconcile_shadow_positions(limit=40):
         return
 
     now = time.time()
+    _all_p = _all_known_presets()
     price_cache = {}
     for row in open_rows:
         mint = row.get("mint")
@@ -5930,7 +5932,7 @@ def reconcile_shadow_positions(limit=40):
             if current_price <= 0:
                 continue
             strategy_name = row.get("strategy_name") or "balanced"
-            settings = PRESETS.get(strategy_name, PRESETS["balanced"])
+            settings = _all_p.get(strategy_name, PRESETS["balanced"])
             opened_at = row.get("opened_at")
             age_min = ((now - opened_at.timestamp()) / 60.0) if opened_at else 0.0
             update = shadow_position_update(row, current_price, settings, age_min)
@@ -10969,6 +10971,10 @@ def api_backtest_results():
         "balanced": "Balanced (Medium Risk)",
         "aggressive": "Aggressive (Higher Risk)",
         "degen": "Full Send (Max Risk)",
+        "safe_v2": "Careful V2 (Optimized)",
+        "balanced_v2": "Balanced V2 (Optimized)",
+        "aggressive_v2": "Aggressive V2 (Optimized)",
+        "degen_v2": "Full Send V2 (Optimized)",
     }
     exit_labels = {
         "take_profit": "Hit profit target",
@@ -11061,10 +11067,10 @@ def api_backtest_results():
                 sname = row.get("strategy_name", "")
                 total = int(row.get("total") or 0)
                 passed = int(row.get("passed") or 0)
-                preset = PRESETS.get(sname, {})
+                preset = SHADOW_V2_PRESETS.get(sname) or PRESETS.get(sname, {})
                 strategies.append({
                     "name": sname,
-                    "label": strategy_labels.get(sname, sname.title()),
+                    "label": strategy_labels.get(sname, preset.get("label", sname.title())),
                     "data_source": f"Shadow Evaluations ({total} coins checked, {passed} would buy)",
                     "total_trades": passed,
                     "wins": 0, "losses": 0,
@@ -11093,10 +11099,11 @@ def api_backtest_results():
         finally:
             db_return(conn2)
 
-    # If STILL no data, show the 4 preset cards as placeholders
+    # If STILL no data, show all preset cards (originals + V2) as placeholders
     if not strategies:
-        for name in ["safe", "balanced", "aggressive", "degen"]:
-            preset = PRESETS.get(name, {})
+        _placeholder_presets = _all_known_presets()
+        for name in list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES:
+            preset = _placeholder_presets.get(name, {})
             strategies.append({
                 "name": name,
                 "label": strategy_labels.get(name, name.title()),
@@ -11714,7 +11721,7 @@ def api_admin_recalc_shadow():
             if entry <= 0 or exit_p <= 0:
                 continue
             strat = row.get("strategy_name") or "balanced"
-            s = PRESETS.get(strat, PRESETS["balanced"])
+            s = _all_known_presets().get(strat, PRESETS["balanced"])
             tp1_mult = float(s.get("tp1_mult", 2.0))
             tp1_sell_pct = float(s.get("tp1_sell_pct", 0.50))
             peak_hit_tp1 = peak >= entry * tp1_mult
