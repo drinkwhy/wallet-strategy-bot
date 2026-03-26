@@ -367,6 +367,52 @@ PRESETS = {
 PRESETS["steady"] = PRESETS["balanced"]
 PRESETS["max"]    = PRESETS["degen"]
 
+# ── V2 Optimized Presets (shadow-test only, not live) ──────────────────
+# These run in parallel with the original presets in shadow trading
+# to A/B test tighter entries, faster exits, and better risk math.
+# Once shadow data proves they outperform, auto-tune promotes them to live.
+SHADOW_V2_PRESETS = {
+    "safe_v2": {
+        **PRESETS["safe"],
+        "label":"Safe V2 — Optimized",
+        "tp1_mult":1.15,"tp2_mult":2.5,"stop_loss":0.87,"time_stop_min":10,
+        "trail_pct":0.18,
+        "min_score":35,"min_green_lights":1,"max_hot_change":150.0,
+        "tp1_sell_pct":0.70,"max_threat_score":45,
+        # Moonshot: if ratio >= 1.5 (50%+ gain), widen trail to let it run
+        "moonshot_trigger":1.5,"moonshot_trail_pct":0.30,
+    },
+    "balanced_v2": {
+        **PRESETS["balanced"],
+        "label":"Balanced V2 — Optimized",
+        "tp1_mult":1.15,"tp2_mult":3.0,"stop_loss":0.85,"time_stop_min":14,
+        "trail_pct":0.22,
+        "min_score":25,"min_green_lights":1,"max_hot_change":150.0,
+        "tp1_sell_pct":0.70,"max_threat_score":45,
+        "moonshot_trigger":1.5,"moonshot_trail_pct":0.35,
+    },
+    "aggressive_v2": {
+        **PRESETS["aggressive"],
+        "label":"Aggressive V2 — Optimized",
+        "tp1_mult":1.15,"tp2_mult":5.0,"stop_loss":0.83,"time_stop_min":18,
+        "trail_pct":0.28,
+        "min_score":20,"min_green_lights":1,"max_hot_change":150.0,
+        "tp1_sell_pct":0.70,"max_threat_score":45,
+        "moonshot_trigger":1.5,"moonshot_trail_pct":0.40,
+    },
+    "degen_v2": {
+        **PRESETS["degen"],
+        "label":"Degen V2 — Optimized",
+        "tp1_mult":1.15,"tp2_mult":8.0,"stop_loss":0.80,"time_stop_min":22,
+        "trail_pct":0.32,
+        "min_score":15,"min_green_lights":1,"max_hot_change":150.0,
+        "tp1_sell_pct":0.70,"max_threat_score":45,
+        "moonshot_trigger":1.5,"moonshot_trail_pct":0.45,
+    },
+}
+# V2 strategies to shadow-test alongside originals
+SHADOW_V2_STRATEGIES = list(SHADOW_V2_PRESETS.keys())
+
 BOT_OVERRIDE_FIELDS = [
     ("max_correlated", int), ("tp1_mult", float), ("tp2_mult", float),
     ("stop_loss", float), ("trail_pct", float), ("max_buy_sol", float),
@@ -410,6 +456,11 @@ def strip_auto_relax_state(settings):
 
 def central_trading_window():
     now = datetime.now(CENTRAL_TZ)
+    hour_utc = now.astimezone(timezone.utc).hour
+    # Block low-liquidity overnight hours (UTC 23:00-10:00)
+    # Data showed 2 wins / 13 losses during these hours
+    if hour_utc >= 23 or hour_utc < 10:
+        return now, False
     return now, True
 
 
@@ -3516,8 +3567,13 @@ class BotInstance:
 
             # ── Progressive trailing stop — tightens as gains increase ──
             base_trail = s["trail_pct"]
+            # Moonshot detection: if coin surges 50%+, widen trail to let it ride
+            moonshot_trigger = float(s.get("moonshot_trigger", 0) or 0)
+            moonshot_trail = float(s.get("moonshot_trail_pct", 0) or 0)
+            moonshot_active = moonshot_trigger > 0 and ratio >= moonshot_trigger
+
             if s.get("peak_plateau_mode"):
-                # Moonshot mode: progressive trailing that tightens at higher multiples
+                # Progressive trailing that tightens at higher multiples
                 if peak_ratio >= 50:
                     effective_trail = min(base_trail, 0.10)   # 10% trail above 50x — lock in mega gains
                 elif peak_ratio >= 20:
@@ -3528,10 +3584,15 @@ class BotInstance:
                     effective_trail = min(base_trail, 0.20)   # 20% trail above 5x
                 elif peak_ratio >= 3:
                     effective_trail = min(base_trail, 0.25)   # 25% trail above 3x
+                elif moonshot_active and moonshot_trail > 0:
+                    effective_trail = moonshot_trail           # 50%+ surge — wide trail, let it moon
                 else:
-                    effective_trail = base_trail               # Default wide trail early
+                    effective_trail = base_trail               # Default trail early
             else:
-                effective_trail = base_trail
+                if moonshot_active and moonshot_trail > 0:
+                    effective_trail = moonshot_trail
+                else:
+                    effective_trail = base_trail
             trail_line = pos["peak_price"] * (1 - effective_trail)
 
             # ── Enhanced position monitoring (whale + rug detection) ─────────
@@ -5471,6 +5532,9 @@ def _shadow_strategy_settings(user_id=None):
         for strategy_name in CANONICAL_STRATEGIES
         if strategy_name in PRESETS
     }
+    # Include V2 optimized strategies for A/B shadow testing
+    for v2_name, v2_settings in SHADOW_V2_PRESETS.items():
+        strategies[v2_name] = dict(v2_settings)
     if user_id:
         try:
             _preset_name, live_settings = load_user_effective_settings(user_id)
@@ -6460,7 +6524,10 @@ def _auto_tune_from_results(requested_by, summary, run_id):
           f"(score={best_score:.1f}, win_rate={best_wr:.1f}%, avg_pnl={best_pnl:+.1f}%, trades={best_trades})", flush=True)
 
     # Build the settings to apply: start from preset, overlay optimization results
-    apply_settings = dict(PRESETS.get(best_name, PRESETS["balanced"]))
+    # Check both live presets and V2 shadow-test presets
+    apply_settings = dict(
+        SHADOW_V2_PRESETS.get(best_name) or PRESETS.get(best_name) or PRESETS["balanced"]
+    )
     if best_settings and isinstance(best_settings, dict):
         # Optimization found better filter values — apply them
         for key in BOT_OVERRIDE_FIELDS:
@@ -10933,10 +11000,10 @@ def api_backtest_results():
     for name, p in sorted(perf_map.items(), key=lambda x: -x[1]["avg_pnl"]):
         trades = p["closed_trades"]
         wins = p["wins"]
-        preset = PRESETS.get(name, {})
+        preset = SHADOW_V2_PRESETS.get(name) or PRESETS.get(name, {})
         strategies.append({
             "name": name,
-            "label": strategy_labels.get(name, name.title()),
+            "label": strategy_labels.get(name, preset.get("label", name.title())),
             "data_source": "Backtest Simulation" if p["source"] == "backtest" else "Live Shadow Trading",
             "total_trades": trades,
             "wins": wins,

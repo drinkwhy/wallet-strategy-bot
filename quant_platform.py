@@ -258,6 +258,11 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     _age_max = _safe_float(settings.get("max_age_min", 9999))
     if _age_val > 0 and _age_val < 9999 and _age_val > _age_max:
         blocker_reasons.append("token_too_old")
+    # Price change cap — reject already-pumped tokens
+    _change_val = _safe_float(snapshot.get("change"))
+    _max_hot = _safe_float(settings.get("max_hot_change", 9999))
+    if _change_val > 0 and _max_hot < 9999 and _change_val > _max_hot:
+        blocker_reasons.append("price_change_too_hot")
     # Green lights, narrative, holder growth, and volume spike are enrichment
     # fields that may not exist in historical snapshots.  Treat them as blockers
     # ONLY when data is actually present (non-zero) but below the threshold —
@@ -282,7 +287,8 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         blocker_reasons.append("cannot_exit")
     if settings.get("anti_rug") and snapshot.get("transfer_hook_enabled"):
         blocker_reasons.append("transfer_hook_enabled")
-    if _safe_int(snapshot.get("threat_risk_score")) >= 70:
+    _threat_max = _safe_int(settings.get("max_threat_score", 70))
+    if _safe_int(snapshot.get("threat_risk_score")) >= _threat_max:
         blocker_reasons.append("threat_risk_too_high")
 
     if _liq_val >= _liq_min or _liq_val == 0:
@@ -357,6 +363,12 @@ def shadow_position_update(position, current_price, settings, age_min):
 
     # Progressive trailing stop calculation
     base_trail = _safe_float(settings.get("trail_pct"), 0.20)
+
+    # Moonshot mode: if coin surges past trigger (e.g. 50%+), widen trail to let it run
+    moonshot_trigger = _safe_float(settings.get("moonshot_trigger"), 0)
+    moonshot_trail = _safe_float(settings.get("moonshot_trail_pct"), 0)
+    moonshot_active = moonshot_trigger > 0 and ratio >= moonshot_trigger
+
     if peak_plateau_mode:
         if peak_ratio >= 50:
             effective_trail = min(base_trail, 0.10)
@@ -368,10 +380,16 @@ def shadow_position_update(position, current_price, settings, age_min):
             effective_trail = min(base_trail, 0.20)
         elif peak_ratio >= 3:
             effective_trail = min(base_trail, 0.25)
+        elif moonshot_active and moonshot_trail > 0:
+            # Coin is surging 50%+ but hasn't hit 3x yet — give it room to moon
+            effective_trail = moonshot_trail
         else:
             effective_trail = base_trail
     else:
-        effective_trail = base_trail
+        if moonshot_active and moonshot_trail > 0:
+            effective_trail = moonshot_trail
+        else:
+            effective_trail = base_trail
     trail_line = peak_price * (1.0 - effective_trail)
 
     status = "open"
