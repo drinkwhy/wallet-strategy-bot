@@ -2844,24 +2844,37 @@ class BotInstance:
                     self.log_msg(f"Jupiter quote failed ({futures[fut].split('/')[2]}): {e}")
         return None
 
+    def _jupiter_swap_single(self, url, quote):
+        """Hit a single Jupiter swap endpoint; return swapTransaction or None."""
+        try:
+            r = requests.post(url, json={
+                "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": {
+                    "priorityLevelWithMaxLamports": {
+                        "maxLamports": int(self.settings.get("priority_fee", 1_000_000)),
+                        "priorityLevel": "veryHigh"
+                    }
+                },
+            }, timeout=12).json()
+            if r.get("swapTransaction"):
+                return r["swapTransaction"]
+        except Exception as e:
+            self.log_msg(f"Jupiter swap failed ({url.split('/')[2]}): {e}")
+        return None
+
     def jupiter_swap(self, quote):
         endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://quote-api.jup.ag/v6/swap"]
-        for url in endpoints:
-            try:
-                r = requests.post(url, json={
-                    "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": {
-                        "priorityLevelWithMaxLamports": {
-                            "maxLamports": int(self.settings.get("priority_fee", 1_000_000)),
-                            "priorityLevel": "veryHigh"
-                        }
-                    },
-                }, timeout=12).json()
-                if r.get("swapTransaction"):
-                    return r["swapTransaction"]
-            except Exception as e:
-                self.log_msg(f"Jupiter swap failed ({url.split('/')[2]}): {e}")
+        # Hit both endpoints in parallel, take first success
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {pool.submit(self._jupiter_swap_single, u, quote): u for u in endpoints}
+            for fut in as_completed(futures, timeout=15):
+                try:
+                    result = fut.result()
+                    if result:
+                        return result
+                except Exception as e:
+                    self.log_msg(f"Jupiter swap failed ({futures[fut].split('/')[2]}): {e}")
         return None
 
     def get_token_balance(self, mint):
@@ -3133,46 +3146,47 @@ class BotInstance:
         if mint in self.positions:
             self.log_msg(f"SKIP {name} — already in position")
             return
-        # ── Live market re-validation ────────────────────────────────────────
-        # Filter ran on scanner data which may be stale.  Quick DexScreener
-        # lookup to confirm the token still meets the minimum thresholds.
-        try:
-            _dex = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-            _pairs = safe_json_response(_dex)
-            if _pairs and isinstance(_pairs, dict):
-                _p = next((p for p in (_pairs.get("pairs") or []) if p.get("chainId") == "solana"), None)
-                if _p:
-                    live_mc  = float(_p.get("marketCap") or 0)
-                    live_liq = float((_p.get("liquidity") or {}).get("usd") or 0)
-                    live_chg = float((_p.get("priceChange") or {}).get("h1") or 0)
-                    min_mc   = float(s.get("min_mc", 0) or 0)
-                    max_mc   = float(s.get("max_mc", 999999) or 999999)
-                    min_liq  = float(s.get("min_liq", 0) or 0)
-                    if live_mc > 0 and not (min_mc <= live_mc <= max_mc):
-                        reason = f"Live MC ${live_mc:,.0f} outside [{min_mc:,}–{max_mc:,}] (was valid at scan)"
-                        self.log_filter(name, mint, False, reason)
-                        self.log_msg(f"SKIP {name} — {reason}")
-                        return
-                    if min_liq > 0 and live_liq > 0 and live_liq < min_liq:
-                        reason = f"Live liquidity ${live_liq:,.0f} < min ${min_liq:,.0f} (drained since scan)"
-                        self.log_filter(name, mint, False, reason)
-                        self.log_msg(f"SKIP {name} — {reason}")
-                        return
-                    if live_chg <= -30:
-                        reason = f"Live 1h change {live_chg:+.0f}% — dumping since scan"
-                        self.log_filter(name, mint, False, reason)
-                        self.log_msg(f"SKIP {name} — {reason}")
-                        return
-                    # Update liq for dynamic slippage calc
-                    liq = live_liq or liq
-        except Exception as _e:
-            print(f"[WARN] Live re-check failed for {name}: {_e}", flush=True)
-            # Continue with original data — don't block buy on a DexScreener hiccup
-        # Dynamic slippage
+        # ── Parallel: live re-validation + Jupiter quote simultaneously ──
         slippage = dynamic_slippage_bps(liq)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
+
+        def _revalidate():
+            """Returns (ok, updated_liq) — ok=False means reject."""
+            try:
+                _dex = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=3)
+                _pairs = safe_json_response(_dex)
+                if _pairs and isinstance(_pairs, dict):
+                    _p = next((p for p in (_pairs.get("pairs") or []) if p.get("chainId") == "solana"), None)
+                    if _p:
+                        live_mc  = float(_p.get("marketCap") or 0)
+                        live_liq = float((_p.get("liquidity") or {}).get("usd") or 0)
+                        live_chg = float((_p.get("priceChange") or {}).get("h1") or 0)
+                        min_mc   = float(s.get("min_mc", 0) or 0)
+                        max_mc   = float(s.get("max_mc", 999999) or 999999)
+                        _min_liq = float(s.get("min_liq", 0) or 0)
+                        if live_mc > 0 and not (min_mc <= live_mc <= max_mc):
+                            return False, f"Live MC ${live_mc:,.0f} outside [{min_mc:,}\u2013{max_mc:,}] (was valid at scan)", liq
+                        if _min_liq > 0 and live_liq > 0 and live_liq < _min_liq:
+                            return False, f"Live liquidity ${live_liq:,.0f} < min ${_min_liq:,.0f} (drained since scan)", liq
+                        if live_chg <= -30:
+                            return False, f"Live 1h change {live_chg:+.0f}% \u2014 dumping since scan", liq
+                        return True, None, (live_liq or liq)
+            except Exception as _e:
+                print(f"[WARN] Live re-check failed for {name}: {_e}", flush=True)
+            return True, None, liq
+
         quote_started = time.perf_counter()
-        quote = self.jupiter_quote(SOL_MINT, mint, int(trade_sol*1e9), slippage)
+        with ThreadPoolExecutor(max_workers=2) as _buy_pool:
+            reval_future = _buy_pool.submit(_revalidate)
+            quote_future = _buy_pool.submit(self.jupiter_quote, SOL_MINT, mint, int(trade_sol*1e9), slippage)
+            # Check revalidation result
+            reval_ok, reval_reason, liq = reval_future.result(timeout=6)
+            if not reval_ok:
+                self.log_filter(name, mint, False, reval_reason)
+                self.log_msg(f"SKIP {name} \u2014 {reval_reason}")
+                quote_future.cancel()
+                return
+            quote = quote_future.result(timeout=12)
         route_source = extract_route_label(quote)
         self.log_execution_event(
             mint, name, "buy", "quote", bool(quote),
@@ -3240,7 +3254,7 @@ class BotInstance:
             expected_out = int(quote.get("outAmount", 0) or 0)
             realized_slip_bps = None
             try:
-                time.sleep(1.5)  # brief wait for tx to land
+                time.sleep(0.3)  # minimal wait for tx to land
                 tokens_received = self.get_token_balance(mint)
                 if tokens_received > 0:
                     # real_price = SOL spent per token (in USD-equivalent via price)
@@ -3991,7 +4005,7 @@ class BotInstance:
                     last_balance_refresh = now
                     self.refresh_balance()
                 consecutive_errors = 0  # reset on success
-                time.sleep(3)
+                time.sleep(1)
             except Exception as e:
                 consecutive_errors += 1
                 self.log_msg(f"⚠️ Loop error ({consecutive_errors}): {e}")
@@ -4006,7 +4020,7 @@ class BotInstance:
                     except Exception:
                         pass
                 else:
-                    time.sleep(3)
+                    time.sleep(1)
 
     def record_perf_fee(self):
         if self.perf_fee_recorded:
@@ -7014,12 +7028,19 @@ def _broadcast_signal(info):
     """Push info to market_feed and evaluate against all running bots."""
     info.setdefault("source", "scanner")
     mint = info["mint"]
-    intel = ensure_token_intel(mint, base_info=info, pair=None, force=False)
-    if intel:
-        info["intel"] = intel
-        info["green_lights"] = intel.get("green_lights", 0)
-        info["deployer_score"] = intel.get("deployer_score", 0)
-        info["narrative_score"] = intel.get("narrative_score", 0)
+    # Non-blocking intel: use cached data if available, kick off background refresh
+    with _token_intel_lock:
+        cached_intel = token_intel_payload(_token_intel_cache.get(mint) or {})
+    if cached_intel:
+        info["intel"] = cached_intel
+        info["green_lights"] = cached_intel.get("green_lights", 0)
+        info["deployer_score"] = cached_intel.get("deployer_score", 0)
+        info["narrative_score"] = cached_intel.get("narrative_score", 0)
+    # Always kick off background refresh (non-blocking)
+    try:
+        _intel_refresh_pool.submit(ensure_token_intel, mint, info, None, False)
+    except Exception:
+        pass
     market_feed.appendleft(info)
     with shadow_market_lock:
         shadow_market_queue.appendleft({
@@ -7223,7 +7244,7 @@ def global_scanner():
                     seen_tokens.add(t["tokenAddress"])
             if new_tokens:
                 print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
-            for t in new_tokens:
+            def _scan_token(t):
                 mint = t["tokenAddress"]
                 try:
                     resp = dex_get(
@@ -7231,17 +7252,18 @@ def global_scanner():
                         timeout=5
                     )
                     if resp.status_code != 200:
-                        continue
+                        return
                     pairs = resp.json().get("pairs") or []
                     if not pairs:
-                        continue
+                        return
                     info = _process_dex_pair(pairs[0])
                     if info:
                         _broadcast_signal(info)
-                    time.sleep(0.3)  # small delay between per-token lookups
                 except Exception:
                     pass
-            time.sleep(20)
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                pool.map(_scan_token, new_tokens)
+            time.sleep(4)
         except Exception as e:
             print(f"[SCANNER] error: {e}", flush=True)
             time.sleep(20)
@@ -7278,7 +7300,7 @@ def new_pairs_scanner():
                             seen_tokens.add(item["tokenAddress"])
                     if new:
                         print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
-                    for item in new:
+                    def _scan2_token(item):
                         mint = item["tokenAddress"]
                         try:
                             r2 = dex_get(
@@ -7286,19 +7308,19 @@ def new_pairs_scanner():
                                 timeout=5
                             )
                             if r2.status_code != 200:
-                                continue
+                                return
                             pairs = r2.json().get("pairs") or []
                             if pairs:
                                 info = _process_dex_pair(pairs[0])
                                 if info:
                                     _broadcast_signal(info)
-                            time.sleep(0.3)
                         except Exception:
                             pass
-                    time.sleep(1)  # pause between the two URLs
+                    with ThreadPoolExecutor(max_workers=6) as pool:
+                        pool.map(_scan2_token, new)
                 except Exception as e2:
                     print(f"[SCANNER2] {label} error: {e2}", flush=True)
-            time.sleep(30 if got_429 else 15)
+            time.sleep(30 if got_429 else 5)
         except Exception as e:
             print(f"[SCANNER2] outer error: {e}", flush=True)
             time.sleep(20)
