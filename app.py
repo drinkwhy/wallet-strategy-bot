@@ -126,15 +126,6 @@ if ANKR_RPC and not ANKR_RPC.startswith("http"):
     print(f"[WARN] ANKR_RPC ignored — not a valid URL: {ANKR_RPC[:60]}", flush=True)
     ANKR_RPC = ""
 
-SPECTRUM_RPC        = os.getenv("SPECTRUM_RPC", "").strip()
-if SPECTRUM_RPC.lower().startswith("value:"):
-    SPECTRUM_RPC = SPECTRUM_RPC.split(":", 1)[1].strip()
-if SPECTRUM_RPC and not SPECTRUM_RPC.startswith("http"):
-    print(f"[WARN] SPECTRUM_RPC ignored — not a valid URL: {SPECTRUM_RPC[:60]}", flush=True)
-    SPECTRUM_RPC = ""
-if SPECTRUM_RPC:
-    print("[CONFIG] SpectrumNode RPC loaded — primary Solana RPC", flush=True)
-
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
 SOL_MINT      = "So11111111111111111111111111111111111111112"
@@ -4396,10 +4387,8 @@ def get_helius_api_key():
 
 
 def rpc_call(method, params=None, timeout=10):
-    """Call Solana RPC with fallback chain: SpectrumNode → Helius → ANKR → public."""
+    """Call Solana RPC with fallback chain: Helius → ANKR → public."""
     _rpc_endpoints = []
-    if SPECTRUM_RPC:
-        _rpc_endpoints.append(("spectrum", SPECTRUM_RPC))
     _rpc_endpoints.append(("helius", HELIUS_RPC))
     if ANKR_RPC:
         _rpc_endpoints.append(("ankr", ANKR_RPC))
