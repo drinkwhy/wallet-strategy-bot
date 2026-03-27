@@ -8972,17 +8972,8 @@ def api_start():
             settings["max_correlated"] = bs["max_correlated"]
         if bs.get("drawdown_limit_sol") is not None:
             settings["drawdown_limit_sol"] = bs["drawdown_limit_sol"]
-        # Apply custom_settings JSON overrides (tp1_mult, stop_loss, etc.)
-        # But skip max_correlated — it's now managed via the dashboard control
-        if bs.get("custom_settings"):
-            try:
-                import json as _json
-                custom = _json.loads(bs["custom_settings"])
-                if isinstance(custom, dict):
-                    custom.pop("max_correlated", None)  # Remove max_correlated override
-                    settings.update(custom)
-            except Exception:
-                pass
+        # Skip custom_settings entirely — use pure preset values for shadow trading optimization
+        # Custom settings could override tp1_mult, tp2_mult, stop_loss, etc. which breaks shadow trading
     max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
     settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
