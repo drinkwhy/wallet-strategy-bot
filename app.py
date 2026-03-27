@@ -2492,10 +2492,8 @@ class BotInstance:
         return False
 
     def refresh_balance(self):
-        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet]}
+        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet, {"commitment":"confirmed"}]}
         _fallbacks = []
-        if SPECTRUM_RPC:
-            _fallbacks.append(SPECTRUM_RPC)
         _fallbacks.append(HELIUS_RPC)
         if ANKR_RPC:
             _fallbacks.append(ANKR_RPC)
