@@ -1853,6 +1853,9 @@ _WALLET_BAL_TTL = 30  # cache for 30 seconds
 
 def get_wallet_balance_standalone(pubkey):
     """Fetch SOL balance for a wallet without a running bot. Cached 30s."""
+    if not pubkey:
+        print("[WARN] get_wallet_balance_standalone: empty pubkey", flush=True)
+        return 0
     cached = _wallet_balance_cache.get(pubkey)
     if cached and (time.time() - cached[1]) < _WALLET_BAL_TTL:
         return cached[0]
@@ -1873,9 +1876,12 @@ def get_wallet_balance_standalone(pubkey):
             val = data.get("result", {}).get("value", 0)
             balance = round(val / 1e9, 4)
             _wallet_balance_cache[pubkey] = (balance, time.time())
+            print(f"[BALANCE] Fetched {pubkey[:8]}... = {balance} SOL from {rpc_url}", flush=True)
             return balance
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] RPC fetch failed for {rpc_url}: {e}", flush=True)
             continue
+    print(f"[ERROR] All RPC endpoints failed for {pubkey[:8]}...", flush=True)
     return 0
 
 
@@ -8835,9 +8841,13 @@ def api_state():
             _w = _c.fetchone()
             if _w:
                 _state_pubkey = _w["public_key"]
+                print(f"[STATE] Fetched pubkey for uid {uid}: {_state_pubkey[:8]}...", flush=True)
+            else:
+                print(f"[WARN] No wallet found for uid {uid}", flush=True)
         finally:
             db_return(_conn)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch pubkey for uid {uid}: {e}", flush=True)
         pass
     preset_name = normalize_preset_name(bot.preset_name if bot else "balanced")
     if bot:
