@@ -8827,19 +8827,18 @@ def api_state():
     pos_list = []
     # Grab wallet pubkey for balance lookup even when bot is stopped
     _state_pubkey = ""
-    if not bot:
+    try:
+        _conn = db()
         try:
-            _conn = db()
-            try:
-                _c = _conn.cursor()
-                _c.execute("SELECT public_key FROM wallets WHERE user_id=%s", (uid,))
-                _w = _c.fetchone()
-                if _w:
-                    _state_pubkey = _w["public_key"]
-            finally:
-                db_return(_conn)
-        except Exception:
-            pass
+            _c = _conn.cursor()
+            _c.execute("SELECT public_key FROM wallets WHERE user_id=%s", (uid,))
+            _w = _c.fetchone()
+            if _w:
+                _state_pubkey = _w["public_key"]
+        finally:
+            db_return(_conn)
+    except Exception:
+        pass
     preset_name = normalize_preset_name(bot.preset_name if bot else "balanced")
     if bot:
         pos_snapshot = dict(bot.positions)  # thread-safe snapshot
