@@ -8897,7 +8897,7 @@ def api_state():
     return jsonify({
         "running":    bot.running if bot else False,
         "preset":     preset_name,
-        "balance":    round(bot.sol_balance, 4) if bot else get_wallet_balance_standalone(_state_pubkey),
+        "balance":    round(bot.sol_balance, 4) if (bot and bot.running) else get_wallet_balance_standalone(_state_pubkey),
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
         "stats":      stats,
