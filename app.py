@@ -7981,65 +7981,111 @@ def _acquire_background_worker_lock():
 
 
 # ── Auto-prune DB to prevent disk exhaustion ──────────────────────────────────
-_DB_PRUNE_INTERVAL = 1800  # every 30 minutes
+_DB_PRUNE_INTERVAL = 600   # every 10 minutes
 _DB_ROW_LIMITS = {
-    # table: (max_rows, id_column)
-    "shadow_decisions": (8000, "id"),
-    "wallet_flow_events": (8000, "id"),
-    "model_decisions": (5000, "id"),
-    "signal_explorer_log": (5000, "id"),
-    "market_events": (5000, "id"),
-    "token_feature_snapshots": (8000, "id"),
-    "token_flow_snapshots": (5000, "id"),
-    "filter_log": (3000, "id"),
-    "liquidity_delta_events": (3000, "id"),
-    "shadow_positions": (15000, "id"),
+    # table: (max_rows, id_column)  — keep tight to prevent disk fill
+    "shadow_decisions":       (2000, "id"),
+    "wallet_flow_events":     (2000, "id"),
+    "model_decisions":        (2000, "id"),
+    "signal_explorer_log":    (2000, "id"),
+    "market_events":          (2000, "id"),
+    "token_feature_snapshots":(2000, "id"),
+    "token_flow_snapshots":   (2000, "id"),
+    "filter_log":             (1000, "id"),
+    "liquidity_delta_events": (1000, "id"),
+    "shadow_positions":       (5000, "id"),
+    "token_intel":            (3000, "id"),
+    "execution_events":       (2000, "id"),
+}
+
+# Time-based max ages — rows older than this are always deleted regardless of count
+_DB_AGE_LIMITS = {
+    # table: (age_interval_sql, timestamp_col)
+    "shadow_decisions":       ("3 days",  "created_at"),
+    "wallet_flow_events":     ("7 days",  "created_at"),
+    "token_flow_snapshots":   ("7 days",  "created_at"),
+    "filter_log":             ("3 days",  "ts"),
+    "signal_explorer_log":    ("3 days",  "ts"),
+    "market_events":          ("7 days",  "created_at"),
+    "token_feature_snapshots":("7 days",  "created_at"),
+    "liquidity_delta_events": ("7 days",  "created_at"),
+    "shadow_positions":       ("14 days", "opened_at"),
+    "execution_events":       ("7 days",  "created_at"),
 }
 
 
+def _run_db_prune():
+    """Execute one full prune cycle: age-based then row-count-based cleanup, then VACUUM."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            total_deleted = 0
+
+            # 1. Age-based pruning — delete rows older than N days regardless of count
+            for table, (interval, ts_col) in _DB_AGE_LIMITS.items():
+                try:
+                    cur.execute(f"DELETE FROM {table} WHERE {ts_col} < NOW() - INTERVAL %s", (interval,))
+                    deleted = cur.rowcount
+                    total_deleted += deleted
+                    if deleted > 0:
+                        print(f"[DB-PRUNE] {table}: deleted {deleted} rows older than {interval}", flush=True)
+                except Exception as te:
+                    conn.rollback()
+                    print(f"[DB-PRUNE] {table} age-prune error: {te}", flush=True)
+
+            # 2. Row-count-based pruning — cap tables that don't have a ts column or still exceed limit
+            for table, (limit, id_col) in _DB_ROW_LIMITS.items():
+                try:
+                    cur.execute(f"SELECT COUNT(*) as c FROM {table}")
+                    count = cur.fetchone()["c"]
+                    if count > limit:
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE {id_col} NOT IN "
+                            f"(SELECT {id_col} FROM {table} ORDER BY {id_col} DESC LIMIT %s)",
+                            (limit,)
+                        )
+                        deleted = cur.rowcount
+                        total_deleted += deleted
+                        if deleted > 0:
+                            print(f"[DB-PRUNE] {table}: capped {count} -> {limit} ({deleted} pruned)", flush=True)
+                except Exception as te:
+                    conn.rollback()
+                    print(f"[DB-PRUNE] {table} count-prune error: {te}", flush=True)
+
+            if total_deleted > 0:
+                conn.commit()
+                print(f"[DB-PRUNE] Total: {total_deleted} rows removed", flush=True)
+            else:
+                conn.commit()  # commit any partial work
+
+        finally:
+            db_return(conn)
+
+        # VACUUM to reclaim dead tuple space (run outside pool connection)
+        try:
+            _vconn = psycopg2.connect(DATABASE_URL)
+            _vconn.autocommit = True
+            with _vconn.cursor() as _vc:
+                _vc.execute("VACUUM ANALYZE")
+            _vconn.close()
+            if total_deleted > 0:
+                print(f"[DB-PRUNE] VACUUM ANALYZE complete", flush=True)
+        except Exception as _ve:
+            print(f"[DB-PRUNE] VACUUM skipped: {_ve}", flush=True)
+
+    except Exception as e:
+        print(f"[DB-PRUNE] Error: {e}", flush=True)
+
+
 def _auto_prune_db():
-    """Background worker: periodically prune large tables to keep DB under control."""
+    """Background worker: prune large tables on startup then every 10 minutes."""
+    # Run immediately on startup — don't wait for first interval
+    print(f"[DB-PRUNE] Startup prune running...", flush=True)
+    _run_db_prune()
     while True:
         time.sleep(_DB_PRUNE_INTERVAL)
-        try:
-            conn = db()
-            try:
-                cur = conn.cursor()
-                total_deleted = 0
-                for table, (limit, id_col) in _DB_ROW_LIMITS.items():
-                    try:
-                        cur.execute(f"SELECT COUNT(*) as c FROM {table}")
-                        count = cur.fetchone()["c"]
-                        if count > limit:
-                            cur.execute(
-                                f"DELETE FROM {table} WHERE {id_col} NOT IN "
-                                f"(SELECT {id_col} FROM {table} ORDER BY {id_col} DESC LIMIT %s)",
-                                (limit,)
-                            )
-                            deleted = cur.rowcount
-                            total_deleted += deleted
-                            if deleted > 0:
-                                print(f"[DB-PRUNE] {table}: {count} -> {limit} ({deleted} rows pruned)", flush=True)
-                    except Exception as te:
-                        conn.rollback()
-                        print(f"[DB-PRUNE] {table}: error {te}", flush=True)
-                if total_deleted > 0:
-                    conn.commit()
-                    print(f"[DB-PRUNE] Done: {total_deleted} total rows pruned", flush=True)
-                    # VACUUM on a separate connection so we don't hold a pool slot
-                    try:
-                        _vconn = psycopg2.connect(DATABASE_URL)
-                        _vconn.autocommit = True
-                        with _vconn.cursor() as _vc:
-                            _vc.execute("VACUUM")
-                        _vconn.close()
-                        print(f"[DB-PRUNE] VACUUM complete", flush=True)
-                    except Exception as _ve:
-                        print(f"[DB-PRUNE] VACUUM skipped: {_ve}", flush=True)
-            finally:
-                db_return(conn)
-        except Exception as e:
-            print(f"[DB-PRUNE] Error: {e}", flush=True)
+        _run_db_prune()
 
 
 _SHADOW_TUNE_INTERVAL = 3600  # auto-tune from shadow results every 1 hour
