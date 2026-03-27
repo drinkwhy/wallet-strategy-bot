@@ -8752,6 +8752,7 @@ def setup():
             kp  = Keypair.from_bytes(base58.b58decode(private_key))
             pub = str(kp.pubkey())
             enc = encrypt_key(private_key)
+            print(f"[SETUP] User {uid} set wallet: {pub}", flush=True)
             conn = db()
             try:
                 cur = conn.cursor()
