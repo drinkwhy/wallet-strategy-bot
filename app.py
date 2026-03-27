@@ -8987,6 +8987,32 @@ def api_start():
     )
     with user_bots_lock:
         user_bots[uid] = bot
+    # Reload open positions from DB so they survive stopping/restarting
+    try:
+        _conn = db()
+        try:
+            _c = _conn.cursor()
+            _c.execute("SELECT * FROM open_positions WHERE user_id=%s", (uid,))
+            saved_pos = _c.fetchall()
+        finally:
+            db_return(_conn)
+        for p in saved_pos:
+            opened_ts = p["opened_at"].timestamp() if p.get("opened_at") else time.time()
+            bot.positions[p["mint"]] = {
+                "name":       p["name"],
+                "entry_price": p["entry_price"],
+                "peak_price":  p["peak_price"],
+                "timestamp":   opened_ts,
+                "tp1_hit":     bool(p["tp1_hit"]),
+                "entry_sol":   p["entry_sol"],
+                "dev_wallet":  p["dev_wallet"],
+                "surge_hold_active": False,
+                "surge_peak_price": p["peak_price"] or p["entry_price"],
+            }
+        if saved_pos:
+            print(f"[START] ✅ U{uid}: restored {len(saved_pos)} position(s)", flush=True)
+    except Exception as _e:
+        print(f"[START] ⚠️ U{uid}: could not reload positions: {_e}", flush=True)
     t = threading.Thread(target=bot.run, daemon=True)
     t.start()
     bot.thread = t
