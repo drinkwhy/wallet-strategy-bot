@@ -1287,7 +1287,20 @@ def init_db():
     finally:
         db_return(conn)
 
-init_db()
+def _init_db_with_retry(max_attempts=10, delay=6):
+    """Call init_db() with retries so the app starts even if Postgres is temporarily down."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            init_db()
+            print(f"[DB] init_db OK (attempt {attempt})", flush=True)
+            return
+        except Exception as e:
+            print(f"[DB] init_db failed (attempt {attempt}/{max_attempts}): {e}", flush=True)
+            if attempt < max_attempts:
+                time.sleep(delay)
+    print("[DB] init_db could not complete — app will retry at next request", flush=True)
+
+_init_db_with_retry()
 
 # migrate existing DB — add new columns if missing
 def migrate_db():
@@ -1702,7 +1715,20 @@ def migrate_db():
         conn.commit()
     finally:
         db_return(conn)
-migrate_db()
+def _migrate_db_with_retry(max_attempts=10, delay=6):
+    """Call migrate_db() with retries so the app starts even if Postgres is temporarily down."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            migrate_db()
+            print(f"[DB] migrate_db OK (attempt {attempt})", flush=True)
+            return
+        except Exception as e:
+            print(f"[DB] migrate_db failed (attempt {attempt}/{max_attempts}): {e}", flush=True)
+            if attempt < max_attempts:
+                time.sleep(delay)
+    print("[DB] migrate_db could not complete — will retry later", flush=True)
+
+_migrate_db_with_retry()
 
 
 def load_preset_overrides():
