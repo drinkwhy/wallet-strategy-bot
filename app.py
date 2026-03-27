@@ -9041,6 +9041,31 @@ def api_stop():
             db_return(conn)
     return jsonify({"ok":True})
 
+@app.route("/api/shadow-trading-mode", methods=["POST"])
+@login_required
+def api_shadow_trading_mode():
+    """Apply optimal shadow trading settings (balanced preset)."""
+    uid = session["user_id"]
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Set to balanced preset which is optimal for shadow trading
+            cur.execute("UPDATE bot_settings SET preset=%s, custom_settings=NULL WHERE user_id=%s", ("balanced", uid))
+            conn.commit()
+        finally:
+            db_return(conn)
+        # Also update running bot if it exists
+        bot = user_bots.get(uid)
+        if bot:
+            settings = dict(PRESETS.get("balanced", PRESETS["balanced"]))
+            bot.settings = settings
+            bot.preset_name = "balanced"
+        return jsonify({"ok": True, "msg": "✅ Shadow trading mode activated — balanced preset applied"})
+    except Exception as e:
+        print(f"[ERROR] Could not apply shadow trading mode: {e}", flush=True)
+        return jsonify({"ok": False, "msg": "Failed to apply shadow trading mode"})
+
 @app.route("/api/set-max-positions", methods=["POST"])
 @login_required
 def api_set_max_positions():
@@ -13301,6 +13326,7 @@ DASHBOARD_HTML = _CSS + """
       </div>
       <div class="hero-actions">
         <button id="toggle-btn" class="btn btn-success" onclick="toggleBot()">▶ Start Bot</button>
+        <button class="btn btn-blue" type="button" onclick="applyShadowTrading()" title="Apply optimal shadow trading settings">⚙️ Shadow Trading Mode</button>
         <div style="display:flex;align-items:center;gap:8px">
           <label style="font-size:12px;color:var(--t3)">Max Open Buys:</label>
           <input type="number" id="max-positions-input" min="1" max="20" value="5" style="width:50px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg1);color:var(--t1);font-family:monospace;font-size:12px">
@@ -15642,6 +15668,19 @@ async function toggleBot() {
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
   setTimeout(refresh, 800);
+}
+async function applyShadowTrading() {
+  if (!confirm('Apply optimal shadow trading settings (balanced preset)? Bot will restart with new settings.')) return;
+  const res = await fetch('/api/shadow-trading-mode', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'}
+  }).then(r=>r.json()).catch(()=>null);
+  if (res && res.ok) {
+    showToast(res.msg, true);
+    setTimeout(refresh, 500);
+  } else {
+    showToast(res?.msg || 'Failed to apply shadow trading mode', false);
+  }
 }
 async function updateMaxPositions() {
   const input = document.getElementById('max-positions-input');
