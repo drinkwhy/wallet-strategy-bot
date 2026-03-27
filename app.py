@@ -3145,11 +3145,17 @@ class BotInstance:
         if cooldown_min_setting > 0 and self._last_buy_ts > 0:
             elapsed_min = (time.time() - self._last_buy_ts) / 60.0
             if elapsed_min < cooldown_min_setting:
-                remaining = round(cooldown_min_setting - elapsed_min, 1)
-                reason = f"Buy cooldown active ({remaining:.1f}m remaining of {cooldown_min_setting:.0f}m)"
-                self.log_filter(name, mint, False, reason)
-                self.log_msg(f"SKIP {name} — {reason}")
-                return
+                # Check if coin is growing exponentially (>100% gain) — bypass cooldown
+                price_change = decision_context.get("change", 0) if decision_context else 0
+                exponential_growth_threshold = 100.0  # 100% gain
+                if price_change >= exponential_growth_threshold:
+                    self.log_msg(f"🚀 EXPONENTIAL GROWTH DETECTED ({price_change:+.0f}%) — bypassing cooldown for {name}")
+                else:
+                    remaining = round(cooldown_min_setting - elapsed_min, 1)
+                    reason = f"Buy cooldown active ({remaining:.1f}m remaining of {cooldown_min_setting:.0f}m)"
+                    self.log_filter(name, mint, False, reason)
+                    self.log_msg(f"SKIP {name} — {reason}")
+                    return
         # ── Consolidated token safety path ───────────────────────────────────
         safety = self.pre_buy_safety_check(mint, name=name, dev_wallet=dev_wallet, age_min=age_min, liq=liq)
         if not safety.get("safe"):
