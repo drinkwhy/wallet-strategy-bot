@@ -1861,8 +1861,6 @@ def get_wallet_balance_standalone(pubkey):
         return cached[0]
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey, {"commitment": "confirmed"}]}
     _fallbacks = []
-    if SPECTRUM_RPC:
-        _fallbacks.append(SPECTRUM_RPC)
     _fallbacks.append(HELIUS_RPC)
     if ANKR_RPC:
         _fallbacks.append(ANKR_RPC)
