@@ -1859,7 +1859,7 @@ def get_wallet_balance_standalone(pubkey):
     cached = _wallet_balance_cache.get(pubkey)
     if cached and (time.time() - cached[1]) < _WALLET_BAL_TTL:
         return cached[0]
-    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]}
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey, {"commitment": "confirmed"}]}
     _fallbacks = []
     if SPECTRUM_RPC:
         _fallbacks.append(SPECTRUM_RPC)
@@ -1871,7 +1871,11 @@ def get_wallet_balance_standalone(pubkey):
         try:
             r = requests.post(rpc_url, json=payload, timeout=5)
             data = safe_json_response(r)
-            if not data or "error" in data:
+            if not data:
+                print(f"[WARN] RPC {rpc_url} returned empty response", flush=True)
+                continue
+            if "error" in data:
+                print(f"[WARN] RPC error from {rpc_url}: {data.get('error')}", flush=True)
                 continue
             val = data.get("result", {}).get("value", 0)
             balance = round(val / 1e9, 4)
