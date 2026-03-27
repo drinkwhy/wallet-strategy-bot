@@ -1845,6 +1845,39 @@ def encrypt_key(private_key_b58: str) -> str:
 def decrypt_key(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
 
+
+# ── Standalone wallet balance lookup (no bot needed) ──────────────────────────
+_wallet_balance_cache = {}  # pubkey -> (balance, timestamp)
+_WALLET_BAL_TTL = 30  # cache for 30 seconds
+
+def get_wallet_balance_standalone(pubkey):
+    """Fetch SOL balance for a wallet without a running bot. Cached 30s."""
+    cached = _wallet_balance_cache.get(pubkey)
+    if cached and (time.time() - cached[1]) < _WALLET_BAL_TTL:
+        return cached[0]
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]}
+    _fallbacks = []
+    if SPECTRUM_RPC:
+        _fallbacks.append(SPECTRUM_RPC)
+    _fallbacks.append(HELIUS_RPC)
+    if ANKR_RPC:
+        _fallbacks.append(ANKR_RPC)
+    _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
+    for rpc_url in _fallbacks:
+        try:
+            r = requests.post(rpc_url, json=payload, timeout=5)
+            data = safe_json_response(r)
+            if not data or "error" in data:
+                continue
+            val = data.get("result", {}).get("value", 0)
+            balance = round(val / 1e9, 4)
+            _wallet_balance_cache[pubkey] = (balance, time.time())
+            return balance
+        except Exception:
+            continue
+    return 0
+
+
 # ── Per-user bot instances ─────────────────────────────────────────────────────
 user_bots    = {}
 user_bots_lock = threading.Lock()
@@ -8781,6 +8814,21 @@ def api_state():
     uid = session["user_id"]
     bot = user_bots.get(uid)
     pos_list = []
+    # Grab wallet pubkey for balance lookup even when bot is stopped
+    _state_pubkey = ""
+    if not bot:
+        try:
+            _conn = db()
+            try:
+                _c = _conn.cursor()
+                _c.execute("SELECT public_key FROM wallets WHERE user_id=%s", (uid,))
+                _w = _c.fetchone()
+                if _w:
+                    _state_pubkey = _w["public_key"]
+            finally:
+                db_return(_conn)
+        except Exception:
+            pass
     preset_name = normalize_preset_name(bot.preset_name if bot else "balanced")
     if bot:
         pos_snapshot = dict(bot.positions)  # thread-safe snapshot
@@ -8849,7 +8897,7 @@ def api_state():
     return jsonify({
         "running":    bot.running if bot else False,
         "preset":     preset_name,
-        "balance":    round(bot.sol_balance, 4) if bot else 0,
+        "balance":    round(bot.sol_balance, 4) if bot else get_wallet_balance_standalone(_state_pubkey),
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
         "stats":      stats,
