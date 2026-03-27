@@ -367,7 +367,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["safe"],
         "label":"Safe V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":2.5,"stop_loss":0.87,"time_stop_min":10,
-        "trail_pct":0.18,
+        "trail_pct":0.18,"cooldown_min":10,
         "min_score":35,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         # Moonshot: if ratio >= 1.5 (50%+ gain), widen trail to let it run
@@ -377,7 +377,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["balanced"],
         "label":"Balanced V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":3.0,"stop_loss":0.85,"time_stop_min":14,
-        "trail_pct":0.22,
+        "trail_pct":0.22,"cooldown_min":6,
         "min_score":25,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         "moonshot_trigger":1.5,"moonshot_trail_pct":0.35,
@@ -386,7 +386,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["aggressive"],
         "label":"Aggressive V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":5.0,"stop_loss":0.83,"time_stop_min":18,
-        "trail_pct":0.28,
+        "trail_pct":0.28,"cooldown_min":4,
         "min_score":20,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         "moonshot_trigger":1.5,"moonshot_trail_pct":0.40,
@@ -395,7 +395,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["degen"],
         "label":"Degen V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":8.0,"stop_loss":0.80,"time_stop_min":22,
-        "trail_pct":0.32,
+        "trail_pct":0.32,"cooldown_min":2,
         "min_score":15,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         "moonshot_trigger":1.5,"moonshot_trail_pct":0.45,
@@ -1356,6 +1356,10 @@ def migrate_db():
             "ALTER TABLE token_flow_snapshots ADD COLUMN IF NOT EXISTS regime_label TEXT DEFAULT 'neutral'",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_pnl_pct REAL DEFAULT 0",
+            "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS blocked_by_cooldown INTEGER DEFAULT 0",
+            "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS cooldown_setting_min INTEGER DEFAULT 0",
+            "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS would_have_been_winner INTEGER DEFAULT 0",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS session_budget_sol REAL DEFAULT 0",
         ]
         for m in migrations:
             try:
@@ -8196,6 +8200,127 @@ def _evaluate_all_recorded_coins(days=7):
         return None
 
 
+def _analyze_cooldown_optimization(days=2):
+    """Analyze shadow position timing to calculate optimal cooldown_min per strategy.
+
+    Returns a dict with:
+      - per_strategy: {strategy_name: {optimal_cooldown: minutes, regret_count: int, regret_pnl: float}}
+      - summary: overall cooldown analysis results
+    """
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Get all closed shadow positions in the last N days
+            cur.execute("""
+                SELECT strategy_name, mint, opened_at, closed_at, realized_pnl_pct, max_upside_pct
+                FROM shadow_positions
+                WHERE status='closed'
+                  AND closed_at >= NOW() - INTERVAL '%d days'
+                ORDER BY strategy_name, mint, closed_at
+            """ % (days,))
+            all_positions = cur.fetchall()
+        finally:
+            db_return(conn)
+
+        if not all_positions:
+            print(f"[COOLDOWN-OPT] no closed shadow positions in last {days} days", flush=True)
+            return None
+
+        # Group by strategy
+        by_strategy = {}
+        for pos in all_positions:
+            sname = pos.get("strategy_name")
+            if sname not in by_strategy:
+                by_strategy[sname] = []
+            by_strategy[sname].append(pos)
+
+        results = {}
+
+        for sname, positions in by_strategy.items():
+            # Sort by closed_at for each strategy/mint combination
+            position_dict = {}
+            for pos in positions:
+                mint = pos.get("mint")
+                if mint not in position_dict:
+                    position_dict[mint] = []
+                position_dict[mint].append(pos)
+
+            # For each mint, sort positions by closed time
+            for mint in position_dict:
+                position_dict[mint].sort(key=lambda x: x.get("closed_at") or 0)
+
+            # Calculate time gaps between consecutive positions for the same mint
+            # and track which would have been winners
+            regret_count = 0  # Positions missed due to cooldown
+            regret_pnl = 0.0  # PnL that would have been made
+            gap_times = []  # Minutes between consecutive positions
+            winning_gaps = []  # Gaps where next position was a winner
+
+            for mint, sorted_pos in position_dict.items():
+                for i in range(len(sorted_pos) - 1):
+                    closed_pos = sorted_pos[i]
+                    next_pos = sorted_pos[i + 1]
+
+                    # Calculate time gap in minutes
+                    closed_at = closed_pos.get("closed_at")
+                    next_opened_at = next_pos.get("opened_at")
+
+                    if closed_at and next_opened_at:
+                        from datetime import datetime
+                        gap_min = (next_opened_at - closed_at).total_seconds() / 60
+                        gap_times.append(gap_min)
+
+                        # Check if next position was a winner (>100% profit)
+                        next_pnl = float(next_pos.get("realized_pnl_pct") or 0)
+                        if next_pnl > 100:  # >100% gain = exponential growth
+                            winning_gaps.append(gap_min)
+                            # If gap is small, this was a regret (opportunity cost)
+                            if gap_min < 15:  # If gap < 15 min, typical cooldown would block it
+                                regret_count += 1
+                                regret_pnl += next_pnl
+
+            # Determine optimal cooldown
+            optimal_cooldown = 5  # Default minimum
+            if winning_gaps:
+                # Optimal cooldown is the 80th percentile of winning gaps
+                # This allows entry for most big winners while avoiding whipsaws
+                winning_gaps.sort()
+                percentile_idx = min(int(len(winning_gaps) * 0.80), len(winning_gaps) - 1)
+                optimal_cooldown = max(2, int(winning_gaps[percentile_idx]))
+            elif gap_times:
+                # No winners yet, use median of all gaps as a safe default
+                gap_times.sort()
+                percentile_idx = len(gap_times) // 2
+                optimal_cooldown = max(2, int(gap_times[percentile_idx] * 0.5))  # Use 50% of median
+
+            results[sname] = {
+                "optimal_cooldown": optimal_cooldown,
+                "regret_count": regret_count,
+                "regret_pnl": round(regret_pnl, 1),
+                "gap_count": len(gap_times),
+                "winner_gap_count": len(winning_gaps),
+                "avg_gap": round(sum(gap_times) / len(gap_times), 1) if gap_times else 0,
+            }
+
+            print(f"[COOLDOWN-OPT] {sname}: optimal={optimal_cooldown}min, "
+                  f"regrets={regret_count}, regret_pnl={regret_pnl:.1f}%, "
+                  f"gaps={len(gap_times)}, winner_gaps={len(winning_gaps)}", flush=True)
+
+        return {
+            "per_strategy": results,
+            "summary": {
+                "strategies_analyzed": len(results),
+                "total_regrets": sum(r["regret_count"] for r in results.values()),
+                "total_regret_pnl": sum(r["regret_pnl"] for r in results.values()),
+            }
+        }
+
+    except Exception as e:
+        print(f"[COOLDOWN-OPT] error analyzing cooldown optimization: {e}", flush=True)
+        return None
+
+
 def _shadow_auto_tune():
     """Background worker: periodically evaluate closed shadow positions and auto-tune bot settings.
 
@@ -8254,6 +8379,10 @@ def _shadow_auto_tune():
             print(f"[SHADOW-TUNE] running coin evaluation on all recorded tokens...", flush=True)
             coin_eval = _evaluate_all_recorded_coins(days=7)
 
+            # --- NEW: Analyze cooldown optimization to reduce regret and catch exponential growers ---
+            print(f"[SHADOW-TUNE] analyzing cooldown optimization across strategies...", flush=True)
+            cooldown_opt = _analyze_cooldown_optimization(days=2)
+
             # Build per_strategy with optimized settings from coin evaluation
             per_strategy = {}
             if coin_eval and coin_eval.get("optimized_settings"):
@@ -8264,6 +8393,17 @@ def _shadow_auto_tune():
                     per_strategy[sname] = {"best_settings": dict(opt)}
             else:
                 print(f"[SHADOW-TUNE] coin evaluation returned no filter overrides (not enough data or no improvement)", flush=True)
+
+            # Add cooldown optimizations to per_strategy settings
+            if cooldown_opt and cooldown_opt.get("per_strategy"):
+                for sname, cooldown_data in cooldown_opt["per_strategy"].items():
+                    if sname not in per_strategy:
+                        per_strategy[sname] = {}
+                    if "best_settings" not in per_strategy[sname]:
+                        per_strategy[sname]["best_settings"] = {}
+                    optimal_cd = cooldown_data["optimal_cooldown"]
+                    per_strategy[sname]["best_settings"]["cooldown_min"] = optimal_cd
+                    print(f"[SHADOW-TUNE] {sname}: adjusted cooldown_min → {optimal_cd} min (regrets={cooldown_data['regret_count']})", flush=True)
 
             summary = {"strategies": strategies, "per_strategy": per_strategy}
 
@@ -8881,7 +9021,7 @@ def api_state():
         conn = db()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT preset, custom_settings, max_correlated, drawdown_limit_sol FROM bot_settings WHERE user_id=%s", (uid,))
+            cur.execute("SELECT preset, custom_settings, max_correlated, drawdown_limit_sol, profit_target_sol, session_budget_sol FROM bot_settings WHERE user_id=%s", (uid,))
             row = cur.fetchone()
             if row:
                 preset_name = normalize_preset_name(row.get("preset", "balanced"))
@@ -8890,6 +9030,10 @@ def api_state():
                     db_settings["max_correlated"] = row["max_correlated"]
                 if row.get("drawdown_limit_sol") is not None:
                     db_settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
+                if row.get("profit_target_sol") is not None:
+                    db_settings["profit_target_sol"] = row["profit_target_sol"]
+                if row.get("session_budget_sol") is not None:
+                    db_settings["session_budget_sol"] = row["session_budget_sol"]
                 if row.get("custom_settings"):
                     try:
                         custom = json.loads(row["custom_settings"])
@@ -9044,24 +9188,24 @@ def api_stop():
 @app.route("/api/shadow-trading-mode", methods=["POST"])
 @login_required
 def api_shadow_trading_mode():
-    """Apply optimal shadow trading settings (balanced preset)."""
+    """Apply optimal shadow trading settings (V2 balanced preset)."""
     uid = session["user_id"]
     try:
         conn = db()
         try:
             cur = conn.cursor()
-            # Set to balanced preset which is optimal for shadow trading
-            cur.execute("UPDATE bot_settings SET preset=%s, custom_settings=NULL WHERE user_id=%s", ("balanced", uid))
+            # Set to balanced_v2 preset which is optimal for shadow trading
+            cur.execute("UPDATE bot_settings SET preset=%s, custom_settings=NULL WHERE user_id=%s", ("balanced_v2", uid))
             conn.commit()
         finally:
             db_return(conn)
         # Also update running bot if it exists
         bot = user_bots.get(uid)
         if bot:
-            settings = dict(PRESETS.get("balanced", PRESETS["balanced"]))
+            settings = dict(SHADOW_V2_PRESETS.get("balanced_v2", SHADOW_V2_PRESETS["balanced_v2"]))
             bot.settings = settings
-            bot.preset_name = "balanced"
-        return jsonify({"ok": True, "msg": "✅ Shadow trading mode activated — balanced preset applied"})
+            bot.preset_name = "balanced_v2"
+        return jsonify({"ok": True, "msg": "✅ Shadow trading mode activated — V2 balanced preset applied"})
     except Exception as e:
         print(f"[ERROR] Could not apply shadow trading mode: {e}", flush=True)
         return jsonify({"ok": False, "msg": "Failed to apply shadow trading mode"})
@@ -9088,6 +9232,36 @@ def api_set_max_positions():
     except Exception as e:
         print(f"[ERROR] Could not save max_positions: {e}", flush=True)
     return jsonify({"ok": True, "max_positions": max_pos})
+
+@app.route("/api/set-session-budget", methods=["POST"])
+@login_required
+def api_set_session_budget():
+    uid = session["user_id"]
+    data = request.get_json(force=True) or {}
+    budget = float(data.get("session_budget_sol", 0) or 0)
+    profit = float(data.get("profit_target_sol", 0) or 0)
+    loss   = float(data.get("drawdown_limit_sol", 0) or 0)
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE bot_settings SET session_budget_sol=%s, profit_target_sol=%s, drawdown_limit_sol=%s WHERE user_id=%s",
+                (budget, profit, loss, uid)
+            )
+            conn.commit()
+        finally:
+            db_return(conn)
+    except Exception as e:
+        print(f"[ERROR] Could not save session budget: {e}", flush=True)
+    # Apply to running bot if any
+    bot = user_bots.get(uid)
+    if bot:
+        if budget > 0:
+            bot.settings["session_budget_sol"] = budget
+        bot.settings["drawdown_limit_sol"] = loss
+        bot.profit_target = profit
+    return jsonify({"ok": True})
 
 @app.route("/api/cashout", methods=["POST"])
 @login_required
@@ -13572,7 +13746,7 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- Tab Bar -->
   <div class="tab-bar">
-    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scanner</span><span class="tab-btn-meta">Discovery, quick buy, wallet tree</span></button>
+    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Activity</span><span class="tab-btn-meta">Live feed, buys, skips &amp; limits</span></button>
     <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
     <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
     <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
@@ -13583,150 +13757,199 @@ DASHBOARD_HTML = _CSS + """
   </div>
 
   <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
+  <style>
+  /* ── Scanner Activity Tab ───────────────────────────── */
+  .sc-shadow-strip{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;background:rgba(20,199,132,.06);border:1px solid rgba(20,199,132,.18);border-radius:12px;padding:10px 16px;margin-bottom:12px}
+  .sc-shadow-left{display:flex;align-items:center;gap:8px}
+  .sc-live-dot{width:8px;height:8px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite;flex-shrink:0}
+  .sc-shadow-label{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#14c784}
+  .sc-shadow-preset{font-size:11px;font-weight:700;color:var(--blue2);background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.2);border-radius:6px;padding:2px 8px}
+  .sc-shadow-stats{display:flex;align-items:center;gap:16px}
+  .sc-shadow-stat{display:flex;flex-direction:column;align-items:center;gap:1px}
+  .sc-stat-val{font-size:15px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif}
+  .sc-stat-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--t3)}
+  .sc-stat-div{width:1px;height:24px;background:rgba(255,255,255,.08)}
+  .pos{color:#14c784}.neg{color:#ef4444}.neu{color:var(--blue2)}
+
+  .sc-status-strip{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px}
+  .sc-status-pill{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:10px 14px;text-align:center}
+  .sc-status-val{font-size:18px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif;color:var(--t1)}
+  .sc-status-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);margin-top:2px}
+
+  .sc-main-layout{display:grid;grid-template-columns:1fr 300px;gap:12px;align-items:start}
+  @media(max-width:900px){.sc-main-layout{grid-template-columns:1fr}}
+  @media(max-width:640px){.sc-status-strip{grid-template-columns:repeat(3,1fr)}}
+
+  .sc-feed-wrap{padding:0;overflow:hidden}
+  .sc-feed-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap}
+  .sc-feed-title{display:flex;align-items:center;gap:7px;font-size:15px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif}
+  .sc-pulse-dot{width:7px;height:7px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite;flex-shrink:0}
+  .sc-feed-sub{font-size:11px;color:var(--t3);margin-top:2px}
+  .sc-feed-filters{display:flex;gap:6px}
+  .sc-filter-btn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:20px;color:var(--t2);font-size:11px;font-weight:600;padding:4px 12px;cursor:pointer;transition:all .15s}
+  .sc-filter-btn.active{background:rgba(20,199,132,.15);border-color:rgba(20,199,132,.4);color:#14c784}
+  .sc-filter-btn:hover{border-color:rgba(255,255,255,.2);color:var(--t1)}
+
+  .sc-activity-feed{max-height:520px;overflow-y:auto;padding:6px 0}
+  .sc-event{display:flex;align-items:flex-start;gap:10px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.03);transition:background .15s;cursor:default}
+  .sc-event:hover{background:rgba(255,255,255,.025)}
+  .sc-event-icon{font-size:16px;width:22px;text-align:center;flex-shrink:0;line-height:1.4}
+  .sc-event-body{flex:1;min-width:0}
+  .sc-event-name{font-size:13px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sc-event-reason{font-size:11px;color:var(--t3);margin-top:1px;line-height:1.4}
+  .sc-event-meta{flex-shrink:0;text-align:right}
+  .sc-event-time{font-size:10px;color:var(--t3);font-family:monospace}
+  .sc-event-pnl{font-size:12px;font-weight:700;font-family:'Space Grotesk',sans-serif}
+  .sc-event.bought .sc-event-name{color:#4ade80}
+  .sc-event.bought .sc-event-icon{color:#4ade80}
+  .sc-event.skipped .sc-event-icon{color:#64748b}
+  .sc-event.skipped .sc-event-name{color:var(--t2)}
+  .sc-event.sold .sc-event-name{color:#fb923c}
+  .sc-event.sold .sc-event-icon{color:#fb923c}
+  .sc-event.system .sc-event-name{color:var(--blue2)}
+  .sc-event.system .sc-event-icon{color:var(--blue2)}
+  .sc-empty-state{padding:32px 16px;text-align:center;color:var(--t3);font-size:12px}
+
+  .sc-sidebar{display:flex;flex-direction:column;gap:10px}
+  .sc-card-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);padding:12px 14px 6px}
+  .sc-preset-badge{margin:0 14px 10px;padding:5px 12px;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:12px;font-weight:700;color:var(--blue2);text-align:center}
+  .sc-settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(255,255,255,.04);border-top:1px solid rgba(255,255,255,.04);border-bottom:1px solid rgba(255,255,255,.04)}
+  .sc-setting-item{padding:8px 12px;background:rgba(8,16,32,.8)}
+  .sc-setting-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3)}
+  .sc-setting-val{font-size:13px;font-weight:700;color:var(--t1);margin-top:2px}
+
+  .sc-budget-card{padding:0;overflow:hidden}
+  .sc-budget-row{display:flex;align-items:center;justify-content:space-between;padding:6px 14px;font-size:12px}
+  .sc-budget-lbl{color:var(--t3)}
+  .sc-budget-val{font-weight:700;color:var(--t1)}
+  .sc-budget-input-row{padding:5px 14px}
+  .sc-finput-lbl{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin-bottom:4px}
+  .sc-budget-save{width:calc(100% - 28px);margin:8px 14px 12px;display:block}
+  </style>
+
   <div id="tab-scanner" class="tab-pane active">
-    <div class="tab-pane-header">
-      <div>
-        <div class="tab-kicker">Live Operations</div>
-        <div class="tab-pane-title">Scanner Command Center</div>
-        <div class="tab-pane-copy">The scanner feed, launch profile, filter pipeline, listings, and wallet tree stay together here so you can move from discovery to action with less friction.</div>
+    <!-- Shadow Trading Strip -->
+    <div class="sc-shadow-strip">
+      <div class="sc-shadow-left">
+        <span class="sc-live-dot"></span>
+        <span class="sc-shadow-label">Shadow Trading</span>
+        <span class="sc-shadow-preset" id="sc-shadow-preset">loading…</span>
       </div>
-      <div class="shortcut-row">
-        <span class="badge bg-blue" id="scanner-active-tab">Scanner focus</span>
-        <span class="badge bg-muted" id="scanner-sync-copy">Waiting for sync…</span>
+      <div class="sc-shadow-stats">
+        <span class="sc-shadow-stat"><span class="sc-stat-val neu" id="sc-shadow-wr">—</span><span class="sc-stat-lbl">Win Rate</span></span>
+        <span class="sc-stat-div"></span>
+        <span class="sc-shadow-stat"><span class="sc-stat-val neu" id="sc-shadow-pnl2">0%</span><span class="sc-stat-lbl">Avg P&L</span></span>
+        <span class="sc-stat-div"></span>
+        <span class="sc-shadow-stat"><span class="sc-stat-val pos" id="sc-shadow-trades2">0</span><span class="sc-stat-lbl">Shadow Trades</span></span>
+      </div>
+      <span class="badge bg-blue" style="font-size:9px">Auto-Tune Active</span>
+    </div>
+
+    <!-- Quick Status Strip -->
+    <div class="sc-status-strip">
+      <div class="sc-status-pill">
+        <div class="sc-status-val" id="sc-wallet-bal">—</div>
+        <div class="sc-status-lbl">Wallet SOL</div>
+      </div>
+      <div class="sc-status-pill">
+        <div class="sc-status-val" id="sc-budget-display">—</div>
+        <div class="sc-status-lbl">Session Budget</div>
+      </div>
+      <div class="sc-status-pill">
+        <div class="sc-status-val" id="sc-open-trades">0</div>
+        <div class="sc-status-lbl">Open Trades</div>
+      </div>
+      <div class="sc-status-pill">
+        <div class="sc-status-val" id="sc-session-pnl" style="color:#14c784">+0.00</div>
+        <div class="sc-status-lbl">Session P&L</div>
+      </div>
+      <div class="sc-status-pill">
+        <div class="sc-status-val" id="sc-session-wr">—</div>
+        <div class="sc-status-lbl">Win Rate</div>
       </div>
     </div>
 
-    <div class="scanner-top-grid">
-      <div class="glass">
-        <div class="panel-head">
+    <!-- Main Layout: Activity Feed + Sidebar -->
+    <div class="sc-main-layout">
+      <!-- Activity Feed -->
+      <div class="glass sc-feed-wrap">
+        <div class="sc-feed-head">
           <div>
-            <div class="panel-title">Launch Summary</div>
-            <div class="panel-copy">Saved settings stay visible here before the bot is armed, so the current operating profile is obvious at a glance.</div>
+            <div class="sc-feed-title">
+              <span class="sc-pulse-dot"></span>
+              Live Activity
+            </div>
+            <div class="sc-feed-sub" id="sc-feed-sub">Waiting for bot activity…</div>
           </div>
-          <div class="panel-actions">
-            <button class="btn btn-ghost" type="button" onclick="openSettingsTab()">Open Settings</button>
-            <button class="btn btn-ghost" type="button" onclick="refreshNow()">Sync State</button>
+          <div class="sc-feed-filters">
+            <button class="sc-filter-btn active" data-filter="all" onclick="scSetFilter(this)">All</button>
+            <button class="sc-filter-btn" data-filter="bought" onclick="scSetFilter(this)">Bought</button>
+            <button class="sc-filter-btn" data-filter="skipped" onclick="scSetFilter(this)">Skipped</button>
           </div>
         </div>
-        <div id="launch-summary" class="settings-echo">
-          <span class="badge bg-muted">Mode loading…</span>
-        </div>
-        <div class="control-action-grid">
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Scanner Feed</div>
-            <div class="scanner-summary-value" id="scanner-token-live">0</div>
-            <div class="scanner-summary-copy">Live tokens visible</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Open Trades</div>
-            <div class="scanner-summary-value" id="scanner-position-live">0</div>
-            <div class="scanner-summary-copy">Currently active positions</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">Filter Checks</div>
-            <div class="scanner-summary-value" id="scanner-filter-live">0</div>
-            <div class="scanner-summary-copy">Recent pipeline decisions</div>
-          </div>
-          <div class="scanner-summary-card">
-            <div class="scanner-summary-label">CEX Catches</div>
-            <div class="scanner-summary-value" id="scanner-listing-live">0</div>
-            <div class="scanner-summary-copy">Listings surfaced this session</div>
-          </div>
+        <div id="sc-activity-feed" class="sc-activity-feed">
+          <div class="sc-empty-state">Start the bot to see live activity here</div>
         </div>
       </div>
 
-      <div class="glass">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Operator Notes</div>
-            <div class="panel-copy">Shortcuts and live telemetry make the dashboard easier to run fast without losing context.</div>
-          </div>
-        </div>
-        <div class="control-note">
-          Slash jumps to search, number keys move tabs, and the activity drawer stays available while you work inside the scanner and settings surfaces.
-        </div>
-        <div class="shortcut-row" style="margin-top:12px">
-          <span class="badge bg-muted" id="enhanced-status-copy">Telemetry loading…</span>
-          <span class="badge bg-muted" id="scanner-last-market">Market feed waiting…</span>
-          <span class="badge bg-muted" id="scanner-last-listing">Listings waiting…</span>
-        </div>
-      </div>
-    </div>
-
-    <div class="scanner-layout">
-      <div class="scanner-sidebar">
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Open Positions</div>
-              <div class="panel-copy">Live trade P&L stays visible while you scan new opportunities.</div>
-            </div>
-          </div>
-          <div id="pos-tbl" style="max-height:220px;overflow-y:auto"><div style="font-size:12px;color:var(--t3)">No open positions</div></div>
-        </div>
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">Filter Pipeline</div>
-              <div class="panel-copy">Recent pass/fail reasons show where flow is getting filtered out.</div>
-            </div>
-          </div>
-          <div id="filter-pipe" style="max-height:160px;overflow-y:auto"><div style="font-size:11px;color:var(--t3)">Scanning…</div></div>
-        </div>
-        <div class="glass">
-          <div class="panel-head">
-            <div>
-              <div class="panel-title">CEX Sniper</div>
-              <div class="panel-copy">Fresh centralized exchange listings show up here as the monitor catches them.</div>
-            </div>
-            <span id="listing-count-badge" class="badge bg-gold">monitoring</span>
-          </div>
-          <div id="listing-feed" style="max-height:120px;overflow-y:auto;font-size:11px;color:var(--t3)">Monitoring exchanges…</div>
-          <div style="margin-top:8px;font-size:11px;color:var(--t2)">Catches: <span id="listing-stat" style="color:var(--gold2);font-weight:800">0</span></div>
-        </div>
-      </div>
-      <div class="scanner-main">
+      <!-- Sidebar -->
+      <div class="sc-sidebar">
+        <!-- Current Strategy Settings -->
         <div class="glass" style="padding:0;overflow:hidden">
-          <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap">
-            <div>
-              <div style="font-weight:800;font-size:16px;font-family:'Space Grotesk','Manrope',sans-serif">Live Scanner</div>
-              <div id="token-count" style="font-size:11px;color:var(--t3);margin-top:3px">0 tokens</div>
-            </div>
-            <div class="scanner-header-actions">
-              <input id="scan-search" class="scanner-search" type="text" placeholder="Search token or symbol…" oninput="renderTokenRows()">
-              <button class="sort-pill active" onclick="setSortCol('score',this)">Score</button>
-              <button class="sort-pill" onclick="setSortCol('vol',this)">Vol</button>
-              <button class="sort-pill" onclick="setSortCol('chg',this)">Chg</button>
-              <button class="sort-pill" onclick="setSortCol('age',this)">Age</button>
-              <button style="background:none;border:none;cursor:pointer;font-size:14px" onclick="openDexScreener()" title="Open DexScreener">↗</button>
-            </div>
-          </div>
-          <div style="max-height:550px;overflow-y:auto">
-            <table class="tbl" style="font-size:11px">
-              <thead><tr><th>#</th><th>Token</th><th>Price</th><th>1h</th><th>Vol</th><th>MCap</th><th>Liq</th><th>Age</th><th>Score</th><th></th></tr></thead>
-            </table>
-            <div id="token-rows"></div>
+          <div class="sc-card-title">Active Strategy</div>
+          <div class="sc-preset-badge" id="sc-preset-name">—</div>
+          <div class="sc-settings-grid" id="sc-settings-grid"></div>
+          <div style="padding:8px 14px 12px">
+            <button class="btn btn-ghost" style="width:100%;font-size:11px" onclick="activateTab('settings')">Adjust Settings →</button>
           </div>
         </div>
-        <!-- Wallet Tree Panel -->
-        <div id="tree-panel" style="display:none;margin-top:14px" class="glass">
-          <div class="panel-head">
-            <div>
-              <div id="tree-tok-name" class="panel-title" style="font-size:18px"></div>
-              <div id="tree-tok-mint" style="font-size:10px;color:var(--t3);font-family:monospace"></div>
-            </div>
-            <div style="display:flex;gap:10px;align-items:center">
-              <span id="tree-buy-count" class="badge bg-grn">0</span>
-              <span id="tree-sell-count" class="badge bg-red">0</span>
-              <a id="tree-dex-link" href="#" target="_blank" style="font-size:11px;color:var(--blue2)">DexScreener ↗</a>
-              <button onclick="closeTree()" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:16px">&times;</button>
-            </div>
+
+        <!-- Session Budget Controls -->
+        <div class="glass sc-budget-card">
+          <div class="sc-card-title">Session Limits</div>
+          <div class="sc-budget-row">
+            <span class="sc-budget-lbl">Wallet Balance</span>
+            <span class="sc-budget-val" id="sc-wallet-bal2">— SOL</span>
           </div>
-          <div style="position:relative">
-            <canvas id="tree-canvas" style="width:100%;border-radius:8px;background:#070d17"></canvas>
-            <div id="tree-loading" style="display:none;position:absolute;inset:0;align-items:center;justify-content:center;color:var(--t3);font-size:12px">Loading wallet tree…</div>
+          <div class="sc-budget-input-row">
+            <label class="sc-finput-lbl">Trade Budget (SOL)</label>
+            <input id="sc-budget-input" type="number" class="finput" step="0.01" min="0" placeholder="e.g. 0.5 (0 = no limit)">
           </div>
-          <div id="tree-list" style="max-height:180px;overflow-y:auto;margin-top:8px"></div>
+          <div class="sc-budget-input-row">
+            <label class="sc-finput-lbl">Stop at Profit (SOL)</label>
+            <input id="sc-profit-input" type="number" class="finput" step="0.01" min="0" placeholder="e.g. 0.2 (0 = off)">
+          </div>
+          <div class="sc-budget-input-row">
+            <label class="sc-finput-lbl">Stop at Loss (SOL)</label>
+            <input id="sc-loss-input" type="number" class="finput" step="0.01" min="0" placeholder="e.g. 0.1 (0 = off)">
+          </div>
+          <button class="btn btn-primary sc-budget-save" onclick="saveBudgetSettings()">Save Limits</button>
+        </div>
+
+        <!-- Open Positions -->
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div class="sc-card-title">Open Positions</div>
+          <div id="pos-tbl" style="padding:6px 14px 12px;max-height:240px;overflow-y:auto">
+            <div style="font-size:12px;color:var(--t3)">No open positions</div>
+          </div>
+        </div>
+
+        <!-- hidden stubs for backward-compat JS references -->
+        <div style="display:none">
+          <div id="filter-pipe"></div>
+          <div id="listing-feed"></div>
+          <span id="listing-stat">0</span>
+          <span id="listing-count-badge"></span>
+          <span id="scanner-filter-live">0</span>
+          <span id="scanner-position-live">0</span>
+          <span id="scanner-token-live">0</span>
+          <span id="scanner-listing-live">0</span>
+          <div id="launch-summary"></div>
+          <span id="enhanced-status-copy"></span>
+          <span id="scanner-last-market"></span>
+          <span id="scanner-last-listing"></span>
+          <span id="scanner-sync-copy"></span>
+          <span id="scanner-active-tab"></span>
         </div>
       </div>
     </div>
@@ -15264,6 +15487,184 @@ function applySettingsToForm(settings, presetName) {
   setChecked('s-auto-promote', s.auto_promote ?? SETTINGS_DEFAULTS.auto_promote);
   renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
 }
+// ── Scanner Activity Tab ─────────────────────────────────────────
+let _scFilter = 'all';
+let _scEvents = [];
+
+function scSetFilter(btn) {
+  _scFilter = btn.dataset.filter;
+  document.querySelectorAll('.sc-filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderScEvents();
+}
+
+function renderScEvents() {
+  const feed = document.getElementById('sc-activity-feed');
+  if (!feed) return;
+  const visible = _scFilter === 'all' ? _scEvents : _scEvents.filter(e => e.type === _scFilter);
+  if (!visible.length) {
+    feed.innerHTML = '<div class="sc-empty-state">No activity yet — start the bot to see events</div>';
+    return;
+  }
+  feed.innerHTML = visible.slice(0, 80).map(ev => {
+    const icons = {bought:'🟢', skipped:'⬜', sold:'🔴', system:'⚙️'};
+    const icon = icons[ev.type] || '•';
+    const pnlHtml = ev.pnl != null
+      ? `<div class="sc-event-pnl ${ev.pnl >= 0 ? 'pos' : 'neg'}">${ev.pnl >= 0 ? '+' : ''}${ev.pnl}%</div>`
+      : '';
+    return `<div class="sc-event ${ev.type}">
+      <div class="sc-event-icon">${icon}</div>
+      <div class="sc-event-body">
+        <div class="sc-event-name">${ev.name || '—'}</div>
+        <div class="sc-event-reason">${ev.reason || ''}</div>
+      </div>
+      <div class="sc-event-meta">${pnlHtml}<div class="sc-event-time">${ev.ts || ''}</div></div>
+    </div>`;
+  }).join('');
+}
+
+function buildScEvents(logLines, filterLog) {
+  const events = [];
+
+  // Parse filter log: each entry is a pass/fail decision
+  if (filterLog && filterLog.length) {
+    filterLog.forEach(f => {
+      events.push({
+        type: f.passed ? 'bought' : 'skipped',
+        name: f.name || '?',
+        reason: f.passed ? `✓ Passed — score ${f.score || '?'}` : `✗ ${f.reason || 'Filtered'}`,
+        pnl: null,
+        ts: f.ts || '',
+        _raw: f,
+      });
+    });
+  }
+
+  // Parse activity log lines for BUY/SELL events not already covered
+  if (logLines && logLines.length) {
+    logLines.forEach(line => {
+      if (line.includes('BUY')) {
+        const nameMatch = line.match(/BUY\s+([A-Za-z0-9$\s]+?)(?:\s+@|\s+–|$)/);
+        const name = nameMatch ? nameMatch[1].trim() : '?';
+        const tsMatch = line.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+        events.push({ type: 'bought', name, reason: line.replace(/^\[.*?\]\s*/, '').substring(0, 80), pnl: null, ts: tsMatch ? tsMatch[1] : '' });
+      } else if (line.includes('SELL') || line.includes('CASHOUT')) {
+        const pnlMatch = line.match(/([+-]?\d+\.?\d*)%/);
+        const tsMatch = line.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+        const pnl = pnlMatch ? parseFloat(pnlMatch[1]) : null;
+        events.push({ type: 'sold', name: line.replace(/^\[.*?\]\s*/, '').split(' ').slice(1, 3).join(' '), reason: line.replace(/^\[.*?\]\s*/, '').substring(0, 80), pnl, ts: tsMatch ? tsMatch[1] : '' });
+      } else if (line.includes('Auto-tune') || line.includes('[BOT]') || line.includes('Bot started') || line.includes('strategy')) {
+        const tsMatch = line.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+        events.push({ type: 'system', name: line.replace(/^\[.*?\]\s*/, '').substring(0, 60), reason: '', pnl: null, ts: tsMatch ? tsMatch[1] : '' });
+      }
+    });
+  }
+
+  // Sort newest first
+  return events.reverse();
+}
+
+function renderScannerTab(d) {
+  if (!d) return;
+
+  // Status strip
+  const bal = d.balance ?? 0;
+  const budget = d.settings?.session_budget_sol ?? 0;
+  const positions = d.positions || [];
+  setText('sc-wallet-bal', bal.toFixed(4));
+  setText('sc-wallet-bal2', bal.toFixed(4) + ' SOL');
+  setText('sc-budget-display', budget > 0 ? budget.toFixed(3) : 'No limit');
+  setText('sc-open-trades', positions.length);
+
+  const stats = d.stats || {};
+  const wins = parseInt(stats.wins || 0);
+  const losses = parseInt(stats.losses || 0);
+  const total = wins + losses;
+  const wr = total > 0 ? Math.round(wins / total * 100) : null;
+  setText('sc-session-wr', wr != null ? wr + '%' : '—');
+
+  const pnl = parseFloat(stats.session_pnl_sol || 0);
+  const pnlEl = document.getElementById('sc-session-pnl');
+  if (pnlEl) {
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4);
+    pnlEl.style.color = pnl >= 0 ? '#14c784' : '#ef4444';
+  }
+
+  // Settings card
+  const s = d.settings || {};
+  const presetName = d.preset || s.preset || 'balanced';
+  setText('sc-preset-name', presetName);
+  const grid = document.getElementById('sc-settings-grid');
+  if (grid) {
+    const items = [
+      ['Cooldown', (s.cooldown_min || 0) + 'm'],
+      ['TP1', (s.tp1_mult || 0) + 'x'],
+      ['TP2', (s.tp2_mult || 0) + 'x'],
+      ['Stop Loss', (((1 - (s.stop_loss || 0.85)) * 100).toFixed(0)) + '%'],
+      ['Trail', ((s.trail_pct || 0) * 100).toFixed(0) + '%'],
+      ['Min Score', s.min_score || 0],
+      ['Max Buys', s.max_correlated || 5],
+      ['Buy Size', (s.max_buy_sol || 0) + ' SOL'],
+    ];
+    grid.innerHTML = items.map(([l, v]) =>
+      `<div class="sc-setting-item"><div class="sc-setting-lbl">${l}</div><div class="sc-setting-val">${v}</div></div>`
+    ).join('');
+  }
+
+  // Budget inputs (populate from settings, only if empty)
+  const budgetInput = document.getElementById('sc-budget-input');
+  const profitInput = document.getElementById('sc-profit-input');
+  const lossInput = document.getElementById('sc-loss-input');
+  if (budgetInput && !budgetInput._dirty) budgetInput.value = budget > 0 ? budget : '';
+  if (profitInput && !profitInput._dirty) profitInput.value = s.profit_target_sol > 0 ? s.profit_target_sol : '';
+  if (lossInput && !lossInput._dirty) lossInput.value = s.drawdown_limit_sol > 0 ? s.drawdown_limit_sol : '';
+
+  // Shadow strip
+  // (values from the existing shadow performance update)
+  const shadowPresetEl = document.getElementById('sc-shadow-preset');
+  if (shadowPresetEl) shadowPresetEl.textContent = presetName;
+
+  // Build activity events
+  _scEvents = buildScEvents(d.log || [], d.filter_log || []);
+  const subEl = document.getElementById('sc-feed-sub');
+  if (subEl) {
+    const buyCount = _scEvents.filter(e => e.type === 'bought').length;
+    const skipCount = _scEvents.filter(e => e.type === 'skipped').length;
+    subEl.textContent = `${buyCount} bought · ${skipCount} skipped this session`;
+  }
+  renderScEvents();
+}
+
+async function saveBudgetSettings() {
+  const budget = parseFloat(document.getElementById('sc-budget-input')?.value || 0) || 0;
+  const profit = parseFloat(document.getElementById('sc-profit-input')?.value || 0) || 0;
+  const loss   = parseFloat(document.getElementById('sc-loss-input')?.value || 0) || 0;
+  const res = await fetch('/api/set-session-budget', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ session_budget_sol: budget, profit_target_sol: profit, drawdown_limit_sol: loss })
+  }).then(r => r.json()).catch(() => null);
+  if (res?.ok) {
+    showToast('Session limits saved ✓', true);
+    // mark inputs clean
+    ['sc-budget-input','sc-profit-input','sc-loss-input'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el._dirty = false;
+    });
+  } else {
+    showToast('Failed to save limits', false);
+  }
+}
+
+// Mark inputs dirty so we don't overwrite user edits
+['sc-budget-input','sc-profit-input','sc-loss-input'].forEach(id => {
+  document.addEventListener('DOMContentLoaded', () => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', () => { el._dirty = true; });
+  });
+});
+// ── End Scanner Activity Tab ─────────────────────────────────────
+
 function getSettingsFromForm() {
   return {
     preset: document.getElementById('s-preset')?.value || 'balanced',
@@ -15600,15 +16001,19 @@ async function refresh() {
     setText('hero-live-state', 'Bot parked');
   }
 
-  document.getElementById('pos-tbl').innerHTML = d.positions.length
+  const posHtml = d.positions.length
     ? d.positions.map(p => {
         const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
         return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
-          <span style="font-weight:700;cursor:pointer" onclick="openWalletTree('${p.address||''}','${p.name||''}')">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
+          <span style="font-weight:700">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
           <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
         </div>`;
       }).join('')
     : '<div style="font-size:12px;color:var(--t3)">No open positions</div>';
+  document.getElementById('pos-tbl').innerHTML = posHtml;
+
+  // Update scanner activity tab
+  renderScannerTab(d);
 
   const logs = d.log || [];
   document.getElementById('log-count').textContent = logs.length + ' entries';
@@ -17120,6 +17525,11 @@ async function pollShadowBanner() {
       bestEl.textContent = bestStrat.charAt(0).toUpperCase() + bestStrat.slice(1);
       bestEl.className = 'live-stat-val pos';
     }
+    // Sync scanner tab shadow strip
+    setText('sc-shadow-wr', wr !== '—' ? wr + '%' : '—');
+    setText('sc-shadow-pnl2', (avgPnl > 0 ? '+' : '') + avgPnl + '%');
+    setText('sc-shadow-trades2', totalTrades.toString());
+    if (bestStrat) setText('sc-shadow-preset', bestStrat);
 
     // Build trade feed from equity data
     const allPoints = [];
