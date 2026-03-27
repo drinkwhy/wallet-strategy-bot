@@ -3171,10 +3171,16 @@ class BotInstance:
             return
         # Correlated position limit
         if len(self.positions) >= s.get("max_correlated", 5):
-            reason = f"Max correlated positions ({len(self.positions)})"
-            self.log_filter(name, mint, False, reason)
-            self.log_msg(f"SKIP {name} — {reason}")
-            return
+            # Check if coin is growing exponentially (>100% gain) — bypass position limit
+            price_change = decision_context.get("change", 0) if decision_context else 0
+            exponential_growth_threshold = 100.0  # 100% gain
+            if price_change >= exponential_growth_threshold:
+                self.log_msg(f"🚀 EXPONENTIAL GROWTH DETECTED ({price_change:+.0f}%) — bypassing position limit for {name}")
+            else:
+                reason = f"Max correlated positions ({len(self.positions)})"
+                self.log_filter(name, mint, False, reason)
+                self.log_msg(f"SKIP {name} — {reason}")
+                return
         if self.sol_balance < trade_sol + 0.01:
             reason = f"Low balance ({self.sol_balance:.4f} SOL, need {trade_sol+0.01:.4f})"
             self.log_filter(name, mint, False, reason)
