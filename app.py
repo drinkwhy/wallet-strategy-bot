@@ -1312,7 +1312,7 @@ def migrate_db():
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS profit_target_sol REAL DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS is_running INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS drawdown_limit_sol REAL DEFAULT 0.5",
-            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 3",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS max_correlated INTEGER DEFAULT 5",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS execution_mode TEXT DEFAULT 'live'",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS decision_policy TEXT DEFAULT 'rules'",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS model_threshold REAL DEFAULT 60",
@@ -8973,11 +8973,13 @@ def api_start():
         if bs.get("drawdown_limit_sol") is not None:
             settings["drawdown_limit_sol"] = bs["drawdown_limit_sol"]
         # Apply custom_settings JSON overrides (tp1_mult, stop_loss, etc.)
+        # But skip max_correlated — it's now managed via the dashboard control
         if bs.get("custom_settings"):
             try:
                 import json as _json
                 custom = _json.loads(bs["custom_settings"])
                 if isinstance(custom, dict):
+                    custom.pop("max_correlated", None)  # Remove max_correlated override
                     settings.update(custom)
             except Exception:
                 pass
@@ -9058,24 +9060,12 @@ def api_set_max_positions():
     bot = user_bots.get(uid)
     if bot:
         bot.settings["max_correlated"] = max_pos
-    # Also save to database for persistence
+    # Save to database max_correlated column
     try:
         conn = db()
         try:
             cur = conn.cursor()
-            # Store in custom_settings JSON
-            cur.execute("SELECT custom_settings FROM bot_settings WHERE user_id=%s", (uid,))
-            row = cur.fetchone()
-            custom = {}
-            if row and row["custom_settings"]:
-                try:
-                    import json as _json
-                    custom = _json.loads(row["custom_settings"])
-                except:
-                    pass
-            custom["max_correlated"] = max_pos
-            import json as _json
-            cur.execute("UPDATE bot_settings SET custom_settings=%s WHERE user_id=%s", (_json.dumps(custom), uid))
+            cur.execute("UPDATE bot_settings SET max_correlated=%s WHERE user_id=%s", (max_pos, uid))
             conn.commit()
         finally:
             db_return(conn)
