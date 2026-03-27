@@ -1313,6 +1313,7 @@ def migrate_db():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings_sol REAL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP DEFAULT NOW()",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS preset TEXT DEFAULT 'steady'",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS custom_settings TEXT",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS run_mode TEXT DEFAULT 'indefinite'",
@@ -8462,6 +8463,16 @@ def login_required(f):
     def decorated(*args, **kwargs):
         if "user_id" not in session:
             return redirect(url_for("login"))
+        # Update last_active timestamp
+        user_id = session.get("user_id")
+        try:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET last_active = NOW() WHERE id = %s", (user_id,))
+            conn.commit()
+            db_return(conn)
+        except Exception:
+            pass
         return f(*args, **kwargs)
     return decorated
 
@@ -12068,7 +12079,7 @@ def api_admin_revenue():
                    COALESCE(t.total_pnl, 0) AS total_pnl_sol,
                    COALESCE(t.wins, 0) AS wins,
                    COALESCE(t.losses, 0) AS losses,
-                   COALESCE(t.last_trade, u.created_at) AS last_active
+                   u.last_active
             FROM users u
             LEFT JOIN LATERAL (
                 SELECT COUNT(*) AS trade_count,
