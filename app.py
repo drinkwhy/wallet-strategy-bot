@@ -737,16 +737,37 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set. Add a PostgreSQL database to your Railway project.")
 
-_db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=1, maxconn=20,
-    dsn=DATABASE_URL,
-    cursor_factory=psycopg2.extras.RealDictCursor,
-    connect_timeout=10,
-)
+_db_pool = None
 _db_semaphore = threading.Semaphore(20)
-print("[Startup] DB pool created", flush=True)
+
+def _create_db_pool():
+    global _db_pool
+    for attempt in range(1, 31):
+        try:
+            _db_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1, maxconn=20,
+                dsn=DATABASE_URL,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=10,
+            )
+            print(f"[Startup] DB pool created (attempt {attempt})", flush=True)
+            return
+        except Exception as e:
+            print(f"[Startup] DB pool failed (attempt {attempt}/30): {e}", flush=True)
+            time.sleep(6)
+    print("[Startup] DB pool could not connect — will retry on first request", flush=True)
+
+threading.Thread(target=_create_db_pool, daemon=True, name="db-pool-init").start()
 
 def db():
+    if _db_pool is None:
+        # Pool still initializing — wait up to 60s
+        for _ in range(60):
+            time.sleep(1)
+            if _db_pool is not None:
+                break
+        else:
+            raise RuntimeError("DB not available — Postgres still starting up")
     if not _db_semaphore.acquire(timeout=10):
         raise RuntimeError("DB connection pool exhausted (10s timeout)")
     try:
