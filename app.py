@@ -12869,13 +12869,6 @@ SETUP_HTML = _CSS + """
         <input class="finput" type="password" name="private_key" placeholder="Paste your base58 private key…" required autocomplete="off">
       </div>
       <div class="fgroup">
-        <label class="flabel">Trading Strategy</label>
-        <select class="finput" name="preset">
-          <option value="steady">Steady Profit — Conservative (1.5x TP1, 3x TP2, −25% stop)</option>
-          <option value="max">Max Profit — Aggressive (2x TP1, 10x TP2, trailing stop)</option>
-        </select>
-      </div>
-      <div class="fgroup">
         <label class="flabel">Stop Condition</label>
         <select class="finput" name="run_mode" onchange="toggleStop(this.value)">
           <option value="indefinite">Run indefinitely (manual stop only)</option>
