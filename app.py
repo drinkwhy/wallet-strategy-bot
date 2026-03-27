@@ -282,7 +282,7 @@ PRESETS = {
         "offpeak_min_change":20,
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
-        "anti_rug":True,"check_holders":True,"max_correlated":2,"drawdown_limit_sol":0.3,
+        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.3,
         "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.50,
         "min_composite_score":20,"min_confidence":0.45,"min_buy_sell_ratio":1.2,
         "min_smart_wallet_buys":1,"min_net_flow_sol":0.5,"min_unique_buyers":3,
@@ -9048,6 +9048,41 @@ def api_stop():
             db_return(conn)
     return jsonify({"ok":True})
 
+@app.route("/api/set-max-positions", methods=["POST"])
+@login_required
+def api_set_max_positions():
+    uid = session["user_id"]
+    data = request.get_json(force=True) or {}
+    max_pos = int(data.get("max_positions", 5))
+    max_pos = max(1, min(20, max_pos))  # Clamp between 1 and 20
+    bot = user_bots.get(uid)
+    if bot:
+        bot.settings["max_correlated"] = max_pos
+    # Also save to database for persistence
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Store in custom_settings JSON
+            cur.execute("SELECT custom_settings FROM bot_settings WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
+            custom = {}
+            if row and row["custom_settings"]:
+                try:
+                    import json as _json
+                    custom = _json.loads(row["custom_settings"])
+                except:
+                    pass
+            custom["max_correlated"] = max_pos
+            import json as _json
+            cur.execute("UPDATE bot_settings SET custom_settings=%s WHERE user_id=%s", (_json.dumps(custom), uid))
+            conn.commit()
+        finally:
+            db_return(conn)
+    except Exception as e:
+        print(f"[ERROR] Could not save max_positions: {e}", flush=True)
+    return jsonify({"ok": True, "max_positions": max_pos})
+
 @app.route("/api/cashout", methods=["POST"])
 @login_required
 def api_cashout():
@@ -13285,6 +13320,11 @@ DASHBOARD_HTML = _CSS + """
       </div>
       <div class="hero-actions">
         <button id="toggle-btn" class="btn btn-success" onclick="toggleBot()">▶ Start Bot</button>
+        <div style="display:flex;align-items:center;gap:8px">
+          <label style="font-size:12px;color:var(--t3)">Max Open Buys:</label>
+          <input type="number" id="max-positions-input" min="1" max="20" value="5" style="width:50px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg1);color:var(--t1);font-family:monospace;font-size:12px">
+          <button class="btn btn-ghost" type="button" onclick="updateMaxPositions()" style="padding:4px 12px;font-size:12px">Apply</button>
+        </div>
         <button class="btn btn-ghost" type="button" onclick="refreshNow()">Refresh Now</button>
         <button class="btn btn-ghost" type="button" onclick="openSettingsTab()">Tune Settings</button>
         <button class="btn btn-ghost" type="button" onclick="focusActivityLog()">Activity Log</button>
@@ -15521,6 +15561,9 @@ async function refresh() {
   }).catch(() => null);
   if (!d) { document.getElementById('stxt').textContent = 'Connection error \u2014 retrying\u2026'; return; }
   running = d.running;
+  // Update max positions input with current setting
+  const maxPos = d.settings && d.settings.max_correlated ? d.settings.max_correlated : 5;
+  document.getElementById('max-positions-input').value = maxPos;
   setText('hero-sync-time', fmtClock());
   setText('scanner-sync-copy', `Synced ${fmtClock()}`);
   setText('scanner-listing-live', String(listingCatchCount));
@@ -15618,6 +15661,22 @@ async function toggleBot() {
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
   setTimeout(refresh, 800);
+}
+async function updateMaxPositions() {
+  const input = document.getElementById('max-positions-input');
+  const val = parseInt(input.value) || 5;
+  const clamped = Math.max(1, Math.min(20, val));
+  input.value = clamped;
+  const res = await fetch('/api/set-max-positions', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({max_positions: clamped})
+  }).then(r=>r.json()).catch(()=>null);
+  if (res && res.ok) {
+    showToast(`Max open buys set to ${clamped}`, true);
+  } else {
+    showToast('Failed to update max positions', false);
+  }
 }
 async function cashout() {
   if (!confirm('Sell all open positions at market price?')) return;
