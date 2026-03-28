@@ -7633,16 +7633,41 @@ def _sniper_process_signature(sig, source_label, seen_signatures):
         return False
     seen_signatures.add(sig)
     try:
-        tx_result = rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}], timeout=8) or {}
+        tx_result = rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}], timeout=5) or {}
         meta = (tx_result.get("meta") if isinstance(tx_result, dict) else {}) or {}
         post_bals = meta.get("postTokenBalances") or []
+        mints_found = set()
         for pb in post_bals:
             mint = pb.get("mint") or ""
-            _sniper_emit_token(mint, source_label=source_label)
+            if mint and mint != SOL_MINT and mint not in mints_found:
+                mints_found.add(mint)
+        # Emit all mints in parallel
+        if mints_found:
+            with ThreadPoolExecutor(max_workers=min(4, len(mints_found))) as pool:
+                pool.map(lambda m: _sniper_emit_token(m, source_label=source_label), mints_found)
         return True
     except Exception as e:
         print(f"[Sniper] tx parse error for {sig[:8]}...: {e}", flush=True)
         return False
+
+
+def _extract_mints_from_logs(logs):
+    """Try to extract token mint addresses directly from transaction logs (avoids getTransaction call)."""
+    import re
+    mints = set()
+    # PumpFun and Raydium logs often contain base58 mint addresses
+    b58_pattern = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
+    for line in logs:
+        if not line:
+            continue
+        line_lower = line.lower()
+        # Look for mint-related log lines
+        if any(kw in line_lower for kw in ("mint:", "token:", "initialize", "create")):
+            matches = b58_pattern.findall(line)
+            for m in matches:
+                if len(m) >= 32 and m != SOL_MINT and m != PUMP_FUN and m != RAYDIUM_AMM:
+                    mints.add(m)
+    return mints
 
 
 def _run_rpc_poll_sniper(tracked_programs, seen_signatures):
@@ -7663,10 +7688,175 @@ def _run_rpc_poll_sniper(tracked_programs, seen_signatures):
             time.sleep(10)
 
 
-def helius_pool_sniper():
-    """Listen for fresh Pump.fun and Raydium transactions and feed them into the main signal path."""
+def _run_enhanced_ws_sniper():
+    """Try Helius Enhanced WebSocket (transactionSubscribe) for fastest detection.
+    Returns True if it ran successfully, False if plan doesn't support it."""
+    if not HELIUS_API_KEY:
+        return False
+
     import json as _json
+    ws_url = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    seen_signatures = set()
+    _SEEN_SIG_MAX = 20_000
+    state = {"plan_blocked": False, "connected": False, "rate_limited": False}
+
+    print("[Sniper] Attempting Enhanced WebSocket (transactionSubscribe)...", flush=True)
+
+    try:
+        import websocket as ws_lib
+
+        def on_open(ws):
+            state["connected"] = True
+            # Subscribe to PumpFun transactions
+            ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "transactionSubscribe",
+                "params": [{
+                    "accountInclude": [PUMP_FUN],
+                    "type": "all",
+                }, {
+                    "commitment": "processed",
+                    "maxSupportedTransactionVersion": 0,
+                }],
+            }))
+            # Subscribe to Raydium transactions
+            ws.send(json.dumps({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "transactionSubscribe",
+                "params": [{
+                    "accountInclude": [RAYDIUM_AMM],
+                    "type": "all",
+                }, {
+                    "commitment": "processed",
+                    "maxSupportedTransactionVersion": 0,
+                }],
+            }))
+            print("[Sniper] ⚡ Enhanced WS subscribed (transactionSubscribe) — fastest mode", flush=True)
+
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                # Check for subscription errors
+                if data.get("error"):
+                    err = data["error"]
+                    err_msg = str(err.get("message", ""))
+                    if "business" in err_msg.lower() or err.get("code") == -32403:
+                        state["plan_blocked"] = True
+                        print(f"[Sniper] Enhanced WS blocked: {err_msg} — falling back", flush=True)
+                        ws.close()
+                        return
+                    print(f"[Sniper] Enhanced WS error: {err}", flush=True)
+                    return
+
+                # Extract transaction data from notification
+                params = (data.get("params") or {})
+                result = (params.get("result") or {})
+                sig = result.get("signature") or ""
+                if not sig or sig in seen_signatures:
+                    return
+                seen_signatures.add(sig)
+
+                # The enhanced WS includes the full transaction — extract mints directly
+                tx = result.get("transaction") or {}
+                meta = tx.get("meta") or {}
+                post_bals = meta.get("postTokenBalances") or []
+                logs = meta.get("logMessages") or []
+
+                # Determine source
+                source_label = "helius-ews"
+                joined_logs = " ".join(str(l or "").lower() for l in logs)
+                if PUMP_FUN.lower() in joined_logs:
+                    source_label = "helius-ews:pumpfun"
+                elif RAYDIUM_AMM.lower() in joined_logs:
+                    source_label = "helius-ews:raydium"
+
+                # Filter: only process relevant transactions
+                if not any(kw in joined_logs for kw in ("initialize", "create", "buy", "swap")):
+                    return
+
+                # Extract mints from postTokenBalances (no extra RPC call needed!)
+                mints = set()
+                for pb in post_bals:
+                    mint = pb.get("mint") or ""
+                    if mint and mint != SOL_MINT:
+                        mints.add(mint)
+
+                if mints:
+                    with ThreadPoolExecutor(max_workers=min(4, len(mints))) as pool:
+                        pool.map(lambda m: _sniper_emit_token(m, source_label=source_label), mints)
+
+                # Prune cache
+                if len(seen_signatures) > _SEEN_SIG_MAX:
+                    seen_signatures.clear()
+            except Exception as e:
+                print(f"[Sniper] Enhanced WS message error: {e}", flush=True)
+
+        def on_error(ws, err):
+            err_text = str(err or "")
+            if "403" in err_text or "business" in err_text.lower() or "-32403" in err_text:
+                state["plan_blocked"] = True
+                print(f"[Sniper] Enhanced WS plan blocked — falling back to logsSubscribe", flush=True)
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return
+            if "429" in err_text or "too many" in err_text.lower():
+                state["rate_limited"] = True
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return
+            print(f"[Sniper] Enhanced WS error: {err}", flush=True)
+
+        def on_close(ws, *a):
+            if not state["plan_blocked"]:
+                print("[Sniper] Enhanced WS closed", flush=True)
+
+        ws_app = ws_lib.WebSocketApp(
+            ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        ws_app.run_forever(ping_interval=30, ping_timeout=15)
+
+        if state["plan_blocked"]:
+            return False  # Signal caller to fall back
+        if state["rate_limited"]:
+            time.sleep(30)
+        return True  # Was running, just disconnected — retry
+    except Exception as e:
+        print(f"[Sniper] Enhanced WS failed: {e}", flush=True)
+        return False
+
+
+def helius_pool_sniper():
+    """Listen for fresh Pump.fun and Raydium transactions and feed them into the main signal path.
+    Tries Enhanced WS (transactionSubscribe) first for fastest detection,
+    falls back to logsSubscribe, then RPC polling."""
+    import json as _json
+
+    # ── Try Enhanced WebSocket first (no getTransaction call needed) ──────
+    if HELIUS_API_KEY:
+        for _attempt in range(3):
+            result = _run_enhanced_ws_sniper()
+            if result is False:
+                break  # Plan doesn't support it, fall back
+            # True = was running but disconnected, retry
+            time.sleep(2)
+        if result is not False:
+            return  # Enhanced WS ran successfully
+
+    print("[Sniper] Using logsSubscribe (standard WebSocket)", flush=True)
+
+    # ── Fall back to logsSubscribe ────────────────────────────────────────
     ws_url = HELIUS_RPC.replace("https://", "wss://").replace("http://", "ws://")
+    # Also try the shared RPC WS if dedicated doesn't have WS support
+    if HELIUS_API_KEY:
+        ws_url = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
     tracked_programs = [
         (PUMP_FUN, "pumpfun"),
         (RAYDIUM_AMM, "raydium"),
@@ -7695,10 +7885,10 @@ def helius_pool_sniper():
                         "method": "logsSubscribe",
                         "params": [
                             {"mentions": [program_id]},
-                            {"commitment": "confirmed"},
+                            {"commitment": "processed"},
                         ],
                     }))
-                    print(f"[Sniper] Subscribed to {label} logs", flush=True)
+                    print(f"[Sniper] Subscribed to {label} logs (processed)", flush=True)
 
             def on_message(ws, message):
                 try:
@@ -7715,7 +7905,16 @@ def helius_pool_sniper():
                         source_label = "helius-ws:pumpfun"
                     elif RAYDIUM_AMM.lower() in joined_logs:
                         source_label = "helius-ws:raydium"
-                    _sniper_process_signature(sig, source_label, seen_signatures)
+
+                    # Try to extract mints from logs first (skip getTransaction if possible)
+                    log_mints = _extract_mints_from_logs(logs)
+                    if log_mints:
+                        with ThreadPoolExecutor(max_workers=min(4, len(log_mints))) as pool:
+                            pool.map(lambda m: _sniper_emit_token(m, source_label=source_label), log_mints)
+                    else:
+                        # Fall back to getTransaction for mint extraction
+                        _sniper_process_signature(sig, source_label, seen_signatures)
+
                     # Prune seen_signatures to prevent unbounded memory growth
                     if len(seen_signatures) > _SEEN_SIG_MAX:
                         seen_signatures.clear()
