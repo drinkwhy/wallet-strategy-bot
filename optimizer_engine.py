@@ -95,6 +95,7 @@ def summarize_feature_edges(snapshot_rows, outcome_labels, top_n=6):
         ("unique_buyer_count", False, "Unique buyers"),
         ("volume_spike_ratio", False, "Volume spike"),
         ("holder_growth_1h", False, "Holder growth"),
+        ("green_lights", False, "Green lights"),
         ("threat_risk_score", True, "Threat risk"),
         ("liquidity_drop_pct", True, "Liquidity drop"),
     ]
@@ -171,6 +172,7 @@ def summarize_regime_edges(snapshot_rows, outcome_labels, flow_rows, top_n=6):
         ("unique_buyer_count", False, "Unique buyers"),
         ("volume_spike_ratio", False, "Volume spike"),
         ("holder_growth_1h", False, "Holder growth"),
+        ("green_lights", False, "Green lights"),
         ("threat_risk_score", True, "Threat risk"),
         ("liquidity_drop_pct", True, "Liquidity drop"),
     ]
@@ -223,6 +225,7 @@ def sweep_entry_filters(snapshot_rows, outcome_labels, threshold_plan=None):
             "buy_sell_ratio": [1.0, 1.5, 2.0, 3.0],
             "smart_wallet_buys": [1, 2, 3],
             "net_flow_sol": [0.0, 2.0, 5.0, 10.0],
+            "green_lights": [1, 2, 3],
         }
 
     sweeps = []
