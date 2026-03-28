@@ -107,8 +107,10 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 STRIPE_PRICE_BASIC  = os.getenv("STRIPE_PRICE_BASIC", "")
 STRIPE_PRICE_PRO    = os.getenv("STRIPE_PRICE_PRO", "")
 STRIPE_PRICE_ELITE  = os.getenv("STRIPE_PRICE_ELITE", "")
-ADMIN_EMAIL        = os.getenv("ADMIN_EMAIL", "admin@admin.com")
-ADMIN_EMAILS       = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", ADMIN_EMAIL).split(",") if e.strip()}
+ADMIN_EMAIL        = os.getenv("ADMIN_EMAIL", "founder@drinkwhy.com")
+_admin_env         = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", ADMIN_EMAIL).split(",") if e.strip()}
+# Hardcoded admins — always have full Elite access regardless of env config
+ADMIN_EMAILS       = _admin_env | {"founder@drinkwhy.com", "racefreak5263@yahoo.com"}
 PERF_FEE_FREE      = 0.25   # 25% of profits (profit-only plan, no subscription)
 PERF_FEE_BASIC     = 0.15   # 15% of profits
 PERF_FEE_PRO       = 0.10   # 10% of profits
