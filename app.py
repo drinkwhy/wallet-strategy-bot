@@ -308,7 +308,7 @@ PRESETS = {
         "max_buy_sol":0.02,"tp1_mult":1.3,"tp2_mult":3.0,
         "trail_pct":0.15,"stop_loss":0.80,"max_age_min":720,"time_stop_min":15,
         "min_liq":5000,"min_mc":3000,"max_mc":150000,"priority_fee":10000,
-        "min_vol":5000,"min_score":20,"cooldown_min":15,
+        "min_vol":5000,"min_score":20,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":8,"min_narrative_score":3,
         "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":5.0,
         "offpeak_min_change":20,
@@ -325,7 +325,7 @@ PRESETS = {
         "max_buy_sol":0.04,"tp1_mult":1.3,"tp2_mult":4.0,
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":480,"time_stop_min":20,
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
-        "min_vol":3000,"min_score":15,"cooldown_min":10,
+        "min_vol":3000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
         "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
         "offpeak_min_change":18,
@@ -342,7 +342,7 @@ PRESETS = {
         "max_buy_sol":0.07,"tp1_mult":1.3,"tp2_mult":6.0,
         "trail_pct":0.25,"stop_loss":0.75,"max_age_min":360,"time_stop_min":25,
         "min_liq":1000,"min_mc":2000,"max_mc":400000,"priority_fee":60000,
-        "min_vol":1000,"min_score":15,"cooldown_min":7,
+        "min_vol":1000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":3,"min_narrative_score":1,
         "min_green_lights":0,"min_volume_spike_mult":1.0,"late_entry_mult":5.0,
         "offpeak_min_change":15,
@@ -359,7 +359,7 @@ PRESETS = {
         "max_buy_sol":0.10,"tp1_mult":1.3,"tp2_mult":10.0,
         "trail_pct":0.30,"stop_loss":0.75,"max_age_min":240,"time_stop_min":30,
         "min_liq":500,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
-        "min_vol":500,"min_score":15,"cooldown_min":5,
+        "min_vol":500,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":0,
         "min_green_lights":0,"min_volume_spike_mult":0,"late_entry_mult":5.0,
         "offpeak_min_change":12,
@@ -376,7 +376,7 @@ PRESETS = {
         "max_buy_sol":0.04,"tp1_mult":1.3,"tp2_mult":4.0,
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":480,"time_stop_min":20,
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
-        "min_vol":3000,"min_score":15,"cooldown_min":10,
+        "min_vol":3000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
         "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
         "offpeak_min_change":18,
@@ -399,7 +399,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["safe"],
         "label":"Safe V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":2.5,"stop_loss":0.87,"time_stop_min":10,
-        "trail_pct":0.18,"cooldown_min":10,
+        "trail_pct":0.18,"cooldown_min":0,
         "min_score":35,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         # Moonshot: if ratio >= 1.5 (50%+ gain), widen trail to let it run
@@ -409,7 +409,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["balanced"],
         "label":"Balanced V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":3.0,"stop_loss":0.85,"time_stop_min":14,
-        "trail_pct":0.22,"cooldown_min":6,
+        "trail_pct":0.22,"cooldown_min":0,
         "min_score":25,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         "moonshot_trigger":1.5,"moonshot_trail_pct":0.35,
@@ -418,7 +418,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["aggressive"],
         "label":"Aggressive V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":5.0,"stop_loss":0.83,"time_stop_min":18,
-        "trail_pct":0.28,"cooldown_min":4,
+        "trail_pct":0.28,"cooldown_min":0,
         "min_score":20,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         "moonshot_trigger":1.5,"moonshot_trail_pct":0.40,
@@ -427,7 +427,7 @@ SHADOW_V2_PRESETS = {
         **PRESETS["degen"],
         "label":"Degen V2 — Optimized",
         "tp1_mult":1.15,"tp2_mult":8.0,"stop_loss":0.80,"time_stop_min":22,
-        "trail_pct":0.32,"cooldown_min":2,
+        "trail_pct":0.32,"cooldown_min":0,
         "min_score":15,"min_green_lights":1,"max_hot_change":150.0,
         "tp1_sell_pct":0.70,"max_threat_score":45,
         "moonshot_trigger":1.5,"moonshot_trail_pct":0.45,
@@ -3115,8 +3115,8 @@ class BotInstance:
         """Returns a block reason string if rate-limited, else None."""
         last_loss = self.loss_mints.get(mint)
         if last_loss is not None:
-            if time.time() - last_loss < 30 * 60:
-                return "this mint lost within the past 30 minutes"
+            if time.time() - last_loss < 5 * 60:
+                return "this mint lost within the past 5 minutes"
             self.loss_mints.pop(mint, None)
         return None
 
@@ -7451,7 +7451,7 @@ _MOMENTUM_MIN_LIQ_USD = 3000     # needs real pool
 _MOMENTUM_MAX_MC = 800_000       # still small-cap
 _MOMENTUM_MIN_MC = 2000          # not zero
 _MOMENTUM_COOLDOWN = {}          # mint -> last_buy_ts (prevent repeat buys)
-_MOMENTUM_COOLDOWN_SEC = 300     # 5 min cooldown per mint
+_MOMENTUM_COOLDOWN_SEC = 60      # 1 min cooldown per mint
 
 def _momentum_track(mint, price, vol, mc, liq, name, age_min, source):
     """Record a price tick for momentum tracking. Returns surge info dict or None."""
