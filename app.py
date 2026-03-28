@@ -1902,8 +1902,7 @@ def get_wallet_balance_standalone(pubkey):
     if cached and (time.time() - cached[1]) < _WALLET_BAL_TTL:
         return cached[0]
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey, {"commitment": "confirmed"}]}
-    _fallbacks = []
-    _fallbacks.append(HELIUS_RPC)
+    _fallbacks = [HELIUS_RPC]
     if ANKR_RPC:
         _fallbacks.append(ANKR_RPC)
     _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
@@ -2535,8 +2534,7 @@ class BotInstance:
 
     def refresh_balance(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet, {"commitment":"confirmed"}]}
-        _fallbacks = []
-        _fallbacks.append(HELIUS_RPC)
+        _fallbacks = [HELIUS_RPC]
         if ANKR_RPC:
             _fallbacks.append(ANKR_RPC)
         _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
@@ -4451,8 +4449,7 @@ def get_helius_api_key():
 
 def rpc_call(method, params=None, timeout=10):
     """Call Solana RPC with fallback chain: Helius → ANKR → public."""
-    _rpc_endpoints = []
-    _rpc_endpoints.append(("helius", HELIUS_RPC))
+    _rpc_endpoints = [("helius", HELIUS_RPC)]
     if ANKR_RPC:
         _rpc_endpoints.append(("ankr", ANKR_RPC))
     _rpc_endpoints.append(("public", "https://solana-rpc.publicnode.com"))
