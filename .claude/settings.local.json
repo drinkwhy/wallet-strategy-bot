@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''app.py'', doraise=True\\); print\\(''app.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''optimizer_engine.py'', doraise=True\\); print\\(''optimizer_engine.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''quant_platform.py'', doraise=True\\); print\\(''quant_platform.py OK''\\)\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr:*)",
+      "Bash(git checkout:*)",
+      "Bash(git pull:*)",
+      "Bash(railway up:*)",
+      "Bash(wc -l /c/Users/dyllan/BOT/.claude/worktrees/sweet-fermat/*.py)"
+    ]
+  }
+}
