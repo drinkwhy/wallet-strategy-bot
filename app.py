@@ -126,6 +126,36 @@ if ANKR_RPC and not ANKR_RPC.startswith("http"):
     print(f"[WARN] ANKR_RPC ignored — not a valid URL: {ANKR_RPC[:60]}", flush=True)
     ANKR_RPC = ""
 
+# ── Helius Enhanced API ───────────────────────────────────────────────────────
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
+if not HELIUS_API_KEY:
+    # Try to extract from HELIUS_RPC URL (?api-key=...)
+    try:
+        from urllib.parse import parse_qs, urlparse as _urlparse
+        _parsed = _urlparse(HELIUS_RPC)
+        HELIUS_API_KEY = parse_qs(_parsed.query).get("api-key", [""])[0]
+    except Exception:
+        pass
+HELIUS_SHARED_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+HELIUS_SENDER_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}" if HELIUS_API_KEY else ""
+HELIUS_REST_API   = "https://api-mainnet.helius-rpc.com/v0"
+if HELIUS_API_KEY:
+    print(f"[CONFIG] Helius Enhanced API loaded — key={HELIUS_API_KEY[:8]}...", flush=True)
+else:
+    print("[WARN] No HELIUS_API_KEY — Enhanced APIs (Priority Fee, DAS) unavailable", flush=True)
+
+# ── Shared HTTP session for connection pooling ────────────────────────────────
+import requests.adapters
+_http_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=20,
+    max_retries=0,
+)
+_http_session.mount("https://", _adapter)
+_http_session.mount("http://", _adapter)
+_http_session.headers.update(HEADERS)
+
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
 SOL_MINT      = "So11111111111111111111111111111111111111112"
@@ -1902,27 +1932,29 @@ def get_wallet_balance_standalone(pubkey):
     if cached and (time.time() - cached[1]) < _WALLET_BAL_TTL:
         return cached[0]
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey, {"commitment": "confirmed"}]}
-    _fallbacks = [HELIUS_RPC]
+    _fallbacks = [("dedicated", HELIUS_RPC)]
+    if HELIUS_SHARED_RPC:
+        _fallbacks.append(("shared", HELIUS_SHARED_RPC))
     if ANKR_RPC:
-        _fallbacks.append(ANKR_RPC)
-    _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
-    for rpc_url in _fallbacks:
+        _fallbacks.append(("ankr", ANKR_RPC))
+    _fallbacks.append(("public", "https://solana-rpc.publicnode.com"))
+    for label, rpc_url in _fallbacks:
         try:
-            r = requests.post(rpc_url, json=payload, timeout=5)
+            r = _http_session.post(rpc_url, json=payload, timeout=5)
             data = safe_json_response(r)
             if not data:
-                print(f"[WARN] RPC {rpc_url} returned empty response", flush=True)
+                print(f"[WARN] Balance RPC {label} returned empty", flush=True)
                 continue
             if "error" in data:
-                print(f"[WARN] RPC error from {rpc_url}: {data.get('error')}", flush=True)
+                print(f"[WARN] Balance RPC {label} error: {data.get('error')}", flush=True)
                 continue
             val = data.get("result", {}).get("value", 0)
             balance = round(val / 1e9, 4)
             _wallet_balance_cache[pubkey] = (balance, time.time())
-            print(f"[BALANCE] Fetched {pubkey[:8]}... = {balance} SOL from {rpc_url}", flush=True)
+            print(f"[BALANCE] {pubkey[:8]}... = {balance} SOL via {label}", flush=True)
             return balance
         except Exception as e:
-            print(f"[WARN] RPC fetch failed for {rpc_url}: {e}", flush=True)
+            print(f"[WARN] Balance RPC {label} failed: {e}", flush=True)
             continue
     print(f"[ERROR] All RPC endpoints failed for {pubkey[:8]}...", flush=True)
     return 0
@@ -2112,7 +2144,7 @@ def send_sol(keypair, to_address, amount_sol):
         from solders.hash import Hash as SolHash
         lamports = int(amount_sol * 1e9)
         # get recent blockhash
-        bh_r = requests.post(HELIUS_RPC, json={
+        bh_r = _http_session.post(HELIUS_RPC, json={
             "jsonrpc":"2.0","id":1,"method":"getLatestBlockhash",
             "params":[{"commitment":"confirmed"}]
         }, timeout=8).json()
@@ -2122,7 +2154,7 @@ def send_sol(keypair, to_address, amount_sol):
         msg   = MessageV0.try_compile(keypair.pubkey(), [ix], [], blockhash)
         tx    = VersionedTransaction(msg, [keypair])
         enc   = base64.b64encode(bytes(tx)).decode()
-        res   = requests.post(HELIUS_RPC, json={
+        res   = _http_session.post(HELIUS_RPC, json={
             "jsonrpc":"2.0","id":1,"method":"sendTransaction",
             "params":[enc,{"encoding":"base64","skipPreflight":False,"preflightCommitment":"confirmed"}]
         }, timeout=15).json()
@@ -2534,22 +2566,23 @@ class BotInstance:
 
     def refresh_balance(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet, {"commitment":"confirmed"}]}
-        _fallbacks = [HELIUS_RPC]
+        _fallbacks = [("dedicated", HELIUS_RPC)]
+        if HELIUS_SHARED_RPC:
+            _fallbacks.append(("shared", HELIUS_SHARED_RPC))
         if ANKR_RPC:
-            _fallbacks.append(ANKR_RPC)
-        _fallbacks += ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"]
-        for rpc_url in _fallbacks:
+            _fallbacks.append(("ankr", ANKR_RPC))
+        _fallbacks.append(("public", "https://solana-rpc.publicnode.com"))
+        for label, rpc_url in _fallbacks:
             started = time.perf_counter()
-            label = "helius" if "helius" in rpc_url else "public"
             try:
-                r = requests.post(rpc_url, json=payload, timeout=5)
+                r = _http_session.post(rpc_url, json=payload, timeout=5)
                 latency = round((time.perf_counter() - started) * 1000)
                 data = safe_json_response(r)
                 if not data:
                     record_rpc_health(label, False, latency, "getBalance")
                     continue
                 if "error" in data:
-                    print(f"[WARN] Balance RPC error from {rpc_url[:40]}: {data['error']}", flush=True)
+                    print(f"[WARN] Balance RPC {label} error: {data['error']}", flush=True)
                     record_rpc_health(label, False, latency, "getBalance")
                     continue
                 val = data.get("result",{}).get("value",0)
@@ -2561,7 +2594,7 @@ class BotInstance:
             except Exception as _e:
                 latency = round((time.perf_counter() - started) * 1000)
                 record_rpc_health(label, False, latency, "getBalance")
-                print(f"[ERROR] Balance fetch failed ({rpc_url[:40]}): {_e}", flush=True)
+                print(f"[ERROR] Balance fetch failed ({label}): {_e}", flush=True)
         print(f"[ERROR] All RPCs failed for balance check, wallet={self.wallet}", flush=True)
 
     # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
@@ -2682,18 +2715,16 @@ class BotInstance:
         return VersionedTransaction(new_msg, [self.keypair])
 
     def _sender_endpoints(self):
-        from urllib.parse import urlparse, parse_qs
-        parsed  = urlparse(HELIUS_RPC)
-        api_key = parse_qs(parsed.query).get("api-key", [""])[0]
+        api_key = get_helius_api_key()
         qs = f"?api-key={api_key}" if api_key else ""
         return [
-            f"http://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
-            f"http://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
-            f"http://lon-sender.helius-rpc.com/fast{qs}",  # London
-            f"http://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
-            f"http://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
-            f"http://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
-            f"http://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
+            f"https://slc-sender.helius-rpc.com/fast{qs}",  # Salt Lake City
+            f"https://ewr-sender.helius-rpc.com/fast{qs}",  # Newark
+            f"https://lon-sender.helius-rpc.com/fast{qs}",  # London
+            f"https://fra-sender.helius-rpc.com/fast{qs}",  # Frankfurt
+            f"https://ams-sender.helius-rpc.com/fast{qs}",  # Amsterdam
+            f"https://sg-sender.helius-rpc.com/fast{qs}",   # Singapore
+            f"https://tyo-sender.helius-rpc.com/fast{qs}",  # Tokyo
         ]
 
     def _encode_signed_transaction(self, signed_tx):
@@ -2761,7 +2792,7 @@ class BotInstance:
         region_errors = []
 
         def _send_region(url):
-            r = requests.post(url, json={
+            r = _http_session.post(url, json={
                 "jsonrpc":"2.0","id":req_id,
                 "method":"sendTransaction","params":[enc, send_params]
             }, timeout=5)
@@ -2793,7 +2824,7 @@ class BotInstance:
 
         # ── fallback: regular Helius RPC ────────────────────────────────────
         try:
-            r   = requests.post(HELIUS_RPC, json={
+            r   = _http_session.post(HELIUS_RPC, json={
                 "jsonrpc":"2.0","id":1,"method":"sendTransaction",
                 "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]
             }, timeout=15)
@@ -2958,7 +2989,7 @@ class BotInstance:
         return None
 
     def get_token_balance(self, mint):
-        r = requests.post(HELIUS_RPC, json={
+        r = _http_session.post(HELIUS_RPC, json={
             "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
             "params":[self.wallet,{"mint":mint},{"encoding":"jsonParsed"}]
         }, timeout=5)
@@ -2984,7 +3015,7 @@ class BotInstance:
 
     def is_safe_token(self, mint):
         try:
-            r = requests.post(HELIUS_RPC, json={
+            r = _http_session.post(HELIUS_RPC, json={
                 "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
                 "params":[mint,{"encoding":"jsonParsed"}]
             }, timeout=5).json()
@@ -4435,6 +4466,9 @@ def _from_iso(value):
 
 
 def get_helius_api_key():
+    """Return the Helius API key — prefers HELIUS_API_KEY env var, falls back to URL parsing."""
+    if HELIUS_API_KEY:
+        return HELIUS_API_KEY
     try:
         from urllib.parse import parse_qs, urlparse
         parsed = urlparse(HELIUS_RPC)
@@ -4447,9 +4481,84 @@ def get_helius_api_key():
     return "" if "?" in tail else tail
 
 
+def helius_get_priority_fee(account_keys=None, tx_base58=None):
+    """Get recommended priority fee from Helius Enhanced API.
+    Returns fee in microlamports, or None on failure."""
+    if not HELIUS_API_KEY:
+        return None
+    try:
+        params = {"options": {"recommended": True, "includeAllPriorityFeeLevels": True}}
+        if tx_base58:
+            params["transaction"] = tx_base58
+        elif account_keys:
+            params["accountKeys"] = account_keys
+        else:
+            return None
+        resp = _http_session.post(
+            HELIUS_SHARED_RPC,
+            json={"jsonrpc": "2.0", "id": 1, "method": "getPriorityFeeEstimate", "params": [params]},
+            timeout=5,
+        )
+        data = resp.json()
+        result = data.get("result", {})
+        levels = result.get("priorityFeeLevels", {})
+        recommended = result.get("priorityFeeEstimate")
+        if recommended:
+            print(f"[HELIUS] Priority fee: recommended={recommended:.0f} µL | high={levels.get('high', '?')} veryHigh={levels.get('veryHigh', '?')}", flush=True)
+            return int(recommended)
+        return int(levels.get("high", 0)) or None
+    except Exception as e:
+        print(f"[HELIUS] getPriorityFeeEstimate failed: {e}", flush=True)
+        return None
+
+
+def helius_get_asset(mint_address):
+    """Fetch token metadata via Helius DAS API. Returns asset dict or None."""
+    if not HELIUS_API_KEY:
+        return None
+    try:
+        resp = _http_session.post(
+            HELIUS_SHARED_RPC,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getAsset",
+                "params": {"id": mint_address, "options": {"showFungible": True}},
+            },
+            timeout=8,
+        )
+        data = resp.json()
+        return data.get("result")
+    except Exception as e:
+        print(f"[HELIUS] getAsset({mint_address[:8]}) failed: {e}", flush=True)
+        return None
+
+
+def helius_get_token_accounts(owner):
+    """Fetch all SPL token accounts via DAS API. Returns list of accounts or []."""
+    if not HELIUS_API_KEY:
+        return []
+    try:
+        resp = _http_session.post(
+            HELIUS_SHARED_RPC,
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getTokenAccounts",
+                "params": {"owner": owner, "options": {"showZeroBalance": False}},
+            },
+            timeout=8,
+        )
+        data = resp.json()
+        return (data.get("result") or {}).get("token_accounts", [])
+    except Exception as e:
+        print(f"[HELIUS] getTokenAccounts failed: {e}", flush=True)
+        return []
+
+
 def rpc_call(method, params=None, timeout=10):
-    """Call Solana RPC with fallback chain: Helius → ANKR → public."""
-    _rpc_endpoints = [("helius", HELIUS_RPC)]
+    """Call Solana RPC with fallback chain: Dedicated → Shared Helius → ANKR → public."""
+    _rpc_endpoints = [("helius-dedicated", HELIUS_RPC)]
+    if HELIUS_SHARED_RPC:
+        _rpc_endpoints.append(("helius-shared", HELIUS_SHARED_RPC))
     if ANKR_RPC:
         _rpc_endpoints.append(("ankr", ANKR_RPC))
     _rpc_endpoints.append(("public", "https://solana-rpc.publicnode.com"))
@@ -4459,7 +4568,7 @@ def rpc_call(method, params=None, timeout=10):
     for label, url in _rpc_endpoints:
         started = time.perf_counter()
         try:
-            resp = requests.post(url, json=payload, headers=HEADERS, timeout=timeout)
+            resp = _http_session.post(url, json=payload, timeout=timeout)
             latency = round((time.perf_counter() - started) * 1000)
             if resp.ok:
                 body = resp.json()
@@ -4488,10 +4597,9 @@ def helius_address_transactions(address, limit=50, tx_type=None, timeout=10):
     if tx_type:
         params["type"] = tx_type
     try:
-        resp = requests.get(
-            f"https://api.helius.xyz/v0/addresses/{address}/transactions",
+        resp = _http_session.get(
+            f"{HELIUS_REST_API}/addresses/{address}/transactions",
             params=params,
-            headers=HEADERS,
             timeout=timeout,
         )
         data = resp.json() if resp.ok else []
@@ -5536,7 +5644,7 @@ def _poll_single_whale(wallet):
         if used_enhanced:
             return
         # Fallback: raw RPC signatures
-        r = requests.post(HELIUS_RPC, json={
+        r = _http_session.post(HELIUS_RPC, json={
             "jsonrpc": "2.0", "id": 1,
             "method": "getSignaturesForAddress",
             "params": [wallet, {"limit": 5}]
@@ -5546,7 +5654,7 @@ def _poll_single_whale(wallet):
             sig = sig_info.get("signature")
             if not sig or _whale_is_sig_seen(sig):
                 continue
-            tx_r = requests.post(HELIUS_RPC, json={
+            tx_r = _http_session.post(HELIUS_RPC, json={
                 "jsonrpc": "2.0", "id": 1,
                 "method": "getTransaction",
                 "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
@@ -7736,20 +7844,18 @@ def auto_restart_bots():
 
 def warm_sender_connections():
     """Ping Helius Sender regional nodes every 30s to reduce cold-start latency."""
-    from urllib.parse import urlparse, parse_qs
-    parsed  = urlparse(HELIUS_RPC)
-    api_key = parse_qs(parsed.query).get("api-key", [""])[0]
+    api_key = get_helius_api_key()
     qs = f"?api-key={api_key}" if api_key else ""
     endpoints = [
-        f"http://slc-sender.helius-rpc.com/fast{qs}",
-        f"http://ewr-sender.helius-rpc.com/fast{qs}",
+        f"https://slc-sender.helius-rpc.com/fast{qs}",
+        f"https://ewr-sender.helius-rpc.com/fast{qs}",
     ]
     while True:
         for url in endpoints:
             try:
-                requests.get(url.replace("/fast", "/ping"), timeout=4)
+                _http_session.get(url.replace("/fast", "/ping"), timeout=4)
             except Exception as _e:
-                print(f"[ERROR] {_e}", flush=True)
+                pass  # silent — just warming connections
         time.sleep(30)
 
 # ── CEX Listing Sniper ─────────────────────────────────────────────────────────
