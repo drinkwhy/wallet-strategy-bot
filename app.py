@@ -2576,10 +2576,11 @@ class BotInstance:
             if (time.time() - self.started_at) / 60 >= self.run_duration_min:
                 self.log_msg(f"Run duration reached ({self.run_duration_min} min) — stopping")
                 return True
-        if self.run_mode == "profit" and self.profit_target > 0:
-            if self.stats["total_pnl_sol"] >= self.profit_target:
-                self.log_msg(f"Profit target reached ({self.profit_target:.4f} SOL) — stopping")
-                return True
+        # Profit target no longer auto-stops — presets handle risk management
+        # if self.run_mode == "profit" and self.profit_target > 0:
+        #     if self.stats["total_pnl_sol"] >= self.profit_target:
+        #         self.log_msg(f"Profit target reached ({self.profit_target:.4f} SOL) — stopping")
+        #         return True
         return False
 
     def refresh_balance(self):
@@ -3903,9 +3904,9 @@ class BotInstance:
         min_vol = s.get("min_vol", 0)
         min_score = s.get("min_score", 0)
         min_green_lights = int(s.get("min_green_lights", 0))
-        min_holder_growth_pct = float(s.get("min_holder_growth_pct", 30))
-        min_narrative_score = int(s.get("min_narrative_score", 16))
-        min_volume_spike_mult = float(s.get("min_volume_spike_mult", 6))
+        min_holder_growth_pct = float(s.get("min_holder_growth_pct", 5))
+        min_narrative_score = int(s.get("min_narrative_score", 2))
+        min_volume_spike_mult = float(s.get("min_volume_spike_mult", 1.2))
         late_entry_mult = float(s.get("late_entry_mult", 5.0))
         nuclear_narrative_score = int(s.get("nuclear_narrative_score", 40))
         max_hot_change = float(s.get("max_hot_change", 400.0))
@@ -5079,7 +5080,7 @@ def build_narrative_profile(name, symbol, pair=None, deployer_stats=None, social
 
 def build_three_signal_checklist(info, intel, settings=None):
     settings = settings or PRESETS["balanced"]
-    deployer_threshold = max(10, int(settings.get("min_narrative_score", 20)) - 4)
+    deployer_threshold = max(1, int(settings.get("min_narrative_score", 2)) - 4)
     whale_override = int(intel.get("whale_score") or 0) >= 45 or int(intel.get("whale_action_score") or 0) >= 35
     price_momentum_override = (
         10 <= float(info.get("change") or 0) <= 25 and
@@ -5096,11 +5097,11 @@ def build_three_signal_checklist(info, intel, settings=None):
         whale_override
     )
     volume_pass = (
-        float(intel.get("volume_spike_ratio") or 0) >= float(settings.get("min_volume_spike_mult", 10)) or
-        float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 50)) or
+        float(intel.get("volume_spike_ratio") or 0) >= float(settings.get("min_volume_spike_mult", 1.2)) or
+        float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 5)) or
         price_momentum_override
     )
-    narrative_floor = max(8, int(settings.get("min_narrative_score", 20)) - 3)
+    narrative_floor = max(1, int(settings.get("min_narrative_score", 2)) - 3)
     aligned_tags = [tag for tag in (intel.get("narrative_tags") or []) if tag in set(market_mood_snapshot())]
     narrative_pass = (
         int(intel.get("narrative_score") or 0) >= narrative_floor or
@@ -5118,8 +5119,8 @@ def build_three_signal_checklist(info, intel, settings=None):
             "passed": volume_pass,
             "value": f"{float(intel.get('volume_spike_ratio') or 0):.1f}x vol | {float(intel.get('holder_growth_1h') or 0):+.0f}% holders",
             "threshold": (
-                f">= {settings.get('min_volume_spike_mult', 10)}x, "
-                f">= {settings.get('min_holder_growth_pct', 50)}%, "
+                f">= {settings.get('min_volume_spike_mult', 1.2)}x, "
+                f">= {settings.get('min_holder_growth_pct', 5)}%, "
                 "or 10-25% price change + strong momentum + whale/narrative confirmation"
             ),
         },
@@ -10029,6 +10030,52 @@ def api_manual_buy():
     threading.Thread(target=bot.buy, args=(mint, name, price), kwargs={"liq": 0, "dev_wallet": None}, daemon=True).start()
     return jsonify({"ok": True, "msg": f"Manual buy triggered for {name}"})
 
+@app.route("/api/force-buy", methods=["POST"])
+@login_required
+def api_force_buy():
+    """Force buy a token — bypasses all filters. For user-submitted buys from Approved Coins."""
+    uid = session["user_id"]
+    data = request.get_json(force=True) or {}
+    mint = (data.get("mint") or "").strip()
+    name = (data.get("name") or "Unknown").strip()[:64]
+    if not mint or len(mint) < 32 or len(mint) > 64:
+        return jsonify({"ok": False, "msg": "Invalid mint address"})
+    if not all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in mint):
+        return jsonify({"ok": False, "msg": "Invalid mint address format"})
+    bot = user_bots.get(uid)
+    if not bot or not bot.running:
+        return jsonify({"ok": False, "msg": "Bot not running — start bot first"})
+    if mint in bot.positions:
+        return jsonify({"ok": False, "msg": "Already in position"})
+    # Fetch live price from DexScreener
+    try:
+        resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
+        pairs = resp.json().get("pairs") or []
+        pair = next((p for p in pairs if p.get("chainId") == "solana"), None)
+        price = float(pair.get("priceUsd") or 0) if pair else 0
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0) if pair else 0
+    except Exception as _e:
+        print(f"[ERROR] Force buy price fetch: {_e}", flush=True)
+        price = 0
+        liq = 0
+    if not price:
+        return jsonify({"ok": False, "msg": "Could not fetch price"})
+    bot.log_msg(f"⚡ FORCE BUY {name} — user-submitted (bypassing filters)")
+    bot.log_filter(name, mint, True, "Force buy — user submitted")
+    threading.Thread(
+        target=bot.buy,
+        args=(mint, name, price),
+        kwargs={"liq": liq, "dev_wallet": None, "decision_context": {
+            "execution_mode": "live",
+            "selected_policy_label": "Force Buy",
+            "buy_reason": "user force buy",
+            "source_tag": "force_buy",
+            "allow_trade": True,
+        }},
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "msg": f"⚡ Force buy sent for {name}"})
+
 @app.route("/api/telegram", methods=["POST"])
 @login_required
 def api_telegram():
@@ -14688,6 +14735,13 @@ DASHBOARD_HTML = _CSS + """
         <div class="glass" style="padding:0;overflow:hidden">
           <div class="ev-approved-title">Approved Coins</div>
           <div class="ev-approved-sub">Tokens that passed all filters</div>
+          <!-- Force Buy input -->
+          <div style="padding:8px 12px;border-bottom:1px solid rgba(255,255,255,.04)">
+            <div style="display:flex;gap:6px">
+              <input id="force-buy-mint" type="text" placeholder="Paste mint address…" style="flex:1;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:7px 10px;font-size:11px;color:var(--t1);outline:none">
+              <button class="btn" style="font-size:10px;padding:7px 14px;white-space:nowrap;background:linear-gradient(135deg,#14c784,#0ea5e9);border:none;border-radius:8px;color:#fff;font-weight:700;cursor:pointer" onclick="submitForceBuy()">⚡ Force Buy</button>
+            </div>
+          </div>
           <div id="ev-approved-list" class="ev-approved-list">
             <div style="padding:20px;text-align:center;font-size:11px;color:var(--t3)">No approved coins yet</div>
           </div>
@@ -16025,6 +16079,42 @@ async function quickBuy(mint, name, btn) {
   if (res.ok) setTimeout(refresh, 2000);
 }
 
+// ── Force Buy (from Approved Coins) ──────────────────────────────────────────
+async function forceBuyCoin(mint, name, btn) {
+  const orig = btn.textContent;
+  btn.textContent = '…'; btn.disabled = true;
+  const res = await fetch('/api/force-buy', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mint, name})
+  }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
+  btn.textContent = res.ok ? '✅' : '❌';
+  showToast(res.ok ? '⚡ Force buy sent!' : '⚠ ' + (res.msg||'Buy failed'), res.ok);
+  setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
+  if (res.ok) setTimeout(refresh, 2000);
+}
+
+async function submitForceBuy() {
+  const input = document.getElementById('force-buy-mint');
+  const mint = (input.value || '').trim();
+  if (!mint || mint.length < 32) {
+    showToast('⚠ Paste a valid Solana mint address', false);
+    return;
+  }
+  // Try to get the name from DexScreener
+  let name = mint.slice(0, 8) + '…';
+  try {
+    const dex = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + mint).then(r => r.json());
+    const pair = (dex.pairs || []).find(p => p.chainId === 'solana');
+    if (pair && pair.baseToken) name = pair.baseToken.symbol || pair.baseToken.name || name;
+  } catch(e) {}
+  const res = await fetch('/api/force-buy', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mint, name})
+  }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
+  showToast(res.ok ? `⚡ Force buy sent for ${name}!` : '⚠ ' + (res.msg||'Buy failed'), res.ok);
+  if (res.ok) { input.value = ''; setTimeout(refresh, 2000); }
+}
+
 // ── Wallet Tree ───────────────────────────────────────────────────────────────
 async function openWalletTree(mint, name) {
   selectedMint = mint;
@@ -16207,12 +16297,12 @@ const SETTINGS_DEFAULTS = {
   drawdown_limit_sol: 0.5,
   max_correlated: 3,
   min_vol: 3000,
-  min_score: 30,
+  min_score: 15,
   risk_per_trade_pct: 2.0,
-  min_holder_growth_pct: 30,
-  min_narrative_score: 16,
-  min_green_lights: 1,
-  min_volume_spike_mult: 6,
+  min_holder_growth_pct: 5,
+  min_narrative_score: 2,
+  min_green_lights: 0,
+  min_volume_spike_mult: 1.2,
   late_entry_mult: 5.0,
   nuclear_narrative_score: 40,
   offpeak_min_change: 18,
@@ -16451,8 +16541,9 @@ function renderEvApproved(approved) {
     const col = tokColor(c.name || '?');
     const checks = (c.checklist || []).slice(0, 3);
     const ts = c.ts ? new Date(c.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
-    return `<div class="ev-coin-card" onclick="window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')">
-      <div class="ev-coin-top">
+    const mintShort = (c.mint||'').slice(0,8) + '…';
+    return `<div class="ev-coin-card">
+      <div class="ev-coin-top" onclick="window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')" style="cursor:pointer">
         <div style="display:flex;align-items:center;gap:8px">
           <div class="ev-coin-icon" style="background:${col}1a;color:${col}">${(c.name||'?').charAt(0)}</div>
           <div>
@@ -16470,6 +16561,10 @@ function renderEvApproved(approved) {
       <div class="ev-coin-checks" style="margin-top:5px">
         ${checks.map(ck => `<div class="ev-ck ${ck.passed?'p':'f'}" title="${ck.name||''}">${ck.passed?'&#10003;':'&#10007;'}</div>`).join('')}
         ${(c.narrative_tags||[]).slice(0,2).map(t => `<span class="ev-tag">${t}</span>`).join('')}
+      </div>
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button class="btn" style="flex:1;font-size:9px;padding:5px 0;background:linear-gradient(135deg,#14c784,#0ea5e9);border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer" onclick="event.stopPropagation();forceBuyCoin('${c.mint||''}','${(c.name||'?').replace(/'/g,"\\'")}',this)">⚡ Force Buy</button>
+        <button class="btn btn-ghost" style="flex:1;font-size:9px;padding:5px 0;border-radius:6px" onclick="event.stopPropagation();window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')">Chart →</button>
       </div>
     </div>`;
   }).join('');
