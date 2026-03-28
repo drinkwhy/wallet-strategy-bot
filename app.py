@@ -10051,6 +10051,135 @@ def api_filter_log():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/evaluation-feed")
+@login_required
+def api_evaluation_feed():
+    """Rich evaluation feed for the Scan tab — pulls from PostgreSQL with full intel."""
+    uid = session["user_id"]
+    limit = min(int(request.args.get("limit", 60)), 200)
+    filter_mode = request.args.get("filter", "all")  # all, passed, rejected
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Main evaluation entries from signal_explorer_log
+        where_clause = "WHERE user_id=%s"
+        params = [uid]
+        if filter_mode == "passed":
+            where_clause += " AND passed=1"
+        elif filter_mode == "rejected":
+            where_clause += " AND passed=0"
+        cur.execute(f"""
+            SELECT id, mint, name, passed, reason, payload_json, ts
+            FROM signal_explorer_log
+            {where_clause}
+            ORDER BY ts DESC
+            LIMIT %s
+        """, (*params, limit))
+        rows = cur.fetchall()
+
+        evaluations = []
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except Exception:
+                payload = {}
+            intel = payload.get("intel") or {}
+            checklist = intel.get("checklist") or payload.get("checklist") or []
+            ts_raw = row.get("ts")
+            ts_str = ts_raw.isoformat() if hasattr(ts_raw, "isoformat") else str(ts_raw or "")
+            evaluations.append({
+                "id": row.get("id"),
+                "mint": row.get("mint") or payload.get("mint", ""),
+                "name": row.get("name") or payload.get("name", "?"),
+                "passed": bool(row.get("passed")),
+                "reason": row.get("reason") or payload.get("reason", ""),
+                "reason_plain": _plain_reason(row.get("reason") or payload.get("reason", "")),
+                "score": payload.get("score") if isinstance(payload.get("score"), (int, float)) else (payload.get("score", {}).get("total", 0) if isinstance(payload.get("score"), dict) else 0),
+                "price": payload.get("price", 0),
+                "mc": payload.get("mc", 0),
+                "liq": payload.get("liq", 0),
+                "vol": payload.get("vol", 0),
+                "age_min": payload.get("age_min", 0),
+                "change": payload.get("change", 0),
+                "source": payload.get("source", ""),
+                "ts": ts_str,
+                "checklist": checklist[:3],
+                "green_lights": intel.get("green_lights", 0),
+                "threat_score": intel.get("threat_risk_score", 0),
+                "narrative_score": intel.get("narrative_score", 0),
+                "deployer_score": intel.get("deployer_score", 0),
+                "whale_score": intel.get("whale_score", 0),
+                "whale_action": intel.get("whale_action_score", 0),
+                "holder_growth": intel.get("holder_growth_1h", 0),
+                "volume_spike": intel.get("volume_spike_ratio", 0),
+                "narrative_tags": intel.get("narrative_tags") or [],
+                "deployer": (intel.get("deployer_wallet") or "")[:8],
+                "smart_first10": intel.get("smart_wallet_first10", 0),
+                "can_exit": intel.get("can_exit"),
+            })
+
+        # Pipeline stats
+        cur.execute("SELECT COUNT(*) AS n FROM signal_explorer_log WHERE user_id=%s", (uid,))
+        total = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("SELECT COUNT(*) AS n FROM signal_explorer_log WHERE user_id=%s AND passed=1", (uid,))
+        passed_count = int((cur.fetchone() or {}).get("n") or 0)
+        cur.execute("""
+            SELECT reason, COUNT(*) AS cnt
+            FROM signal_explorer_log
+            WHERE user_id=%s AND passed=0 AND reason IS NOT NULL AND reason != ''
+            GROUP BY reason ORDER BY cnt DESC LIMIT 5
+        """, (uid,))
+        top_rejects = [{"reason": r["reason"], "reason_plain": _plain_reason(r["reason"]), "count": r["cnt"]} for r in cur.fetchall()]
+
+        # Recent approved coins with enriched intel
+        cur.execute("""
+            SELECT mint, name, payload_json, ts
+            FROM signal_explorer_log
+            WHERE user_id=%s AND passed=1
+            ORDER BY ts DESC LIMIT 10
+        """, (uid,))
+        approved = []
+        for row in cur.fetchall():
+            try:
+                p = json.loads(row.get("payload_json") or "{}")
+            except Exception:
+                p = {}
+            intel = p.get("intel") or {}
+            ts_raw = row.get("ts")
+            approved.append({
+                "mint": row.get("mint", ""),
+                "name": row.get("name") or p.get("name", "?"),
+                "score": p.get("score") if isinstance(p.get("score"), (int, float)) else (p.get("score", {}).get("total", 0) if isinstance(p.get("score"), dict) else 0),
+                "price": p.get("price", 0),
+                "mc": p.get("mc", 0),
+                "liq": p.get("liq", 0),
+                "vol": p.get("vol", 0),
+                "change": p.get("change", 0),
+                "age_min": p.get("age_min", 0),
+                "green_lights": intel.get("green_lights", 0),
+                "checklist": (intel.get("checklist") or p.get("checklist") or [])[:3],
+                "narrative_tags": intel.get("narrative_tags") or [],
+                "whale_score": intel.get("whale_score", 0),
+                "deployer_score": intel.get("deployer_score", 0),
+                "threat_score": intel.get("threat_risk_score", 0),
+                "source": p.get("source", ""),
+                "ts": ts_raw.isoformat() if hasattr(ts_raw, "isoformat") else str(ts_raw or ""),
+            })
+    finally:
+        db_return(conn)
+
+    return jsonify({
+        "evaluations": evaluations,
+        "approved": approved,
+        "pipeline": {
+            "total_evaluated": total,
+            "total_passed": passed_count,
+            "pass_rate": round(passed_count / total * 100, 1) if total > 0 else 0,
+            "top_rejects": top_rejects,
+        },
+    })
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # QUANT DATA PLATFORM API ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -13613,7 +13742,7 @@ function toggleStop(v){
 DASHBOARD_HTML = _CSS + """
 <style>
 .dashboard-shell{max-width:1520px;padding-top:18px}
-.ticker-strip{background:rgba(11,21,36,.82);border-bottom:1px solid rgba(255,255,255,.06);overflow:hidden;height:38px;display:flex;align-items:center;backdrop-filter:blur(14px)}
+/* ticker-strip removed */
 .dashboard-hero{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.85fr);gap:18px;margin-bottom:18px}
 .hero-panel,.glass,.settings-card{
   background:linear-gradient(180deg, rgba(17,31,51,.94), rgba(10,19,32,.9));
@@ -13857,10 +13986,7 @@ DASHBOARD_HTML = _CSS + """
   </div>
 </nav>
 
-<div class="ticker-strip">
-  <div id="ticker-inner" style="display:flex;gap:28px;white-space:nowrap;animation:tickscroll 40s linear infinite;font-size:12px;color:var(--t2)">Loading market data…</div>
-</div>
-<style>.tick-item{display:inline-flex;gap:6px;align-items:center}.tick-name{font-weight:700;color:var(--t1);font-size:11px}@keyframes tickscroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}</style>
+<!-- ticker strip removed -->
 
 <div class="wrap dashboard-shell">
 
@@ -14216,7 +14342,7 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- Tab Bar -->
   <div class="tab-bar">
-    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Activity</span><span class="tab-btn-meta">Live feed, buys, skips &amp; limits</span></button>
+    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scan</span><span class="tab-btn-meta">Evaluation ramp &amp; approved coins</span></button>
     <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
     <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
     <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
@@ -14226,181 +14352,196 @@ DASHBOARD_HTML = _CSS + """
     <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')"><span class="tab-btn-label">Paper</span><span class="tab-btn-meta">Simulated trades, no real money</span></button>
   </div>
 
-  <!-- ═══════════════════════ SCANNER TAB ═══════════════════════ -->
+  <!-- ═══════════════════════ SCAN TAB — EVALUATION RAMP ═══════════════════════ -->
   <style>
-  /* ── Scanner Activity Tab ───────────────────────────── */
-  .sc-shadow-strip{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;background:rgba(20,199,132,.06);border:1px solid rgba(20,199,132,.18);border-radius:12px;padding:10px 16px;margin-bottom:12px}
-  .sc-shadow-left{display:flex;align-items:center;gap:8px}
-  .sc-live-dot{width:8px;height:8px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite;flex-shrink:0}
-  .sc-shadow-label{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#14c784}
-  .sc-shadow-preset{font-size:11px;font-weight:700;color:var(--blue2);background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.2);border-radius:6px;padding:2px 8px}
-  .sc-shadow-stats{display:flex;align-items:center;gap:16px}
-  .sc-shadow-stat{display:flex;flex-direction:column;align-items:center;gap:1px}
-  .sc-stat-val{font-size:15px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif}
-  .sc-stat-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--t3)}
-  .sc-stat-div{width:1px;height:24px;background:rgba(255,255,255,.08)}
   .pos{color:#14c784}.neg{color:#ef4444}.neu{color:var(--blue2)}
 
-  .sc-status-strip{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px}
-  .sc-status-pill{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:10px 14px;text-align:center}
-  .sc-status-val{font-size:18px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif;color:var(--t1)}
-  .sc-status-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);margin-top:2px}
+  /* ── Pipeline funnel strip ───────────────────────────── */
+  .ev-pipeline{display:flex;align-items:center;gap:0;margin-bottom:16px;background:rgba(8,16,32,.72);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:6px 8px;overflow-x:auto}
+  .ev-pipe-stage{flex:1;min-width:100px;text-align:center;padding:10px 8px;position:relative}
+  .ev-pipe-stage+.ev-pipe-stage::before{content:"";position:absolute;left:-1px;top:20%;height:60%;width:1px;background:rgba(255,255,255,.08)}
+  .ev-pipe-num{font-size:22px;font-weight:900;font-family:'Space Grotesk','Manrope',sans-serif;letter-spacing:-.5px;color:var(--t1)}
+  .ev-pipe-lbl{font-size:8px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--t3);margin-top:3px}
+  .ev-pipe-stage.pass .ev-pipe-num{color:#14c784}
+  .ev-pipe-stage.fail .ev-pipe-num{color:#ef4444}
+  .ev-pipe-stage.rate .ev-pipe-num{color:#f59e0b}
+  .ev-pipe-arrow{font-size:14px;color:rgba(255,255,255,.12);flex-shrink:0;padding:0 2px}
 
-  .sc-main-layout{display:grid;grid-template-columns:1fr 300px;gap:12px;align-items:start}
-  @media(max-width:900px){.sc-main-layout{grid-template-columns:1fr}}
-  @media(max-width:640px){.sc-status-strip{grid-template-columns:repeat(3,1fr)}}
+  /* ── Top rejection bar ───────────────────────────────── */
+  .ev-reject-bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px}
+  .ev-reject-chip{display:flex;align-items:center;gap:5px;padding:5px 10px;border-radius:8px;font-size:10px;font-weight:700;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.12);color:var(--t2)}
+  .ev-reject-chip .cnt{color:#ef4444;font-family:'Space Grotesk',sans-serif;font-weight:900}
 
-  .sc-feed-wrap{padding:0;overflow:hidden}
-  .sc-feed-head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap}
-  .sc-feed-title{display:flex;align-items:center;gap:7px;font-size:15px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif}
-  .sc-pulse-dot{width:7px;height:7px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite;flex-shrink:0}
-  .sc-feed-sub{font-size:11px;color:var(--t3);margin-top:2px}
-  .sc-feed-filters{display:flex;gap:6px}
-  .sc-filter-btn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:20px;color:var(--t2);font-size:11px;font-weight:600;padding:4px 12px;cursor:pointer;transition:all .15s}
-  .sc-filter-btn.active{background:rgba(20,199,132,.15);border-color:rgba(20,199,132,.4);color:#14c784}
-  .sc-filter-btn:hover{border-color:rgba(255,255,255,.2);color:var(--t1)}
+  /* ── Main layout ─────────────────────────────────────── */
+  .ev-layout{display:grid;grid-template-columns:1fr 340px;gap:14px;align-items:start}
+  @media(max-width:960px){.ev-layout{grid-template-columns:1fr}}
 
-  .sc-activity-feed{max-height:520px;overflow-y:auto;padding:6px 0}
-  .sc-event{display:flex;align-items:flex-start;gap:10px;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.03);transition:background .15s;cursor:default}
-  .sc-event:hover{background:rgba(255,255,255,.025)}
-  .sc-event-icon{font-size:16px;width:22px;text-align:center;flex-shrink:0;line-height:1.4}
-  .sc-event-body{flex:1;min-width:0}
-  .sc-event-name{font-size:13px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .sc-event-reason{font-size:11px;color:var(--t3);margin-top:1px;line-height:1.4}
-  .sc-event-meta{flex-shrink:0;text-align:right}
-  .sc-event-time{font-size:10px;color:var(--t3);font-family:monospace}
-  .sc-event-pnl{font-size:12px;font-weight:700;font-family:'Space Grotesk',sans-serif}
-  .sc-event.bought .sc-event-name{color:#4ade80}
-  .sc-event.bought .sc-event-icon{color:#4ade80}
-  .sc-event.skipped .sc-event-icon{color:#64748b}
-  .sc-event.skipped .sc-event-name{color:var(--t2)}
-  .sc-event.sold .sc-event-name{color:#fb923c}
-  .sc-event.sold .sc-event-icon{color:#fb923c}
-  .sc-event.system .sc-event-name{color:var(--blue2)}
-  .sc-event.system .sc-event-icon{color:var(--blue2)}
-  .sc-empty-state{padding:32px 16px;text-align:center;color:var(--t3);font-size:12px}
+  /* ── Evaluation log ──────────────────────────────────── */
+  .ev-log-wrap{padding:0;overflow:hidden}
+  .ev-log-head{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid rgba(255,255,255,.06);gap:10px;flex-wrap:wrap}
+  .ev-log-title{display:flex;align-items:center;gap:7px;font-size:15px;font-weight:800;font-family:'Space Grotesk','Manrope',sans-serif}
+  .ev-log-sub{font-size:11px;color:var(--t3);margin-top:2px}
+  .ev-pulse{width:7px;height:7px;border-radius:50%;background:#14c784;animation:livePulse 1.5s ease-in-out infinite;flex-shrink:0}
+  .ev-filters{display:flex;gap:5px}
+  .ev-fbtn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:20px;color:var(--t2);font-size:10px;font-weight:700;padding:4px 11px;cursor:pointer;transition:.15s}
+  .ev-fbtn.active{background:rgba(20,199,132,.15);border-color:rgba(20,199,132,.4);color:#14c784}
+  .ev-fbtn:hover{border-color:rgba(255,255,255,.2);color:var(--t1)}
+  .ev-log-list{max-height:600px;overflow-y:auto;padding:4px 0}
 
-  .sc-sidebar{display:flex;flex-direction:column;gap:10px}
-  .sc-card-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);padding:12px 14px 6px}
-  .sc-preset-badge{margin:0 14px 10px;padding:5px 12px;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.25);border-radius:8px;font-size:12px;font-weight:700;color:var(--blue2);text-align:center}
-  .sc-settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(255,255,255,.04);border-top:1px solid rgba(255,255,255,.04);border-bottom:1px solid rgba(255,255,255,.04)}
-  .sc-setting-item{padding:8px 12px;background:rgba(8,16,32,.8)}
-  .sc-setting-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3)}
-  .sc-setting-val{font-size:13px;font-weight:700;color:var(--t1);margin-top:2px}
+  /* ── Individual evaluation row ───────────────────────── */
+  .ev-row{display:grid;grid-template-columns:28px 1fr 90px 180px 70px;gap:8px;align-items:center;padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.03);transition:background .12s;cursor:pointer}
+  .ev-row:hover{background:rgba(255,255,255,.025)}
+  @media(max-width:1100px){.ev-row{grid-template-columns:28px 1fr 90px 70px}}
+  @media(max-width:700px){.ev-row{grid-template-columns:28px 1fr 70px}}
+  .ev-verdict{width:24px;height:24px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;flex-shrink:0}
+  .ev-verdict.pass{background:rgba(20,199,132,.12);border:1px solid rgba(20,199,132,.3);color:#14c784}
+  .ev-verdict.fail{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);color:#ef4444}
+  .ev-info{min-width:0}
+  .ev-name{font-size:12px;font-weight:800;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ev-name .ev-src{font-size:9px;font-weight:600;color:var(--t3);margin-left:6px;letter-spacing:.04em}
+  .ev-reason{font-size:10px;color:var(--t3);margin-top:1px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ev-reason.pass-reason{color:rgba(20,199,132,.7)}
+  .ev-score{display:flex;align-items:center;gap:5px}
+  .ev-score-bar{height:5px;width:50px;border-radius:99px;background:rgba(255,255,255,.06);overflow:hidden}
+  .ev-score-fill{height:100%;border-radius:99px}
+  .ev-score-num{font-size:10px;font-weight:800;font-family:monospace}
+  .ev-checks{display:flex;gap:3px;flex-wrap:nowrap}
+  .ev-ck{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:900;border:1px solid transparent}
+  .ev-ck.p{background:rgba(20,199,132,.1);border-color:rgba(20,199,132,.25);color:#14c784}
+  .ev-ck.f{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.2);color:#ef4444}
+  .ev-time{font-size:10px;color:var(--t3);font-family:monospace;text-align:right}
+  .ev-tags{display:flex;gap:3px;flex-wrap:wrap;margin-top:3px}
+  .ev-tag{font-size:8px;font-weight:700;padding:1px 5px;border-radius:4px;background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.2);color:#c084fc;text-transform:uppercase;letter-spacing:.05em}
+  .ev-empty{padding:40px 16px;text-align:center;color:var(--t3);font-size:13px;line-height:1.7}
 
-  .sc-budget-card{padding:0;overflow:hidden}
-  .sc-budget-row{display:flex;align-items:center;justify-content:space-between;padding:6px 14px;font-size:12px}
-  .sc-budget-lbl{color:var(--t3)}
-  .sc-budget-val{font-weight:700;color:var(--t1)}
-  .sc-budget-input-row{padding:5px 14px}
-  .sc-finput-lbl{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin-bottom:4px}
-  .sc-budget-save{width:calc(100% - 28px);margin:8px 14px 12px;display:block}
+  /* ── Expanded detail panel (click a row) ─────────────── */
+  .ev-detail{display:none;background:rgba(8,16,32,.96);border:1px solid rgba(59,130,246,.2);border-radius:14px;padding:16px;margin:0 14px 10px;animation:fadeSlideIn .25s ease}
+  .ev-detail.open{display:block}
+  .ev-detail-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+  .ev-detail-title{font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk',sans-serif}
+  .ev-detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin-bottom:12px}
+  .ev-detail-cell{padding:8px;border-radius:8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05)}
+  .ev-detail-lbl{font-size:8px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--t3)}
+  .ev-detail-val{font-size:14px;font-weight:800;color:var(--t1);margin-top:2px;font-family:'Space Grotesk',sans-serif}
+  .ev-checklist-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px}
+  .ev-checklist-row:last-child{border-bottom:none}
+  .ev-checklist-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .ev-checklist-dot.p{background:#14c784}.ev-checklist-dot.f{background:#ef4444}
+  .ev-checklist-name{color:var(--t2);font-weight:600}
+  .ev-checklist-status{margin-left:auto;font-weight:800;font-size:11px}
+
+  /* ── Approved coins sidebar ──────────────────────────── */
+  .ev-sidebar{display:flex;flex-direction:column;gap:12px;position:sticky;top:148px}
+  .ev-approved-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.12em;color:#14c784;padding:14px 16px 0}
+  .ev-approved-sub{font-size:10px;color:var(--t3);padding:0 16px 8px;border-bottom:1px solid rgba(255,255,255,.04)}
+  .ev-approved-list{max-height:440px;overflow-y:auto;padding:6px 0}
+  .ev-coin-card{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.03);transition:background .12s;cursor:pointer}
+  .ev-coin-card:hover{background:rgba(20,199,132,.04)}
+  .ev-coin-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .ev-coin-icon{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;flex-shrink:0}
+  .ev-coin-name{font-size:12px;font-weight:800;color:var(--t1)}
+  .ev-coin-meta{font-size:10px;color:var(--t3);margin-top:1px}
+  .ev-coin-score{font-size:16px;font-weight:900;font-family:'Space Grotesk',sans-serif}
+  .ev-coin-metrics{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:6px}
+  .ev-coin-m{font-size:9px;color:var(--t3)}.ev-coin-mv{font-weight:800;color:var(--t2)}
+  .ev-coin-checks{display:flex;gap:3px;margin-top:5px}
+
+  /* ── Session controls sidebar card ───────────────────── */
+  .ev-ctrl-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);padding:12px 14px 6px}
+  .ev-ctrl-row{display:flex;justify-content:space-between;padding:5px 14px;font-size:11px}
+  .ev-ctrl-lbl{color:var(--t3)}.ev-ctrl-val{font-weight:700;color:var(--t1)}
+  .ev-input-row{padding:4px 14px}
+  .ev-input-lbl{display:block;font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin-bottom:3px}
   </style>
 
   <div id="tab-scanner" class="tab-pane active">
-    <!-- Shadow Trading Strip -->
-    <div class="sc-shadow-strip">
-      <div class="sc-shadow-left">
-        <span class="sc-live-dot"></span>
-        <span class="sc-shadow-label">Shadow Trading</span>
-        <span class="sc-shadow-preset" id="sc-shadow-preset">loading…</span>
-      </div>
-      <div class="sc-shadow-stats">
-        <span class="sc-shadow-stat"><span class="sc-stat-val neu" id="sc-shadow-wr">—</span><span class="sc-stat-lbl">Win Rate</span></span>
-        <span class="sc-stat-div"></span>
-        <span class="sc-shadow-stat"><span class="sc-stat-val neu" id="sc-shadow-pnl2">0%</span><span class="sc-stat-lbl">Avg P&L</span></span>
-        <span class="sc-stat-div"></span>
-        <span class="sc-shadow-stat"><span class="sc-stat-val pos" id="sc-shadow-trades2">0</span><span class="sc-stat-lbl">Shadow Trades</span></span>
-      </div>
-      <span class="badge bg-blue" style="font-size:9px">Auto-Tune Active</span>
+
+    <!-- Pipeline Funnel -->
+    <div class="ev-pipeline" id="ev-pipeline">
+      <div class="ev-pipe-stage"><div class="ev-pipe-num" id="evp-scanned">0</div><div class="ev-pipe-lbl">Scanned</div></div>
+      <div class="ev-pipe-arrow">&rsaquo;</div>
+      <div class="ev-pipe-stage"><div class="ev-pipe-num" id="evp-evaluated">0</div><div class="ev-pipe-lbl">Evaluated</div></div>
+      <div class="ev-pipe-arrow">&rsaquo;</div>
+      <div class="ev-pipe-stage pass"><div class="ev-pipe-num" id="evp-passed">0</div><div class="ev-pipe-lbl">Approved</div></div>
+      <div class="ev-pipe-arrow">&rsaquo;</div>
+      <div class="ev-pipe-stage fail"><div class="ev-pipe-num" id="evp-rejected">0</div><div class="ev-pipe-lbl">Rejected</div></div>
+      <div class="ev-pipe-arrow">&rsaquo;</div>
+      <div class="ev-pipe-stage rate"><div class="ev-pipe-num" id="evp-rate">0%</div><div class="ev-pipe-lbl">Pass Rate</div></div>
     </div>
 
-    <!-- Quick Status Strip -->
-    <div class="sc-status-strip">
-      <div class="sc-status-pill">
-        <div class="sc-status-val" id="sc-wallet-bal">—</div>
-        <div class="sc-status-lbl">Wallet SOL</div>
-      </div>
-      <div class="sc-status-pill">
-        <div class="sc-status-val" id="sc-budget-display">—</div>
-        <div class="sc-status-lbl">Session Budget</div>
-      </div>
-      <div class="sc-status-pill">
-        <div class="sc-status-val" id="sc-open-trades">0</div>
-        <div class="sc-status-lbl">Open Trades</div>
-      </div>
-      <div class="sc-status-pill">
-        <div class="sc-status-val" id="sc-session-pnl" style="color:#14c784">+0.00</div>
-        <div class="sc-status-lbl">Session P&L</div>
-      </div>
-      <div class="sc-status-pill">
-        <div class="sc-status-val" id="sc-session-wr">—</div>
-        <div class="sc-status-lbl">Win Rate</div>
-      </div>
-    </div>
+    <!-- Top Rejection Reasons -->
+    <div class="ev-reject-bar" id="ev-reject-bar"></div>
 
-    <!-- Main Layout: Activity Feed + Sidebar -->
-    <div class="sc-main-layout">
-      <!-- Activity Feed -->
-      <div class="glass sc-feed-wrap">
-        <div class="sc-feed-head">
+    <!-- Main Layout -->
+    <div class="ev-layout">
+      <!-- Evaluation Log -->
+      <div class="glass ev-log-wrap">
+        <div class="ev-log-head">
           <div>
-            <div class="sc-feed-title">
-              <span class="sc-pulse-dot"></span>
-              Live Activity
-            </div>
-            <div class="sc-feed-sub" id="sc-feed-sub">Waiting for bot activity…</div>
+            <div class="ev-log-title"><span class="ev-pulse"></span> Evaluation Ramp</div>
+            <div class="ev-log-sub" id="ev-log-sub">Every coin the bot sees flows through here</div>
           </div>
-          <div class="sc-feed-filters">
-            <button class="sc-filter-btn active" data-filter="all" onclick="scSetFilter(this)">All</button>
-            <button class="sc-filter-btn" data-filter="bought" onclick="scSetFilter(this)">Bought</button>
-            <button class="sc-filter-btn" data-filter="skipped" onclick="scSetFilter(this)">Skipped</button>
+          <div class="ev-filters">
+            <button class="ev-fbtn active" data-evf="all" onclick="evSetFilter(this)">All</button>
+            <button class="ev-fbtn" data-evf="passed" onclick="evSetFilter(this)">Approved</button>
+            <button class="ev-fbtn" data-evf="rejected" onclick="evSetFilter(this)">Rejected</button>
           </div>
         </div>
-        <div id="sc-activity-feed" class="sc-activity-feed">
-          <div class="sc-empty-state">Start the bot to see live activity here</div>
+        <div id="ev-log-list" class="ev-log-list">
+          <div class="ev-empty">Start the bot to see coin evaluations flow through the pipeline</div>
         </div>
       </div>
 
       <!-- Sidebar -->
-      <div class="sc-sidebar">
-        <!-- Current Strategy Settings -->
+      <div class="ev-sidebar">
+        <!-- Approved Coins -->
         <div class="glass" style="padding:0;overflow:hidden">
-          <div class="sc-card-title">Active Strategy</div>
-          <div class="sc-preset-badge" id="sc-preset-name">—</div>
-          <div class="sc-settings-grid" id="sc-settings-grid"></div>
-          <div style="padding:8px 14px 12px">
-            <button class="btn btn-ghost" style="width:100%;font-size:11px" onclick="activateTab('settings')">Adjust Settings →</button>
+          <div class="ev-approved-title">Approved Coins</div>
+          <div class="ev-approved-sub">Tokens that passed all filters</div>
+          <div id="ev-approved-list" class="ev-approved-list">
+            <div style="padding:20px;text-align:center;font-size:11px;color:var(--t3)">No approved coins yet</div>
           </div>
         </div>
 
-        <!-- Session Budget Controls -->
-        <div class="glass sc-budget-card">
-          <div class="sc-card-title">Session Limits</div>
-          <div class="sc-budget-row">
-            <span class="sc-budget-lbl">Wallet Balance</span>
-            <span class="sc-budget-val" id="sc-wallet-bal2">— SOL</span>
+        <!-- Session Controls -->
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div class="ev-ctrl-title">Session</div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Balance</span><span class="ev-ctrl-val" id="sc-wallet-bal">—</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Open Trades</span><span class="ev-ctrl-val" id="sc-open-trades">0</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Session P&L</span><span class="ev-ctrl-val" id="sc-session-pnl" style="color:#14c784">+0.00</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Win Rate</span><span class="ev-ctrl-val" id="sc-session-wr">—</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Preset</span><span class="ev-ctrl-val" id="sc-preset-name">—</span></div>
+          <div style="padding:6px 14px 10px">
+            <button class="btn btn-ghost" style="width:100%;font-size:10px" onclick="activateTab('settings')">Settings &rarr;</button>
           </div>
-          <div class="sc-budget-input-row">
-            <label class="sc-finput-lbl">Trade Budget (SOL)</label>
-            <input id="sc-budget-input" type="number" class="finput" step="0.01" min="0" placeholder="e.g. 0.5 (0 = no limit)">
+        </div>
+
+        <!-- Budget Controls -->
+        <div class="glass" style="padding:0;overflow:hidden">
+          <div class="ev-ctrl-title">Session Limits</div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Wallet</span><span class="ev-ctrl-val" id="sc-wallet-bal2">— SOL</span></div>
+          <div class="ev-input-row">
+            <label class="ev-input-lbl">Budget (SOL)</label>
+            <input id="sc-budget-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = no limit" style="font-size:11px">
           </div>
-          <div class="sc-budget-input-row">
-            <label class="sc-finput-lbl">Stop at Profit (SOL)</label>
-            <input id="sc-profit-input" type="number" class="finput" step="0.01" min="0" placeholder="e.g. 0.2 (0 = off)">
+          <div class="ev-input-row">
+            <label class="ev-input-lbl">Profit Target</label>
+            <input id="sc-profit-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = off" style="font-size:11px">
           </div>
-          <div class="sc-budget-input-row">
-            <label class="sc-finput-lbl">Stop at Loss (SOL)</label>
-            <input id="sc-loss-input" type="number" class="finput" step="0.01" min="0" placeholder="e.g. 0.1 (0 = off)">
+          <div class="ev-input-row">
+            <label class="ev-input-lbl">Loss Limit</label>
+            <input id="sc-loss-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = off" style="font-size:11px">
           </div>
-          <button class="btn btn-primary sc-budget-save" onclick="saveBudgetSettings()">Save Limits</button>
+          <div style="padding:6px 14px 10px">
+            <button class="btn btn-primary" style="width:100%;font-size:10px" onclick="saveBudgetSettings()">Save Limits</button>
+          </div>
         </div>
 
         <!-- Open Positions -->
         <div class="glass" style="padding:0;overflow:hidden">
-          <div class="sc-card-title">Open Positions</div>
-          <div id="pos-tbl" style="padding:6px 14px 12px;max-height:240px;overflow-y:auto">
-            <div style="font-size:12px;color:var(--t3)">No open positions</div>
+          <div class="ev-ctrl-title">Open Positions</div>
+          <div id="pos-tbl" style="padding:6px 14px 12px;max-height:200px;overflow-y:auto">
+            <div style="font-size:11px;color:var(--t3)">No open positions</div>
           </div>
         </div>
 
@@ -14420,6 +14561,18 @@ DASHBOARD_HTML = _CSS + """
           <span id="scanner-last-listing"></span>
           <span id="scanner-sync-copy"></span>
           <span id="scanner-active-tab"></span>
+          <span id="sc-shadow-preset"></span>
+          <span id="sc-shadow-wr"></span>
+          <span id="sc-shadow-pnl2"></span>
+          <span id="sc-shadow-trades2"></span>
+          <span id="sc-budget-display"></span>
+          <div id="sc-settings-grid"></div>
+          <div id="sc-activity-feed"></div>
+          <div id="sc-feed-sub"></div>
+          <span id="token-count">0</span>
+          <div id="token-rows"></div>
+          <span id="ticker-inner"></span>
+          <input id="scan-search" type="hidden">
         </div>
       </div>
     </div>
@@ -15354,6 +15507,7 @@ function switchTab(tab, btn) {
   // Start tab-specific polling
   Object.values(_tabPollers).forEach(id => clearInterval(id));
   _tabPollers = {};
+  if (tab === 'scanner') { pollEvaluationFeed(); _tabPollers.ev = setInterval(pollEvaluationFeed, 6000); }
   if (tab === 'signals') { pollSignals(); _tabPollers.sig = setInterval(pollSignals, 6000); }
   if (tab === 'whales') { pollWhales(); _tabPollers.whale = setInterval(pollWhales, 8000); }
   if (tab === 'positions') { pollPositions(); _tabPollers.pos = setInterval(pollPositions, 5000); }
@@ -15702,7 +15856,7 @@ async function openWalletTree(mint, name) {
   }
   panel.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
-function closeTree() { selectedMint = null; document.getElementById('tree-panel').style.display = 'none'; renderTokenRows(); }
+function closeTree() { selectedMint = null; const tp = document.getElementById('tree-panel'); if (tp) tp.style.display = 'none'; renderTokenRows(); }
 function drawTreeBg() { if (!treeCanvas) return; treeCtx.fillStyle = '#070d17'; treeCtx.fillRect(0,0,treeCanvas.width,treeCanvas.height); }
 function drawTreeMsg(msg) {
   const W = treeCanvas.width, H = treeCanvas.height;
@@ -15787,17 +15941,7 @@ async function pollFeed() {
 }
 
 function updateTicker() {
-  const items = allTokens.slice(0, 20).map(t => {
-    const chg = t.change || 0;
-    const col = chg >= 0 ? '#14c784' : '#f23645';
-    return `<span class="tick-item">
-      <span class="tick-name">${t.symbol||t.name||'?'}</span>
-      <span style="font-family:monospace;font-size:11px">${fmtPrice(t.price)}</span>
-      <span style="color:${col};font-weight:700">${chgStr(chg)}</span>
-    </span>`;
-  });
-  const html = [...items, ...items].join('');
-  document.getElementById('ticker-inner').innerHTML = html || 'Loading market data\u2026';
+  // Ticker strip removed — no-op stub
 }
 
 // ── CEX Listing alerts ────────────────────────────────────────────────────────
@@ -15957,41 +16101,176 @@ function applySettingsToForm(settings, presetName) {
   setChecked('s-auto-promote', s.auto_promote ?? SETTINGS_DEFAULTS.auto_promote);
   renderSettingsVisuals({ ...s, preset: presetName || s.preset || 'balanced' });
 }
-// ── Scanner Activity Tab ─────────────────────────────────────────
-let _scFilter = 'all';
-let _scEvents = [];
+// ── Evaluation Ramp Tab ──────────────────────────────────────────
+let _evFilter = 'all';
+let _evData = { evaluations: [], approved: [], pipeline: {} };
+let _evExpandedId = null;
+let _scFilter = 'all';  // backward compat
+let _scEvents = [];       // backward compat
 
-function scSetFilter(btn) {
-  _scFilter = btn.dataset.filter;
-  document.querySelectorAll('.sc-filter-btn').forEach(b => b.classList.remove('active'));
+function evSetFilter(btn) {
+  _evFilter = btn.dataset.evf;
+  document.querySelectorAll('.ev-fbtn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  renderScEvents();
+  pollEvaluationFeed();
 }
 
-function renderScEvents() {
-  const feed = document.getElementById('sc-activity-feed');
-  if (!feed) return;
-  const visible = _scFilter === 'all' ? _scEvents : _scEvents.filter(e => e.type === _scFilter);
-  if (!visible.length) {
-    feed.innerHTML = '<div class="sc-empty-state">No activity yet — start the bot to see events</div>';
+function scSetFilter() {} // stub
+
+async function pollEvaluationFeed() {
+  try {
+    const data = await fetch('/api/evaluation-feed?limit=60&filter=' + _evFilter).then(r => r.json()).catch(() => null);
+    if (data) {
+      _evData = data;
+      renderEvPipeline(data.pipeline || {});
+      renderEvRejectBar(data.pipeline?.top_rejects || []);
+      renderEvLog();
+      renderEvApproved(data.approved || []);
+    }
+  } catch(e) {}
+}
+
+function renderEvPipeline(p) {
+  const total = p.total_evaluated || 0;
+  const passed = p.total_passed || 0;
+  const rejected = total - passed;
+  setText('evp-scanned', total.toLocaleString());
+  setText('evp-evaluated', total.toLocaleString());
+  setText('evp-passed', passed.toLocaleString());
+  setText('evp-rejected', rejected.toLocaleString());
+  setText('evp-rate', (p.pass_rate || 0).toFixed(1) + '%');
+}
+
+function renderEvRejectBar(rejects) {
+  const el = document.getElementById('ev-reject-bar');
+  if (!el) return;
+  if (!rejects.length) { el.innerHTML = ''; return; }
+  el.innerHTML = rejects.slice(0, 5).map(r =>
+    `<div class="ev-reject-chip"><span class="cnt">${r.count}</span> ${r.reason_plain || r.reason}</div>`
+  ).join('');
+}
+
+function renderEvLog() {
+  const list = document.getElementById('ev-log-list');
+  if (!list) return;
+  const evals = _evData.evaluations || [];
+  const sub = document.getElementById('ev-log-sub');
+  if (sub) sub.textContent = evals.length + ' evaluations loaded from database';
+
+  if (!evals.length) {
+    list.innerHTML = '<div class="ev-empty">No evaluations yet. Start the bot to see coins flow through the pipeline.<br><span style="font-size:11px;color:var(--t3);margin-top:8px;display:block">The bot scans for new tokens, evaluates them through filters, and logs every decision here.</span></div>';
     return;
   }
-  feed.innerHTML = visible.slice(0, 80).map(ev => {
-    const icons = {bought:'🟢', skipped:'⬜', sold:'🔴', system:'⚙️'};
-    const icon = icons[ev.type] || '•';
-    const pnlHtml = ev.pnl != null
-      ? `<div class="sc-event-pnl ${ev.pnl >= 0 ? 'pos' : 'neg'}">${ev.pnl >= 0 ? '+' : ''}${ev.pnl}%</div>`
-      : '';
-    return `<div class="sc-event ${ev.type}">
-      <div class="sc-event-icon">${icon}</div>
-      <div class="sc-event-body">
-        <div class="sc-event-name">${ev.name || '—'}</div>
-        <div class="sc-event-reason">${ev.reason || ''}</div>
+
+  list.innerHTML = evals.map(ev => {
+    const sc = typeof ev.score === 'number' ? ev.score : 0;
+    const col = scoreColor(sc);
+    const checks = (ev.checklist || []).slice(0, 3);
+    const checksHtml = checks.length
+      ? checks.map(c => `<div class="ev-ck ${c.passed ? 'p' : 'f'}" title="${c.name || ''}">${c.passed ? '&#10003;' : '&#10007;'}</div>`).join('')
+      : '<div class="ev-ck f">?</div><div class="ev-ck f">?</div><div class="ev-ck f">?</div>';
+    const tagsHtml = (ev.narrative_tags || []).slice(0, 3).map(t =>
+      `<span class="ev-tag">${t}</span>`
+    ).join('');
+    const ts = ev.ts ? new Date(ev.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+    const isExpanded = _evExpandedId === ev.id;
+
+    let detailHtml = '';
+    if (isExpanded) {
+      detailHtml = `<div class="ev-detail open">
+        <div class="ev-detail-head">
+          <div class="ev-detail-title">${ev.name || '?'} <span style="font-size:11px;color:var(--t3);font-weight:400;margin-left:8px">${ev.mint ? ev.mint.slice(0,12)+'...' : ''}</span></div>
+          <a href="https://dexscreener.com/solana/${ev.mint || ''}" target="_blank" style="font-size:10px;color:var(--blue2);text-decoration:none">DexScreener &rarr;</a>
+        </div>
+        <div class="ev-detail-grid">
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Score</div><div class="ev-detail-val" style="color:${col}">${sc}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Price</div><div class="ev-detail-val">${fmtPrice(ev.price)}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">MC</div><div class="ev-detail-val">${fmtK(ev.mc)}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Liquidity</div><div class="ev-detail-val">${fmtK(ev.liq)}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Volume</div><div class="ev-detail-val">${fmtK(ev.vol)}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Age</div><div class="ev-detail-val">${ev.age_min ? fmtAge(ev.age_min) : '—'}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Change</div><div class="ev-detail-val ${(ev.change||0) >= 0 ? 'pos' : 'neg'}">${chgStr(ev.change||0)}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Green Lights</div><div class="ev-detail-val">${ev.green_lights || 0}/3</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Threat</div><div class="ev-detail-val" style="color:${(ev.threat_score||0) >= 30 ? '#ef4444' : 'var(--t1)'}">${ev.threat_score || 0}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Whale</div><div class="ev-detail-val">${ev.whale_score || 0}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Deployer</div><div class="ev-detail-val">${ev.deployer_score || 0}</div></div>
+          <div class="ev-detail-cell"><div class="ev-detail-lbl">Narrative</div><div class="ev-detail-val">${ev.narrative_score || 0}</div></div>
+        </div>
+        <div style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Three-Signal Checklist</div>
+        ${checks.length ? checks.map(c => `
+          <div class="ev-checklist-row">
+            <div class="ev-checklist-dot ${c.passed ? 'p' : 'f'}"></div>
+            <span class="ev-checklist-name">${c.name || 'Check'}</span>
+            <span class="ev-checklist-status" style="color:${c.passed ? '#14c784' : '#ef4444'}">${c.passed ? 'PASS' : 'FAIL'}</span>
+          </div>
+        `).join('') : '<div style="font-size:11px;color:var(--t3)">Checklist data not available</div>'}
+        <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+          ${(ev.narrative_tags||[]).map(t => `<span class="ev-tag">${t}</span>`).join('')}
+          ${ev.source ? `<span style="font-size:9px;color:var(--t3);padding:2px 6px;border:1px solid rgba(255,255,255,.06);border-radius:4px">${ev.source}</span>` : ''}
+        </div>
+      </div>`;
+    }
+
+    return `<div class="ev-row" onclick="evToggleDetail(${ev.id})" title="Click for details">
+      <div class="ev-verdict ${ev.passed ? 'pass' : 'fail'}">${ev.passed ? '&#10003;' : '&#10007;'}</div>
+      <div class="ev-info">
+        <div class="ev-name">${ev.name || '?'}${ev.source ? '<span class="ev-src">' + ev.source + '</span>' : ''}</div>
+        <div class="ev-reason ${ev.passed ? 'pass-reason' : ''}">${ev.passed ? 'Approved — score ' + sc : (ev.reason_plain || ev.reason || 'Rejected')}</div>
+        ${tagsHtml ? '<div class="ev-tags">' + tagsHtml + '</div>' : ''}
       </div>
-      <div class="sc-event-meta">${pnlHtml}<div class="sc-event-time">${ev.ts || ''}</div></div>
+      <div class="ev-score">
+        <div class="ev-score-bar"><div class="ev-score-fill" style="width:${Math.min(sc,100)}%;background:${col}"></div></div>
+        <span class="ev-score-num" style="color:${col}">${sc}</span>
+      </div>
+      <div class="ev-checks">${checksHtml}</div>
+      <div class="ev-time">${ts}</div>
+    </div>${detailHtml}`;
+  }).join('');
+}
+
+function evToggleDetail(id) {
+  _evExpandedId = _evExpandedId === id ? null : id;
+  renderEvLog();
+}
+
+function renderEvApproved(approved) {
+  const el = document.getElementById('ev-approved-list');
+  if (!el) return;
+  if (!approved.length) {
+    el.innerHTML = '<div style="padding:20px;text-align:center;font-size:11px;color:var(--t3)">No approved coins yet</div>';
+    return;
+  }
+  el.innerHTML = approved.map(c => {
+    const sc = typeof c.score === 'number' ? c.score : 0;
+    const col = tokColor(c.name || '?');
+    const checks = (c.checklist || []).slice(0, 3);
+    const ts = c.ts ? new Date(c.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
+    return `<div class="ev-coin-card" onclick="window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')">
+      <div class="ev-coin-top">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="ev-coin-icon" style="background:${col}1a;color:${col}">${(c.name||'?').charAt(0)}</div>
+          <div>
+            <div class="ev-coin-name">${c.name || '?'}</div>
+            <div class="ev-coin-meta">${fmtK(c.mc)} MC · ${fmtAge(c.age_min||0)} · ${ts}</div>
+          </div>
+        </div>
+        <div class="ev-coin-score" style="color:${scoreColor(sc)}">${sc}</div>
+      </div>
+      <div class="ev-coin-metrics">
+        <div class="ev-coin-m">Liq <span class="ev-coin-mv">${fmtK(c.liq)}</span></div>
+        <div class="ev-coin-m">Vol <span class="ev-coin-mv">${fmtK(c.vol)}</span></div>
+        <div class="ev-coin-m">GL <span class="ev-coin-mv">${c.green_lights||0}/3</span></div>
+      </div>
+      <div class="ev-coin-checks" style="margin-top:5px">
+        ${checks.map(ck => `<div class="ev-ck ${ck.passed?'p':'f'}" title="${ck.name||''}">${ck.passed?'&#10003;':'&#10007;'}</div>`).join('')}
+        ${(c.narrative_tags||[]).slice(0,2).map(t => `<span class="ev-tag">${t}</span>`).join('')}
+      </div>
     </div>`;
   }).join('');
 }
+
+function renderScEvents() {} // stub
+function buildScEvents() { return []; } // stub
 
 function buildScEvents(logLines, filterLog) {
   const events = [];
@@ -16036,14 +16315,12 @@ function buildScEvents(logLines, filterLog) {
 
 function renderScannerTab(d) {
   if (!d) return;
-
-  // Status strip
+  // Update sidebar session info from /api/state
   const bal = d.balance ?? 0;
   const budget = d.settings?.session_budget_sol ?? 0;
   const positions = d.positions || [];
   setText('sc-wallet-bal', bal.toFixed(4));
   setText('sc-wallet-bal2', bal.toFixed(4) + ' SOL');
-  setText('sc-budget-display', budget > 0 ? budget.toFixed(3) : 'No limit');
   setText('sc-open-trades', positions.length);
 
   const stats = d.stats || {};
@@ -16053,56 +16330,27 @@ function renderScannerTab(d) {
   const wr = total > 0 ? Math.round(wins / total * 100) : null;
   setText('sc-session-wr', wr != null ? wr + '%' : '—');
 
-  const pnl = parseFloat(stats.session_pnl_sol || 0);
+  const pnl = parseFloat(stats.total_pnl_sol || 0);
   const pnlEl = document.getElementById('sc-session-pnl');
   if (pnlEl) {
     pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4);
     pnlEl.style.color = pnl >= 0 ? '#14c784' : '#ef4444';
   }
 
-  // Settings card
-  const s = d.settings || {};
-  const presetName = d.preset || s.preset || 'balanced';
+  const presetName = d.preset || (d.settings || {}).preset || 'balanced';
   setText('sc-preset-name', presetName);
-  const grid = document.getElementById('sc-settings-grid');
-  if (grid) {
-    const items = [
-      ['Cooldown', (s.cooldown_min || 0) + 'm'],
-      ['TP1', (s.tp1_mult || 0) + 'x'],
-      ['TP2', (s.tp2_mult || 0) + 'x'],
-      ['Stop Loss', (((1 - (s.stop_loss || 0.85)) * 100).toFixed(0)) + '%'],
-      ['Trail', ((s.trail_pct || 0) * 100).toFixed(0) + '%'],
-      ['Min Score', s.min_score || 0],
-      ['Max Buys', s.max_correlated || 5],
-      ['Buy Size', (s.max_buy_sol || 0) + ' SOL'],
-    ];
-    grid.innerHTML = items.map(([l, v]) =>
-      `<div class="sc-setting-item"><div class="sc-setting-lbl">${l}</div><div class="sc-setting-val">${v}</div></div>`
-    ).join('');
-  }
 
-  // Budget inputs (populate from settings, only if empty)
+  // Budget inputs
   const budgetInput = document.getElementById('sc-budget-input');
   const profitInput = document.getElementById('sc-profit-input');
   const lossInput = document.getElementById('sc-loss-input');
+  const s = d.settings || {};
   if (budgetInput && !budgetInput._dirty) budgetInput.value = budget > 0 ? budget : '';
   if (profitInput && !profitInput._dirty) profitInput.value = s.profit_target_sol > 0 ? s.profit_target_sol : '';
   if (lossInput && !lossInput._dirty) lossInput.value = s.drawdown_limit_sol > 0 ? s.drawdown_limit_sol : '';
 
-  // Shadow strip
-  // (values from the existing shadow performance update)
-  const shadowPresetEl = document.getElementById('sc-shadow-preset');
-  if (shadowPresetEl) shadowPresetEl.textContent = presetName;
-
-  // Build activity events
-  _scEvents = buildScEvents(d.log || [], d.filter_log || []);
-  const subEl = document.getElementById('sc-feed-sub');
-  if (subEl) {
-    const buyCount = _scEvents.filter(e => e.type === 'bought').length;
-    const skipCount = _scEvents.filter(e => e.type === 'skipped').length;
-    subEl.textContent = `${buyCount} bought · ${skipCount} skipped this session`;
-  }
-  renderScEvents();
+  // Poll evaluation feed when scanner tab active
+  if (_activeTab === 'scanner') pollEvaluationFeed();
 }
 
 async function saveBudgetSettings() {
@@ -17947,13 +18195,14 @@ async function showQuantRunDetail(runId, silent=false) {
   renderEnhancedDashboard(null);
 })();
 window.addEventListener('resize', () => {
-  if (treeCanvas && document.getElementById('tree-panel').style.display !== 'none') {
+  if (treeCanvas && document.getElementById('tree-panel')?.style.display !== 'none') {
     treeCanvas.width = treeCanvas.parentElement.clientWidth;
   }
 });
 refresh();
 setInterval(refresh, 5000);
-pollFeed(); setInterval(pollFeed, 4000);
+pollFeed(); setInterval(pollFeed, 8000);
+pollEvaluationFeed(); setInterval(pollEvaluationFeed, 6000);
 pollListings(); setInterval(pollListings, 6000);
 pollEnhancedDashboard(); setInterval(pollEnhancedDashboard, 15000);
 
