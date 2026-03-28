@@ -307,8 +307,8 @@ PRESETS = {
         "trail_pct":0.15,"stop_loss":0.80,"max_age_min":720,"time_stop_min":15,
         "min_liq":5000,"min_mc":3000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":20,"cooldown_min":15,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":40,"min_narrative_score":8,
-        "min_green_lights":0,"min_volume_spike_mult":3,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":8,"min_narrative_score":3,
+        "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":5.0,
         "offpeak_min_change":20,
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
@@ -324,8 +324,8 @@ PRESETS = {
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":480,"time_stop_min":20,
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":10,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":6,
-        "min_green_lights":0,"min_volume_spike_mult":2,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
+        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
@@ -341,8 +341,8 @@ PRESETS = {
         "trail_pct":0.25,"stop_loss":0.75,"max_age_min":360,"time_stop_min":25,
         "min_liq":1000,"min_mc":2000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":15,"cooldown_min":7,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":25,"min_narrative_score":4,
-        "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":3,"min_narrative_score":1,
+        "min_green_lights":0,"min_volume_spike_mult":1.0,"late_entry_mult":5.0,
         "offpeak_min_change":15,
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
@@ -375,8 +375,8 @@ PRESETS = {
         "trail_pct":0.20,"stop_loss":0.75,"max_age_min":480,"time_stop_min":20,
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":10,
-        "risk_per_trade_pct":2.0,"min_holder_growth_pct":30,"min_narrative_score":6,
-        "min_green_lights":0,"min_volume_spike_mult":2,"late_entry_mult":5.0,
+        "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
+        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
@@ -14706,30 +14706,14 @@ DASHBOARD_HTML = _CSS + """
           </div>
         </div>
 
-        <!-- Budget Controls -->
+        <!-- Risk Controls (from preset) -->
         <div class="glass" style="padding:0;overflow:hidden">
-          <div class="ev-ctrl-title">Session Limits</div>
+          <div class="ev-ctrl-title">Risk Controls</div>
           <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Wallet</span><span class="ev-ctrl-val" id="sc-wallet-bal2">— SOL</span></div>
-          <div class="ev-input-row" style="padding-bottom:6px">
-            <label class="ev-input-lbl">Trade Budget — <span id="sc-budget-pct-val" style="color:var(--blue2);font-weight:800">100%</span> of max buy</label>
-            <input id="sc-budget-pct" type="range" class="budget-slider" min="5" max="100" step="5" value="100"
-              oninput="document.getElementById('sc-budget-pct-val').textContent=this.value+'%'">
-          </div>
-          <div class="ev-input-row">
-            <label class="ev-input-lbl">Budget (SOL)</label>
-            <input id="sc-budget-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = no limit" style="font-size:11px">
-          </div>
-          <div class="ev-input-row">
-            <label class="ev-input-lbl">Profit Target</label>
-            <input id="sc-profit-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = off" style="font-size:11px">
-          </div>
-          <div class="ev-input-row">
-            <label class="ev-input-lbl">Loss Limit (auto-pause)</label>
-            <input id="sc-loss-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = off" style="font-size:11px">
-          </div>
-          <div style="padding:6px 14px 10px">
-            <button class="btn btn-primary" style="width:100%;font-size:10px" onclick="saveBudgetSettings()">Save Limits</button>
-          </div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Drawdown Limit</span><span class="ev-ctrl-val" id="sc-dd-limit">—</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Max Positions</span><span class="ev-ctrl-val" id="sc-max-pos">—</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Stop Loss</span><span class="ev-ctrl-val" id="sc-stop-loss">—</span></div>
+          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Trail %</span><span class="ev-ctrl-val" id="sc-trail-pct">—</span></div>
         </div>
 
         <!-- Open Positions — rich cards -->
@@ -16539,7 +16523,6 @@ function renderScannerTab(d) {
   if (!d) return;
   // Update sidebar session info from /api/state
   const bal = d.balance ?? 0;
-  const budget = d.settings?.session_budget_sol ?? 0;
   const positions = d.positions || [];
   setText('sc-wallet-bal', bal.toFixed(4));
   setText('sc-wallet-bal2', bal.toFixed(4) + ' SOL');
@@ -16562,14 +16545,9 @@ function renderScannerTab(d) {
   const presetName = d.preset || (d.settings || {}).preset || 'balanced';
   setText('sc-preset-name', presetName);
 
-  // Budget inputs
-  const budgetInput = document.getElementById('sc-budget-input');
-  const profitInput = document.getElementById('sc-profit-input');
-  const lossInput = document.getElementById('sc-loss-input');
+  // Risk controls from preset (no manual session limits)
   const s = d.settings || {};
-  if (budgetInput && !budgetInput._dirty) budgetInput.value = budget > 0 ? budget : '';
-  if (profitInput && !profitInput._dirty) profitInput.value = s.profit_target_sol > 0 ? s.profit_target_sol : '';
-  if (lossInput && !lossInput._dirty) lossInput.value = s.drawdown_limit_sol > 0 ? s.drawdown_limit_sol : '';
+  renderRiskControls(s);
 
   // Poll evaluation feed when scanner tab active
   if (_activeTab === 'scanner') pollEvaluationFeed();
@@ -16664,29 +16642,16 @@ async function pollScanDetail() {
   }
 }
 
-async function saveBudgetSettings() {
-  const budget = parseFloat(document.getElementById('sc-budget-input')?.value || 0) || 0;
-  const profit = parseFloat(document.getElementById('sc-profit-input')?.value || 0) || 0;
-  const loss   = parseFloat(document.getElementById('sc-loss-input')?.value || 0) || 0;
-  const res = await fetch('/api/set-session-budget', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ session_budget_sol: budget, profit_target_sol: profit, drawdown_limit_sol: loss })
-  }).then(r => r.json()).catch(() => null);
-  if (res?.ok) {
-    showToast('Session limits saved ✓', true);
-    // mark inputs clean
-    ['sc-budget-input','sc-profit-input','sc-loss-input'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el._dirty = false;
-    });
-  } else {
-    showToast('Failed to save limits', false);
-  }
+// Risk controls are read-only from preset — no manual session limits
+function renderRiskControls(s) {
+  setText('sc-dd-limit', (s.drawdown_limit_sol || 0).toFixed(2) + ' SOL');
+  setText('sc-max-pos', s.max_correlated || '—');
+  setText('sc-stop-loss', s.stop_loss ? (s.stop_loss * 100).toFixed(0) + '%' : '—');
+  setText('sc-trail-pct', s.trail_pct ? (s.trail_pct * 100).toFixed(0) + '%' : '—');
 }
 
-// Mark inputs dirty so we don't overwrite user edits
-['sc-budget-input','sc-profit-input','sc-loss-input'].forEach(id => {
+// (removed: saveBudgetSettings — session limits now come from preset)
+['placeholder-no-op'].forEach(id => {
   document.addEventListener('DOMContentLoaded', () => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('input', () => { el._dirty = true; });
