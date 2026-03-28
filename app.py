@@ -310,7 +310,7 @@ PRESETS = {
         "min_liq":5000,"min_mc":3000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":20,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":8,"min_narrative_score":3,
-        "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":5.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":8.0,
         "offpeak_min_change":20,
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
@@ -327,7 +327,7 @@ PRESETS = {
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
-        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":8.0,
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
@@ -344,7 +344,7 @@ PRESETS = {
         "min_liq":1000,"min_mc":2000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":3,"min_narrative_score":1,
-        "min_green_lights":0,"min_volume_spike_mult":1.0,"late_entry_mult":5.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.0,"late_entry_mult":8.0,
         "offpeak_min_change":15,
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
@@ -361,7 +361,7 @@ PRESETS = {
         "min_liq":500,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "min_vol":500,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":0,
-        "min_green_lights":0,"min_volume_spike_mult":0,"late_entry_mult":5.0,
+        "min_green_lights":0,"min_volume_spike_mult":0,"late_entry_mult":8.0,
         "offpeak_min_change":12,
         "max_hot_change":400.0,
         "nuclear_narrative_score":35,
@@ -378,7 +378,7 @@ PRESETS = {
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
-        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":8.0,
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
@@ -479,11 +479,9 @@ def strip_auto_relax_state(settings):
 
 def central_trading_window():
     now = datetime.now(CENTRAL_TZ)
-    hour_utc = now.astimezone(timezone.utc).hour
-    # Block low-liquidity overnight hours (UTC 23:00-10:00)
-    # Data showed 2 wins / 13 losses during these hours
-    if hour_utc >= 23 or hour_utc < 10:
-        return now, False
+    # Trading window removed — let preset filters and shadow optimizations
+    # control entry quality instead of blanket time blocks.
+    # The old UTC 23:00-10:00 block was killing 42% of viable signals.
     return now, True
 
 
@@ -1989,7 +1987,7 @@ shadow_market_queue = deque(maxlen=400)
 shadow_market_lock = threading.Lock()
 _backtest_jobs = {}
 _backtest_jobs_lock = threading.Lock()
-MODEL_DECISION_THRESHOLD = 60.0
+MODEL_DECISION_THRESHOLD = 45.0
 MODEL_TRAIN_DAYS = 14
 MODEL_CACHE_REFRESH_SEC = 300
 EDGE_REPORT_AUTO_WINDOWS = (
@@ -2981,10 +2979,11 @@ class BotInstance:
     def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
         urls = [
             f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+            f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
             f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         ]
-        # Hit both endpoints in parallel, take first success
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        # Hit all endpoints in parallel, take first success
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(self._jupiter_quote_single, u): u for u in urls}
             for fut in as_completed(futures, timeout=12):
                 try:
@@ -3037,9 +3036,9 @@ class BotInstance:
         return None
 
     def jupiter_swap(self, quote):
-        endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://quote-api.jup.ag/v6/swap"]
-        # Hit both endpoints in parallel, take first success
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://api.jup.ag/swap/v1/swap", "https://quote-api.jup.ag/v6/swap"]
+        # Hit all endpoints in parallel, take first success
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(self._jupiter_swap_single, u, quote): u for u in endpoints}
             for fut in as_completed(futures, timeout=15):
                 try:
@@ -4487,6 +4486,7 @@ def infer_infrastructure_labels(wallets):
 def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
     urls = [
         f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+        f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
     ]
     for url in urls:
@@ -7451,7 +7451,7 @@ _MOMENTUM_MIN_LIQ_USD = 3000     # needs real pool
 _MOMENTUM_MAX_MC = 800_000       # still small-cap
 _MOMENTUM_MIN_MC = 2000          # not zero
 _MOMENTUM_COOLDOWN = {}          # mint -> last_buy_ts (prevent repeat buys)
-_MOMENTUM_COOLDOWN_SEC = 60      # 1 min cooldown per mint
+_MOMENTUM_COOLDOWN_SEC = 0       # no cooldown — let presets control pace
 
 def _momentum_track(mint, price, vol, mc, liq, name, age_min, source):
     """Record a price tick for momentum tracking. Returns surge info dict or None."""
