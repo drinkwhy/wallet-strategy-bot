@@ -1919,43 +1919,61 @@ def decrypt_key(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
 
 
+# ── Blockhash cache (2-second TTL) ────────────────────────────────────────────
+_blockhash_cache = {"hash": None, "ts": 0.0}
+_BLOCKHASH_TTL = 2  # seconds — blockhashes valid ~60s, 2s avoids stale without re-fetching
+
+# ── Priority fee cache (10-second TTL) ───────────────────────────────────────
+_priority_fee_cache = {"key": None, "fee": None, "ts": 0.0}
+_PRIORITY_FEE_TTL = 10  # seconds — avoids hammering Helius during trading bursts
+
 # ── Standalone wallet balance lookup (no bot needed) ──────────────────────────
 _wallet_balance_cache = {}  # pubkey -> (balance, timestamp)
 _WALLET_BAL_TTL = 30  # cache for 30 seconds
 
 def get_wallet_balance_standalone(pubkey):
-    """Fetch SOL balance for a wallet without a running bot. Cached 30s."""
+    """Fetch SOL balance for a wallet without a running bot. Cached 30s.
+    Uses RPC racing (parallel requests) and 'processed' commitment for speed."""
     if not pubkey:
         print("[WARN] get_wallet_balance_standalone: empty pubkey", flush=True)
         return 0
     cached = _wallet_balance_cache.get(pubkey)
     if cached and (time.time() - cached[1]) < _WALLET_BAL_TTL:
         return cached[0]
-    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey, {"commitment": "confirmed"}]}
+    # Use "processed" for non-critical balance display (faster than "confirmed")
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey, {"commitment": "processed"}]}
     _fallbacks = [("dedicated", HELIUS_RPC)]
     if HELIUS_SHARED_RPC:
         _fallbacks.append(("shared", HELIUS_SHARED_RPC))
     if ANKR_RPC:
         _fallbacks.append(("ankr", ANKR_RPC))
     _fallbacks.append(("public", "https://solana-rpc.publicnode.com"))
-    for label, rpc_url in _fallbacks:
-        try:
-            r = _http_session.post(rpc_url, json=payload, timeout=5)
-            data = safe_json_response(r)
-            if not data:
-                print(f"[WARN] Balance RPC {label} returned empty", flush=True)
-                continue
-            if "error" in data:
-                print(f"[WARN] Balance RPC {label} error: {data.get('error')}", flush=True)
-                continue
-            val = data.get("result", {}).get("value", 0)
-            balance = round(val / 1e9, 4)
-            _wallet_balance_cache[pubkey] = (balance, time.time())
-            print(f"[BALANCE] {pubkey[:8]}... = {balance} SOL via {label}", flush=True)
-            return balance
-        except Exception as e:
-            print(f"[WARN] Balance RPC {label} failed: {e}", flush=True)
-            continue
+
+    # RPC racing: fire all endpoints in parallel, take first success
+    def _fetch_balance(label_url):
+        label, rpc_url = label_url
+        r = _http_session.post(rpc_url, json=payload, timeout=5)
+        data = safe_json_response(r)
+        if not data:
+            raise ValueError(f"{label} returned empty")
+        if "error" in data:
+            raise ValueError(f"{label} error: {data.get('error')}")
+        val = data.get("result", {}).get("value", 0)
+        return label, round(val / 1e9, 4)
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(_fallbacks)) as pool:
+            futures = {pool.submit(_fetch_balance, fb): fb[0] for fb in _fallbacks}
+            for fut in as_completed(futures, timeout=6):
+                try:
+                    label, balance = fut.result()
+                    _wallet_balance_cache[pubkey] = (balance, time.time())
+                    print(f"[BALANCE] {pubkey[:8]}... = {balance} SOL via {label} (raced)", flush=True)
+                    return balance
+                except Exception as e:
+                    print(f"[WARN] Balance RPC {futures[fut]} failed: {e}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Balance race failed: {e}", flush=True)
     print(f"[ERROR] All RPC endpoints failed for {pubkey[:8]}...", flush=True)
     return 0
 
@@ -2565,36 +2583,48 @@ class BotInstance:
         return False
 
     def refresh_balance(self):
-        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet, {"commitment":"confirmed"}]}
+        # Use "processed" for non-critical balance display (faster than "confirmed")
+        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[self.wallet, {"commitment":"processed"}]}
         _fallbacks = [("dedicated", HELIUS_RPC)]
         if HELIUS_SHARED_RPC:
             _fallbacks.append(("shared", HELIUS_SHARED_RPC))
         if ANKR_RPC:
             _fallbacks.append(("ankr", ANKR_RPC))
         _fallbacks.append(("public", "https://solana-rpc.publicnode.com"))
-        for label, rpc_url in _fallbacks:
+
+        # RPC racing: fire all endpoints in parallel, take first success
+        bot_ref = self  # capture for closure
+
+        def _fetch_balance(label_url):
+            label, rpc_url = label_url
             started = time.perf_counter()
-            try:
-                r = _http_session.post(rpc_url, json=payload, timeout=5)
-                latency = round((time.perf_counter() - started) * 1000)
-                data = safe_json_response(r)
-                if not data:
-                    record_rpc_health(label, False, latency, "getBalance")
-                    continue
-                if "error" in data:
-                    print(f"[WARN] Balance RPC {label} error: {data['error']}", flush=True)
-                    record_rpc_health(label, False, latency, "getBalance")
-                    continue
-                val = data.get("result",{}).get("value",0)
-                self.sol_balance = val / 1e9
-                if self.sol_balance > self.peak_balance:
-                    self.peak_balance = self.sol_balance
-                record_rpc_health(label, True, latency, "getBalance")
-                return
-            except Exception as _e:
-                latency = round((time.perf_counter() - started) * 1000)
+            r = _http_session.post(rpc_url, json=payload, timeout=5)
+            latency = round((time.perf_counter() - started) * 1000)
+            data = safe_json_response(r)
+            if not data:
                 record_rpc_health(label, False, latency, "getBalance")
-                print(f"[ERROR] Balance fetch failed ({label}): {_e}", flush=True)
+                raise ValueError(f"{label} returned empty")
+            if "error" in data:
+                record_rpc_health(label, False, latency, "getBalance")
+                raise ValueError(f"{label} error: {data['error']}")
+            val = data.get("result", {}).get("value", 0)
+            record_rpc_health(label, True, latency, "getBalance")
+            return label, val / 1e9
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(_fallbacks)) as pool:
+                futures = {pool.submit(_fetch_balance, fb): fb[0] for fb in _fallbacks}
+                for fut in as_completed(futures, timeout=6):
+                    try:
+                        label, balance = fut.result()
+                        self.sol_balance = balance
+                        if self.sol_balance > self.peak_balance:
+                            self.peak_balance = self.sol_balance
+                        return
+                    except Exception as _e:
+                        print(f"[ERROR] Balance fetch failed ({futures[fut]}): {_e}", flush=True)
+        except Exception as _e:
+            print(f"[ERROR] Balance race failed: {_e}", flush=True)
         print(f"[ERROR] All RPCs failed for balance check, wallet={self.wallet}", flush=True)
 
     # ── Jito tip accounts (mainnet) ──────────────────────────────────────────
@@ -2731,9 +2761,17 @@ class BotInstance:
         return base64.b64encode(bytes(signed_tx)).decode()
 
     def _latest_blockhash(self):
+        # 2-second cache: blockhashes valid ~60s, avoid re-fetching on every call
+        now = time.time()
+        if _blockhash_cache["hash"] and (now - _blockhash_cache["ts"]) < _BLOCKHASH_TTL:
+            return _blockhash_cache["hash"]
         result = rpc_call("getLatestBlockhash", [{"commitment": "processed"}], timeout=6) or {}
         value = result.get("value") if isinstance(result, dict) else {}
-        return (value or {}).get("blockhash")
+        bh = (value or {}).get("blockhash")
+        if bh:
+            _blockhash_cache["hash"] = bh
+            _blockhash_cache["ts"] = now
+        return bh
 
     def _resign_with_blockhash(self, tx, recent_blockhash):
         from solders.hash import Hash as SolHash
@@ -2827,7 +2865,7 @@ class BotInstance:
             r   = _http_session.post(HELIUS_RPC, json={
                 "jsonrpc":"2.0","id":1,"method":"sendTransaction",
                 "params":[enc,{"encoding":"base64","skipPreflight":True,"maxRetries":3}]
-            }, timeout=15)
+            }, timeout=8)
             res = r.json()
             if res.get("result"):
                 return {
@@ -2956,14 +2994,36 @@ class BotInstance:
         return None
 
     def _jupiter_swap_single(self, url, quote):
-        """Hit a single Jupiter swap endpoint; return swapTransaction or None."""
+        """Hit a single Jupiter swap endpoint; return swapTransaction or None.
+        Uses Helius priority fee estimate when available, falls back to user setting."""
         try:
+            # Wire in dynamic priority fee from Helius (cached 10s)
+            user_max = int(self.settings.get("priority_fee", 1_000_000))
+            helius_fee = None
+            try:
+                # Use the swap's input/output mints as account keys for fee estimation
+                acct_keys = [self.wallet]
+                input_mint = quote.get("inputMint")
+                output_mint = quote.get("outputMint")
+                if input_mint:
+                    acct_keys.append(input_mint)
+                if output_mint:
+                    acct_keys.append(output_mint)
+                helius_fee = helius_get_priority_fee(account_keys=acct_keys)
+            except Exception:
+                pass
+            # Use Helius estimate but cap at user's max setting for cost control
+            if helius_fee and helius_fee > 0:
+                optimal_fee = min(helius_fee, user_max)
+                self.log_msg(f"Priority fee: Helius={helius_fee} µL, cap={user_max}, using={optimal_fee}")
+            else:
+                optimal_fee = user_max
             r = requests.post(url, json={
                 "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
                 "dynamicComputeUnitLimit": True,
                 "prioritizationFeeLamports": {
                     "priorityLevelWithMaxLamports": {
-                        "maxLamports": int(self.settings.get("priority_fee", 1_000_000)),
+                        "maxLamports": optimal_fee,
                         "priorityLevel": "veryHigh"
                     }
                 },
@@ -4483,9 +4543,17 @@ def get_helius_api_key():
 
 def helius_get_priority_fee(account_keys=None, tx_base58=None):
     """Get recommended priority fee from Helius Enhanced API.
-    Returns fee in microlamports, or None on failure."""
+    Returns fee in microlamports, or None on failure.
+    Results are cached for 10 seconds to avoid hammering during trading bursts."""
     if not HELIUS_API_KEY:
         return None
+    # 10-second cache keyed on the request identity
+    cache_key = str(account_keys or tx_base58 or "")
+    now = time.time()
+    if (_priority_fee_cache["key"] == cache_key
+            and _priority_fee_cache["fee"] is not None
+            and (now - _priority_fee_cache["ts"]) < _PRIORITY_FEE_TTL):
+        return _priority_fee_cache["fee"]
     try:
         params = {"options": {"recommended": True, "includeAllPriorityFeeLevels": True}}
         if tx_base58:
@@ -4503,10 +4571,17 @@ def helius_get_priority_fee(account_keys=None, tx_base58=None):
         result = data.get("result", {})
         levels = result.get("priorityFeeLevels", {})
         recommended = result.get("priorityFeeEstimate")
+        fee = None
         if recommended:
             print(f"[HELIUS] Priority fee: recommended={recommended:.0f} µL | high={levels.get('high', '?')} veryHigh={levels.get('veryHigh', '?')}", flush=True)
-            return int(recommended)
-        return int(levels.get("high", 0)) or None
+            fee = int(recommended)
+        else:
+            fee = int(levels.get("high", 0)) or None
+        # Update cache
+        _priority_fee_cache["key"] = cache_key
+        _priority_fee_cache["fee"] = fee
+        _priority_fee_cache["ts"] = now
+        return fee
     except Exception as e:
         print(f"[HELIUS] getPriorityFeeEstimate failed: {e}", flush=True)
         return None
@@ -4554,7 +4629,7 @@ def helius_get_token_accounts(owner):
         return []
 
 
-def rpc_call(method, params=None, timeout=10):
+def rpc_call(method, params=None, timeout=8):
     """Call Solana RPC with fallback chain: Dedicated → Shared Helius → ANKR → public."""
     _rpc_endpoints = [("helius-dedicated", HELIUS_RPC)]
     if HELIUS_SHARED_RPC:
