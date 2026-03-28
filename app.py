@@ -600,8 +600,7 @@ def load_user_effective_settings(user_id):
     if row:
         if row.get("max_correlated") is not None:
             settings["max_correlated"] = row["max_correlated"]
-        if row.get("drawdown_limit_sol") is not None:
-            settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
+        # drawdown_limit_sol now comes from preset (may be auto-tuned by shadow optimization)
         if row.get("custom_settings"):
             try:
                 custom = json.loads(row["custom_settings"])
@@ -3241,6 +3240,73 @@ class BotInstance:
     def buy(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, decision_context=None):
         with self._buy_lock:
             self._buy_inner(mint, name, price, liq=liq, dev_wallet=dev_wallet, age_min=age_min, decision_context=decision_context)
+
+    def _force_buy(self, mint, name, price, liq=0):
+        """Manual/force buy — bypasses edge guard, drawdown, cooldown, rate limit, safety checks."""
+        with self._buy_lock:
+            s = self.settings  # raw settings, no edge guard
+            trade_sol = round(float(s.get("max_buy_sol") or 0.04), 4)
+            if trade_sol <= 0:
+                trade_sol = 0.04
+            if self.sol_balance < trade_sol + 0.01:
+                self.log_msg(f"FORCE-BUY SKIP {name} — Low balance ({self.sol_balance:.4f} SOL)")
+                return
+            if mint in self.positions:
+                self.log_msg(f"FORCE-BUY SKIP {name} — already in position")
+                return
+            self.log_msg(f"FORCE-BUY {name} | size={trade_sol:.4f} SOL | bypassing filters")
+            slippage = dynamic_slippage_bps(liq)
+            quote = self.jupiter_quote(SOL_MINT, mint, int(trade_sol * 1e9), slippage)
+            if not quote:
+                self.log_msg(f"FORCE-BUY FAIL {name} — no Jupiter quote")
+                return
+            swap_tx = self.jupiter_swap(quote)
+            if not swap_tx:
+                self.log_msg(f"FORCE-BUY FAIL {name} — swap build failed")
+                return
+            send_result = self.sign_and_send(swap_tx)
+            sig = send_result.get("sig")
+            if sig:
+                real_price = price
+                expected_out = int(quote.get("outAmount", 0) or 0)
+                try:
+                    time.sleep(0.3)
+                    tokens_received = self.get_token_balance(mint)
+                    if tokens_received > 0 and expected_out > 0:
+                        slip_ratio = expected_out / tokens_received if tokens_received > 0 else 1
+                        real_price = price * slip_ratio
+                except Exception:
+                    pass
+                self.positions[mint] = {
+                    "name": name, "entry_price": real_price, "peak_price": real_price,
+                    "timestamp": time.time(), "tp1_hit": False, "entry_sol": trade_sol,
+                    "dev_wallet": None, "surge_hold_active": False,
+                    "surge_peak_price": real_price,
+                    "buy_reason": "manual force buy", "source": "manual",
+                }
+                try:
+                    _conn = db()
+                    try:
+                        _c = _conn.cursor()
+                        _c.execute("""INSERT INTO open_positions
+                                      (user_id,mint,name,entry_price,peak_price,entry_sol,tp1_hit,dev_wallet)
+                                      VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                                      ON CONFLICT (user_id,mint) DO UPDATE
+                                      SET name=EXCLUDED.name,entry_price=EXCLUDED.entry_price,
+                                          peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
+                                          tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
+                                   (self.user_id, mint, name, real_price, real_price, trade_sol, 0, None))
+                        _conn.commit()
+                    finally:
+                        db_return(_conn)
+                except Exception as e:
+                    print(f"[FORCE-BUY] DB error: {e}", flush=True)
+                self.sol_balance -= trade_sol
+                self._last_buy_ts = time.time()
+                self.log_msg(f"BUY {name} (FORCE) | {trade_sol:.4f} SOL @ ${real_price:.8f}")
+                send_telegram(self.telegram_chat_id, f"<b>BUY</b> {name} (force) | {trade_sol:.4f} SOL")
+            else:
+                self.log_msg(f"FORCE-BUY FAIL {name} — transaction send failed")
 
     def _buy_inner(self, mint, name, price, liq=0, dev_wallet=None, age_min=0, decision_context=None):
         s = self.entry_settings()
@@ -9515,12 +9581,8 @@ def api_state():
                 db_settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
                 if row.get("max_correlated") is not None:
                     db_settings["max_correlated"] = row["max_correlated"]
-                if row.get("drawdown_limit_sol") is not None:
-                    db_settings["drawdown_limit_sol"] = row["drawdown_limit_sol"]
-                if row.get("profit_target_sol") is not None:
-                    db_settings["profit_target_sol"] = row["profit_target_sol"]
-                if row.get("session_budget_sol") is not None:
-                    db_settings["session_budget_sol"] = row["session_budget_sol"]
+                # Session limits removed — drawdown_limit falls back to preset values
+                # which may be auto-tuned by shadow trading optimization results
                 if row.get("custom_settings"):
                     try:
                         custom = json.loads(row["custom_settings"])
@@ -9723,31 +9785,29 @@ def api_set_max_positions():
 @app.route("/api/set-session-budget", methods=["POST"])
 @login_required
 def api_set_session_budget():
+    """Session budget/limits are now managed by preset optimization.
+    This endpoint is kept for backward compat but no longer overrides preset drawdown limits."""
     uid = session["user_id"]
     data = request.get_json(force=True) or {}
-    budget = float(data.get("session_budget_sol", 0) or 0)
     profit = float(data.get("profit_target_sol", 0) or 0)
-    loss   = float(data.get("drawdown_limit_sol", 0) or 0)
     try:
         conn = db()
         try:
             cur = conn.cursor()
+            # Only persist profit target — drawdown comes from preset/optimization
             cur.execute(
-                "UPDATE bot_settings SET session_budget_sol=%s, profit_target_sol=%s, drawdown_limit_sol=%s WHERE user_id=%s",
-                (budget, profit, loss, uid)
+                "UPDATE bot_settings SET session_budget_sol=0, profit_target_sol=%s WHERE user_id=%s",
+                (profit, uid)
             )
             conn.commit()
         finally:
             db_return(conn)
     except Exception as e:
         print(f"[ERROR] Could not save session budget: {e}", flush=True)
-    # Apply to running bot if any
     bot = user_bots.get(uid)
     if bot:
-        if budget > 0:
-            bot.settings["session_budget_sol"] = budget
-        bot.settings["drawdown_limit_sol"] = loss
         bot.profit_target = profit
+        # drawdown_limit_sol stays from preset — not overridden
     return jsonify({"ok": True})
 
 @app.route("/api/cashout", methods=["POST"])
@@ -10017,18 +10077,27 @@ def api_manual_buy():
         return jsonify({"ok": False, "msg": "Bot not running — start bot first"})
     if mint in bot.positions:
         return jsonify({"ok": False, "msg": "Already in position"})
-    # get current price
+    # get current price + liquidity from DexScreener
     try:
-        pairs = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                        timeout=5).json().get("pairs")
+        resp_data = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                        timeout=5).json()
+        pairs = resp_data.get("pairs") or []
         price = float(pairs[0].get("priceUsd") or 0) if pairs else 0
+        liq = float((pairs[0].get("liquidity") or {}).get("usd") or 0) if pairs else 0
     except Exception as _e:
         print(f"[ERROR] {_e}", flush=True)
         price = 0
+        liq = 0
     if not price:
         return jsonify({"ok": False, "msg": "Could not fetch price"})
-    threading.Thread(target=bot.buy, args=(mint, name, price), kwargs={"liq": 0, "dev_wallet": None}, daemon=True).start()
-    return jsonify({"ok": True, "msg": f"Manual buy triggered for {name}"})
+    # Force buy — bypass edge guard / drawdown / cooldown blockers
+    def _force_buy():
+        try:
+            bot._force_buy(mint, name, price, liq=liq)
+        except Exception as e:
+            print(f"[FORCE-BUY] error: {e}", flush=True)
+    threading.Thread(target=_force_buy, daemon=True).start()
+    return jsonify({"ok": True, "msg": f"Force buy triggered for {name}"})
 
 @app.route("/api/force-buy", methods=["POST"])
 @login_required
@@ -14123,6 +14192,81 @@ DASHBOARD_HTML = _CSS + """
 .confirm-title{font-family:'Space Grotesk','Manrope',sans-serif;font-size:18px;font-weight:700;color:var(--t1);margin-bottom:8px}
 .confirm-body{font-size:13px;line-height:1.6;color:var(--t2);margin-bottom:16px}
 .confirm-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+/* ── Floating Portfolio FAB ─────────────────────────────────── */
+#portfolio-fab{
+  position:fixed;bottom:226px;right:24px;z-index:200;
+  width:52px;height:52px;border-radius:50%;
+  background:linear-gradient(135deg,#2F6BFF,#14C784);
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;box-shadow:0 6px 24px rgba(20,199,132,.35);
+  transition:transform .2s,box-shadow .2s;
+  color:#fff;
+}
+#portfolio-fab:hover{transform:scale(1.1);box-shadow:0 8px 32px rgba(20,199,132,.5)}
+.fab-count{
+  position:absolute;top:-4px;right:-4px;
+  min-width:20px;height:20px;padding:0 5px;
+  border-radius:999px;font-size:10px;font-weight:800;
+  background:#f23645;color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  border:2px solid rgba(6,13,23,.9);
+}
+.fab-count.zero{background:rgba(100,116,139,.5)}
+.portfolio-panel{
+  position:fixed;bottom:226px;right:24px;z-index:199;
+  width:360px;max-height:480px;
+  background:linear-gradient(180deg,rgba(13,23,38,.98),rgba(8,16,26,.98));
+  border:1px solid rgba(47,107,255,.25);
+  border-radius:20px;
+  box-shadow:0 20px 60px rgba(0,0,0,.5),0 0 40px rgba(47,107,255,.1);
+  backdrop-filter:blur(20px);
+  display:none;
+  flex-direction:column;
+  overflow:hidden;
+  animation:panelSlideUp .25s ease;
+}
+@keyframes panelSlideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+.portfolio-panel.open{display:flex}
+.portfolio-header{
+  display:flex;justify-content:space-between;align-items:flex-start;
+  padding:16px 18px 12px;
+  border-bottom:1px solid rgba(255,255,255,.06);
+}
+.portfolio-coins{
+  flex:1;overflow-y:auto;padding:6px 0;
+  max-height:380px;
+}
+.portfolio-coin{
+  display:flex;align-items:center;gap:12px;
+  padding:12px 18px;
+  border-bottom:1px solid rgba(255,255,255,.04);
+  transition:background .12s;
+  cursor:default;
+}
+.portfolio-coin:hover{background:rgba(255,255,255,.03)}
+.portfolio-coin:last-child{border-bottom:none}
+.coin-icon{
+  width:36px;height:36px;border-radius:12px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:13px;font-weight:800;color:#fff;
+  flex-shrink:0;
+}
+.coin-info{flex:1;min-width:0}
+.coin-name{font-size:13px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.coin-meta{font-size:10px;color:var(--t3);margin-top:2px}
+.coin-pnl{text-align:right;flex-shrink:0}
+.coin-pnl-pct{font-size:16px;font-weight:800}
+.coin-pnl-sol{font-size:10px;color:var(--t3);margin-top:2px}
+.portfolio-empty{
+  text-align:center;padding:40px 20px;color:var(--t3);font-size:12px;line-height:1.6;
+}
+.portfolio-total-row{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:12px 18px;
+  border-top:1px solid rgba(255,255,255,.08);
+  background:rgba(7,14,23,.5);
+}
+
 .activity-shell{position:fixed;bottom:0;left:0;right:0;height:210px;background:rgba(6,13,23,.92);border-top:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;z-index:90;backdrop-filter:blur(18px);transition:height .2s;box-shadow:0 -18px 42px rgba(2,8,23,.25)}
 .activity-head{display:flex;justify-content:space-between;align-items:center;padding:8px 16px;border-bottom:1px solid rgba(255,255,255,.06);flex-shrink:0}
 .activity-title{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:700;color:var(--t2)}
@@ -15635,6 +15779,25 @@ DASHBOARD_HTML = _CSS + """
     <div class="confirm-meta" id="confirm-meta"></div>
     <button class="btn btn-primary btn-full" onclick="hideConfirmModal()">OK</button>
   </div>
+</div>
+
+<!-- Floating Portfolio Widget -->
+<div id="portfolio-fab" onclick="togglePortfolioPanel()" title="My Positions">
+  <div class="fab-icon">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
+  </div>
+  <span id="fab-count" class="fab-count">0</span>
+</div>
+
+<div id="portfolio-panel" class="portfolio-panel">
+  <div class="portfolio-header">
+    <div>
+      <div style="font-size:15px;font-weight:800;color:var(--t1)">Active Positions</div>
+      <div id="portfolio-summary" style="font-size:11px;color:var(--t2);margin-top:2px">Loading...</div>
+    </div>
+    <button onclick="togglePortfolioPanel()" style="background:none;border:none;color:var(--t3);font-size:18px;cursor:pointer;padding:2px 6px">&times;</button>
+  </div>
+  <div id="portfolio-coins" class="portfolio-coins"></div>
 </div>
 
 <!-- Activity Bar -->
@@ -18566,6 +18729,85 @@ window.addEventListener('resize', () => {
 });
 refresh();
 setInterval(refresh, 5000);
+
+// ══════════════════════════ FLOATING PORTFOLIO WIDGET ══════════════════════════
+let _portfolioOpen = false;
+function togglePortfolioPanel() {
+  _portfolioOpen = !_portfolioOpen;
+  const panel = document.getElementById('portfolio-panel');
+  const fab = document.getElementById('portfolio-fab');
+  if (_portfolioOpen) {
+    panel.classList.add('open');
+    fab.style.display = 'none';
+    pollPortfolioWidget();
+  } else {
+    panel.classList.remove('open');
+    fab.style.display = 'flex';
+  }
+}
+
+const _coinColors = ['#2563eb','#7c3aed','#0891b2','#059669','#d97706','#dc2626','#4f46e5','#0d9488','#c026d3','#ea580c'];
+function coinColor(name) {
+  let h = 0;
+  for (let i = 0; i < (name||'').length; i++) h = ((h << 5) - h) + name.charCodeAt(i);
+  return _coinColors[Math.abs(h) % _coinColors.length];
+}
+
+async function pollPortfolioWidget() {
+  try {
+    const data = await fetch('/api/my-trades').then(r => r.json());
+    const trades = data.open_trades || [];
+    const totals = data.totals || {};
+    const countEl = document.getElementById('fab-count');
+    countEl.textContent = trades.length;
+    countEl.className = 'fab-count' + (trades.length === 0 ? ' zero' : '');
+
+    const summaryEl = document.getElementById('portfolio-summary');
+    if (trades.length === 0) {
+      summaryEl.textContent = 'No open positions';
+    } else {
+      const totalPnl = trades.reduce((s, t) => s + (t.profit_pct || 0), 0);
+      const avgPnl = totalPnl / trades.length;
+      summaryEl.innerHTML = `<span style="color:var(--t1);font-weight:700">${trades.length}</span> coin${trades.length>1?'s':''} &middot; avg <span class="${avgPnl>=0?'c-grn':'c-red'}" style="font-weight:700">${avgPnl>=0?'+':''}${avgPnl.toFixed(1)}%</span>`;
+    }
+
+    const container = document.getElementById('portfolio-coins');
+    if (!trades.length) {
+      container.innerHTML = '<div class="portfolio-empty">No active positions yet.<br>The bot will show your coins here when it buys.</div>';
+      return;
+    }
+
+    container.innerHTML = trades.map(t => {
+      const pnl = t.profit_pct || 0;
+      const pnlCls = pnl >= 0 ? 'c-grn' : 'c-red';
+      const pnlSol = t.amount_sol ? (t.amount_sol * pnl / 100) : 0;
+      const bg = coinColor(t.name);
+      const initial = (t.name||'?')[0].toUpperCase();
+      return `<div class="portfolio-coin">
+        <div class="coin-icon" style="background:${bg}">${initial}</div>
+        <div class="coin-info">
+          <div class="coin-name">${t.name||'Unknown'}</div>
+          <div class="coin-meta">${t.held_for} &middot; ${t.amount_sol||0} SOL &middot; ${t.bought_when||''}</div>
+        </div>
+        <div class="coin-pnl">
+          <div class="coin-pnl-pct ${pnlCls}">${pnl>0?'+':''}${pnl.toFixed(1)}%</div>
+          <div class="coin-pnl-sol">${pnlSol>=0?'+':''}${pnlSol.toFixed(4)} SOL</div>
+        </div>
+      </div>`;
+    }).join('') + `<div class="portfolio-total-row">
+      <div style="font-size:11px;color:var(--t2);font-weight:700">Balance</div>
+      <div style="font-size:13px;font-weight:800;color:var(--t1)">${(totals.balance_sol||0).toFixed(4)} SOL</div>
+    </div>
+    <div class="portfolio-total-row" style="border-top:none;padding-top:4px">
+      <div style="font-size:11px;color:var(--t2);font-weight:700">Session P&L</div>
+      <div class="${(totals.total_profit_sol||0)>=0?'c-grn':'c-red'}" style="font-size:13px;font-weight:800">${(totals.total_profit_sol||0)>=0?'+':''}${(totals.total_profit_sol||0).toFixed(4)} SOL</div>
+    </div>`;
+  } catch(e) { console.error('portfolio widget error', e); }
+}
+// Poll portfolio data
+pollPortfolioWidget();
+setInterval(pollPortfolioWidget, 6000);
+
 pollFeed(); setInterval(pollFeed, 8000);
 pollEvaluationFeed(); setInterval(pollEvaluationFeed, 6000);
 pollScanDetail(); setInterval(pollScanDetail, 7000);
