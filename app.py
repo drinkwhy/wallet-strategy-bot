@@ -3470,6 +3470,8 @@ class BotInstance:
                 "dev_wallet": dev_wallet,
                 "surge_hold_active": False,
                 "surge_peak_price": real_price,
+                "buy_reason": (decision_context or {}).get("buy_reason", ""),
+                "source": (decision_context or {}).get("source_tag", "scanner"),
             }
             try:
                 _conn = db()
@@ -4105,6 +4107,20 @@ class BotInstance:
         self.log_signal_entry(sig_entry)
         self.log_msg(f"🟢 SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
         self.log_filter(name, mint, True, "Signal passed all filters")
+        # ── Build human-readable buy reason for dashboard cards ────────────────
+        _br = []
+        if change >= 30: _br.append(f"+{change:.0f}% momentum")
+        if age_min <= 5: _br.append("ultra-fresh")
+        elif age_min <= 15: _br.append("early entry")
+        if mc < 10000: _br.append("micro-cap")
+        elif mc < 50000: _br.append("small-cap")
+        if score_total >= 70: _br.append(f"score {score_total}")
+        if int(intel.get("narrative_score") or 0) >= 50: _br.append("strong narrative")
+        _src = source or "scanner"
+        if _src == "listing": _br.append("new listing")
+        elif _src not in ("scanner", "new_pairs", "helius-ws"): _br.append(_src)
+        execution_decision["buy_reason"] = ", ".join(_br) if _br else "rules passed"
+        execution_decision["source_tag"] = _src
         if execution_decision.get("execution_mode") == "paper":
             detail = f"{policy_label} accepted"
             if execution_decision.get("model_score") is not None:
@@ -11727,6 +11743,117 @@ def api_my_trades():
     })
 
 
+@app.route("/api/scan-detail")
+@login_required
+def api_scan_detail():
+    """Extended scan-tab data: rich positions, trade history wins/losses, optimizer."""
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+
+    # ── Positions with full metadata ──────────────────────────────────────────
+    pos_list = []
+    if bot:
+        pos_snapshot = dict(bot.positions)
+        for mint, p in pos_snapshot.items():
+            try:
+                cur_price = bot.get_token_price(mint)
+                entry = p.get("entry_price") or 0
+                ratio = (cur_price / entry) if cur_price and entry else None
+                peak_ratio = (p.get("peak_price", entry) / entry) if entry else None
+                pnl_pct = round((ratio - 1) * 100, 1) if ratio else None
+                pnl_sol = round(p.get("entry_sol", 0) * (ratio - 1), 4) if ratio else 0
+                age_sec = time.time() - p.get("timestamp", time.time())
+                pos_list.append({
+                    "address":     mint,
+                    "name":        p["name"],
+                    "entry_price": entry,
+                    "cur_price":   cur_price,
+                    "ratio":       ratio,
+                    "peak_ratio":  peak_ratio,
+                    "pnl_pct":     pnl_pct,
+                    "pnl_sol":     pnl_sol,
+                    "age_min":     round(age_sec / 60, 1),
+                    "entry_sol":   p.get("entry_sol", 0),
+                    "tp1_hit":     p.get("tp1_hit", False),
+                    "buy_reason":  p.get("buy_reason", ""),
+                    "source":      p.get("source", "scanner"),
+                })
+            except Exception:
+                pass
+
+    # ── Trade history: recent wins and losses from DB ─────────────────────────
+    winners, losers = [], []
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT mint, name, action, pnl_sol, timestamp
+                FROM trades WHERE user_id=%s AND action ILIKE 'SELL%%'
+                ORDER BY timestamp DESC LIMIT 80
+            """, (uid,))
+            for row in cur.fetchall():
+                pnl = float(row.get("pnl_sol") or 0)
+                ts = row.get("timestamp")
+                ts_str = ts.strftime("%H:%M") if ts and hasattr(ts, "strftime") else ""
+                action = row.get("action", "")
+                close_reason = action.replace("SELL-", "", 1) if action.startswith("SELL-") else action
+                entry = {
+                    "name":         row.get("name", "?"),
+                    "mint":         row.get("mint", ""),
+                    "pnl_sol":      round(pnl, 4),
+                    "close_reason": close_reason[:30],
+                    "ts":           ts_str,
+                }
+                if pnl >= 0:
+                    winners.append(entry)
+                else:
+                    losers.append(entry)
+        finally:
+            db_return(conn)
+    except Exception:
+        pass
+
+    # ── Optimizer: win rate by buy_reason tag from live positions + bot stats ─
+    optimizer = []
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Close reason breakdown from trades
+            cur.execute("""
+                SELECT action,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) AS wins
+                FROM trades WHERE user_id=%s AND action ILIKE 'SELL%%'
+                GROUP BY action ORDER BY total DESC LIMIT 8
+            """, (uid,))
+            for row in cur.fetchall():
+                total = int(row.get("total") or 0)
+                wins = int(row.get("wins") or 0)
+                label = (row.get("action") or "").replace("SELL-", "", 1)[:20]
+                if total > 0:
+                    optimizer.append({
+                        "label":    label,
+                        "trades":   total,
+                        "wins":     wins,
+                        "win_rate": round(wins / total * 100),
+                    })
+        finally:
+            db_return(conn)
+    except Exception:
+        pass
+
+    stats = bot.stats if bot else {"wins": 0, "losses": 0, "total_pnl_sol": 0}
+    return jsonify({
+        "positions": pos_list,
+        "winners":   winners[:25],
+        "losers":    losers[:25],
+        "optimizer": optimizer,
+        "stats":     stats,
+    })
+
+
 @app.route("/api/backtest-results")
 @login_required
 def api_backtest_results():
@@ -14452,9 +14579,72 @@ DASHBOARD_HTML = _CSS + """
   .ev-ctrl-lbl{color:var(--t3)}.ev-ctrl-val{font-weight:700;color:var(--t1)}
   .ev-input-row{padding:4px 14px}
   .ev-input-lbl{display:block;font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin-bottom:3px}
+
+  /* ── Scan balance strip ──────────────────────────────── */
+  .scan-bal-strip{display:flex;gap:0;align-items:stretch;background:rgba(8,16,32,.85);border:1px solid rgba(255,255,255,.06);border-radius:12px;margin-bottom:14px;overflow:hidden;backdrop-filter:blur(8px)}
+  .scan-bal-item{flex:1;padding:10px 14px;border-right:1px solid rgba(255,255,255,.05);display:flex;flex-direction:column;gap:2px;min-width:90px}
+  .scan-bal-item:last-child{border-right:none}
+  .scan-bal-lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--t3)}
+  .scan-bal-val{font-size:17px;font-weight:900;font-family:'Space Grotesk','Manrope',sans-serif;letter-spacing:-.3px;color:var(--t1)}
+
+  /* ── Position cards ──────────────────────────────────── */
+  .pos-cards{display:flex;flex-direction:column;gap:8px;padding:8px 14px 12px}
+  .pos-card{background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.05);border-radius:10px;padding:10px 12px;cursor:pointer;transition:border-color .15s}
+  .pos-card.winning{border-color:rgba(20,199,132,.2)}
+  .pos-card.losing {border-color:rgba(220,38,38,.2)}
+  .pos-card:hover{border-color:rgba(96,165,250,.25)}
+  .pc-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+  .pc-name{font-size:12px;font-weight:800;color:var(--t1)}
+  .pc-reason{font-size:9px;color:var(--t3);margin-top:1px;line-height:1.3}
+  .pc-pnl{font-size:16px;font-weight:900;font-family:'Space Grotesk',sans-serif;text-align:right;line-height:1.1}
+  .pc-pnl-sub{font-size:10px;font-weight:600;text-align:right;color:var(--t3);margin-top:1px}
+  .pc-meta{display:flex;gap:8px;margin-top:6px;flex-wrap:wrap}
+  .pc-meta span{font-size:10px;color:var(--t3)}
+  .pc-meta .pc-badge{font-size:9px;padding:1px 5px;border-radius:4px;background:rgba(20,199,132,.1);border:1px solid rgba(20,199,132,.2);color:var(--grn)}
+  .pc-bar-wrap{height:3px;background:rgba(255,255,255,.05);border-radius:99px;margin-top:7px;overflow:hidden}
+  .pc-bar{height:3px;border-radius:99px;background:var(--grn);transition:width .6s}
+  .pc-bar.red{background:var(--red2)}
+
+  /* ── Winners / Losers history ────────────────────────── */
+  .scan-hist-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}
+  @media(max-width:700px){.scan-hist-row{grid-template-columns:1fr}}
+  .scan-hist-card{background:rgba(8,16,32,.6);border:1px solid rgba(255,255,255,.06);border-radius:12px;overflow:hidden}
+  .scan-hist-head{padding:10px 14px 6px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;border-bottom:1px solid rgba(255,255,255,.04)}
+  .scan-hist-head.win{color:var(--grn)}.scan-hist-head.loss{color:var(--red2)}
+  .scan-hist-list{max-height:260px;overflow-y:auto}
+  .scan-hist-item{display:flex;align-items:center;gap:8px;padding:6px 14px;border-bottom:1px solid rgba(255,255,255,.03);font-size:11px}
+  .scan-hist-item .shi-name{flex:1;font-weight:700;color:var(--t1);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .scan-hist-item .shi-reason{font-size:10px;color:var(--t3);max-width:90px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .scan-hist-item .shi-pnl{font-weight:800;font-family:monospace;white-space:nowrap}
+  .scan-hist-item .shi-ts{font-size:9px;color:var(--t3);white-space:nowrap}
+
+  /* ── Live optimizer ──────────────────────────────────── */
+  .scan-opt-wrap{margin-top:14px;background:rgba(8,16,32,.6);border:1px solid rgba(255,255,255,.06);border-radius:12px;overflow:hidden}
+  .scan-opt-head{padding:10px 14px 6px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--blue2);border-bottom:1px solid rgba(255,255,255,.04)}
+  .scan-opt-body{padding:8px 14px 10px}
+  .scan-opt-row{display:flex;align-items:center;gap:10px;padding:5px 0;font-size:11px;border-bottom:1px solid rgba(255,255,255,.03)}
+  .scan-opt-row:last-child{border-bottom:none}
+  .scan-opt-lbl{width:130px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px}
+  .scan-opt-bar-wrap{flex:1;height:5px;background:rgba(255,255,255,.05);border-radius:99px;overflow:hidden}
+  .scan-opt-bar{height:5px;border-radius:99px;background:rgba(168,85,247,.6);transition:width .5s}
+  .scan-opt-pct{width:38px;text-align:right;font-weight:800;color:#c084fc;font-size:11px}
+  .scan-opt-cnt{width:38px;text-align:right;color:var(--t3);font-size:10px}
+
+  /* ── Budget % slider ─────────────────────────────────── */
+  input[type=range].budget-slider{width:100%;accent-color:var(--blue2);cursor:pointer}
   </style>
 
   <div id="tab-scanner" class="tab-pane active">
+
+    <!-- Balance Strip -->
+    <div class="scan-bal-strip" id="scan-bal-strip">
+      <div class="scan-bal-item"><div class="scan-bal-lbl">Balance</div><div class="scan-bal-val" id="sbs-balance">—</div></div>
+      <div class="scan-bal-item"><div class="scan-bal-lbl">Open</div><div class="scan-bal-val" id="sbs-open">0</div></div>
+      <div class="scan-bal-item"><div class="scan-bal-lbl">Session P&amp;L</div><div class="scan-bal-val" id="sbs-pnl">—</div></div>
+      <div class="scan-bal-item"><div class="scan-bal-lbl">Wins</div><div class="scan-bal-val" id="sbs-wins" style="color:var(--grn)">0</div></div>
+      <div class="scan-bal-item"><div class="scan-bal-lbl">Losses</div><div class="scan-bal-val" id="sbs-losses" style="color:var(--red2)">0</div></div>
+      <div class="scan-bal-item"><div class="scan-bal-lbl">Win Rate</div><div class="scan-bal-val" id="sbs-wr">—</div></div>
+    </div>
 
     <!-- Pipeline Funnel -->
     <div class="ev-pipeline" id="ev-pipeline">
@@ -14520,6 +14710,11 @@ DASHBOARD_HTML = _CSS + """
         <div class="glass" style="padding:0;overflow:hidden">
           <div class="ev-ctrl-title">Session Limits</div>
           <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Wallet</span><span class="ev-ctrl-val" id="sc-wallet-bal2">— SOL</span></div>
+          <div class="ev-input-row" style="padding-bottom:6px">
+            <label class="ev-input-lbl">Trade Budget — <span id="sc-budget-pct-val" style="color:var(--blue2);font-weight:800">100%</span> of max buy</label>
+            <input id="sc-budget-pct" type="range" class="budget-slider" min="5" max="100" step="5" value="100"
+              oninput="document.getElementById('sc-budget-pct-val').textContent=this.value+'%'">
+          </div>
           <div class="ev-input-row">
             <label class="ev-input-lbl">Budget (SOL)</label>
             <input id="sc-budget-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = no limit" style="font-size:11px">
@@ -14529,7 +14724,7 @@ DASHBOARD_HTML = _CSS + """
             <input id="sc-profit-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = off" style="font-size:11px">
           </div>
           <div class="ev-input-row">
-            <label class="ev-input-lbl">Loss Limit</label>
+            <label class="ev-input-lbl">Loss Limit (auto-pause)</label>
             <input id="sc-loss-input" type="number" class="finput" step="0.01" min="0" placeholder="0 = off" style="font-size:11px">
           </div>
           <div style="padding:6px 14px 10px">
@@ -14537,11 +14732,12 @@ DASHBOARD_HTML = _CSS + """
           </div>
         </div>
 
-        <!-- Open Positions -->
+        <!-- Open Positions — rich cards -->
         <div class="glass" style="padding:0;overflow:hidden">
           <div class="ev-ctrl-title">Open Positions</div>
-          <div id="pos-tbl" style="padding:6px 14px 12px;max-height:200px;overflow-y:auto">
-            <div style="font-size:11px;color:var(--t3)">No open positions</div>
+          <div id="pos-tbl" style="display:none"></div><!-- compat stub -->
+          <div id="pos-cards" class="pos-cards">
+            <div style="font-size:11px;color:var(--t3);padding:4px 0">No open positions</div>
           </div>
         </div>
 
@@ -14576,6 +14772,31 @@ DASHBOARD_HTML = _CSS + """
         </div>
       </div>
     </div>
+
+    <!-- Winners / Losers History -->
+    <div class="scan-hist-row">
+      <div class="scan-hist-card">
+        <div class="scan-hist-head win">Winners</div>
+        <div id="scan-winners" class="scan-hist-list">
+          <div style="padding:14px;font-size:11px;color:var(--t3)">No winners yet this session</div>
+        </div>
+      </div>
+      <div class="scan-hist-card">
+        <div class="scan-hist-head loss">Losers</div>
+        <div id="scan-losers" class="scan-hist-list">
+          <div style="padding:14px;font-size:11px;color:var(--t3)">No losses yet this session</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Close-Reason Optimizer -->
+    <div class="scan-opt-wrap">
+      <div class="scan-opt-head">Close Reason Win Rate</div>
+      <div id="scan-optimizer" class="scan-opt-body">
+        <div style="font-size:11px;color:var(--t3)">Accumulating trade data…</div>
+      </div>
+    </div>
+
   </div>
 
   <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
@@ -15507,7 +15728,7 @@ function switchTab(tab, btn) {
   // Start tab-specific polling
   Object.values(_tabPollers).forEach(id => clearInterval(id));
   _tabPollers = {};
-  if (tab === 'scanner') { pollEvaluationFeed(); _tabPollers.ev = setInterval(pollEvaluationFeed, 6000); }
+  if (tab === 'scanner') { pollEvaluationFeed(); _tabPollers.ev = setInterval(pollEvaluationFeed, 6000); pollScanDetail(); _tabPollers.sd = setInterval(pollScanDetail, 7000); }
   if (tab === 'signals') { pollSignals(); _tabPollers.sig = setInterval(pollSignals, 6000); }
   if (tab === 'whales') { pollWhales(); _tabPollers.whale = setInterval(pollWhales, 8000); }
   if (tab === 'positions') { pollPositions(); _tabPollers.pos = setInterval(pollPositions, 5000); }
@@ -16057,6 +16278,7 @@ function setPresetChoice(name) {
 }
 function applySettingsToForm(settings, presetName) {
   const s = { ...SETTINGS_DEFAULTS, ...(settings || {}) };
+  window._lastSettings = s;
   const setVal = (id, value) => {
     const el = document.getElementById(id);
     if (el) el.value = value;
@@ -16351,6 +16573,95 @@ function renderScannerTab(d) {
 
   // Poll evaluation feed when scanner tab active
   if (_activeTab === 'scanner') pollEvaluationFeed();
+  if (_activeTab === 'scanner') pollScanDetail();
+}
+
+// ── Scan Balance Strip ────────────────────────────────────────────────────────
+function renderScanBalStrip(d) {
+  const bal = d.balance || 0;
+  const stats = d.stats || {};
+  const pnl = stats.total_pnl_sol || 0;
+  const wins = stats.wins || 0;
+  const losses = stats.losses || 0;
+  const total = wins + losses;
+  const wr = total > 0 ? Math.round(wins / total * 100) : null;
+  setText('sbs-balance', bal.toFixed(4) + ' SOL');
+  setText('sbs-open', d.positions?.length ?? 0);
+  const pnlEl = document.getElementById('sbs-pnl');
+  if (pnlEl) { pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4); pnlEl.style.color = pnl >= 0 ? 'var(--grn)' : 'var(--red2)'; }
+  setText('sbs-wins', wins);
+  setText('sbs-losses', losses);
+  setText('sbs-wr', wr !== null ? wr + '%' : '—');
+}
+
+// ── Scan Detail Poller (positions cards, history, optimizer) ──────────────────
+async function pollScanDetail() {
+  const d = await fetch('/api/scan-detail').then(r => r.json()).catch(() => null);
+  if (!d) return;
+
+  // ── Position Cards ──────────────────────────────────────────────────────────
+  const cards = document.getElementById('pos-cards');
+  if (cards) {
+    if (d.positions && d.positions.length) {
+      const tp1target = (window._lastSettings && window._lastSettings.tp1_mult) || 1.5;
+      cards.innerHTML = d.positions.map(p => {
+        const pnl = p.pnl_pct;
+        const won = pnl != null && pnl >= 0;
+        const pnlCls = pnl == null ? '' : won ? 'c-grn' : 'c-red';
+        const cardCls = pnl == null ? '' : won ? 'winning' : 'losing';
+        const pnlTxt = pnl == null ? '?' : (pnl >= 0 ? '+' : '') + pnl.toFixed(1) + '%';
+        const solTxt = (p.pnl_sol >= 0 ? '+' : '') + (p.pnl_sol || 0).toFixed(4) + ' SOL';
+        const tp1 = p.tp1_hit ? '<span class="pc-badge">TP1✓</span>' : '';
+        const barPct = p.ratio ? Math.min(100, Math.max(0, ((p.ratio - 1) / (tp1target - 1)) * 100)) : 0;
+        const barCls = pnl != null && pnl < 0 ? 'red' : '';
+        return `<div class="pos-card ${cardCls}" onclick="window.open('https://dexscreener.com/solana/${p.address}','_blank')">
+          <div class="pc-top">
+            <div><div class="pc-name">${p.name}${tp1}</div><div class="pc-reason">${p.buy_reason || p.source || 'signal'}</div></div>
+            <div><div class="pc-pnl ${pnlCls}">${pnlTxt}</div><div class="pc-pnl-sub">${solTxt}</div></div>
+          </div>
+          <div class="pc-meta">
+            <span>${p.ratio != null ? p.ratio.toFixed(3) + 'x' : ''}</span>
+            <span>peak ${p.peak_ratio != null ? p.peak_ratio.toFixed(2) + 'x' : '—'}</span>
+            <span>${p.age_min}m</span>
+            <span>${(p.entry_sol || 0).toFixed(3)} SOL in</span>
+          </div>
+          <div class="pc-bar-wrap"><div class="pc-bar ${barCls}" style="width:${barPct}%"></div></div>
+        </div>`;
+      }).join('');
+    } else {
+      cards.innerHTML = '<div style="font-size:11px;color:var(--t3);padding:4px 0">No open positions</div>';
+    }
+  }
+
+  // ── Winners ─────────────────────────────────────────────────────────────────
+  function histHTML(list) {
+    if (!list || !list.length) return '<div style="padding:14px;font-size:11px;color:var(--t3)">None yet</div>';
+    return list.map(t => `<div class="scan-hist-item">
+      <span class="shi-name">${t.name}</span>
+      <span class="shi-reason" title="${t.close_reason}">${t.close_reason}</span>
+      <span class="shi-pnl ${t.pnl_sol >= 0 ? 'c-grn' : 'c-red'}">${t.pnl_sol >= 0 ? '+' : ''}${t.pnl_sol.toFixed(4)}</span>
+      <span class="shi-ts">${t.ts}</span>
+    </div>`).join('');
+  }
+  const wEl = document.getElementById('scan-winners');
+  const lEl = document.getElementById('scan-losers');
+  if (wEl) wEl.innerHTML = histHTML(d.winners);
+  if (lEl) lEl.innerHTML = histHTML(d.losers);
+
+  // ── Optimizer ───────────────────────────────────────────────────────────────
+  const optEl = document.getElementById('scan-optimizer');
+  if (optEl) {
+    if (d.optimizer && d.optimizer.length) {
+      optEl.innerHTML = d.optimizer.map(o => `<div class="scan-opt-row">
+        <span class="scan-opt-lbl" title="${o.label}">${o.label}</span>
+        <div class="scan-opt-bar-wrap"><div class="scan-opt-bar" style="width:${o.win_rate}%"></div></div>
+        <span class="scan-opt-pct">${o.win_rate}%</span>
+        <span class="scan-opt-cnt">${o.wins}/${o.trades}</span>
+      </div>`).join('');
+    } else {
+      optEl.innerHTML = '<div style="font-size:11px;color:var(--t3)">Accumulating trade data…</div>';
+    }
+  }
 }
 
 async function saveBudgetSettings() {
@@ -16719,19 +17030,13 @@ async function refresh() {
     setText('hero-live-state', 'Bot parked');
   }
 
-  const posHtml = d.positions.length
-    ? d.positions.map(p => {
-        const cls = !p.ratio ? 'c-muted' : p.ratio>=1 ? 'c-grn' : 'c-red';
-        return `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--b1);font-size:12px">
-          <span style="font-weight:700">${p.name}${p.tp1_hit?'<span class="badge bg-grn" style="margin-left:4px;font-size:9px">TP1</span>':''}</span>
-          <span class="${cls}" style="font-weight:700;font-family:monospace">${p.pnl}</span>
-        </div>`;
-      }).join('')
-    : '<div style="font-size:12px;color:var(--t3)">No open positions</div>';
-  document.getElementById('pos-tbl').innerHTML = posHtml;
+  // pos-tbl compat stub (hidden; pos-cards used instead)
+  document.getElementById('pos-tbl').innerHTML = '';
 
   // Update scanner activity tab
   renderScannerTab(d);
+  // Update balance strip from state data
+  renderScanBalStrip(d);
 
   const logs = d.log || [];
   document.getElementById('log-count').textContent = logs.length + ' entries';
@@ -18203,6 +18508,7 @@ refresh();
 setInterval(refresh, 5000);
 pollFeed(); setInterval(pollFeed, 8000);
 pollEvaluationFeed(); setInterval(pollEvaluationFeed, 6000);
+pollScanDetail(); setInterval(pollScanDetail, 7000);
 pollListings(); setInterval(pollListings, 6000);
 pollEnhancedDashboard(); setInterval(pollEnhancedDashboard, 15000);
 
