@@ -105,12 +105,18 @@ PRESETS = {
 settings = dict(PRESETS["steady"])
 
 # ── Shared state ───────────────────────────────────────────────────────────────
-seen_tokens = set()
-positions   = {}   # {mint: {name, entry_price, peak_price, timestamp, tp1_hit}}
-trade_log   = []
-sol_balance = 0.0
-bot_running = True
-stats       = {"wins": 0, "losses": 0, "total_pnl_sol": 0.0}
+seen_tokens  = set()
+positions    = {}   # {mint: {name, entry_price, peak_price, timestamp, tp1_hit, buy_reason, entry_sol, source}}
+trade_log    = []
+sol_balance  = 0.0
+bot_running  = True
+stats        = {"wins": 0, "losses": 0, "total_pnl_sol": 0.0}
+trade_history= []   # [{name, mint, entry_sol, pnl_sol, pnl_pct, reason, close_reason, ts}]
+
+# ── Budget / risk controls ──────────────────────────────────────────────────────
+budget_pct      = 1.0   # fraction of balance to use (0.1 – 1.0)
+loss_limit_sol  = 0.0   # if >0, auto-pause bot when session loss exceeds this
+_session_start_balance = None   # set on first balance refresh
 
 def log(msg):
     ts = time.strftime("%H:%M:%S")
@@ -122,12 +128,20 @@ def log(msg):
 
 # ── Solana helpers ─────────────────────────────────────────────────────────────
 def refresh_balance():
-    global sol_balance
+    global sol_balance, bot_running, _session_start_balance
     try:
         r = requests.post(HELIUS_RPC, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]
         }, timeout=5)
         sol_balance = r.json().get("result", {}).get("value", 0) / 1e9
+        if _session_start_balance is None:
+            _session_start_balance = sol_balance
+        # Loss-limit auto-shutoff
+        if loss_limit_sol > 0 and bot_running:
+            session_loss = _session_start_balance - sol_balance
+            if session_loss >= loss_limit_sol:
+                bot_running = False
+                log(f"LOSS LIMIT HIT — session loss {session_loss:.4f} SOL >= limit {loss_limit_sol:.4f} SOL — bot PAUSED")
     except:
         pass
 
@@ -328,7 +342,16 @@ def evaluate_and_buy(mint, name, price, mc, vol, liq, age_min, change, source="d
     if change < 0 and source != "grad":
         return  # skip downtrending (except graduation plays)
 
-    log(f"SIGNAL [{source.upper()}] {name} | MC:${mc:,.0f} Vol:${vol:,.0f} Liq:${liq:,.0f} | Age:{age_min:.0f}m {change:+.0f}%")
+    # Build human-readable buy reason
+    reasons = []
+    if change >= 20:   reasons.append(f"+{change:.0f}% momentum")
+    if vol_mc >= 1.0:  reasons.append("high vol/MC")
+    if age_min <= 5:   reasons.append("ultra-fresh")
+    elif age_min <= 15: reasons.append("early entry")
+    if mc < 10000:     reasons.append("micro-cap")
+    buy_reason = ", ".join(reasons) if reasons else f"{source.upper()} signal"
+
+    log(f"SIGNAL [{source.upper()}] {name} | MC:${mc:,.0f} Vol:${vol:,.0f} Liq:${liq:,.0f} | Age:{age_min:.0f}m {change:+.0f}% | {buy_reason}")
 
     # Anti-rug check
     if s.get("anti_rug"):
@@ -336,15 +359,19 @@ def evaluate_and_buy(mint, name, price, mc, vol, liq, age_min, change, source="d
             log(f"  RUG RISK — skipping {name} (mint/freeze authority or top holder)")
             return
 
-    buy_token(mint, name, price)
+    buy_token(mint, name, price, source=source, buy_reason=buy_reason)
 
-def buy_token(mint, name, price):
+def buy_token(mint, name, price, source="dex", buy_reason="signal"):
+    global budget_pct
     s = settings
-    if sol_balance < s["max_buy_sol"] + 0.01:
+    spend_sol = round(sol_balance * budget_pct * s["max_buy_sol"] / max(s["max_buy_sol"], 0.001), 6)
+    spend_sol = min(spend_sol, s["max_buy_sol"])
+    spend_sol = max(spend_sol, 0.001)
+    if sol_balance < spend_sol + 0.01:
         log(f"Low balance ({sol_balance:.4f} SOL) — skip {name}")
         return
 
-    lamports = int(s["max_buy_sol"] * 1e9)
+    lamports = int(spend_sol * 1e9)
     quote = jupiter_quote(SOL_MINT, mint, lamports)
     if not quote:
         log(f"No buy route for {name}")
@@ -363,9 +390,11 @@ def buy_token(mint, name, price):
             "peak_price":  price,
             "timestamp":   time.time(),
             "tp1_hit":     False,
-            "entry_sol":   s["max_buy_sol"],
+            "entry_sol":   spend_sol,
+            "source":      source,
+            "buy_reason":  buy_reason,
         }
-        log(f"BUY  {name} @ ${price:.8f} | {s['max_buy_sol']} SOL | solscan.io/tx/{sig}")
+        log(f"BUY  {name} @ ${price:.8f} | {spend_sol} SOL | {buy_reason} | solscan.io/tx/{sig}")
         refresh_balance()
 
 def sell_partial(mint, pct, reason):
@@ -400,11 +429,25 @@ def sell_partial(mint, pct, reason):
             log(f"SELL {pos['name']} {int(pct*100)}% — {reason} | PnL: {pnl_pct:+.1f}% ({pnl_sol:+.4f} SOL) | solscan.io/tx/{sig}")
 
             if pct >= 1.0:
-                if pnl_pct >= 0:
+                won = pnl_pct >= 0
+                if won:
                     stats["wins"] += 1
                 else:
                     stats["losses"] += 1
                 stats["total_pnl_sol"] += pnl_sol
+                trade_history.insert(0, {
+                    "name":         pos["name"],
+                    "mint":         mint,
+                    "entry_sol":    pos["entry_sol"],
+                    "pnl_sol":      round(pnl_sol, 4),
+                    "pnl_pct":      round(pnl_pct, 1),
+                    "buy_reason":   pos.get("buy_reason", "signal"),
+                    "close_reason": reason,
+                    "won":          won,
+                    "ts":           time.strftime("%H:%M:%S"),
+                })
+                if len(trade_history) > 200:
+                    trade_history.pop()
                 del positions[mint]
             else:
                 positions[mint]["tp1_hit"] = True
@@ -630,6 +673,73 @@ def update_settings():
     log(f"Custom settings applied")
     return jsonify({"ok": True, "settings": settings})
 
+@app.route("/risk", methods=["POST"])
+def update_risk():
+    global budget_pct, loss_limit_sol
+    data = request.json or {}
+    if "budget_pct" in data:
+        budget_pct = max(0.01, min(1.0, float(data["budget_pct"])))
+    if "loss_limit_sol" in data:
+        loss_limit_sol = max(0.0, float(data["loss_limit_sol"]))
+    log(f"Risk updated: budget={budget_pct*100:.0f}% loss_limit={loss_limit_sol:.4f} SOL")
+    return jsonify({"ok": True, "budget_pct": budget_pct, "loss_limit_sol": loss_limit_sol})
+
+@app.route("/trade_detail")
+def trade_detail():
+    """Extended data for the new dashboard: positions with full metadata, trade history, optimizer hints."""
+    pos_list = []
+    for mint, p in positions.items():
+        cur        = get_token_price(mint)
+        ratio      = (cur / p["entry_price"]) if cur and p["entry_price"] else None
+        peak_ratio = p["peak_price"] / p["entry_price"] if p["entry_price"] else None
+        pnl_sol    = p["entry_sol"] * ((ratio - 1) if ratio else 0)
+        pos_list.append({
+            "address":       mint,
+            "name":          p["name"],
+            "entry_price":   p["entry_price"],
+            "current_price": cur,
+            "ratio":         ratio,
+            "peak_ratio":    peak_ratio,
+            "pnl_pct":       round((ratio - 1) * 100, 1) if ratio else None,
+            "pnl_sol":       round(pnl_sol, 4),
+            "age_min":       round((time.time() - p["timestamp"]) / 60, 1),
+            "tp1_hit":       p["tp1_hit"],
+            "entry_sol":     p["entry_sol"],
+            "source":        p.get("source", "dex"),
+            "buy_reason":    p.get("buy_reason", "signal"),
+        })
+
+    # Optimizer hints: win-rate by source, best/worst close reason
+    wins_by_source   = {}
+    trades_by_source = {}
+    for t in trade_history:
+        src = t.get("buy_reason", "signal")[:12]
+        trades_by_source[src] = trades_by_source.get(src, 0) + 1
+        if t["won"]:
+            wins_by_source[src] = wins_by_source.get(src, 0) + 1
+    optimizer = []
+    for src, total in sorted(trades_by_source.items(), key=lambda x: -x[1])[:5]:
+        wins = wins_by_source.get(src, 0)
+        optimizer.append({
+            "label":    src,
+            "trades":   total,
+            "wins":     wins,
+            "win_rate": round(wins / total * 100) if total else 0,
+        })
+
+    # Session drawdown
+    session_loss = round((_session_start_balance or sol_balance) - sol_balance, 4)
+
+    return jsonify({
+        "positions":      pos_list,
+        "trade_history":  trade_history[:60],
+        "optimizer":      optimizer,
+        "budget_pct":     budget_pct,
+        "loss_limit_sol": loss_limit_sol,
+        "session_loss":   session_loss,
+        "start_balance":  round(_session_start_balance or sol_balance, 4),
+    })
+
 # ── Dashboard HTML ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html>
@@ -637,82 +747,163 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8"><title>SOL Bot</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d0d0d;color:#e0e0e0;font-family:'Courier New',monospace;padding:20px}
-h1{color:#9945FF;margin-bottom:4px;font-size:22px}
-.sub{color:#555;font-size:12px;margin-bottom:18px}
-.row{display:flex;gap:14px;margin-bottom:14px;flex-wrap:wrap}
-.card{background:#1a1a1a;border:1px solid #252525;border-radius:8px;padding:14px;flex:1;min-width:160px}
-.card h2{font-size:11px;color:#555;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-.big{font-size:26px;color:#14F195;font-weight:bold}
-.sm{font-size:11px;color:#555;margin-top:3px}
+body{background:#0d0d0d;color:#e0e0e0;font-family:'Courier New',monospace;padding-top:64px}
+/* ── Sticky balance bar ── */
+#balance-bar{position:fixed;top:0;left:0;right:0;z-index:100;background:#111;border-bottom:1px solid #252525;
+  display:flex;align-items:center;gap:0;height:52px;padding:0 18px;overflow:hidden}
+#balance-bar .bb-item{display:flex;flex-direction:column;justify-content:center;padding:0 16px;border-right:1px solid #222;height:100%}
+#balance-bar .bb-item:last-child{border-right:none;margin-left:auto}
+#balance-bar .bb-label{font-size:9px;color:#444;text-transform:uppercase;letter-spacing:1px}
+#balance-bar .bb-val{font-size:16px;font-weight:bold;line-height:1.2}
+#balance-bar .bb-status{display:flex;align-items:center;gap:8px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#14F195;animation:pulse 1.5s infinite}
+.dot.red{background:#FF4444;animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+/* ── Layout ── */
+.wrap{padding:14px 18px}
+h1{color:#9945FF;margin-bottom:2px;font-size:20px}
+.sub{color:#444;font-size:11px;margin-bottom:14px}
+.row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.card{background:#141414;border:1px solid #222;border-radius:8px;padding:13px;flex:1;min-width:150px}
+.card h2{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px;margin-bottom:9px}
+.big{font-size:24px;color:#14F195;font-weight:bold}
+.sm{font-size:11px;color:#444;margin-top:2px}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th{color:#555;font-weight:normal;text-align:left;padding:4px 8px;border-bottom:1px solid #222;font-size:10px;text-transform:uppercase}
-td{padding:5px 8px;border-bottom:1px solid #1c1c1c}
-.green{color:#14F195}.red{color:#FF4444}.yellow{color:#FFD700}.purple{color:#9945FF}.gray{color:#555}
-.log-box{background:#1a1a1a;border:1px solid #252525;border-radius:8px;padding:14px;height:260px;overflow-y:auto}
-.log-line{font-size:11px;color:#666;line-height:1.9;border-bottom:1px solid #181818}
-.log-line.buy{color:#ffffff}.log-line.sell-win{color:#14F195}.log-line.sell-loss{color:#FF4444}.log-line.signal{color:#FFD700}
-.log-line.hold{color:#3a3a3a}.log-line.rug{color:#FF4444}
+th{color:#444;font-weight:normal;text-align:left;padding:4px 8px;border-bottom:1px solid #1e1e1e;font-size:10px;text-transform:uppercase}
+td{padding:5px 8px;border-bottom:1px solid #191919}
+.green{color:#14F195}.red{color:#FF4444}.yellow{color:#FFD700}.purple{color:#9945FF}.gray{color:#444}.white{color:#e0e0e0}
+.log-box{background:#141414;border:1px solid #222;border-radius:8px;padding:13px;height:240px;overflow-y:auto}
+.log-line{font-size:11px;color:#555;line-height:1.9;border-bottom:1px solid #161616}
+.log-line.buy{color:#e0e0e0}.log-line.sell-win{color:#14F195}.log-line.sell-loss{color:#FF4444}
+.log-line.signal{color:#FFD700}.log-line.hold{color:#333}.log-line.rug{color:#FF4444}
 .btn{border:none;border-radius:6px;padding:7px 14px;font-family:monospace;font-size:12px;cursor:pointer;font-weight:bold;transition:opacity .15s}
 .btn:hover{opacity:.8}
 .btn-red{background:#FF4444;color:#fff}.btn-green{background:#14F195;color:#000}
-.btn-yellow{background:#FFD700;color:#000}.btn-gray{background:#2a2a2a;color:#aaa}
+.btn-yellow{background:#FFD700;color:#000}.btn-gray{background:#222;color:#aaa}
 .btn-purple{background:#9945FF;color:#fff}.btn-blue{background:#1E90FF;color:#fff}
-input[type=number],input[type=text]{background:#111;border:1px solid #333;color:#e0e0e0;border-radius:4px;padding:4px 6px;font-family:monospace;font-size:12px;width:80px}
+input[type=number],input[type=text]{background:#0e0e0e;border:1px solid #2a2a2a;color:#e0e0e0;border-radius:4px;padding:4px 6px;font-family:monospace;font-size:12px;width:80px}
+input[type=range]{width:140px;accent-color:#9945FF;cursor:pointer;vertical-align:middle}
 input[type=checkbox]{width:16px;height:16px;cursor:pointer}
-label{font-size:11px;color:#777;display:block;margin-bottom:3px}
+label{font-size:11px;color:#666;display:block;margin-bottom:3px}
 .field{margin-right:12px;margin-bottom:8px;display:inline-block;vertical-align:top}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#14F195;animation:pulse 1.5s infinite;margin-right:5px}
-.dot.red{background:#FF4444;animation:none}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-a{color:#9945FF;text-decoration:none}
-.empty{color:#444;font-size:12px}
+/* ── Position cards ── */
+.pos-grid{display:flex;flex-wrap:wrap;gap:10px}
+.pos-card{background:#181818;border:1px solid #252525;border-radius:8px;padding:12px;min-width:220px;flex:1;max-width:320px;position:relative}
+.pos-card.winning{border-color:#14F19540}
+.pos-card.losing{border-color:#FF444440}
+.pos-card .pc-name{font-size:14px;font-weight:bold;margin-bottom:2px}
+.pos-card .pc-reason{font-size:10px;color:#555;margin-bottom:8px}
+.pos-card .pc-pnl{font-size:22px;font-weight:bold;margin-bottom:2px}
+.pos-card .pc-meta{display:flex;gap:12px;font-size:11px;color:#555;margin-top:6px;flex-wrap:wrap}
+.pos-card .pc-badge{font-size:9px;padding:2px 5px;border-radius:3px;background:#1e2a1e;color:#14F195;margin-left:4px}
+.pos-card .pc-badge.pump{background:#2a1e2a;color:#9945FF}
+.pos-card .pc-bar-wrap{height:4px;background:#222;border-radius:2px;margin-top:8px;overflow:hidden}
+.pos-card .pc-bar{height:4px;border-radius:2px;background:#14F195;transition:width .5s}
+.pos-card .pc-bar.red{background:#FF4444}
+.pos-card .pc-link{position:absolute;top:10px;right:10px;font-size:10px;color:#444}
+.pos-card .pc-link:hover{color:#9945FF}
+/* ── History lists ── */
+.hist-list{max-height:320px;overflow-y:auto}
+.hist-item{display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #191919;font-size:11px}
+.hist-item .hi-icon{font-size:14px;width:20px;text-align:center}
+.hist-item .hi-name{flex:1;font-weight:bold}
+.hist-item .hi-reason{color:#444;font-size:10px;max-width:110px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.hist-item .hi-pnl{font-weight:bold;white-space:nowrap}
+.hist-item .hi-ts{color:#333;font-size:10px;white-space:nowrap}
+/* ── Optimizer ── */
+.opt-row{display:flex;align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid #191919;font-size:11px}
+.opt-row .or-label{width:120px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:#888}
+.opt-row .or-bar-wrap{flex:1;height:6px;background:#1a1a1a;border-radius:3px;overflow:hidden}
+.opt-row .or-bar{height:6px;border-radius:3px;background:#9945FF;transition:width .5s}
+.opt-row .or-pct{width:40px;text-align:right;color:#9945FF;font-weight:bold}
+.opt-row .or-count{width:40px;text-align:right;color:#444}
+/* ── Budget/risk panel ── */
+.risk-row{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.risk-row label{display:inline;margin:0;min-width:110px}
+.risk-val{font-size:13px;font-weight:bold;color:#9945FF;min-width:40px}
+/* ── Misc ── */
 .badge{font-size:10px;padding:2px 5px;border-radius:3px;background:#1e2a1e;color:#14F195;margin-left:4px}
 .badge.pump{background:#2a1e2a;color:#9945FF}
 .preset-active{outline:2px solid #14F195}
-.divider{border:none;border-top:1px solid #222;margin:12px 0}
-.stat-row{display:flex;gap:20px;margin-top:6px}
-.stat{font-size:12px}.stat .val{font-size:18px;font-weight:bold}
+.divider{border:none;border-top:1px solid #1e1e1e;margin:11px 0}
+.stat-row{display:flex;gap:18px;margin-top:5px}
+.stat .val{font-size:18px;font-weight:bold}
+.stat .sm{font-size:11px;color:#444}
+a{color:#9945FF;text-decoration:none}
+.empty{color:#333;font-size:12px;padding:8px 0}
 </style>
 </head>
 <body>
-<h1>SOL Trading Bot</h1>
-<p class="sub"><span class="dot" id="sdot"></span><span id="stxt">Live</span>&nbsp;·&nbsp;refreshes every 5s</p>
 
-<!-- Row 1: stats -->
-<div class="row">
-  <div class="card">
-    <h2>Balance</h2>
-    <div class="big" id="balance">…</div><div class="sm">SOL</div>
+<!-- ── Sticky Balance Bar ── -->
+<div id="balance-bar">
+  <div class="bb-item">
+    <span class="bb-label">Balance</span>
+    <span class="bb-val green" id="bb-balance">…</span>
   </div>
-  <div class="card">
-    <h2>Open Positions</h2>
-    <div class="big yellow" id="pos-count">0</div><div class="sm">active</div>
+  <div class="bb-item">
+    <span class="bb-label">Start</span>
+    <span class="bb-val white" id="bb-start">…</span>
   </div>
-  <div class="card">
-    <h2>Session P&amp;L</h2>
-    <div class="stat-row">
-      <div class="stat"><div class="val green" id="wins">0</div><div class="sm">wins</div></div>
-      <div class="stat"><div class="val red"   id="losses">0</div><div class="sm">losses</div></div>
-      <div class="stat"><div class="val" id="pnl-sol">+0.0000</div><div class="sm">SOL P&L</div></div>
-    </div>
+  <div class="bb-item">
+    <span class="bb-label">Session P&amp;L</span>
+    <span class="bb-val" id="bb-pnl">…</span>
   </div>
-  <div class="card" style="flex:2">
-    <h2>Controls</h2>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <button class="btn btn-red"    onclick="cashout()">💸 Cashout All</button>
-      <button class="btn btn-yellow" id="tbtn" onclick="toggleBot()">⏸ Pause</button>
+  <div class="bb-item">
+    <span class="bb-label">Positions</span>
+    <span class="bb-val yellow" id="bb-pos">0</span>
+  </div>
+  <div class="bb-item">
+    <span class="bb-label">W / L</span>
+    <span class="bb-val" id="bb-wl">0 / 0</span>
+  </div>
+  <div class="bb-item" style="margin-left:auto;border-right:none">
+    <div class="bb-status">
+      <span class="dot" id="sdot"></span>
+      <span id="stxt" style="font-size:12px;color:#777">Live</span>
+      <button class="btn btn-yellow" id="tbtn" onclick="toggleBot()" style="padding:4px 10px;font-size:11px">⏸ Pause</button>
+      <button class="btn btn-red"    onclick="cashout()"             style="padding:4px 10px;font-size:11px">💸 Cashout</button>
     </div>
   </div>
 </div>
 
-<!-- Row 2: presets + settings -->
-<div class="card" style="margin-bottom:14px">
+<div class="wrap">
+<h1>SOL Trading Bot</h1>
+<p class="sub">refreshes every 5s</p>
+
+<!-- ── Position Cards ── -->
+<div class="card" style="margin-bottom:12px">
+  <h2>Open Positions</h2>
+  <div id="pos-grid" class="pos-grid"><p class="empty">No open positions</p></div>
+</div>
+
+<!-- ── Budget / Risk Controls ── -->
+<div class="card" style="margin-bottom:12px">
+  <h2>Risk Controls</h2>
+  <div class="risk-row">
+    <label>Trade Budget</label>
+    <input type="range" id="r-budget" min="5" max="100" step="5" value="100" oninput="document.getElementById('r-budget-val').textContent=this.value+'%'">
+    <span class="risk-val" id="r-budget-val">100%</span>
+    <span class="sm">of max_buy_sol per trade</span>
+  </div>
+  <div class="risk-row">
+    <label>Loss Limit (SOL)</label>
+    <input type="number" id="r-loss" step="0.01" min="0" value="0" style="width:80px">
+    <span class="sm">0 = disabled — auto-pause when session loss hits this</span>
+  </div>
+  <div class="risk-row">
+    <span id="r-session-loss" class="sm"></span>
+    <button class="btn btn-gray" onclick="saveRisk()" style="margin-left:auto">Apply</button>
+  </div>
+</div>
+
+<!-- ── Strategy Presets + Settings ── -->
+<div class="card" style="margin-bottom:12px">
   <h2>Strategy Presets</h2>
   <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
     <button class="btn btn-green"  id="preset-steady" onclick="loadPreset('steady')">📈 Steady Profit</button>
     <button class="btn btn-purple" id="preset-max"    onclick="loadPreset('max')">🚀 Max Profit</button>
-    <span style="color:#555;font-size:11px;align-self:center">— or customize below then Apply</span>
+    <span style="color:#444;font-size:11px;align-self:center">— or customize below then Apply</span>
   </div>
   <hr class="divider">
   <div style="margin-top:10px">
@@ -733,39 +924,75 @@ a{color:#9945FF;text-decoration:none}
   </div>
 </div>
 
-<!-- Positions -->
-<div class="card" style="margin-bottom:14px">
-  <h2>Positions</h2>
-  <div id="pos-tbl"><p class="empty">No open positions</p></div>
+<!-- ── Winners / Losers History ── -->
+<div class="row">
+  <div class="card">
+    <h2 class="green">Winners</h2>
+    <div id="hist-wins" class="hist-list"><p class="empty">No winners yet</p></div>
+  </div>
+  <div class="card">
+    <h2 class="red">Losers</h2>
+    <div id="hist-losses" class="hist-list"><p class="empty">No losses yet</p></div>
+  </div>
 </div>
 
-<!-- Log -->
-<div class="log-box">
-  <h2 style="margin-bottom:8px">Activity Log</h2>
+<!-- ── Live Parameter Optimizer ── -->
+<div class="card" style="margin-bottom:12px">
+  <h2>Live Signal Optimizer — Win Rate by Buy Reason</h2>
+  <div id="optimizer"><p class="empty">Accumulating trade data…</p></div>
+</div>
+
+<!-- ── Log ── -->
+<div class="log-box" style="margin-bottom:12px">
+  <h2 style="margin-bottom:8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px">Activity Log</h2>
   <div id="log"></div>
 </div>
+</div><!-- /wrap -->
 
 <script>
 let running=true, st={};
 
+function fmt(v,d=4){return v==null?'?':v.toFixed(d);}
+function pnlCls(v){return v==null?'':v>=0?'green':'red';}
+function sign(v){return v>=0?'+':'';}
+
 async function refresh(){
-  const d=await fetch('/state').then(r=>r.json()).catch(()=>null);
-  if(!d)return;
+  const [d,td]=await Promise.all([
+    fetch('/state').then(r=>r.json()).catch(()=>null),
+    fetch('/trade_detail').then(r=>r.json()).catch(()=>null)
+  ]);
+  if(!d||!td)return;
   running=d.running; st=d.settings;
 
-  document.getElementById('balance').textContent=d.balance.toFixed(4);
-  document.getElementById('pos-count').textContent=d.positions.length;
-  document.getElementById('wins').textContent=d.stats.wins;
-  document.getElementById('losses').textContent=d.stats.losses;
-  const pnlEl=document.getElementById('pnl-sol');
-  pnlEl.textContent=(d.stats.total_pnl_sol>=0?'+':'')+d.stats.total_pnl_sol.toFixed(4);
-  pnlEl.className='val '+(d.stats.total_pnl_sol>=0?'green':'red');
+  // ── Balance bar ──
+  document.getElementById('bb-balance').textContent=fmt(d.balance,4)+' SOL';
+  document.getElementById('bb-start').textContent=fmt(td.start_balance,4)+' SOL';
+  const pnlSol=d.stats.total_pnl_sol;
+  const bbPnl=document.getElementById('bb-pnl');
+  bbPnl.textContent=(pnlSol>=0?'+':'')+fmt(pnlSol,4)+' SOL';
+  bbPnl.className='bb-val '+(pnlSol>=0?'green':'red');
+  document.getElementById('bb-pos').textContent=td.positions.length;
+  document.getElementById('bb-wl').textContent=`${d.stats.wins} / ${d.stats.losses}`;
 
   const dot=document.getElementById('sdot'),txt=document.getElementById('stxt'),btn=document.getElementById('tbtn');
   if(running){dot.className='dot';txt.textContent='Running';btn.textContent='⏸ Pause';btn.className='btn btn-yellow';}
   else{dot.className='dot red';txt.textContent='Paused';btn.textContent='▶ Resume';btn.className='btn btn-green';}
 
-  // Sync settings fields
+  // ── Risk panel ──
+  const rl=document.getElementById('r-loss');
+  if(document.activeElement!==rl) rl.value=td.loss_limit_sol;
+  const rb=document.getElementById('r-budget');
+  if(document.activeElement!==rb){
+    rb.value=Math.round(td.budget_pct*100);
+    document.getElementById('r-budget-val').textContent=Math.round(td.budget_pct*100)+'%';
+  }
+  const sl_el=document.getElementById('r-session-loss');
+  if(td.session_loss>0){
+    sl_el.innerHTML=`Session drawdown: <span class="red">${fmt(td.session_loss,4)} SOL</span>`
+      +(td.loss_limit_sol>0?` / limit ${fmt(td.loss_limit_sol,4)} SOL`:'');
+  } else { sl_el.textContent='No session drawdown'; }
+
+  // ── Settings fields ──
   document.getElementById('s-buy').value   =st.max_buy_sol;
   document.getElementById('s-tp1').value   =st.tp1_mult;
   document.getElementById('s-tp2').value   =st.tp2_mult;
@@ -780,39 +1007,76 @@ async function refresh(){
   document.getElementById('s-rug').checked =!!st.anti_rug;
   document.getElementById('s-pump').checked=!!st.pump_scan;
 
-  // Positions
-  if(d.positions.length){
-    const rows=d.positions.map(p=>{
-      const cls=!p.ratio?'':p.ratio>=1?'green':'red';
-      const tp1=p.tp1_hit?'<span class="badge">TP1✓</span>':'';
-      return `<tr>
-        <td>${p.name}${tp1}</td>
-        <td>$${p.entry_price?.toFixed(8)??'?'}</td>
-        <td>$${p.current_price?.toFixed(8)??'?'}</td>
-        <td class="${cls}">${p.pnl}</td>
-        <td class="yellow">⬆${p.peak_ratio?.toFixed(2)??'?'}x</td>
-        <td>${p.age_min}m</td>
-        <td><a href="https://dexscreener.com/solana/${p.address}" target="_blank">chart</a></td>
-      </tr>`;
+  // ── Position cards ──
+  const grid=document.getElementById('pos-grid');
+  if(td.positions.length){
+    grid.innerHTML=td.positions.map(p=>{
+      const pnl=p.pnl_pct;
+      const cls=pnl==null?'':pnl>=0?'winning':'losing';
+      const pnlTxt=pnl==null?'?':(pnl>=0?'+':'')+pnl.toFixed(1)+'%';
+      const pnlSolTxt=(p.pnl_sol>=0?'+':'')+fmt(p.pnl_sol,4)+' SOL';
+      const pnlCl=pnl==null?'white':pnl>=0?'green':'red';
+      const tp1=p.tp1_hit?'<span class="pc-badge">TP1✓</span>':'';
+      const srcBadge=p.source==='pump'?'<span class="pc-badge pump">pump.fun</span>':'';
+      // Progress bar: ratio 1.0→tp1 = 0→100%
+      const tp1target=st.tp1_mult||1.5;
+      const barPct=p.ratio?Math.min(100,Math.max(0,((p.ratio-1)/(tp1target-1))*100)):0;
+      const barCls=pnl!=null&&pnl<0?'red':'';
+      return `<div class="pos-card ${cls}">
+        <a class="pc-link" href="https://dexscreener.com/solana/${p.address}" target="_blank">chart ↗</a>
+        <div class="pc-name">${p.name}${tp1}${srcBadge}</div>
+        <div class="pc-reason">${p.buy_reason||'signal'}</div>
+        <div class="pc-pnl ${pnlCl}">${pnlTxt} <span style="font-size:13px">${pnlSolTxt}</span></div>
+        <div class="pc-meta">
+          <span>${p.ratio!=null?p.ratio.toFixed(3)+'x':''}</span>
+          <span class="yellow">peak ${p.peak_ratio!=null?p.peak_ratio.toFixed(2)+'x':''}</span>
+          <span>${p.age_min}m</span>
+          <span>${fmt(p.entry_sol,3)} SOL in</span>
+        </div>
+        <div class="pc-bar-wrap"><div class="pc-bar ${barCls}" style="width:${barPct}%"></div></div>
+      </div>`;
     }).join('');
-    document.getElementById('pos-tbl').innerHTML=
-      `<table><thead><tr><th>Token</th><th>Entry</th><th>Current</th><th>PnL</th><th>Peak</th><th>Age</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-  }else{
-    document.getElementById('pos-tbl').innerHTML='<p class="empty">No open positions</p>';
+  } else {
+    grid.innerHTML='<p class="empty">No open positions</p>';
   }
 
-  // Log
-  document.getElementById('log').innerHTML=d.log.map(l=>{
-    let c='';
-    if(l.includes('BUY')){c='buy';}
-    else if(l.includes('SELL')||l.includes('CASHOUT')){
-      c=l.includes('PnL: -')?'sell-loss':'sell-win';
-    }
-    else if(l.includes('SIGNAL')){c='signal';}
-    else if(l.includes('HOLD')){c='hold';}
-    else if(l.includes('RUG')||l.includes('rug')){c='rug';}
-    return `<div class="log-line ${c}">${l}</div>`;
-  }).join('');
+  // ── Trade history: winners / losers ──
+  const wins=td.trade_history.filter(t=>t.won);
+  const losses=td.trade_history.filter(t=>!t.won);
+  function histHTML(list){
+    if(!list.length) return '<p class="empty">None yet</p>';
+    return list.slice(0,30).map(t=>{
+      const cls=t.won?'green':'red';
+      const icon=t.won?'✅':'❌';
+      return `<div class="hist-item">
+        <span class="hi-icon">${icon}</span>
+        <span class="hi-name ${cls}">${t.name}</span>
+        <span class="hi-reason" title="${t.buy_reason}">${t.buy_reason}</span>
+        <span class="hi-pnl ${cls}">${sign(t.pnl_pct)}${t.pnl_pct}% (${sign(t.pnl_sol)}${fmt(t.pnl_sol,4)})</span>
+        <span class="hi-reason" style="color:#333">${t.close_reason}</span>
+        <span class="hi-ts">${t.ts}</span>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('hist-wins').innerHTML=histHTML(wins);
+  document.getElementById('hist-losses').innerHTML=histHTML(losses);
+
+  // ── Optimizer ──
+  const optEl=document.getElementById('optimizer');
+  if(td.optimizer&&td.optimizer.length){
+    optEl.innerHTML=td.optimizer.map(o=>{
+      return `<div class="opt-row">
+        <span class="or-label" title="${o.label}">${o.label}</span>
+        <div class="or-bar-wrap"><div class="or-bar" style="width:${o.win_rate}%"></div></div>
+        <span class="or-pct">${o.win_rate}%</span>
+        <span class="or-count">${o.wins}/${o.trades}</span>
+      </div>`;
+    }).join('');
+  } else {
+    optEl.innerHTML='<p class="empty">Accumulating trade data…</p>';
+  }
+
+  // ── Log ──
 }
 
 async function cashout(){
@@ -828,7 +1092,6 @@ async function toggleBot(){
 
 async function loadPreset(name){
   await fetch('/preset/'+name,{method:'POST'});
-  // Highlight active preset button
   document.querySelectorAll('[id^=preset-]').forEach(b=>b.classList.remove('preset-active'));
   document.getElementById('preset-'+name)?.classList.add('preset-active');
   setTimeout(refresh,400);
@@ -837,7 +1100,6 @@ async function loadPreset(name){
 async function saveSettings(){
   const sl=parseFloat(document.getElementById('s-sl').value);
   const trail=parseFloat(document.getElementById('s-trail').value);
-  // Clear preset highlight since user customized
   document.querySelectorAll('[id^=preset-]').forEach(b=>b.classList.remove('preset-active'));
   await fetch('/settings',{
     method:'POST',headers:{'Content-Type':'application/json'},
@@ -856,6 +1118,16 @@ async function saveSettings(){
       anti_rug:     document.getElementById('s-rug').checked,
       pump_scan:    document.getElementById('s-pump').checked,
     })
+  });
+  setTimeout(refresh,300);
+}
+
+async function saveRisk(){
+  const pct=parseFloat(document.getElementById('r-budget').value)/100;
+  const loss=parseFloat(document.getElementById('r-loss').value)||0;
+  await fetch('/risk',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({budget_pct:pct,loss_limit_sol:loss})
   });
   setTimeout(refresh,300);
 }
