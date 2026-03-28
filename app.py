@@ -154,13 +154,13 @@ _adapter = requests.adapters.HTTPAdapter(
 )
 _http_session.mount("https://", _adapter)
 _http_session.mount("http://", _adapter)
-_http_session.headers.update(HEADERS)
 
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
 SOL_MINT      = "So11111111111111111111111111111111111111112"
 PUMP_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 HEADERS       = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+_http_session.headers.update(HEADERS)
 SESSION_COOKIE_SECURE = os.getenv(
     "SESSION_COOKIE_SECURE",
     "1" if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("FLASK_ENV") == "production" else "0",
