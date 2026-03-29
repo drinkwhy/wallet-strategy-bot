@@ -137,7 +137,7 @@ def buy_token(address, name, entry_price):
 
     try:
         quote = requests.get(
-            f"https://quote-api.jup.ag/v6/quote"
+            f"https://lite-api.jup.ag/swap/v1/quote"
             f"?inputMint=So11111111111111111111111111111111111111112"
             f"&outputMint={address}"
             f"&amount={int(MAX_BUY_SOL * 1e9)}"
@@ -148,7 +148,7 @@ def buy_token(address, name, entry_price):
             print(f"   ❌ No route: {quote['error']}")
             return False
 
-        swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json={
+        swap_resp = requests.post("https://lite-api.jup.ag/swap/v1/swap", json={
             "quoteResponse": quote,
             "userPublicKey": wallet,
             "wrapAndUnwrapSol": True,
@@ -189,7 +189,7 @@ def sell_token(address, reason):
             return
 
         quote = requests.get(
-            f"https://quote-api.jup.ag/v6/quote"
+            f"https://lite-api.jup.ag/swap/v1/quote"
             f"?inputMint={address}"
             f"&outputMint=So11111111111111111111111111111111111111112"
             f"&amount={token_amount}"
@@ -200,7 +200,7 @@ def sell_token(address, reason):
             print(f"   ❌ No sell route for {pos['name']}: {quote['error']}")
             return
 
-        swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json={
+        swap_resp = requests.post("https://lite-api.jup.ag/swap/v1/swap", json={
             "quoteResponse": quote,
             "userPublicKey": wallet,
             "wrapAndUnwrapSol": True,

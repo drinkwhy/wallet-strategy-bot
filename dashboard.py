@@ -163,7 +163,7 @@ def sign_and_send(swap_tx_b64):
 
 def jupiter_quote(input_mint, output_mint, amount_lamports):
     r = requests.get(
-        f"https://quote-api.jup.ag/v6/quote"
+        f"https://lite-api.jup.ag/swap/v1/quote"
         f"?inputMint={input_mint}&outputMint={output_mint}"
         f"&amount={amount_lamports}&slippageBps=1500",
         timeout=10
@@ -171,7 +171,7 @@ def jupiter_quote(input_mint, output_mint, amount_lamports):
     return None if "error" in r else r
 
 def jupiter_swap(quote, priority_fee_lamports=10000):
-    r = requests.post("https://quote-api.jup.ag/v6/swap", json={
+    r = requests.post("https://lite-api.jup.ag/swap/v1/swap", json={
         "quoteResponse":            quote,
         "userPublicKey":            wallet,
         "wrapAndUnwrapSol":         True,

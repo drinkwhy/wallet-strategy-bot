@@ -462,7 +462,7 @@ class ExitSimulator:
         """Get quote from Jupiter API."""
         try:
             url = (
-                f"https://quote-api.jup.ag/v6/quote"
+                f"https://lite-api.jup.ag/swap/v1/quote"
                 f"?inputMint={input_mint}"
                 f"&outputMint={output_mint}"
                 f"&amount={amount}"

@@ -2978,7 +2978,6 @@ class BotInstance:
         urls = [
             f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true",
             f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true",
-            f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         ]
         # Hit all endpoints in parallel, take first success
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -3017,7 +3016,7 @@ class BotInstance:
                 self.log_msg(f"Priority fee: Helius={helius_fee} µL, cap={user_max}, using={optimal_fee}")
             else:
                 optimal_fee = user_max
-            r = requests.post(url, json={
+            resp = requests.post(url, json={
                 "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
                 "dynamicComputeUnitLimit": True,
                 "dynamicSlippage": {"minBps": 10, "maxBps": 300},
@@ -3028,15 +3027,19 @@ class BotInstance:
                         "global": False,
                     }
                 },
-            }, timeout=12).json()
+            }, timeout=12)
+            r = resp.json()
             if r.get("swapTransaction"):
                 return r["swapTransaction"]
+            # Log the actual error so we can diagnose v1 endpoint failures
+            err = r.get("error") or r.get("message") or r.get("msg") or str(r)[:200]
+            self.log_msg(f"Jupiter swap no-tx ({url.split('/')[2]}): HTTP {resp.status_code} — {err}")
         except Exception as e:
             self.log_msg(f"Jupiter swap failed ({url.split('/')[2]}): {e}")
         return None
 
     def jupiter_swap(self, quote):
-        endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://api.jup.ag/swap/v1/swap", "https://quote-api.jup.ag/v6/swap"]
+        endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://api.jup.ag/swap/v1/swap"]
         # Hit all endpoints in parallel, take first success
         with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {pool.submit(self._jupiter_swap_single, u, quote): u for u in endpoints}
@@ -4529,7 +4532,7 @@ def infer_infrastructure_labels(wallets):
 def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
     urls = [
         f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-        f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+        f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
     ]
     for url in urls:
         try:
