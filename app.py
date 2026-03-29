@@ -121,6 +121,10 @@ SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
 REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
 FEE_WALLET          = os.getenv("FEE_WALLET", "")  # your SOL wallet to receive perf fees
 JUPITER_API_KEY     = os.getenv("JUPITER_API_KEY", "").strip()
+if JUPITER_API_KEY:
+    print(f"[CONFIG] Jupiter API key loaded — key={JUPITER_API_KEY[:8]}...", flush=True)
+else:
+    print("[WARN] No JUPITER_API_KEY — Jupiter v2 swap will not work! Get one at portal.jup.ag", flush=True)
 ANKR_RPC            = os.getenv("ANKR_RPC", "").strip()
 # Sanitize: Railway UI sometimes stores "Value: https://..." — strip the prefix
 if ANKR_RPC.lower().startswith("value:"):
@@ -4191,10 +4195,15 @@ class BotInstance:
             _jup_headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
             _r = _http_session.get("https://api.jup.ag/swap/v2/order?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", headers=_jup_headers, timeout=10)
             _jup_ms = round((time.perf_counter() - _t0) * 1000)
-            _jup_ok = _r.status_code == 200 and "error" not in (_r.text or "")[:100].lower()
-            preflight_results.append(("Jupiter API", _jup_ok, f"{_jup_ms}ms" + ("" if JUPITER_API_KEY else " (NO API KEY!)")))
+            _jup_ok = _r.status_code == 200
+            _jup_detail = f"{_jup_ms}ms"
+            if not _jup_ok:
+                _jup_detail += f" HTTP {_r.status_code}: {(_r.text or '')[:80]}"
+            if not JUPITER_API_KEY:
+                _jup_detail += " (NO API KEY!)"
+            preflight_results.append(("Jupiter API", _jup_ok, _jup_detail))
         except Exception as _e:
-            preflight_results.append(("Jupiter API", False, str(_e)[:60]))
+            preflight_results.append(("Jupiter API", False, str(_e)[:80]))
         # 3. DexScreener
         try:
             _t0 = time.perf_counter()
