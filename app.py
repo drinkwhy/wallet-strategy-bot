@@ -620,7 +620,9 @@ def load_user_effective_settings(user_id):
     finally:
         db_return(conn)
     preset_name = normalize_preset_name((row or {}).get("preset", "balanced"))
-    settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
+    settings = dict(
+        PRESETS.get(preset_name) or SHADOW_V2_PRESETS.get(preset_name) or PRESETS["balanced"]
+    )
     if row:
         if row.get("max_correlated") is not None:
             settings["max_correlated"] = row["max_correlated"]
@@ -8128,7 +8130,7 @@ def _start_bot_from_row(row):
     uid = row["user_id"]
     kp = Keypair.from_bytes(base58.b58decode(decrypt_key(row["encrypted_key"])))
     preset_name = normalize_preset_name(row["preset"])
-    settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
+    settings = dict(PRESETS.get(preset_name) or SHADOW_V2_PRESETS.get(preset_name) or PRESETS["balanced"])
     if row.get("max_correlated") is not None:
         settings["max_correlated"] = row["max_correlated"]
     if row.get("drawdown_limit_sol") is not None:
@@ -9652,7 +9654,7 @@ def api_state():
             row = cur.fetchone()
             if row:
                 preset_name = normalize_preset_name(row.get("preset", "balanced"))
-                db_settings = dict(PRESETS.get(preset_name, PRESETS["balanced"]))
+                db_settings = dict(PRESETS.get(preset_name) or SHADOW_V2_PRESETS.get(preset_name) or PRESETS["balanced"])
                 if row.get("max_correlated") is not None:
                     db_settings["max_correlated"] = row["max_correlated"]
                 # Session limits removed — drawdown_limit falls back to preset values
@@ -9732,7 +9734,7 @@ def api_start():
     except Exception:
         return jsonify({"ok":False,"msg":"Wallet key could not be decrypted — please re-enter your private key at /setup"})
     preset   = normalize_preset_name(bs["preset"] if bs else "balanced")
-    settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
+    settings = dict(PRESETS.get(preset) or SHADOW_V2_PRESETS.get(preset) or PRESETS["balanced"])
     # Apply user-specific overrides saved in DB on top of preset defaults
     if bs:
         if bs.get("max_correlated") is not None:
@@ -9949,7 +9951,9 @@ def api_settings():
         if not base_settings:
             base_settings = dict(PRESETS["custom"])
     else:
-        base_settings = dict(PRESETS.get(preset, PRESETS["balanced"]))
+        base_settings = dict(
+            PRESETS.get(preset) or SHADOW_V2_PRESETS.get(preset) or PRESETS["balanced"]
+        )
     base_settings.update(overrides)
     persist_bot_settings(uid, preset, run_mode, duration, profit, base_settings)
     persist_user_execution_control(uid, execution_control)
