@@ -1,5 +1,5 @@
 """
-SaaS Trading Bot Platform — SolTrader
+SaaS Trading Bot Platform — SolTrader v2.1 (Jupiter v2 API)
 Run: python app.py
 Then open: http://localhost:5000
 
