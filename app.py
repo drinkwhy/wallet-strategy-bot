@@ -120,6 +120,7 @@ SENDGRID_API_KEY   = os.getenv("SENDGRID_API_KEY", "")
 SMTP_FROM          = os.getenv("SMTP_FROM", "noreply@soltrader.app")
 REFERRAL_COMMISSION = 0.10  # 10% of referred user's first month
 FEE_WALLET          = os.getenv("FEE_WALLET", "")  # your SOL wallet to receive perf fees
+JUPITER_API_KEY     = os.getenv("JUPITER_API_KEY", "").strip()
 ANKR_RPC            = os.getenv("ANKR_RPC", "").strip()
 # Sanitize: Railway UI sometimes stores "Value: https://..." — strip the prefix
 if ANKR_RPC.lower().startswith("value:"):
@@ -2962,94 +2963,53 @@ class BotInstance:
         meta["failure_reason"] = "" if meta["sig"] else (last_error or "transaction-send-failed")
         return meta
 
-    def _jupiter_quote_single(self, url):
-        """Try a single Jupiter quote URL with retries. Returns quote dict or None."""
+    def jupiter_order(self, input_mint, output_mint, amount, slippage_bps=1500):
+        """Jupiter v2 /order — returns quote + assembled transaction in one call.
+        Returns full response dict (with 'transaction' key) or None."""
+        if not JUPITER_API_KEY:
+            self.log_msg("Jupiter API key missing — set JUPITER_API_KEY env var (portal.jup.ag)")
+            return None
+        # Dynamic priority fee from Helius
+        user_max = int(self.settings.get("priority_fee", 1_000_000))
+        helius_fee = None
+        try:
+            acct_keys = [self.wallet]
+            if input_mint:
+                acct_keys.append(input_mint)
+            if output_mint:
+                acct_keys.append(output_mint)
+            helius_fee = helius_get_priority_fee(account_keys=acct_keys)
+        except Exception:
+            pass
+        if helius_fee and helius_fee > 0:
+            optimal_fee = min(helius_fee, user_max)
+            self.log_msg(f"Priority fee: Helius={helius_fee} µL, cap={user_max}, using={optimal_fee}")
+        else:
+            optimal_fee = user_max
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount),
+            "taker": self.wallet,
+            "slippageBps": str(slippage_bps),
+            "priorityFeeLamports": str(optimal_fee),
+        }
+        headers = {"x-api-key": JUPITER_API_KEY}
         for attempt in range(2):
             try:
-                r = requests.get(url, timeout=8).json()
-                if "error" not in r:
+                resp = requests.get(
+                    "https://api.jup.ag/swap/v2/order",
+                    params=params, headers=headers, timeout=12,
+                )
+                r = resp.json()
+                if r.get("transaction"):
                     return r
-            except Exception:
-                if attempt < 1:
-                    time.sleep(0.5)
-        return None
-
-    def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
-        urls = [
-            f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true",
-            f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true",
-        ]
-        # Hit all endpoints in parallel, take first success
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(self._jupiter_quote_single, u): u for u in urls}
-            for fut in as_completed(futures, timeout=12):
-                try:
-                    result = fut.result()
-                    if result:
-                        return result
-                except Exception as e:
-                    self.log_msg(f"Jupiter quote failed ({futures[fut].split('/')[2]}): {e}")
-        return None
-
-    def _jupiter_swap_single(self, url, quote):
-        """Hit a single Jupiter swap endpoint; return swapTransaction or None.
-        Uses Helius priority fee estimate when available, falls back to user setting."""
-        try:
-            # Wire in dynamic priority fee from Helius (cached 10s)
-            user_max = int(self.settings.get("priority_fee", 1_000_000))
-            helius_fee = None
-            try:
-                # Use the swap's input/output mints as account keys for fee estimation
-                acct_keys = [self.wallet]
-                input_mint = quote.get("inputMint")
-                output_mint = quote.get("outputMint")
-                if input_mint:
-                    acct_keys.append(input_mint)
-                if output_mint:
-                    acct_keys.append(output_mint)
-                helius_fee = helius_get_priority_fee(account_keys=acct_keys)
-            except Exception:
-                pass
-            # Use Helius estimate but cap at user's max setting for cost control
-            if helius_fee and helius_fee > 0:
-                optimal_fee = min(helius_fee, user_max)
-                self.log_msg(f"Priority fee: Helius={helius_fee} µL, cap={user_max}, using={optimal_fee}")
-            else:
-                optimal_fee = user_max
-            resp = requests.post(url, json={
-                "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
-                "dynamicComputeUnitLimit": True,
-                "dynamicSlippage": {"minBps": 10, "maxBps": 300},
-                "prioritizationFeeLamports": {
-                    "priorityLevelWithMaxLamports": {
-                        "maxLamports": optimal_fee,
-                        "priorityLevel": "veryHigh",
-                        "global": False,
-                    }
-                },
-            }, timeout=12)
-            r = resp.json()
-            if r.get("swapTransaction"):
-                return r["swapTransaction"]
-            # Log the actual error so we can diagnose v1 endpoint failures
-            err = r.get("error") or r.get("message") or r.get("msg") or str(r)[:200]
-            self.log_msg(f"Jupiter swap no-tx ({url.split('/')[2]}): HTTP {resp.status_code} — {err}")
-        except Exception as e:
-            self.log_msg(f"Jupiter swap failed ({url.split('/')[2]}): {e}")
-        return None
-
-    def jupiter_swap(self, quote):
-        endpoints = ["https://lite-api.jup.ag/swap/v1/swap", "https://api.jup.ag/swap/v1/swap"]
-        # Hit all endpoints in parallel, take first success
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = {pool.submit(self._jupiter_swap_single, u, quote): u for u in endpoints}
-            for fut in as_completed(futures, timeout=15):
-                try:
-                    result = fut.result()
-                    if result:
-                        return result
-                except Exception as e:
-                    self.log_msg(f"Jupiter swap failed ({futures[fut].split('/')[2]}): {e}")
+                err = r.get("error") or r.get("errorMessage") or r.get("message") or str(r)[:200]
+                self.log_msg(f"Jupiter order no-tx: HTTP {resp.status_code} — {err}")
+            except Exception as e:
+                self.log_msg(f"Jupiter order failed: {e}")
+            if attempt < 1:
+                time.sleep(0.3)
         return None
 
     def get_token_balance(self, mint):
@@ -3128,16 +3088,16 @@ class BotInstance:
             return True  # too new for Jupiter to index; rely on authority checks instead
         try:
             started = time.perf_counter()
-            test_quote = self.jupiter_quote(mint, SOL_MINT, 10_000_000, 5000)
+            test_order = self.jupiter_order(mint, SOL_MINT, 10_000_000, 5000)
             self.log_execution_event(
-                mint, None, "risk", "exit-check", bool(test_quote),
+                mint, None, "risk", "exit-check", bool(test_order),
                 latency_ms=round((time.perf_counter() - started) * 1000),
                 slippage_bps=5000,
-                expected_out=(test_quote or {}).get("outAmount"),
-                route_source=extract_route_label(test_quote),
-                failure_reason=None if test_quote else "no-sell-route",
+                expected_out=(test_order or {}).get("outAmount"),
+                route_source=extract_route_label(test_order),
+                failure_reason=None if test_order else "no-sell-route",
             )
-            return test_quote is not None
+            return test_order is not None
         except Exception as _e:
             self.log_execution_event(mint, None, "risk", "exit-check", False, failure_reason=str(_e)[:180])
             print(f"[ERROR] {_e}", flush=True)
@@ -3260,19 +3220,15 @@ class BotInstance:
                 return
             self.log_msg(f"FORCE-BUY {name} | size={trade_sol:.4f} SOL | bypassing filters")
             slippage = dynamic_slippage_bps(liq)
-            quote = self.jupiter_quote(SOL_MINT, mint, int(trade_sol * 1e9), slippage)
-            if not quote:
-                self.log_msg(f"FORCE-BUY FAIL {name} — no Jupiter quote")
+            order = self.jupiter_order(SOL_MINT, mint, int(trade_sol * 1e9), slippage)
+            if not order or not order.get("transaction"):
+                self.log_msg(f"FORCE-BUY FAIL {name} — no Jupiter order/transaction")
                 return
-            swap_tx = self.jupiter_swap(quote)
-            if not swap_tx:
-                self.log_msg(f"FORCE-BUY FAIL {name} — swap build failed")
-                return
-            send_result = self.sign_and_send(swap_tx)
+            send_result = self.sign_and_send(order["transaction"])
             sig = send_result.get("sig")
             if sig:
                 real_price = price
-                expected_out = int(quote.get("outAmount", 0) or 0)
+                expected_out = int(order.get("outAmount", 0) or 0)
                 try:
                     time.sleep(0.3)
                     tokens_received = self.get_token_balance(mint)
@@ -3397,7 +3353,7 @@ class BotInstance:
         if mint in self.positions:
             self.log_msg(f"SKIP {name} — already in position")
             return
-        # ── Parallel: live re-validation + Jupiter quote simultaneously ──
+        # ── Parallel: live re-validation + Jupiter order simultaneously ──
         slippage = dynamic_slippage_bps(liq)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
 
@@ -3426,44 +3382,44 @@ class BotInstance:
                 print(f"[WARN] Live re-check failed for {name}: {_e}", flush=True)
             return True, None, liq
 
-        quote_started = time.perf_counter()
+        order_started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=2) as _buy_pool:
             reval_future = _buy_pool.submit(_revalidate)
-            quote_future = _buy_pool.submit(self.jupiter_quote, SOL_MINT, mint, int(trade_sol*1e9), slippage)
+            order_future = _buy_pool.submit(self.jupiter_order, SOL_MINT, mint, int(trade_sol*1e9), slippage)
             # Check revalidation result
             reval_ok, reval_reason, liq = reval_future.result(timeout=6)
             if not reval_ok:
                 self.log_filter(name, mint, False, reval_reason)
                 self.log_msg(f"SKIP {name} \u2014 {reval_reason}")
-                quote_future.cancel()
+                order_future.cancel()
                 return
-            quote = quote_future.result(timeout=12)
-        route_source = extract_route_label(quote)
+            order = order_future.result(timeout=15)
+        order_ms = round((time.perf_counter() - order_started) * 1000)
+        route_source = extract_route_label(order)
+        swap_tx = (order or {}).get("transaction")
         self.log_execution_event(
-            mint, name, "buy", "quote", bool(quote),
-            latency_ms=round((time.perf_counter() - quote_started) * 1000),
+            mint, name, "buy", "quote", bool(order),
+            latency_ms=order_ms,
             slippage_bps=slippage,
-            expected_out=(quote or {}).get("outAmount"),
+            expected_out=(order or {}).get("outAmount"),
             route_source=route_source,
-            failure_reason=None if quote else "no-quote",
+            failure_reason=None if order else "no-quote",
         )
-        if not quote:
+        if not order:
             self.log_filter(name, mint, False, "No Jupiter quote available")
             self.log_msg(f"SKIP {name} — no Jupiter quote (token may not be tradeable yet)")
             return
-        swap_started = time.perf_counter()
-        swap_tx = self.jupiter_swap(quote)
         self.log_execution_event(
             mint, name, "buy", "build", bool(swap_tx),
-            latency_ms=round((time.perf_counter() - swap_started) * 1000),
+            latency_ms=0,
             slippage_bps=slippage,
-            expected_out=quote.get("outAmount"),
+            expected_out=order.get("outAmount"),
             route_source=route_source,
-            failure_reason=None if swap_tx else "swap-build-failed",
+            failure_reason=None if swap_tx else "order-no-transaction",
         )
         if not swap_tx:
-            self.log_filter(name, mint, False, "Jupiter swap build failed")
-            self.log_msg(f"SKIP {name} — Jupiter swap build failed")
+            self.log_filter(name, mint, False, "Jupiter order returned no transaction")
+            self.log_msg(f"SKIP {name} — Jupiter order returned no transaction")
             return
         send_result = self.sign_and_send(swap_tx)
         simulate_note = None
@@ -3475,7 +3431,7 @@ class BotInstance:
             mint, name, "buy", "simulate", bool(send_result.get("simulation_ok")),
             latency_ms=send_result.get("simulation_latency_ms"),
             slippage_bps=slippage,
-            expected_out=quote.get("outAmount"),
+            expected_out=order.get("outAmount"),
             route_source=route_source,
             failure_reason=simulate_note,
         )
@@ -3484,7 +3440,7 @@ class BotInstance:
                 mint, name, "buy", "resend", bool(send_result.get("sig")),
                 latency_ms=0,
                 slippage_bps=slippage,
-                expected_out=quote.get("outAmount"),
+                expected_out=order.get("outAmount"),
                 route_source=route_source,
                 failure_reason=f"attempts={int(send_result['resend_count'])}",
             )
@@ -3493,7 +3449,7 @@ class BotInstance:
             mint, name, "buy", "send", bool(sig),
             latency_ms=send_result.get("send_latency_ms"),
             slippage_bps=slippage,
-            expected_out=quote.get("outAmount"),
+            expected_out=order.get("outAmount"),
             route_source=route_source,
             failure_reason=None if sig else (send_result.get("failure_reason") or "transaction-send-failed"),
         )
@@ -3502,7 +3458,7 @@ class BotInstance:
             real_price = price  # fallback to scanner price
             fill_started = time.perf_counter()
             tokens_received = 0
-            expected_out = int(quote.get("outAmount", 0) or 0)
+            expected_out = int(order.get("outAmount", 0) or 0)
             realized_slip_bps = None
             try:
                 time.sleep(0.3)  # minimal wait for tx to land
@@ -3607,38 +3563,19 @@ class BotInstance:
             amount = int(total * pct)
             if not amount:
                 return
-            quote_started = time.perf_counter()
-            quote = self.jupiter_quote(mint, SOL_MINT, amount)
-            route_source = extract_route_label(quote)
+            order_started = time.perf_counter()
+            order = self.jupiter_order(mint, SOL_MINT, amount)
+            route_source = extract_route_label(order)
+            swap_tx = (order or {}).get("transaction")
             self.log_execution_event(
-                mint, pos["name"], "sell", "quote", bool(quote),
-                latency_ms=round((time.perf_counter() - quote_started) * 1000),
-                expected_out=(quote or {}).get("outAmount"),
+                mint, pos["name"], "sell", "quote", bool(order),
+                latency_ms=round((time.perf_counter() - order_started) * 1000),
+                expected_out=(order or {}).get("outAmount"),
                 route_source=route_source,
-                failure_reason=None if quote else "no-quote",
+                failure_reason=None if order else "no-quote",
             )
-            if not quote:
+            if not order or not swap_tx:
                 # Record failed exit in enhanced risk engine
-                if self.enhanced_enabled:
-                    try:
-                        self.risk_engine.post_trade_update(
-                            user_id=self.user_id, mint=mint,
-                            sol_amount=pos.get("entry_sol", 0),
-                            success=False, is_exit=True, exit_failed=True,
-                        )
-                    except Exception:
-                        pass
-                return
-            swap_started = time.perf_counter()
-            swap_tx = self.jupiter_swap(quote)
-            self.log_execution_event(
-                mint, pos["name"], "sell", "build", bool(swap_tx),
-                latency_ms=round((time.perf_counter() - swap_started) * 1000),
-                expected_out=quote.get("outAmount"),
-                route_source=route_source,
-                failure_reason=None if swap_tx else "swap-build-failed",
-            )
-            if not swap_tx:
                 if self.enhanced_enabled:
                     try:
                         self.risk_engine.post_trade_update(
@@ -3658,7 +3595,7 @@ class BotInstance:
             self.log_execution_event(
                 mint, pos["name"], "sell", "simulate", bool(send_result.get("simulation_ok")),
                 latency_ms=send_result.get("simulation_latency_ms"),
-                expected_out=quote.get("outAmount"),
+                expected_out=order.get("outAmount"),
                 route_source=route_source,
                 failure_reason=simulate_note,
             )
@@ -3666,7 +3603,7 @@ class BotInstance:
                 self.log_execution_event(
                     mint, pos["name"], "sell", "resend", bool(send_result.get("sig")),
                     latency_ms=0,
-                    expected_out=quote.get("outAmount"),
+                    expected_out=order.get("outAmount"),
                     route_source=route_source,
                     failure_reason=f"attempts={int(send_result['resend_count'])}",
                 )
@@ -3674,7 +3611,7 @@ class BotInstance:
             self.log_execution_event(
                 mint, pos["name"], "sell", "send", bool(sig),
                 latency_ms=send_result.get("send_latency_ms"),
-                expected_out=quote.get("outAmount"),
+                expected_out=order.get("outAmount"),
                 route_source=route_source,
                 failure_reason=None if sig else (send_result.get("failure_reason") or "transaction-send-failed"),
             )
@@ -4233,12 +4170,14 @@ class BotInstance:
             preflight_results.append(("Helius RPC", _r.status_code == 200, f"{_rpc_ms}ms"))
         except Exception as _e:
             preflight_results.append(("Helius RPC", False, str(_e)[:60]))
-        # 2. Jupiter API
+        # 2. Jupiter API v2
         try:
             _t0 = time.perf_counter()
-            _r = _http_session.get("https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", timeout=10)
+            _jup_headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+            _r = _http_session.get("https://api.jup.ag/swap/v2/order?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", headers=_jup_headers, timeout=10)
             _jup_ms = round((time.perf_counter() - _t0) * 1000)
-            preflight_results.append(("Jupiter API", _r.status_code == 200, f"{_jup_ms}ms"))
+            _jup_ok = _r.status_code == 200 and "error" not in (_r.text or "")[:100].lower()
+            preflight_results.append(("Jupiter API", _jup_ok, f"{_jup_ms}ms" + ("" if JUPITER_API_KEY else " (NO API KEY!)")))
         except Exception as _e:
             preflight_results.append(("Jupiter API", False, str(_e)[:60]))
         # 3. DexScreener
@@ -4530,17 +4469,25 @@ def infer_infrastructure_labels(wallets):
 
 
 def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
-    urls = [
-        f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-        f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-    ]
-    for url in urls:
-        try:
-            data = requests.get(url, timeout=6).json()
-            if "error" not in data:
-                return data
-        except Exception:
-            pass
+    """Quick quote check via Jupiter v2 /order (no taker = no transaction, just quote data)."""
+    if not JUPITER_API_KEY:
+        return None
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": str(slippage_bps),
+    }
+    try:
+        resp = requests.get(
+            "https://api.jup.ag/swap/v2/order",
+            params=params, headers={"x-api-key": JUPITER_API_KEY}, timeout=8,
+        )
+        data = resp.json()
+        if data.get("outAmount") and not data.get("error"):
+            return data
+    except Exception:
+        pass
     return None
 
 
@@ -9256,7 +9203,8 @@ def api_preflight():
         checks.append({"name": "Helius RPC", "ok": False, "detail": str(e)[:80]})
     try:
         t0 = time.perf_counter()
-        r = _http_session.get("https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", timeout=10)
+        _jh = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+        r = _http_session.get("https://api.jup.ag/swap/v2/order?inputMint=So11111111111111111111111111111111111111112&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", headers=_jh, timeout=10)
         ms = round((time.perf_counter() - t0) * 1000)
         checks.append({"name": "Jupiter API", "ok": r.status_code == 200, "detail": f"{ms}ms"})
     except Exception as e:
