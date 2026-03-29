@@ -310,7 +310,7 @@ PRESETS = {
         "min_liq":5000,"min_mc":3000,"max_mc":150000,"priority_fee":10000,
         "min_vol":5000,"min_score":20,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":8,"min_narrative_score":3,
-        "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":8.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.5,"late_entry_mult":5.0,
         "offpeak_min_change":20,
         "max_hot_change":400.0,
         "nuclear_narrative_score":42,
@@ -327,7 +327,7 @@ PRESETS = {
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
-        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":8.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
@@ -344,7 +344,7 @@ PRESETS = {
         "min_liq":1000,"min_mc":2000,"max_mc":400000,"priority_fee":60000,
         "min_vol":1000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":3,"min_narrative_score":1,
-        "min_green_lights":0,"min_volume_spike_mult":1.0,"late_entry_mult":8.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.0,"late_entry_mult":5.0,
         "offpeak_min_change":15,
         "max_hot_change":400.0,
         "nuclear_narrative_score":38,
@@ -361,7 +361,7 @@ PRESETS = {
         "min_liq":500,"min_mc":2000,"max_mc":500000,"priority_fee":100000,
         "min_vol":500,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":20,"min_narrative_score":0,
-        "min_green_lights":0,"min_volume_spike_mult":0,"late_entry_mult":8.0,
+        "min_green_lights":0,"min_volume_spike_mult":0,"late_entry_mult":5.0,
         "offpeak_min_change":12,
         "max_hot_change":400.0,
         "nuclear_narrative_score":35,
@@ -378,7 +378,7 @@ PRESETS = {
         "min_liq":2000,"min_mc":2000,"max_mc":250000,"priority_fee":30000,
         "min_vol":3000,"min_score":15,"cooldown_min":0,
         "risk_per_trade_pct":2.0,"min_holder_growth_pct":5,"min_narrative_score":2,
-        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":8.0,
+        "min_green_lights":0,"min_volume_spike_mult":1.2,"late_entry_mult":5.0,
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
@@ -481,7 +481,6 @@ def central_trading_window():
     now = datetime.now(CENTRAL_TZ)
     # Trading window removed — let preset filters and shadow optimizations
     # control entry quality instead of blanket time blocks.
-    # The old UTC 23:00-10:00 block was killing 42% of viable signals.
     return now, True
 
 
@@ -2053,14 +2052,14 @@ def _fetch_largest_accounts(mint):
     return accounts
 
 def check_holder_concentration(mint):
-    """Returns True if top holders don't own >50% of supply."""
+    """Returns True if top holders don't own >70% of supply (relaxed from 50%)."""
     try:
         accounts = _fetch_largest_accounts(mint)
         if not accounts: return True
         total = sum(float(a.get("uiAmount") or 0) for a in accounts)
         top5  = sum(float(a.get("uiAmount") or 0) for a in accounts[:5])
         if total <= 0: return True
-        return (top5 / total) < 0.50
+        return (top5 / total) < 0.70
     except Exception as _e:
         print(f"[ERROR] Holder check failed: {_e}", flush=True)
         return True
@@ -2575,11 +2574,10 @@ class BotInstance:
             if (time.time() - self.started_at) / 60 >= self.run_duration_min:
                 self.log_msg(f"Run duration reached ({self.run_duration_min} min) — stopping")
                 return True
-        # Profit target no longer auto-stops — presets handle risk management
-        # if self.run_mode == "profit" and self.profit_target > 0:
-        #     if self.stats["total_pnl_sol"] >= self.profit_target:
-        #         self.log_msg(f"Profit target reached ({self.profit_target:.4f} SOL) — stopping")
-        #         return True
+        if self.run_mode == "profit" and self.profit_target > 0:
+            if self.stats["total_pnl_sol"] >= self.profit_target:
+                self.log_msg(f"Profit target reached ({self.profit_target:.4f} SOL) — stopping")
+                return True
         return False
 
     def refresh_balance(self):
@@ -2978,8 +2976,8 @@ class BotInstance:
 
     def jupiter_quote(self, input_mint, output_mint, amount, slippage_bps=1500):
         urls = [
-            f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-            f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
+            f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true",
+            f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}&restrictIntermediateTokens=true",
             f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         ]
         # Hit all endpoints in parallel, take first success
@@ -3022,10 +3020,12 @@ class BotInstance:
             r = requests.post(url, json={
                 "quoteResponse":quote,"userPublicKey":self.wallet,"wrapAndUnwrapSol":True,
                 "dynamicComputeUnitLimit": True,
+                "dynamicSlippage": {"minBps": 10, "maxBps": 300},
                 "prioritizationFeeLamports": {
                     "priorityLevelWithMaxLamports": {
                         "maxLamports": optimal_fee,
-                        "priorityLevel": "veryHigh"
+                        "priorityLevel": "veryHigh",
+                        "global": False,
                     }
                 },
             }, timeout=12).json()
@@ -3206,7 +3206,7 @@ class BotInstance:
         if checks.get("holders") is False:
             return {
                 "safe": False,
-                "reason": "Top 5 holders own >50% of supply",
+                "reason": "Top 5 holders own >70% of supply",
                 "warnings": warnings,
                 "risk_score": 70,
                 "timings_ms": timings_ms,
@@ -3371,12 +3371,9 @@ class BotInstance:
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
             return
-        # Drawdown limit
+        # Drawdown limit — log warning but don't block (presets/shadow optimizations control entry quality)
         if s.get("drawdown_limit_sol",0) > 0 and self.session_drawdown >= s["drawdown_limit_sol"]:
-            reason = f"Drawdown limit reached ({self.session_drawdown:.3f} SOL)"
-            self.log_filter(name, mint, False, reason)
-            self.log_msg(f"SKIP {name} — {reason}")
-            return
+            self.log_msg(f"⚠️ Drawdown warning ({self.session_drawdown:.3f} SOL >= {s['drawdown_limit_sol']:.3f}) — continuing with preset filters")
         # Correlated position limit
         if len(self.positions) >= s.get("max_correlated", 5):
             # Check if coin is growing exponentially (>100% gain) — bypass position limit
@@ -4222,13 +4219,59 @@ class BotInstance:
             import traceback; traceback.print_exc()
 
     def _run_inner(self):
-        # Retry balance fetch on startup — RPC may be degraded
+        # ── PREFLIGHT DEPENDENCY CHECKLIST ────────────────────────────────
+        self.log_msg("🔧 Running preflight checklist...")
+        preflight_results = []
+        # 1. Helius RPC
+        try:
+            _t0 = time.perf_counter()
+            _r = _http_session.post(HELIUS_RPC, json={"jsonrpc":"2.0","id":1,"method":"getHealth"}, timeout=8)
+            _rpc_ms = round((time.perf_counter() - _t0) * 1000)
+            preflight_results.append(("Helius RPC", _r.status_code == 200, f"{_rpc_ms}ms"))
+        except Exception as _e:
+            preflight_results.append(("Helius RPC", False, str(_e)[:60]))
+        # 2. Jupiter API
+        try:
+            _t0 = time.perf_counter()
+            _r = _http_session.get("https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", timeout=10)
+            _jup_ms = round((time.perf_counter() - _t0) * 1000)
+            preflight_results.append(("Jupiter API", _r.status_code == 200, f"{_jup_ms}ms"))
+        except Exception as _e:
+            preflight_results.append(("Jupiter API", False, str(_e)[:60]))
+        # 3. DexScreener
+        try:
+            _t0 = time.perf_counter()
+            _r = _http_session.get("https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111", timeout=8)
+            _dex_ms = round((time.perf_counter() - _t0) * 1000)
+            preflight_results.append(("DexScreener", _r.status_code == 200, f"{_dex_ms}ms"))
+        except Exception as _e:
+            preflight_results.append(("DexScreener", False, str(_e)[:60]))
+        # 4. Helius Priority Fee
+        if HELIUS_API_KEY:
+            try:
+                _t0 = time.perf_counter()
+                _r = _http_session.post(HELIUS_RPC, json={"jsonrpc":"2.0","id":1,"method":"getRecentPrioritizationFees","params":[]}, timeout=8)
+                _fee_ms = round((time.perf_counter() - _t0) * 1000)
+                preflight_results.append(("Priority Fee API", _r.status_code == 200, f"{_fee_ms}ms"))
+            except Exception as _e:
+                preflight_results.append(("Priority Fee API", False, str(_e)[:60]))
+        else:
+            preflight_results.append(("Priority Fee API", False, "No API key"))
+        # 5. Wallet balance
         for attempt in range(5):
             self.refresh_balance()
             if self.sol_balance > 0:
                 break
             self.log_msg(f"⏳ Balance read 0.0 SOL, retrying ({attempt+1}/5)...")
             time.sleep(2)
+        preflight_results.append(("Wallet Balance", self.sol_balance > 0, f"{self.sol_balance:.4f} SOL"))
+        # Log results
+        all_ok = all(ok for _, ok, _ in preflight_results)
+        self.log_msg("━━━━ PREFLIGHT CHECKLIST ━━━━")
+        for chk_name, ok, detail in preflight_results:
+            self.log_msg(f"  {'✅' if ok else '❌'} {chk_name}: {detail}")
+        passed = sum(1 for _, ok, _ in preflight_results if ok)
+        self.log_msg(f"━━━━ {passed}/{len(preflight_results)} passed {'— ALL GOOD' if all_ok else '— some issues'} ━━━━")
         self.start_balance = self.sol_balance
         self.peak_balance  = self.sol_balance
         self.log_msg(f"✅ Bot started | Wallet: {self.wallet[:8]}...{self.wallet[-4:]} | Balance: {self.sol_balance:.4f} SOL")
@@ -4486,7 +4529,6 @@ def infer_infrastructure_labels(wallets):
 def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
     urls = [
         f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
-        f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
         f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}",
     ]
     for url in urls:
@@ -5148,7 +5190,7 @@ def build_narrative_profile(name, symbol, pair=None, deployer_stats=None, social
 
 def build_three_signal_checklist(info, intel, settings=None):
     settings = settings or PRESETS["balanced"]
-    deployer_threshold = max(1, int(settings.get("min_narrative_score", 2)) - 4)
+    deployer_threshold = max(5, int(settings.get("min_narrative_score", 2)) - 4)
     whale_override = int(intel.get("whale_score") or 0) >= 45 or int(intel.get("whale_action_score") or 0) >= 35
     price_momentum_override = (
         10 <= float(info.get("change") or 0) <= 25 and
@@ -5169,7 +5211,7 @@ def build_three_signal_checklist(info, intel, settings=None):
         float(intel.get("holder_growth_1h") or 0) >= float(settings.get("min_holder_growth_pct", 5)) or
         price_momentum_override
     )
-    narrative_floor = max(1, int(settings.get("min_narrative_score", 2)) - 3)
+    narrative_floor = max(1, int(settings.get("min_narrative_score", 2)) - 1)
     aligned_tags = [tag for tag in (intel.get("narrative_tags") or []) if tag in set(market_mood_snapshot())]
     narrative_pass = (
         int(intel.get("narrative_score") or 0) >= narrative_floor or
@@ -7451,7 +7493,7 @@ _MOMENTUM_MIN_LIQ_USD = 3000     # needs real pool
 _MOMENTUM_MAX_MC = 800_000       # still small-cap
 _MOMENTUM_MIN_MC = 2000          # not zero
 _MOMENTUM_COOLDOWN = {}          # mint -> last_buy_ts (prevent repeat buys)
-_MOMENTUM_COOLDOWN_SEC = 0       # no cooldown — let presets control pace
+_MOMENTUM_COOLDOWN_SEC = 60      # 1 min cooldown per mint
 
 def _momentum_track(mint, price, vol, mc, liq, name, age_min, source):
     """Record a price tick for momentum tracking. Returns surge info dict or None."""
@@ -9197,6 +9239,52 @@ def admin_required(f):
     return decorated
 
 
+@app.route("/api/preflight")
+@login_required
+def api_preflight():
+    """Run dependency checks and return results for the UI startup checklist."""
+    checks = []
+    try:
+        t0 = time.perf_counter()
+        r = _http_session.post(HELIUS_RPC, json={"jsonrpc":"2.0","id":1,"method":"getHealth"}, timeout=8)
+        ms = round((time.perf_counter() - t0) * 1000)
+        checks.append({"name": "Helius RPC", "ok": r.status_code == 200, "detail": f"{ms}ms"})
+    except Exception as e:
+        checks.append({"name": "Helius RPC", "ok": False, "detail": str(e)[:80]})
+    try:
+        t0 = time.perf_counter()
+        r = _http_session.get("https://lite-api.jup.ag/swap/v1/quote?inputMint=So11111111111111111111111111111111&outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=100000&slippageBps=300", timeout=10)
+        ms = round((time.perf_counter() - t0) * 1000)
+        checks.append({"name": "Jupiter API", "ok": r.status_code == 200, "detail": f"{ms}ms"})
+    except Exception as e:
+        checks.append({"name": "Jupiter API", "ok": False, "detail": str(e)[:80]})
+    try:
+        t0 = time.perf_counter()
+        r = _http_session.get("https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111", timeout=8)
+        ms = round((time.perf_counter() - t0) * 1000)
+        checks.append({"name": "DexScreener", "ok": r.status_code == 200, "detail": f"{ms}ms"})
+    except Exception as e:
+        checks.append({"name": "DexScreener", "ok": False, "detail": str(e)[:80]})
+    if HELIUS_API_KEY:
+        try:
+            t0 = time.perf_counter()
+            r = _http_session.post(HELIUS_RPC, json={"jsonrpc":"2.0","id":1,"method":"getRecentPrioritizationFees","params":[]}, timeout=8)
+            ms = round((time.perf_counter() - t0) * 1000)
+            checks.append({"name": "Priority Fee", "ok": r.status_code == 200, "detail": f"{ms}ms"})
+        except Exception as e:
+            checks.append({"name": "Priority Fee", "ok": False, "detail": str(e)[:80]})
+    else:
+        checks.append({"name": "Priority Fee", "ok": False, "detail": "No API key"})
+    db_ok, db_err = db_health_check(retries=1)
+    checks.append({"name": "Database", "ok": db_ok, "detail": "OK" if db_ok else (db_err or "error")[:80]})
+    uid = session["user_id"]
+    bot = user_bots.get(uid)
+    if bot:
+        checks.append({"name": "Wallet Balance", "ok": bot.sol_balance > 0, "detail": f"{bot.sol_balance:.4f} SOL"})
+    passed = sum(1 for c in checks if c["ok"])
+    return jsonify({"checks": checks, "passed": passed, "total": len(checks), "all_ok": passed == len(checks)})
+
+
 def _plan_from_stripe_subscription(subscription):
     items = (((subscription or {}).get("items") or {}).get("data") or [])
     for item in items:
@@ -10100,52 +10188,6 @@ def api_manual_buy():
             print(f"[FORCE-BUY] error: {e}", flush=True)
     threading.Thread(target=_force_buy, daemon=True).start()
     return jsonify({"ok": True, "msg": f"Force buy triggered for {name}"})
-
-@app.route("/api/force-buy", methods=["POST"])
-@login_required
-def api_force_buy():
-    """Force buy a token — bypasses all filters. For user-submitted buys from Approved Coins."""
-    uid = session["user_id"]
-    data = request.get_json(force=True) or {}
-    mint = (data.get("mint") or "").strip()
-    name = (data.get("name") or "Unknown").strip()[:64]
-    if not mint or len(mint) < 32 or len(mint) > 64:
-        return jsonify({"ok": False, "msg": "Invalid mint address"})
-    if not all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in mint):
-        return jsonify({"ok": False, "msg": "Invalid mint address format"})
-    bot = user_bots.get(uid)
-    if not bot or not bot.running:
-        return jsonify({"ok": False, "msg": "Bot not running — start bot first"})
-    if mint in bot.positions:
-        return jsonify({"ok": False, "msg": "Already in position"})
-    # Fetch live price from DexScreener
-    try:
-        resp = dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5)
-        pairs = resp.json().get("pairs") or []
-        pair = next((p for p in pairs if p.get("chainId") == "solana"), None)
-        price = float(pair.get("priceUsd") or 0) if pair else 0
-        liq = float((pair.get("liquidity") or {}).get("usd") or 0) if pair else 0
-    except Exception as _e:
-        print(f"[ERROR] Force buy price fetch: {_e}", flush=True)
-        price = 0
-        liq = 0
-    if not price:
-        return jsonify({"ok": False, "msg": "Could not fetch price"})
-    bot.log_msg(f"⚡ FORCE BUY {name} — user-submitted (bypassing filters)")
-    bot.log_filter(name, mint, True, "Force buy — user submitted")
-    threading.Thread(
-        target=bot.buy,
-        args=(mint, name, price),
-        kwargs={"liq": liq, "dev_wallet": None, "decision_context": {
-            "execution_mode": "live",
-            "selected_policy_label": "Force Buy",
-            "buy_reason": "user force buy",
-            "source_tag": "force_buy",
-            "allow_trade": True,
-        }},
-        daemon=True,
-    ).start()
-    return jsonify({"ok": True, "msg": f"⚡ Force buy sent for {name}"})
 
 @app.route("/api/telegram", methods=["POST"])
 @login_required
@@ -11811,7 +11853,7 @@ def api_my_trades():
                     "profit_pct": profit_pct,
                     "bought_when": time.strftime("%I:%M %p", time.localtime(p["timestamp"])),
                     "held_for": held_for,
-                    "amount_sol": p.get("sol_in", 0),
+                    "amount_sol": p.get("entry_sol", 0),
                 })
             except Exception:
                 pass
@@ -14881,13 +14923,6 @@ DASHBOARD_HTML = _CSS + """
         <div class="glass" style="padding:0;overflow:hidden">
           <div class="ev-approved-title">Approved Coins</div>
           <div class="ev-approved-sub">Tokens that passed all filters</div>
-          <!-- Force Buy input -->
-          <div style="padding:8px 12px;border-bottom:1px solid rgba(255,255,255,.04)">
-            <div style="display:flex;gap:6px">
-              <input id="force-buy-mint" type="text" placeholder="Paste mint address…" style="flex:1;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:7px 10px;font-size:11px;color:var(--t1);outline:none">
-              <button class="btn" style="font-size:10px;padding:7px 14px;white-space:nowrap;background:linear-gradient(135deg,#14c784,#0ea5e9);border:none;border-radius:8px;color:#fff;font-weight:700;cursor:pointer" onclick="submitForceBuy()">⚡ Force Buy</button>
-            </div>
-          </div>
           <div id="ev-approved-list" class="ev-approved-list">
             <div style="padding:20px;text-align:center;font-size:11px;color:var(--t3)">No approved coins yet</div>
           </div>
@@ -16244,42 +16279,6 @@ async function quickBuy(mint, name, btn) {
   if (res.ok) setTimeout(refresh, 2000);
 }
 
-// ── Force Buy (from Approved Coins) ──────────────────────────────────────────
-async function forceBuyCoin(mint, name, btn) {
-  const orig = btn.textContent;
-  btn.textContent = '…'; btn.disabled = true;
-  const res = await fetch('/api/force-buy', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mint, name})
-  }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
-  btn.textContent = res.ok ? '✅' : '❌';
-  showToast(res.ok ? '⚡ Force buy sent!' : '⚠ ' + (res.msg||'Buy failed'), res.ok);
-  setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
-  if (res.ok) setTimeout(refresh, 2000);
-}
-
-async function submitForceBuy() {
-  const input = document.getElementById('force-buy-mint');
-  const mint = (input.value || '').trim();
-  if (!mint || mint.length < 32) {
-    showToast('⚠ Paste a valid Solana mint address', false);
-    return;
-  }
-  // Try to get the name from DexScreener
-  let name = mint.slice(0, 8) + '…';
-  try {
-    const dex = await fetch('https://api.dexscreener.com/latest/dex/tokens/' + mint).then(r => r.json());
-    const pair = (dex.pairs || []).find(p => p.chainId === 'solana');
-    if (pair && pair.baseToken) name = pair.baseToken.symbol || pair.baseToken.name || name;
-  } catch(e) {}
-  const res = await fetch('/api/force-buy', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mint, name})
-  }).then(r => r.json()).catch(() => ({ok:false, msg:'Failed'}));
-  showToast(res.ok ? `⚡ Force buy sent for ${name}!` : '⚠ ' + (res.msg||'Buy failed'), res.ok);
-  if (res.ok) { input.value = ''; setTimeout(refresh, 2000); }
-}
-
 // ── Wallet Tree ───────────────────────────────────────────────────────────────
 async function openWalletTree(mint, name) {
   selectedMint = mint;
@@ -16462,12 +16461,12 @@ const SETTINGS_DEFAULTS = {
   drawdown_limit_sol: 0.5,
   max_correlated: 3,
   min_vol: 3000,
-  min_score: 15,
+  min_score: 30,
   risk_per_trade_pct: 2.0,
-  min_holder_growth_pct: 5,
-  min_narrative_score: 2,
-  min_green_lights: 0,
-  min_volume_spike_mult: 1.2,
+  min_holder_growth_pct: 30,
+  min_narrative_score: 16,
+  min_green_lights: 1,
+  min_volume_spike_mult: 6,
   late_entry_mult: 5.0,
   nuclear_narrative_score: 40,
   offpeak_min_change: 18,
@@ -16706,9 +16705,8 @@ function renderEvApproved(approved) {
     const col = tokColor(c.name || '?');
     const checks = (c.checklist || []).slice(0, 3);
     const ts = c.ts ? new Date(c.ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '';
-    const mintShort = (c.mint||'').slice(0,8) + '…';
-    return `<div class="ev-coin-card">
-      <div class="ev-coin-top" onclick="window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')" style="cursor:pointer">
+    return `<div class="ev-coin-card" onclick="window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')">
+      <div class="ev-coin-top">
         <div style="display:flex;align-items:center;gap:8px">
           <div class="ev-coin-icon" style="background:${col}1a;color:${col}">${(c.name||'?').charAt(0)}</div>
           <div>
@@ -16726,10 +16724,6 @@ function renderEvApproved(approved) {
       <div class="ev-coin-checks" style="margin-top:5px">
         ${checks.map(ck => `<div class="ev-ck ${ck.passed?'p':'f'}" title="${ck.name||''}">${ck.passed?'&#10003;':'&#10007;'}</div>`).join('')}
         ${(c.narrative_tags||[]).slice(0,2).map(t => `<span class="ev-tag">${t}</span>`).join('')}
-      </div>
-      <div style="margin-top:6px;display:flex;gap:6px">
-        <button class="btn" style="flex:1;font-size:9px;padding:5px 0;background:linear-gradient(135deg,#14c784,#0ea5e9);border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer" onclick="event.stopPropagation();forceBuyCoin('${c.mint||''}','${(c.name||'?').replace(/'/g,"\\'")}',this)">⚡ Force Buy</button>
-        <button class="btn btn-ghost" style="flex:1;font-size:9px;padding:5px 0;border-radius:6px" onclick="event.stopPropagation();window.open('https://dexscreener.com/solana/${c.mint||''}','_blank')">Chart →</button>
       </div>
     </div>`;
   }).join('');
@@ -17316,12 +17310,38 @@ async function refresh() {
 
 async function toggleBot() {
   if (!running && _settingsDirty) { await saveSettings(); }
+  if (!running) {
+    showPreflightModal();
+    try {
+      const pf = await fetch('/api/preflight').then(r=>r.json()).catch(()=>null);
+      if (pf && pf.checks) { updatePreflightModal(pf); await new Promise(r => setTimeout(r, 1500)); }
+    } catch(e) { console.error('preflight error', e); }
+  }
   const res = await fetch(running ? '/api/stop' : '/api/start', {method:'POST'}).then(r=>r.json()).catch(()=>null);
+  hidePreflightModal();
   if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
   setTimeout(refresh, 800);
 }
+function showPreflightModal() {
+  let m = document.getElementById('preflight-modal');
+  if (!m) {
+    m = document.createElement('div'); m.id = 'preflight-modal';
+    m.innerHTML = '<div style="position:fixed;inset:0;background:rgba(2,6,23,.8);display:flex;align-items:center;justify-content:center;z-index:300;padding:20px"><div style="width:min(420px,100%);background:linear-gradient(180deg,#0d1726,#08101a);border:1px solid rgba(20,199,132,.3);border-radius:20px;padding:24px;box-shadow:0 24px 80px rgba(0,0,0,.5)"><div style="font-size:16px;font-weight:800;color:#e2e8f0;margin-bottom:16px;display:flex;align-items:center;gap:8px"><span id="pf-spinner">&#x21bb;</span> Preflight Checklist</div><div id="pf-checks" style="display:flex;flex-direction:column;gap:6px"></div><div id="pf-summary" style="margin-top:14px;font-size:12px;color:#94a3b8;text-align:center">Checking dependencies...</div></div></div>';
+    document.body.appendChild(m);
+  }
+  m.style.display = 'block';
+  document.getElementById('pf-checks').innerHTML = ['Helius RPC','Jupiter API','DexScreener','Priority Fee','Database'].map(function(n) { return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(255,255,255,.03);border-radius:10px"><span style="width:20px;text-align:center;color:#94a3b8">&#x23f3;</span><span style="flex:1;font-size:13px;color:#cbd5e1">' + n + '</span><span style="font-size:11px;color:#64748b">checking...</span></div>'; }).join('');
+}
+function updatePreflightModal(pf) {
+  var el = document.getElementById('pf-checks'); if (!el) return;
+  el.innerHTML = pf.checks.map(function(c) { return '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(255,255,255,.03);border-radius:10px"><span style="width:20px;text-align:center">' + (c.ok ? '&#x2705;' : '&#x274c;') + '</span><span style="flex:1;font-size:13px;color:#cbd5e1;font-weight:600">' + c.name + '</span><span style="font-size:11px;color:' + (c.ok ? '#4ade80' : '#f87171') + ';font-weight:700">' + c.detail + '</span></div>'; }).join('');
+  var spin = document.getElementById('pf-spinner'); if (spin) spin.textContent = pf.all_ok ? '✅' : '⚠️';
+  var summary = document.getElementById('pf-summary');
+  if (summary) { summary.style.color = pf.all_ok ? '#4ade80' : '#fbbf24'; summary.textContent = pf.passed + '/' + pf.total + ' checks passed' + (pf.all_ok ? ' — launching bot...' : ' — launching anyway...'); }
+}
+function hidePreflightModal() { var m = document.getElementById('preflight-modal'); if (m) m.style.display = 'none'; }
 async function applyShadowTrading() {
   if (!confirm('Apply optimal shadow trading settings (balanced preset)? Bot will restart with new settings.')) return;
   const res = await fetch('/api/shadow-trading-mode', {

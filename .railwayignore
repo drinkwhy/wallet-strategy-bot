@@ -14,3 +14,5 @@ venv/
 test_*.py
 .vscode/
 .idea/
+.codex/
+_check.js

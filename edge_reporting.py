@@ -292,13 +292,13 @@ def derive_edge_guard_state(history_summary):
 
     state = {
         "status": "warming_up",
-        "action_label": "Warm-up throttle",
-        "reason": "Not enough report history yet; keep size reduced while validation data accumulates.",
+        "action_label": "Warm-up — preset filters active",
+        "reason": "Not enough report history yet; using preset optimization filters for entry quality.",
         "allow_new_entries": True,
-        "size_multiplier": 0.5,
-        "risk_multiplier": 0.5,
-        "max_positions_cap": 1,
-        "drawdown_multiplier": 0.75,
+        "size_multiplier": 0.9,
+        "risk_multiplier": 0.9,
+        "max_positions_cap": 3,
+        "drawdown_multiplier": 0.9,
         "prefer_rules_only": False,
         "report_count": _safe_int((history_summary or {}).get("report_count")),
         "focus_window_days": _safe_int((history_summary or {}).get("focus_window_days"), 7),
@@ -348,13 +348,13 @@ def derive_edge_guard_state(history_summary):
     ):
         state.update({
             "status": "defensive",
-            "action_label": "Defensive throttle",
-            "reason": "Tape regime or report leadership is weak enough to keep the live book defensive.",
+            "action_label": "Defensive — relaxed",
+            "reason": "Tape regime or report leadership is weak; using preset filters instead of hard throttle.",
             "allow_new_entries": True,
-            "size_multiplier": 0.4,
-            "risk_multiplier": 0.45,
-            "max_positions_cap": 1,
-            "drawdown_multiplier": 0.65,
+            "size_multiplier": 0.85,
+            "risk_multiplier": 0.85,
+            "max_positions_cap": 3,
+            "drawdown_multiplier": 0.85,
             "prefer_rules_only": True,
         })
         return state
@@ -367,13 +367,13 @@ def derive_edge_guard_state(history_summary):
     ):
         state.update({
             "status": "throttled",
-            "action_label": "Risk throttled",
-            "reason": "Edge is still positive, but the report trend has softened enough to cut size and cap exposure.",
+            "action_label": "Lightly throttled",
+            "reason": "Edge is positive but trend softening; slight size reduction, preset filters handle quality.",
             "allow_new_entries": True,
-            "size_multiplier": 0.65,
-            "risk_multiplier": 0.7,
-            "max_positions_cap": 2,
-            "drawdown_multiplier": 0.8,
+            "size_multiplier": 0.85,
+            "risk_multiplier": 0.85,
+            "max_positions_cap": 3,
+            "drawdown_multiplier": 0.9,
             "prefer_rules_only": False,
         })
         return state
