@@ -3107,16 +3107,18 @@ class BotInstance:
             return True  # too new for Jupiter to index; rely on authority checks instead
         try:
             started = time.perf_counter()
-            test_order = self.jupiter_order(mint, SOL_MINT, 10_000_000, 5000)
+            # Use quote-only (no taker) — we don't own the token yet so v2 /order
+            # with taker returns "Insufficient funds". Without taker we get route data.
+            test_quote = jupiter_quote_direct(mint, SOL_MINT, 10_000_000, 5000)
             self.log_execution_event(
-                mint, None, "risk", "exit-check", bool(test_order),
+                mint, None, "risk", "exit-check", bool(test_quote),
                 latency_ms=round((time.perf_counter() - started) * 1000),
                 slippage_bps=5000,
-                expected_out=(test_order or {}).get("outAmount"),
-                route_source=extract_route_label(test_order),
-                failure_reason=None if test_order else "no-sell-route",
+                expected_out=(test_quote or {}).get("outAmount"),
+                route_source=extract_route_label(test_quote),
+                failure_reason=None if test_quote else "no-sell-route",
             )
-            return test_order is not None
+            return test_quote is not None
         except Exception as _e:
             self.log_execution_event(mint, None, "risk", "exit-check", False, failure_reason=str(_e)[:180])
             print(f"[ERROR] {_e}", flush=True)
