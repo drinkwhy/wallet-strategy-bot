@@ -161,6 +161,20 @@ _http_session.mount("http://", _adapter)
 fernet        = Fernet(FERNET_KEY)
 stripe.api_key = STRIPE_SECRET
 SOL_MINT      = "So11111111111111111111111111111111111111112"
+
+# ── Jupiter v2 rate limiter (Basic tier = 1 RPS) ─────────────────────────────
+_jupiter_rate_lock = threading.Lock()
+_jupiter_last_call = 0.0
+
+def _jupiter_rate_wait():
+    """Enforce 1 RPS for Jupiter API (Basic tier limit)."""
+    global _jupiter_last_call
+    with _jupiter_rate_lock:
+        now = time.time()
+        wait = 1.05 - (now - _jupiter_last_call)  # 1.05s gap for safety
+        if wait > 0:
+            time.sleep(wait)
+        _jupiter_last_call = time.time()
 PUMP_PROGRAM  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 HEADERS       = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 _http_session.headers.update(HEADERS)
@@ -2969,6 +2983,7 @@ class BotInstance:
         if not JUPITER_API_KEY:
             self.log_msg("Jupiter API key missing — set JUPITER_API_KEY env var (portal.jup.ag)")
             return None
+        _jupiter_rate_wait()
         # Dynamic priority fee from Helius
         user_max = int(self.settings.get("priority_fee", 1_000_000))
         helius_fee = None
@@ -4472,6 +4487,7 @@ def jupiter_quote_direct(input_mint, output_mint, amount, slippage_bps=5000):
     """Quick quote check via Jupiter v2 /order (no taker = no transaction, just quote data)."""
     if not JUPITER_API_KEY:
         return None
+    _jupiter_rate_wait()
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
