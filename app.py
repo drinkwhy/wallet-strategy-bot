@@ -427,6 +427,7 @@ SHADOW_V2_PRESETS = {
     "balanced_v2": {
         **PRESETS["balanced"],
         "label":"Balanced V2 — Optimized",
+        "max_mc":500_000,
         "tp1_mult":1.15,"tp2_mult":3.0,"stop_loss":0.85,"time_stop_min":14,
         "trail_pct":0.22,"cooldown_min":0,
         "min_score":25,"min_green_lights":1,"max_hot_change":150.0,
@@ -436,6 +437,7 @@ SHADOW_V2_PRESETS = {
     "aggressive_v2": {
         **PRESETS["aggressive"],
         "label":"Aggressive V2 — Optimized",
+        "max_mc":1_000_000,
         "tp1_mult":1.15,"tp2_mult":5.0,"stop_loss":0.83,"time_stop_min":18,
         "trail_pct":0.28,"cooldown_min":0,
         "min_score":20,"min_green_lights":1,"max_hot_change":150.0,
@@ -445,6 +447,7 @@ SHADOW_V2_PRESETS = {
     "degen_v2": {
         **PRESETS["degen"],
         "label":"Degen V2 — Optimized",
+        "max_mc":2_000_000,
         "tp1_mult":1.15,"tp2_mult":8.0,"stop_loss":0.80,"time_stop_min":22,
         "trail_pct":0.32,"cooldown_min":0,
         "min_score":15,"min_green_lights":1,"max_hot_change":150.0,
@@ -542,10 +545,13 @@ def admin_preset_defaults():
 
 
 def dashboard_preset_settings():
-    return {
+    base = {
         preset_name: dict(PRESETS[preset_name])
         for preset_name in ("safe", "balanced", "aggressive", "degen", "custom")
     }
+    for name, preset in SHADOW_V2_PRESETS.items():
+        base[name] = dict(preset)
+    return base
 
 
 def build_bot_overrides(source):
@@ -15061,10 +15067,18 @@ DASHBOARD_HTML = _CSS + """
           <div class="setting-row">
             <div><div class="setting-label">Strategy Mode</div></div>
             <select class="setting-input" id="s-preset" onchange="selectPreset(this.value)">
-              <option value="safe">Safe — Small buys, tight stops</option>
-              <option value="balanced">Balanced — Default for most markets</option>
-              <option value="aggressive">Aggressive — Bigger positions, wider stops</option>
-              <option value="degen">Degen — Max risk, max reward</option>
+              <optgroup label="Classic">
+                <option value="safe">Safe — Small buys, tight stops</option>
+                <option value="balanced">Balanced — Default for most markets</option>
+                <option value="aggressive">Aggressive — Bigger positions, wider stops</option>
+                <option value="degen">Degen — Max risk, max reward</option>
+              </optgroup>
+              <optgroup label="V2 — AI Optimized">
+                <option value="safe_v2">Safe V2 — Tighter exits, moonshot trail</option>
+                <option value="balanced_v2">Balanced V2 — MC to $500K, smart exits</option>
+                <option value="aggressive_v2">Aggressive V2 — MC to $1M, wide net</option>
+                <option value="degen_v2">Degen V2 — MC to $2M, max opportunity</option>
+              </optgroup>
               <option value="custom">Custom — Manual control</option>
             </select>
             <div class="setting-unit">preset</div>
