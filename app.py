@@ -595,8 +595,8 @@ def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
             run_mode,
             int(duration or 0),
             float(profit or 0),
-            int(overrides.get("max_correlated", settings.get("max_correlated", PRESETS[preset]["max_correlated"]))),
-            float(overrides.get("drawdown_limit_sol", settings.get("drawdown_limit_sol", PRESETS[preset]["drawdown_limit_sol"]))),
+            int(overrides.get("max_correlated", settings.get("max_correlated", (PRESETS.get(preset) or SHADOW_V2_PRESETS.get(preset) or PRESETS["balanced"])["max_correlated"]))),
+            float(overrides.get("drawdown_limit_sol", settings.get("drawdown_limit_sol", (PRESETS.get(preset) or SHADOW_V2_PRESETS.get(preset) or PRESETS["balanced"])["drawdown_limit_sol"]))),
             json.dumps(overrides) if overrides else None,
         ))
         conn.commit()
@@ -17144,14 +17144,17 @@ async function saveSettings() {
   if (res && res.ok !== false) {
     _settingsDirty = false;
     document._settingsFocused = false;
+    window._lastSaveTs = Date.now();  // guard against stale refresh
+    const resolvedPreset = res.preset || payload.preset;
     const mergedSettings = {
       ...(res.settings || payload),
       ...(res.execution_control?.control || {}),
+      preset: resolvedPreset,
       decision_policy: res.execution_control?.control?.policy_mode || payload.decision_policy,
       execution_mode: res.execution_control?.control?.execution_mode || payload.execution_mode,
       model_threshold: res.execution_control?.control?.model_threshold || payload.model_threshold,
     };
-    applySettingsToForm(mergedSettings, res.preset || payload.preset);
+    applySettingsToForm(mergedSettings, resolvedPreset);
     renderExecutionControlSummary(res.execution_control || { control: mergedSettings });
     setSettingsSaveState('Saved to bot settings');
     showToast('\u2713 Settings saved', true);
@@ -17219,7 +17222,9 @@ async function refresh() {
   setText('hero-sync-time', fmtClock());
   setText('scanner-sync-copy', `Synced ${fmtClock()}`);
   setText('scanner-listing-live', String(listingCatchCount));
-  setText('hero-preset-badge', `${titleCase(d.preset || 'balanced')} preset`);
+  if (!(window._lastSaveTs && (Date.now() - window._lastSaveTs < 3000))) {
+    setText('hero-preset-badge', `${titleCase(d.preset || 'balanced')} preset`);
+  }
   document.getElementById('balance').textContent   = d.balance.toFixed(4);
   document.getElementById('pos-count').textContent = d.positions.length;
   setText('scanner-position-live', String(d.positions.length));
@@ -17283,11 +17288,13 @@ async function refresh() {
       execution_mode: d.execution_control?.control?.execution_mode || d.execution_control?.execution_mode || 'live',
       preset: d.preset || 'balanced',
     };
-    if (!document._settingsFocused && !_settingsDirty) {
+    // Guard: skip applying stale refresh data for 3s after a save
+    const saveGuard = window._lastSaveTs && (Date.now() - window._lastSaveTs < 3000);
+    if (!document._settingsFocused && !_settingsDirty && !saveGuard) {
       applySettingsToForm(savedSettings, savedSettings.preset);
       _settingsDirty = false;
       setSettingsSaveState('Loaded from saved state');
-    } else {
+    } else if (!saveGuard) {
       renderLaunchSummary(savedSettings);
       renderSettingsSnapshot(savedSettings);
     }
