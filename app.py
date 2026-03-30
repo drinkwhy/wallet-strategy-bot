@@ -1523,6 +1523,16 @@ def migrate_db():
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS cooldown_setting_min INTEGER DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS would_have_been_winner INTEGER DEFAULT 0",
             "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS session_budget_sol REAL DEFAULT 0",
+            "ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS locked_max_buy_sol REAL",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_price REAL",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price REAL",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_sol REAL",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_sol REAL",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl_pct REAL",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS hold_time_min INTEGER",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT",
+            "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tx_signature TEXT",
         ]
         for m in migrations:
             try:
@@ -1535,6 +1545,8 @@ def migrate_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_signal_explorer_user_id_ts ON signal_explorer_log (user_id, ts DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_perf_fees_user_id_created_at ON perf_fees (user_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_execution_events_user_id_created_at ON execution_events (user_id, created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_mint ON trades (user_id, mint)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_coin_portfolio_user ON coin_portfolio_cache (user_id)")
         except Exception:
             conn.rollback()
         try:
@@ -3359,7 +3371,13 @@ class BotInstance:
                                           peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
                                           tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
                                    (self.user_id, mint, name, real_price, real_price, trade_sol, 0, None))
+                        # Also log BUY to trades table for portfolio tracking
+                        _c.execute("""INSERT INTO trades
+                                     (user_id,mint,name,action,entry_price,entry_sol,price,pnl_sol,pnl_pct)
+                                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                   (self.user_id, mint, name, "BUY", real_price, trade_sol, real_price, 0, 0))
                         _conn.commit()
+                        update_coin_portfolio_cache(self.user_id, mint, name)
                     finally:
                         db_return(_conn)
                 except Exception as e:
@@ -3612,7 +3630,13 @@ class BotInstance:
                                       peak_price=EXCLUDED.peak_price,entry_sol=EXCLUDED.entry_sol,
                                       tp1_hit=EXCLUDED.tp1_hit,dev_wallet=EXCLUDED.dev_wallet""",
                                (self.user_id, mint, name, real_price, real_price, trade_sol, 0, dev_wallet))
+                    # Also log BUY to trades table for portfolio tracking
+                    _c.execute("""INSERT INTO trades
+                                 (user_id,mint,name,action,entry_price,entry_sol,price,pnl_sol,pnl_pct)
+                                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                               (self.user_id, mint, name, "BUY", real_price, trade_sol, real_price, 0, 0))
                     _conn.commit()
+                    update_coin_portfolio_cache(self.user_id, mint, name)
                 finally:
                     db_return(_conn)
             except Exception as _e:
@@ -14924,14 +14948,103 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- Tab Bar -->
   <div class="tab-bar">
+    <button class="tab-btn" data-tab="portfolio" onclick="activateTab('portfolio')"><span class="tab-btn-label">My Coins</span><span class="tab-btn-meta">Portfolio &amp; trade history</span></button>
     <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scan</span><span class="tab-btn-meta">Evaluation ramp &amp; approved coins</span></button>
     <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
     <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
     <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
     <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
     <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
-    <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Replay runs and strategy research</span></button>
+    <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Quantum backtester &amp; strategy</span></button>
     <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')"><span class="tab-btn-label">Paper</span><span class="tab-btn-meta">Simulated trades, no real money</span></button>
+  </div>
+
+  <!-- ===================== PORTFOLIO TAB — MY COINS ===================== -->
+  <div id="tab-portfolio" class="tab-pane" style="display:none">
+    <style>
+    .ptf-layout{display:grid;grid-template-columns:380px 1fr;gap:16px;min-height:520px}
+    @media(max-width:960px){.ptf-layout{grid-template-columns:1fr}}
+    .ptf-watchlist{overflow:hidden}
+    .ptf-watchlist-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .ptf-watchlist-title{font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif;display:flex;align-items:center;gap:8px}
+    .ptf-sort-btns{display:flex;gap:4px}
+    .ptf-sort-btn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:6px;color:var(--t3);font-size:9px;font-weight:700;padding:3px 8px;cursor:pointer;transition:.12s}
+    .ptf-sort-btn.active{background:rgba(20,199,132,.12);border-color:rgba(20,199,132,.3);color:#14c784}
+    .ptf-coin-list{overflow-y:auto;max-height:480px;padding:0}
+    .ptf-coin-row{display:grid;grid-template-columns:36px 1fr 90px 70px;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.03);cursor:pointer;transition:background .12s}
+    .ptf-coin-row:hover{background:rgba(255,255,255,.03)}
+    .ptf-coin-row.selected{background:rgba(47,107,255,.1);border-left:3px solid var(--blue2)}
+    .ptf-coin-icon{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:#fff;flex-shrink:0}
+    .ptf-coin-name{font-size:12px;font-weight:700;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ptf-coin-mint{font-size:9px;color:var(--t3);margin-top:1px;font-family:monospace}
+    .ptf-coin-spent{font-size:11px;color:var(--t2);text-align:right}
+    .ptf-coin-spent-label{font-size:8px;color:var(--t3);text-transform:uppercase}
+    .ptf-coin-pnl{text-align:right}
+    .ptf-coin-pnl-val{font-size:13px;font-weight:800}
+    .ptf-coin-pnl-sub{font-size:9px;color:var(--t3);margin-top:1px}
+    .ptf-summary-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:14px 16px;border-top:1px solid rgba(255,255,255,.08);background:rgba(7,14,23,.5)}
+    .ptf-summary-cell{text-align:center}
+    .ptf-summary-val{font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk',sans-serif}
+    .ptf-summary-lbl{font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;margin-top:2px}
+    .ptf-chart-area{overflow:hidden;display:flex;flex-direction:column}
+    .ptf-chart-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.06)}
+    .ptf-chart-title{font-size:16px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif}
+    .ptf-chart-badges{display:flex;gap:6px}
+    .ptf-chart-body{flex:1;padding:16px;position:relative;min-height:300px}
+    .ptf-chart-canvas{width:100%;height:280px}
+    .ptf-trade-table{width:100%;border-collapse:collapse;margin-top:16px}
+    .ptf-trade-table th{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;padding:6px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,.08);font-weight:700}
+    .ptf-trade-table td{font-size:11px;color:var(--t2);padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.03)}
+    .ptf-trade-table tr:hover td{background:rgba(255,255,255,.02)}
+    .ptf-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;color:var(--t3);text-align:center;gap:12px}
+    .ptf-empty-icon{font-size:48px;opacity:.3}
+    .ptf-empty-title{font-size:16px;font-weight:700;color:var(--t2)}
+    .ptf-empty-sub{font-size:12px;max-width:300px;line-height:1.6}
+    </style>
+
+    <div class="ptf-layout">
+      <!-- Left Panel: Coin Watchlist -->
+      <div class="glass ptf-watchlist">
+        <div class="ptf-watchlist-head">
+          <div class="ptf-watchlist-title">My Coins <span class="badge bg-blue" id="ptf-coin-count">0</span></div>
+          <div class="ptf-sort-btns">
+            <button class="ptf-sort-btn active" onclick="ptfSort('pnl')">P&L</button>
+            <button class="ptf-sort-btn" onclick="ptfSort('spent')">Spent</button>
+            <button class="ptf-sort-btn" onclick="ptfSort('recent')">Recent</button>
+          </div>
+        </div>
+        <div class="ptf-coin-list" id="ptf-coin-list">
+          <div class="ptf-empty" style="min-height:300px">
+            <div class="ptf-empty-icon">&#x1F4B0;</div>
+            <div class="ptf-empty-title">No trades yet</div>
+            <div class="ptf-empty-sub">Add SOL to your wallet and the bot will start trading. All coins will appear here.</div>
+          </div>
+        </div>
+        <div class="ptf-summary-strip">
+          <div class="ptf-summary-cell"><div class="ptf-summary-val" id="ptf-total-spent">0</div><div class="ptf-summary-lbl">Total Spent</div></div>
+          <div class="ptf-summary-cell"><div class="ptf-summary-val" id="ptf-total-earned">0</div><div class="ptf-summary-lbl">Total Earned</div></div>
+          <div class="ptf-summary-cell"><div class="ptf-summary-val" id="ptf-net-pnl">0</div><div class="ptf-summary-lbl">Net P&L</div></div>
+          <div class="ptf-summary-cell"><div class="ptf-summary-val" id="ptf-win-rate">--</div><div class="ptf-summary-lbl">Win Rate</div></div>
+        </div>
+      </div>
+
+      <!-- Right Panel: Chart + Trade Details -->
+      <div class="glass ptf-chart-area">
+        <div class="ptf-chart-head">
+          <div class="ptf-chart-title" id="ptf-chart-coin-name">Select a coin</div>
+          <div class="ptf-chart-badges" id="ptf-chart-badges"></div>
+        </div>
+        <div class="ptf-chart-body">
+          <canvas id="ptf-chart-canvas" class="ptf-chart-canvas"></canvas>
+          <div id="ptf-trade-details">
+            <div class="ptf-empty" style="min-height:200px">
+              <div style="font-size:24px;opacity:.3">&#x1F4CA;</div>
+              <div class="ptf-empty-sub">Click a coin from the watchlist to see trade history and price chart</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- ═══════════════════════ SCAN TAB — EVALUATION RAMP ═══════════════════════ -->
@@ -15334,8 +15447,11 @@ DASHBOARD_HTML = _CSS + """
           <div class="settings-section-title">Position Management</div>
           <div class="setting-row">
             <div><div class="setting-label">Buy Size</div><div class="setting-desc">How much SOL to spend per trade</div></div>
-            <input class="setting-input" id="s-max-buy" type="number" step="0.01">
-            <div class="setting-unit">SOL</div>
+            <div style="display:flex;align-items:center;gap:6px">
+              <input class="setting-input" id="s-max-buy" type="number" step="0.01">
+              <button id="lock-amount-btn" class="btn" style="font-size:9px;padding:6px 10px;white-space:nowrap;min-width:60px" onclick="toggleLockAmount()">Lock</button>
+            </div>
+            <div class="setting-unit">SOL <span id="lock-status" style="font-size:9px;color:var(--t3)"></span></div>
           </div>
           <div class="setting-row">
             <div><div class="setting-label">Take Profit 1</div><div class="setting-desc">Sell half when price hits this multiple (e.g. 2x = double)</div></div>
@@ -16119,7 +16235,7 @@ function planAtLeast(required) {
   return (PLAN_TIER[window.__PLAN] || 0) >= (PLAN_TIER[required] || 0);
 }
 const TAB_PLAN_GATES = {
-  scanner: 'free', settings: 'free', signals: 'basic', whales: 'pro',
+  portfolio: 'free', scanner: 'free', settings: 'free', signals: 'basic', whales: 'pro',
   positions: 'free', pnl: 'free', quant: 'pro', paper: 'basic',
 };
 
@@ -16194,6 +16310,7 @@ function switchTab(tab, btn) {
   // Start tab-specific polling
   Object.values(_tabPollers).forEach(id => clearInterval(id));
   _tabPollers = {};
+  if (tab === 'portfolio') { loadPortfolio(); _tabPollers.ptf = setInterval(loadPortfolio, 15000); }
   if (tab === 'scanner') { pollEvaluationFeed(); _tabPollers.ev = setInterval(pollEvaluationFeed, 6000); pollScanDetail(); _tabPollers.sd = setInterval(pollScanDetail, 7000); }
   if (tab === 'signals') { pollSignals(); _tabPollers.sig = setInterval(pollSignals, 6000); }
   if (tab === 'whales') { pollWhales(); _tabPollers.whale = setInterval(pollWhales, 8000); }
@@ -16382,6 +16499,7 @@ async function pollEnhancedDashboard() {
 }
 async function refreshNow() {
   await refresh();
+  if (_activeTab === 'portfolio') await loadPortfolio();
   if (_activeTab === 'signals') await pollSignals();
   if (_activeTab === 'whales') await pollWhales();
   if (_activeTab === 'positions') await pollPositions();
@@ -18966,6 +19084,299 @@ async function showQuantRunDetail(runId, silent=false) {
       `).join('') || '<div style="font-size:11px;color:var(--t3)">No trades recorded yet.</div>'}
     </div>
   `;
+}
+
+// ══════════════════════════ PORTFOLIO TAB ══════════════════════════════════════
+let _ptfData = null;
+let _ptfSelectedMint = null;
+let _ptfSortMode = 'pnl';
+
+async function loadPortfolio() {
+  try {
+    const r = await fetch('/api/coin-portfolio').then(r => r.json()).catch(() => null);
+    if (!r) return;
+    _ptfData = r;
+    renderPortfolioList(r);
+    renderPortfolioSummary(r.summary);
+  } catch(e) { console.error('Portfolio load error:', e); }
+}
+
+function renderPortfolioList(data) {
+  const list = document.getElementById('ptf-coin-list');
+  const countEl = document.getElementById('ptf-coin-count');
+  if (!list) return;
+  let coins = [...(data.coins || [])];
+  if (countEl) countEl.textContent = coins.length;
+
+  // Sort
+  if (_ptfSortMode === 'pnl') coins.sort((a,b) => (b.net_pnl_sol || 0) - (a.net_pnl_sol || 0));
+  else if (_ptfSortMode === 'spent') coins.sort((a,b) => (b.total_spent_sol || 0) - (a.total_spent_sol || 0));
+  else if (_ptfSortMode === 'recent') coins.sort((a,b) => (b.last_trade_at || '').localeCompare(a.last_trade_at || ''));
+
+  if (!coins.length) {
+    list.innerHTML = `<div class="ptf-empty" style="min-height:300px">
+      <div class="ptf-empty-icon">&#x1F4B0;</div>
+      <div class="ptf-empty-title">No trades yet</div>
+      <div class="ptf-empty-sub">Add SOL to your wallet and start the bot. All traded coins will appear here with full P&L tracking.</div>
+    </div>`;
+    return;
+  }
+
+  const colors = ['#3b82f6','#14c784','#a855f7','#f59e0b','#ef4444','#06b6d4','#ec4899','#84cc16'];
+  list.innerHTML = coins.map((c, i) => {
+    const pnl = c.net_pnl_sol || 0;
+    const pnlPct = c.pnl_pct || 0;
+    const isUp = pnl >= 0;
+    const sel = _ptfSelectedMint === c.mint ? ' selected' : '';
+    const bg = colors[i % colors.length];
+    const initial = (c.name || '?').charAt(0).toUpperCase();
+    return `<div class="ptf-coin-row${sel}" onclick="ptfSelectCoin('${c.mint}','${(c.name||'').replace(/'/g,"\\'")}')">
+      <div class="ptf-coin-icon" style="background:${bg}">${initial}</div>
+      <div>
+        <div class="ptf-coin-name">${c.name || c.mint.slice(0,8)}</div>
+        <div class="ptf-coin-mint">${c.mint.slice(0,6)}...${c.mint.slice(-4)}</div>
+      </div>
+      <div class="ptf-coin-spent">
+        <div>${c.total_spent_sol.toFixed(4)}</div>
+        <div class="ptf-coin-spent-label">${c.buy_count} buys / ${c.sell_count} sells</div>
+      </div>
+      <div class="ptf-coin-pnl">
+        <div class="ptf-coin-pnl-val ${isUp ? 'c-grn' : 'c-red'}">${isUp?'+':''}${pnl.toFixed(4)}</div>
+        <div class="ptf-coin-pnl-sub">${isUp?'+':''}${pnlPct.toFixed(1)}% | W${c.win_count}/L${c.loss_count}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderPortfolioSummary(summary) {
+  if (!summary) return;
+  const s = document.getElementById('ptf-total-spent');
+  const e = document.getElementById('ptf-total-earned');
+  const p = document.getElementById('ptf-net-pnl');
+  const w = document.getElementById('ptf-win-rate');
+  if (s) s.textContent = summary.total_spent.toFixed(4);
+  if (e) e.textContent = summary.total_earned.toFixed(4);
+  if (p) {
+    p.textContent = (summary.net_pnl_sol >= 0 ? '+' : '') + summary.net_pnl_sol.toFixed(4);
+    p.style.color = summary.net_pnl_sol >= 0 ? '#14c784' : '#ef4444';
+  }
+  if (w) w.textContent = summary.overall_win_rate.toFixed(0) + '%';
+}
+
+function ptfSort(mode) {
+  _ptfSortMode = mode;
+  document.querySelectorAll('.ptf-sort-btn').forEach(b => b.classList.toggle('active', b.textContent.toLowerCase() === mode));
+  if (_ptfData) renderPortfolioList(_ptfData);
+}
+
+async function ptfSelectCoin(mint, name) {
+  _ptfSelectedMint = mint;
+  // Highlight selected row
+  document.querySelectorAll('.ptf-coin-row').forEach(r => r.classList.remove('selected'));
+  const rows = document.querySelectorAll('.ptf-coin-row');
+  rows.forEach(r => { if (r.onclick && r.onclick.toString().includes(mint)) r.classList.add('selected'); });
+  if (_ptfData) renderPortfolioList(_ptfData);
+
+  // Update chart title
+  const titleEl = document.getElementById('ptf-chart-coin-name');
+  if (titleEl) titleEl.textContent = name || mint.slice(0,12);
+
+  // Load trade history for this coin
+  try {
+    const r = await fetch(`/api/coin-history/${mint}`).then(r => r.json()).catch(() => null);
+    if (!r) return;
+    renderCoinChart(r.trades);
+    renderCoinTradeTable(r.trades, name);
+    // Update badges
+    const badgesEl = document.getElementById('ptf-chart-badges');
+    if (badgesEl && r.trades.length) {
+      const wins = r.trades.filter(t => (t.pnl_sol || 0) >= 0).length;
+      const losses = r.trades.filter(t => (t.pnl_sol || 0) < 0).length;
+      const totalPnl = r.trades.reduce((s, t) => s + (t.pnl_sol || 0), 0);
+      badgesEl.innerHTML = `
+        <span class="badge bg-blue">${r.trades.length} trades</span>
+        <span class="badge" style="background:rgba(20,199,132,.15);color:#14c784">W${wins}</span>
+        <span class="badge" style="background:rgba(239,68,68,.15);color:#ef4444">L${losses}</span>
+        <span class="badge ${totalPnl >= 0 ? 'bg-blue' : ''}" style="${totalPnl < 0 ? 'background:rgba(239,68,68,.15);color:#ef4444' : ''}">${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL</span>
+      `;
+    }
+  } catch(e) { console.error('Coin history error:', e); }
+}
+
+function renderCoinChart(trades) {
+  const canvas = document.getElementById('ptf-chart-canvas');
+  if (!canvas || !trades.length) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const w = rect.width - 32;
+  const h = 260;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  // Build cumulative P&L curve
+  const sortedTrades = [...trades].sort((a,b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+  let cumPnl = 0;
+  const points = sortedTrades.map(t => {
+    cumPnl += (t.pnl_sol || 0);
+    return { pnl: cumPnl, label: t.exit_reason || 'trade', ts: t.timestamp };
+  });
+
+  if (!points.length) return;
+
+  const maxPnl = Math.max(...points.map(p => p.pnl), 0.001);
+  const minPnl = Math.min(...points.map(p => p.pnl), -0.001);
+  const range = maxPnl - minPnl || 1;
+  const pad = { t: 30, b: 40, l: 60, r: 20 };
+  const chartW = w - pad.l - pad.r;
+  const chartH = h - pad.t - pad.b;
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,.06)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (chartH / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    const val = maxPnl - (range / 4) * i;
+    ctx.fillStyle = 'rgba(255,255,255,.4)';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText((val >= 0 ? '+' : '') + val.toFixed(4), pad.l - 8, y + 3);
+  }
+
+  // Zero line
+  const zeroY = pad.t + ((maxPnl - 0) / range) * chartH;
+  ctx.strokeStyle = 'rgba(255,255,255,.15)';
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(pad.l, zeroY); ctx.lineTo(w - pad.r, zeroY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Draw P&L line
+  const gradient = ctx.createLinearGradient(0, pad.t, 0, h - pad.b);
+  gradient.addColorStop(0, 'rgba(20,199,132,.3)');
+  gradient.addColorStop(1, 'rgba(20,199,132,.02)');
+
+  ctx.beginPath();
+  ctx.moveTo(pad.l, zeroY);
+  points.forEach((p, i) => {
+    const x = pad.l + (i / Math.max(points.length - 1, 1)) * chartW;
+    const y = pad.t + ((maxPnl - p.pnl) / range) * chartH;
+    ctx.lineTo(x, y);
+  });
+  // Fill area
+  const lastX = pad.l + chartW;
+  ctx.lineTo(lastX, zeroY);
+  ctx.closePath();
+  ctx.fillStyle = gradient;
+  ctx.fill();
+
+  // Draw line on top
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const x = pad.l + (i / Math.max(points.length - 1, 1)) * chartW;
+    const y = pad.t + ((maxPnl - p.pnl) / range) * chartH;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#14c784';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Draw dots for each trade
+  points.forEach((p, i) => {
+    const x = pad.l + (i / Math.max(points.length - 1, 1)) * chartW;
+    const y = pad.t + ((maxPnl - p.pnl) / range) * chartH;
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = p.pnl >= 0 ? '#14c784' : '#ef4444';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+
+  // Title
+  ctx.font = '10px sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,.5)';
+  ctx.textAlign = 'left';
+  ctx.fillText('Cumulative P&L (SOL)', pad.l, pad.t - 12);
+}
+
+function renderCoinTradeTable(trades, coinName) {
+  const el = document.getElementById('ptf-trade-details');
+  if (!el) return;
+  if (!trades.length) {
+    el.innerHTML = `<div class="ptf-empty" style="min-height:100px"><div class="ptf-empty-sub">No trade records for this coin</div></div>`;
+    return;
+  }
+  el.innerHTML = `
+    <table class="ptf-trade-table">
+      <thead><tr>
+        <th>Time</th><th>Entry</th><th>Exit</th><th>Spent</th><th>Earned</th><th>P&L</th><th>Hold</th><th>Reason</th>
+      </tr></thead>
+      <tbody>
+        ${trades.map(t => {
+          const pnl = t.pnl_sol || 0;
+          const pnlPct = t.pnl_pct || 0;
+          const isUp = pnl >= 0;
+          const ts = t.timestamp ? new Date(t.timestamp).toLocaleString() : '--';
+          return `<tr>
+            <td>${ts}</td>
+            <td>${t.entry_price ? '$' + Number(t.entry_price).toExponential(2) : '--'}</td>
+            <td>${t.exit_price ? '$' + Number(t.exit_price).toExponential(2) : '--'}</td>
+            <td>${t.entry_sol ? t.entry_sol.toFixed(4) : '--'}</td>
+            <td>${t.exit_sol ? t.exit_sol.toFixed(4) : '--'}</td>
+            <td style="color:${isUp ? '#14c784' : '#ef4444'};font-weight:700">${isUp?'+':''}${pnl.toFixed(4)} (${isUp?'+':''}${pnlPct.toFixed(1)}%)</td>
+            <td>${t.hold_time_min || 0}m</td>
+            <td><span class="badge bg-muted" style="font-size:9px">${t.exit_reason || '--'}</span></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>`;
+}
+
+// ── Lock Amount ──
+let _amountLocked = false;
+async function toggleLockAmount() {
+  const btn = document.getElementById('lock-amount-btn');
+  const status = document.getElementById('lock-status');
+  const input = document.getElementById('s-max-buy');
+  if (!btn || !input) return;
+
+  if (_amountLocked) {
+    // Unlock
+    const r = await fetch('/api/lock-amount', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'unlock'})
+    }).then(r => r.json()).catch(() => null);
+    if (r && r.ok) {
+      _amountLocked = false;
+      btn.textContent = 'Lock';
+      btn.style.background = '';
+      btn.style.borderColor = '';
+      if (status) status.textContent = '';
+      showToast('Amount unlocked', true);
+    }
+  } else {
+    // Lock
+    const amount = parseFloat(input.value);
+    if (!amount || amount <= 0) { showToast('Enter a valid amount first', false); return; }
+    const r = await fetch('/api/lock-amount', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'lock', amount: amount})
+    }).then(r => r.json()).catch(() => null);
+    if (r && r.ok) {
+      _amountLocked = true;
+      btn.textContent = 'Unlock';
+      btn.style.background = 'rgba(20,199,132,.15)';
+      btn.style.borderColor = 'rgba(20,199,132,.4)';
+      if (status) status.textContent = 'Locked at ' + amount.toFixed(2);
+      showToast('Amount locked at ' + amount + ' SOL', true);
+    }
+  }
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
