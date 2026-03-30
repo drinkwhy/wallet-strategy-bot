@@ -608,12 +608,55 @@ def persist_bot_settings(user_id, preset, run_mode, duration, profit, settings):
     return overrides
 
 
+def update_coin_portfolio_cache(user_id, mint, name):
+    """Update coin_portfolio_cache after a trade"""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO coin_portfolio_cache
+            (user_id, mint, name, total_entry_sol, total_exit_sol, buy_count, sell_count,
+             win_count, loss_count, avg_entry_price, avg_exit_price, best_pnl_pct, worst_pnl_pct, last_trade_at)
+            SELECT user_id, mint, name,
+                   COALESCE(SUM(CASE WHEN action='BUY' THEN entry_sol ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' THEN exit_sol ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' AND pnl_sol > 0 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' AND pnl_sol < 0 THEN 1 ELSE 0 END), 0),
+                   COALESCE(AVG(CASE WHEN action='BUY' THEN entry_price ELSE NULL END), 0),
+                   COALESCE(AVG(CASE WHEN action LIKE 'SELL%' THEN exit_price ELSE NULL END), 0),
+                   MAX(CASE WHEN action LIKE 'SELL%' THEN pnl_pct ELSE NULL END),
+                   MIN(CASE WHEN action LIKE 'SELL%' THEN pnl_pct ELSE NULL END),
+                   MAX(CASE WHEN action LIKE 'SELL%' THEN timestamp ELSE NULL END)
+            FROM trades WHERE user_id=%s AND mint=%s
+            ON CONFLICT (user_id, mint) DO UPDATE SET
+                total_entry_sol = EXCLUDED.total_entry_sol,
+                total_exit_sol = EXCLUDED.total_exit_sol,
+                buy_count = EXCLUDED.buy_count,
+                sell_count = EXCLUDED.sell_count,
+                win_count = EXCLUDED.win_count,
+                loss_count = EXCLUDED.loss_count,
+                avg_entry_price = EXCLUDED.avg_entry_price,
+                avg_exit_price = EXCLUDED.avg_exit_price,
+                best_pnl_pct = EXCLUDED.best_pnl_pct,
+                worst_pnl_pct = EXCLUDED.worst_pnl_pct,
+                last_trade_at = EXCLUDED.last_trade_at,
+                updated_at = NOW()
+        """, (user_id, mint))
+        conn.commit()
+    except Exception as e:
+        print(f"[CACHE] Portfolio cache update failed: {e}", flush=True)
+    finally:
+        db_return(conn)
+
+
 def load_user_effective_settings(user_id):
     conn = db()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT preset, custom_settings, max_correlated, drawdown_limit_sol FROM bot_settings WHERE user_id=%s",
+            "SELECT preset, custom_settings, max_correlated, drawdown_limit_sol, locked_max_buy_sol FROM bot_settings WHERE user_id=%s",
             (user_id,),
         )
         row = cur.fetchone()
@@ -634,6 +677,9 @@ def load_user_effective_settings(user_id):
                     settings.update(custom)
             except Exception:
                 pass
+        # Locked max_buy_sol takes precedence over everything
+        if row.get("locked_max_buy_sol") and row.get("locked_max_buy_sol") > 0:
+            settings["max_buy_sol"] = row["locked_max_buy_sol"]
     return preset_name, strip_auto_relax_state(settings)
 
 
@@ -934,7 +980,8 @@ def init_db():
             active_policy_source TEXT DEFAULT 'manual',
             active_policy_report_id INTEGER,
             active_policy_updated_at TIMESTAMP,
-            auto_promote_locked_until TIMESTAMP
+            auto_promote_locked_until TIMESTAMP,
+            locked_max_buy_sol REAL
         )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS open_positions (
@@ -955,8 +1002,35 @@ def init_db():
             id SERIAL PRIMARY KEY,
             user_id INTEGER,
             mint TEXT, name TEXT, action TEXT,
-            price REAL, pnl_sol REAL,
+            entry_price REAL, exit_price REAL,
+            entry_sol REAL, exit_sol REAL,
+            price REAL, pnl_sol REAL, pnl_pct REAL,
+            hold_time_min INTEGER,
+            tp1_hit INTEGER DEFAULT 0,
+            exit_reason TEXT,
+            tx_signature TEXT,
             timestamp TIMESTAMP DEFAULT NOW()
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS coin_portfolio_cache (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            mint TEXT NOT NULL,
+            name TEXT,
+            total_entry_sol REAL DEFAULT 0,
+            total_exit_sol REAL DEFAULT 0,
+            buy_count INTEGER DEFAULT 0,
+            sell_count INTEGER DEFAULT 0,
+            win_count INTEGER DEFAULT 0,
+            loss_count INTEGER DEFAULT 0,
+            avg_entry_price REAL,
+            avg_exit_price REAL,
+            best_pnl_pct REAL,
+            worst_pnl_pct REAL,
+            last_trade_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, mint)
         )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS perf_fees (
@@ -3717,14 +3791,25 @@ class BotInstance:
                             f"📝 {reason}")
                 except Exception as _e:
                     print(f"[ERROR] {_e}", flush=True)
+                # Calculate hold time in minutes
+                hold_time_min = (time.time() - pos.get("timestamp", time.time())) / 60
+                exit_sol = pos["entry_sol"] * pct
                 conn = db()
                 try:
                     _cur = conn.cursor()
                     _cur.execute(
-                        "INSERT INTO trades (user_id,mint,name,action,price,pnl_sol) VALUES (%s,%s,%s,%s,%s,%s)",
-                        (self.user_id, mint, pos["name"], f"SELL-{reason}", cur, pnl_sol)
+                        """INSERT INTO trades
+                        (user_id,mint,name,action,entry_price,exit_price,entry_sol,exit_sol,
+                         price,pnl_sol,pnl_pct,hold_time_min,tp1_hit,exit_reason,tx_signature)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (self.user_id, mint, pos["name"], f"SELL-{reason}",
+                         pos["entry_price"], cur, pos["entry_sol"], exit_sol,
+                         cur, pnl_sol, pnl_pct, int(hold_time_min),
+                         1 if (pct < 1.0 and pnl_pct >= 0) else 0, reason, sig)
                     )
                     conn.commit()
+                    # Update coin portfolio cache
+                    update_coin_portfolio_cache(self.user_id, mint, pos["name"])
                 finally:
                     db_return(conn)
                 if pct >= 1.0:
@@ -9596,6 +9681,153 @@ def dashboard():
         return Response("<h1>Dashboard Error</h1><p>An unexpected error occurred.</p>", status=500, mimetype="text/html")
 
 # ── API ────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/coin-portfolio")
+@login_required
+def api_coin_portfolio():
+    """Get aggregated coin-by-coin trading statistics"""
+    uid = session["user_id"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Get coin portfolio from cache
+        cur.execute("""
+            SELECT mint, name, total_entry_sol, total_exit_sol, buy_count, sell_count,
+                   win_count, loss_count, avg_entry_price, avg_exit_price,
+                   best_pnl_pct, worst_pnl_pct, last_trade_at
+            FROM coin_portfolio_cache
+            WHERE user_id=%s
+            ORDER BY total_entry_sol DESC
+        """, (uid,))
+        coins = cur.fetchall() or []
+
+        # Get summary stats
+        total_spent = sum(float(c.get("total_entry_sol") or 0) for c in coins)
+        total_earned = sum(float(c.get("total_exit_sol") or 0) for c in coins)
+        total_wins = sum(int(c.get("win_count") or 0) for c in coins)
+        total_losses = sum(int(c.get("loss_count") or 0) for c in coins)
+
+        coin_list = []
+        for c in coins:
+            total_trades = (c.get("buy_count") or 0) + (c.get("sell_count") or 0)
+            win_count = c.get("win_count") or 0
+            loss_count = c.get("loss_count") or 0
+            sell_count = c.get("sell_count") or 0
+
+            coin_list.append({
+                "mint": c.get("mint"),
+                "name": c.get("name"),
+                "total_spent_sol": float(c.get("total_entry_sol") or 0),
+                "total_earned_sol": float(c.get("total_exit_sol") or 0),
+                "net_pnl_sol": float(c.get("total_exit_sol") or 0) - float(c.get("total_entry_sol") or 0),
+                "pnl_pct": ((float(c.get("total_exit_sol") or 0) / float(c.get("total_entry_sol") or 1)) - 1) * 100 if c.get("total_entry_sol") else 0,
+                "buy_count": c.get("buy_count") or 0,
+                "sell_count": c.get("sell_count") or 0,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate": (win_count / sell_count * 100) if sell_count > 0 else 0,
+                "best_trade_pnl_pct": float(c.get("best_pnl_pct") or 0),
+                "worst_trade_pnl_pct": float(c.get("worst_pnl_pct") or 0),
+                "last_trade_at": c.get("last_trade_at").isoformat() if c.get("last_trade_at") else None,
+            })
+    finally:
+        db_return(conn)
+
+    total_trades = total_wins + total_losses
+    return jsonify({
+        "coins": coin_list,
+        "summary": {
+            "total_coins_traded": len(coin_list),
+            "total_trades": total_trades,
+            "total_spent": round(total_spent, 4),
+            "total_earned": round(total_earned, 4),
+            "net_pnl_sol": round(total_earned - total_spent, 4),
+            "overall_win_rate": (total_wins / total_trades * 100) if total_trades > 0 else 0,
+        }
+    })
+
+@app.route("/api/coin-history/<mint>")
+@login_required
+def api_coin_history(mint):
+    """Get all trades for a specific coin"""
+    uid = session["user_id"]
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Get coin info
+        cur.execute("""
+            SELECT DISTINCT name FROM trades WHERE user_id=%s AND mint=%s LIMIT 1
+        """, (uid, mint))
+        coin_row = cur.fetchone()
+        coin_name = coin_row.get("name") if coin_row else mint
+
+        # Get all trades for this coin
+        cur.execute("""
+            SELECT id, entry_price, exit_price, entry_sol, exit_sol,
+                   pnl_sol, pnl_pct, hold_time_min, tp1_hit, exit_reason, timestamp
+            FROM trades
+            WHERE user_id=%s AND mint=%s
+            ORDER BY timestamp DESC
+        """, (uid, mint))
+        trades = cur.fetchall() or []
+    finally:
+        db_return(conn)
+
+    trade_list = []
+    for t in trades:
+        trade_list.append({
+            "id": t.get("id"),
+            "entry_price": float(t.get("entry_price") or 0),
+            "exit_price": float(t.get("exit_price") or 0),
+            "entry_sol": float(t.get("entry_sol") or 0),
+            "exit_sol": float(t.get("exit_sol") or 0),
+            "pnl_sol": float(t.get("pnl_sol") or 0),
+            "pnl_pct": float(t.get("pnl_pct") or 0),
+            "hold_time_min": t.get("hold_time_min") or 0,
+            "tp1_hit": bool(t.get("tp1_hit")),
+            "exit_reason": t.get("exit_reason"),
+            "timestamp": t.get("timestamp").isoformat() if t.get("timestamp") else None,
+        })
+
+    return jsonify({
+        "coin": {"mint": mint, "name": coin_name},
+        "trades": trade_list,
+    })
+
+@app.route("/api/lock-amount", methods=["POST"])
+@login_required
+def api_lock_amount():
+    """Lock/unlock max_buy_sol amount"""
+    uid = session["user_id"]
+    data = request.json or {}
+    action = data.get("action")  # "lock" or "unlock"
+    amount = float(data.get("amount", 0)) if action == "lock" else None
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        if action == "lock" and amount > 0:
+            cur.execute(
+                "UPDATE bot_settings SET locked_max_buy_sol=%s WHERE user_id=%s",
+                (amount, uid)
+            )
+            result_msg = f"Amount locked at {amount} SOL"
+        elif action == "unlock":
+            cur.execute(
+                "UPDATE bot_settings SET locked_max_buy_sol=NULL WHERE user_id=%s",
+                (uid,)
+            )
+            result_msg = "Amount unlocked — auto-optimization can now change it"
+        else:
+            return jsonify({"ok": False, "msg": "Invalid action"}), 400
+
+        conn.commit()
+        return jsonify({"ok": True, "msg": result_msg})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+    finally:
+        db_return(conn)
+
 @app.route("/api/state")
 @login_required
 def api_state():
