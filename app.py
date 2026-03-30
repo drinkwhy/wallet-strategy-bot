@@ -15166,7 +15166,7 @@ function renderCoins(data) {
     const initial = (c.name || '?').charAt(0).toUpperCase();
     const src = c.source === 'shadow' ? '<span class="badge bg-gld" style="margin-left:6px">SIM</span>' : c.source === 'open' ? '<span class="badge bg-blue" style="margin-left:6px">OPEN</span>' : '';
     const sel = _selectedCoinMint === c.mint ? ' active' : '';
-    return '<div class="coin-card' + sel + '" onclick="selectCoin(\'' + c.mint + '\',\'' + esc(c.name||'').replace(/'/g,"\\'") + '\')">' +
+    return '<div class="coin-card' + sel + '" data-mint="' + c.mint + '" data-name="' + esc(c.name||'') + '">' +
       '<div class="coin-header">' +
         '<div class="coin-icon" style="background:' + bg + '">' + initial + '</div>' +
         '<div><div class="coin-nm">' + esc(c.name || c.mint.slice(0,8)) + src + '</div><div class="coin-addr">' + c.mint.slice(0,6) + '...' + c.mint.slice(-4) + '</div></div>' +
@@ -15321,8 +15321,8 @@ function renderPositions(data) {
       '<div>' +
         '<div class="pos-pnl ' + (isUp?'c-grn':'c-red') + '">' + (isUp?'+':'') + pnlPct.toFixed(1) + '%</div>' +
         '<div class="pos-actions">' +
-          '<button class="btn-sell" onclick="sellPosition(\'' + p.mint + '\',50)">Sell 50%</button>' +
-          '<button class="btn-sell" onclick="sellPosition(\'' + p.mint + '\',100)">Sell 100%</button>' +
+          '<button class="btn-sell" data-mint="' + p.mint + '" data-pct="50">Sell 50%</button>' +
+          '<button class="btn-sell" data-mint="' + p.mint + '" data-pct="100">Sell 100%</button>' +
         '</div>' +
       '</div>' +
     '</div>';
@@ -15344,7 +15344,7 @@ function renderPositionsFallback(positions) {
     return '<div class="pos-card">' +
       '<div><div class="pos-name">' + esc(p.name) + '</div><div class="pos-meta">' + (p.age_min||0).toFixed(0) + 'm held</div></div>' +
       '<div><div class="pos-pnl ' + (isUp?'c-grn':'c-red') + '">' + pnlStr + '</div>' +
-      '<div class="pos-actions"><button class="btn-sell" onclick="sellPosition(\'' + p.address + '\',100)">Sell</button></div></div>' +
+      '<div class="pos-actions"><button class="btn-sell" data-mint="' + p.address + '" data-pct="100">Sell</button></div></div>' +
     '</div>';
   }).join('');
 }
@@ -15651,11 +15651,11 @@ function closeConfirm() {
 // ONBOARDING TOUR
 // ══════════════════════════════════════════════════════════════════════════════
 const TOUR_STEPS = [
-  { target: null, title: 'Welcome to SolTrader!', body: 'This is your AI-powered Solana trading bot. Let\\'s take a 30-second tour to get you started.' },
-  { target: 'tour-target-stats', title: 'Your Stats', body: 'Your wallet balance, open positions, wins/losses, and P&L are always visible here. This never goes away so you always know where you stand.' },
-  { target: 'tour-target-start', title: 'Start Trading', body: 'Hit the green START button to begin. The bot automatically finds, buys, and sells coins based on your strategy. You can stop anytime.' },
-  { target: 'tour-target-pages', title: 'Switch Pages', body: 'Use this dropdown to navigate: My Coins shows your portfolio, Positions shows open trades, Settings lets you customize your strategy.' },
-  { target: null, title: 'You\\'re All Set!', body: 'Make sure you have SOL in your wallet, pick a strategy in Settings, and hit Start. The bot handles the rest! You can always come back to this tour from the help icon.' },
+  { target: null, title: "Welcome to SolTrader!", body: "This is your AI-powered Solana trading bot. We will take a 30-second tour to get you started." },
+  { target: "tour-target-stats", title: "Your Stats", body: "Your wallet balance, open positions, wins/losses, and P&L are always visible here. This never goes away so you always know where you stand." },
+  { target: "tour-target-start", title: "Start Trading", body: "Hit the green START button to begin. The bot automatically finds, buys, and sells coins based on your strategy. You can stop anytime." },
+  { target: "tour-target-pages", title: "Switch Pages", body: "Use this dropdown to navigate: My Coins shows your portfolio, Positions shows open trades, Settings lets you customize your strategy." },
+  { target: null, title: "All Set!", body: "Make sure you have SOL in your wallet, pick a strategy in Settings, and hit Start. The bot handles the rest!" },
 ];
 let _tourStep = 0;
 
@@ -15731,23 +15731,36 @@ function isChecked(id) { const el = document.getElementById(id); return el ? el.
 function setChecked(id, val) { const el = document.getElementById(id); if (el) el.checked = !!val; }
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 function titleCase(s) { var r = s || ''; r = r.replace(/_/g, ' '); return r.charAt(0).toUpperCase() + r.slice(1); }
-function fmtPrice(p) { if (!p) return '—'; if (p < 0.0001) return p.toExponential(2); return p.toFixed(6); }
+function fmtPrice(p) { if (!p) return "--"; if (p < 0.0001) return p.toExponential(2); return p.toFixed(6); }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════════════════════════════════════════
 (async function init() {
   // Mark settings inputs as dirty when changed
-  document.querySelectorAll('.s-input, .s-toggle input').forEach(el => {
-    el.addEventListener('change', () => { document._settingsDirty = true; });
-    el.addEventListener('input', () => { document._settingsDirty = true; });
+  document.querySelectorAll(".s-input, .s-toggle input").forEach(function(el) {
+    el.addEventListener("change", function() { document._settingsDirty = true; });
+    el.addEventListener("input", function() { document._settingsDirty = true; });
+  });
+  // Event delegation for coin cards
+  document.addEventListener("click", function(e) {
+    var card = e.target.closest(".coin-card[data-mint]");
+    if (card) {
+      selectCoin(card.dataset.mint, card.dataset.name || "");
+      return;
+    }
+    var sellBtn = e.target.closest(".btn-sell[data-mint]");
+    if (sellBtn) {
+      sellPosition(sellBtn.dataset.mint, parseInt(sellBtn.dataset.pct) || 100);
+      return;
+    }
   });
   // Load state
   await loadState();
   // Main poll every 5 seconds
   setInterval(loadState, 5000);
   // Onboarding tour
-  if (!localStorage.getItem('soltrader_tour_done')) {
+  if (!localStorage.getItem("soltrader_tour_done")) {
     setTimeout(startTour, 800);
   }
 })();
