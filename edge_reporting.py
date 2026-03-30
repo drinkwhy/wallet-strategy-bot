@@ -295,10 +295,10 @@ def derive_edge_guard_state(history_summary):
         "action_label": "Warm-up — preset filters active",
         "reason": "Not enough report history yet; using preset optimization filters for entry quality.",
         "allow_new_entries": True,
-        "size_multiplier": 0.9,
-        "risk_multiplier": 0.9,
-        "max_positions_cap": 3,
-        "drawdown_multiplier": 0.9,
+        "size_multiplier": 1.0,
+        "risk_multiplier": 1.0,
+        "max_positions_cap": 5,
+        "drawdown_multiplier": 1.0,
         "prefer_rules_only": False,
         "report_count": _safe_int((history_summary or {}).get("report_count")),
         "focus_window_days": _safe_int((history_summary or {}).get("focus_window_days"), 7),
@@ -322,10 +322,10 @@ def derive_edge_guard_state(history_summary):
         return state
 
     if (
-        model_edge_pct <= -4.0
-        or regime_edge_pct <= -4.0
-        or (active_regime == "defensive" and leader_avg_pnl_pct <= 0)
-        or (has_long_term_report and long_term_edge_pct <= -3.0 and active_regime in {"distribution", "defensive"})
+        model_edge_pct <= -8.0
+        or regime_edge_pct <= -8.0
+        or (active_regime == "defensive" and leader_avg_pnl_pct <= -5.0)
+        or (has_long_term_report and long_term_edge_pct <= -6.0 and active_regime in {"distribution", "defensive"})
     ):
         state.update({
             "status": "halted",
@@ -342,38 +342,38 @@ def derive_edge_guard_state(history_summary):
 
     if (
         active_regime in {"distribution", "defensive"}
-        or regime_edge_pct < 0
-        or leader_policy == "rule_balanced"
-        or (has_long_term_report and long_term_edge_pct < 1.0)
+        or regime_edge_pct < -2.0
+        or (leader_policy == "rule_balanced" and leader_avg_pnl_pct < -3.0)
+        or (has_long_term_report and long_term_edge_pct < -1.0)
     ):
         state.update({
             "status": "defensive",
             "action_label": "Defensive — relaxed",
             "reason": "Tape regime or report leadership is weak; using preset filters instead of hard throttle.",
             "allow_new_entries": True,
-            "size_multiplier": 0.85,
-            "risk_multiplier": 0.85,
-            "max_positions_cap": 3,
-            "drawdown_multiplier": 0.85,
+            "size_multiplier": 1.0,
+            "risk_multiplier": 1.0,
+            "max_positions_cap": 5,
+            "drawdown_multiplier": 1.0,
             "prefer_rules_only": True,
         })
         return state
 
     if (
-        model_edge_pct < 2.0
-        or regime_edge_pct < 1.5
-        or (delta_model_edge_pct is not None and _safe_float(delta_model_edge_pct) < -2.0)
-        or (delta_regime_edge_pct is not None and _safe_float(delta_regime_edge_pct) < -2.0)
+        model_edge_pct < 0.5
+        or regime_edge_pct < 0.0
+        or (delta_model_edge_pct is not None and _safe_float(delta_model_edge_pct) < -4.0)
+        or (delta_regime_edge_pct is not None and _safe_float(delta_regime_edge_pct) < -4.0)
     ):
         state.update({
             "status": "throttled",
             "action_label": "Lightly throttled",
             "reason": "Edge is positive but trend softening; slight size reduction, preset filters handle quality.",
             "allow_new_entries": True,
-            "size_multiplier": 0.85,
-            "risk_multiplier": 0.85,
-            "max_positions_cap": 3,
-            "drawdown_multiplier": 0.9,
+            "size_multiplier": 1.0,
+            "risk_multiplier": 1.0,
+            "max_positions_cap": 5,
+            "drawdown_multiplier": 1.0,
             "prefer_rules_only": False,
         })
         return state
