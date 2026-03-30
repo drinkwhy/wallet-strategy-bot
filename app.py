@@ -15111,7 +15111,7 @@ DASHBOARD_HTML = _CSS + """
   </div>
 
   <!-- ===================== PORTFOLIO TAB — MY COINS ===================== -->
-  <div id="tab-portfolio" class="tab-pane" style="display:none">
+  <div id="tab-portfolio" class="tab-pane">
     <style>
     .ptf-layout{display:grid;grid-template-columns:380px 1fr;gap:16px;min-height:520px}
     @media(max-width:960px){.ptf-layout{grid-template-columns:1fr}}
@@ -16452,7 +16452,7 @@ function switchTab(tab, btn) {
     return;
   }
   _activeTab = tab;
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => { p.classList.remove('active'); p.style.display = ''; });
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.getElementById('tab-' + tab).classList.add('active');
   if (btn) btn.classList.add('active');
