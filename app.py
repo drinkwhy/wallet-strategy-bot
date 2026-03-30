@@ -613,40 +613,56 @@ def update_coin_portfolio_cache(user_id, mint, name):
     conn = db()
     try:
         cur = conn.cursor()
+        # Aggregate trades for this user+mint
         cur.execute("""
-            INSERT INTO coin_portfolio_cache
-            (user_id, mint, name, total_entry_sol, total_exit_sol, buy_count, sell_count,
-             win_count, loss_count, avg_entry_price, avg_exit_price, best_pnl_pct, worst_pnl_pct, last_trade_at)
-            SELECT user_id, mint, name,
-                   COALESCE(SUM(CASE WHEN action='BUY' THEN entry_sol ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' THEN exit_sol ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' AND pnl_sol > 0 THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN action LIKE 'SELL%' AND pnl_sol < 0 THEN 1 ELSE 0 END), 0),
-                   COALESCE(AVG(CASE WHEN action='BUY' THEN entry_price ELSE NULL END), 0),
-                   COALESCE(AVG(CASE WHEN action LIKE 'SELL%' THEN exit_price ELSE NULL END), 0),
-                   MAX(CASE WHEN action LIKE 'SELL%' THEN pnl_pct ELSE NULL END),
-                   MIN(CASE WHEN action LIKE 'SELL%' THEN pnl_pct ELSE NULL END),
-                   MAX(CASE WHEN action LIKE 'SELL%' THEN timestamp ELSE NULL END)
+            SELECT
+                COALESCE(SUM(CASE WHEN action='BUY' THEN entry_sol ELSE 0 END), 0) as total_entry,
+                COALESCE(SUM(CASE WHEN action LIKE 'SELL%%' THEN exit_sol ELSE 0 END), 0) as total_exit,
+                COALESCE(SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END), 0) as buys,
+                COALESCE(SUM(CASE WHEN action LIKE 'SELL%%' THEN 1 ELSE 0 END), 0) as sells,
+                COALESCE(SUM(CASE WHEN action LIKE 'SELL%%' AND pnl_sol > 0 THEN 1 ELSE 0 END), 0) as wins,
+                COALESCE(SUM(CASE WHEN action LIKE 'SELL%%' AND pnl_sol < 0 THEN 1 ELSE 0 END), 0) as losses,
+                AVG(CASE WHEN action='BUY' THEN entry_price END) as avg_ep,
+                AVG(CASE WHEN action LIKE 'SELL%%' THEN exit_price END) as avg_xp,
+                MAX(CASE WHEN action LIKE 'SELL%%' THEN pnl_pct END) as best,
+                MIN(CASE WHEN action LIKE 'SELL%%' THEN pnl_pct END) as worst,
+                MAX(timestamp) as last_ts
             FROM trades WHERE user_id=%s AND mint=%s
-            ON CONFLICT (user_id, mint) DO UPDATE SET
-                total_entry_sol = EXCLUDED.total_entry_sol,
-                total_exit_sol = EXCLUDED.total_exit_sol,
-                buy_count = EXCLUDED.buy_count,
-                sell_count = EXCLUDED.sell_count,
-                win_count = EXCLUDED.win_count,
-                loss_count = EXCLUDED.loss_count,
-                avg_entry_price = EXCLUDED.avg_entry_price,
-                avg_exit_price = EXCLUDED.avg_exit_price,
-                best_pnl_pct = EXCLUDED.best_pnl_pct,
-                worst_pnl_pct = EXCLUDED.worst_pnl_pct,
-                last_trade_at = EXCLUDED.last_trade_at,
-                updated_at = NOW()
         """, (user_id, mint))
+        row = cur.fetchone()
+        if row:
+            cur.execute("""
+                INSERT INTO coin_portfolio_cache
+                (user_id, mint, name, total_entry_sol, total_exit_sol, buy_count, sell_count,
+                 win_count, loss_count, avg_entry_price, avg_exit_price, best_pnl_pct, worst_pnl_pct, last_trade_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (user_id, mint) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    total_entry_sol = EXCLUDED.total_entry_sol,
+                    total_exit_sol = EXCLUDED.total_exit_sol,
+                    buy_count = EXCLUDED.buy_count,
+                    sell_count = EXCLUDED.sell_count,
+                    win_count = EXCLUDED.win_count,
+                    loss_count = EXCLUDED.loss_count,
+                    avg_entry_price = EXCLUDED.avg_entry_price,
+                    avg_exit_price = EXCLUDED.avg_exit_price,
+                    best_pnl_pct = EXCLUDED.best_pnl_pct,
+                    worst_pnl_pct = EXCLUDED.worst_pnl_pct,
+                    last_trade_at = EXCLUDED.last_trade_at,
+                    updated_at = NOW()
+            """, (user_id, mint, name,
+                  float(row["total_entry"] or 0), float(row["total_exit"] or 0),
+                  int(row["buys"] or 0), int(row["sells"] or 0),
+                  int(row["wins"] or 0), int(row["losses"] or 0),
+                  float(row["avg_ep"] or 0), float(row["avg_xp"] or 0),
+                  float(row["best"]) if row["best"] is not None else None,
+                  float(row["worst"]) if row["worst"] is not None else None,
+                  row["last_ts"]))
         conn.commit()
+        print(f"[CACHE] Updated portfolio cache for {name} ({mint[:8]}...)", flush=True)
     except Exception as e:
         print(f"[CACHE] Portfolio cache update failed: {e}", flush=True)
+        import traceback; traceback.print_exc()
     finally:
         db_return(conn)
 
@@ -9709,12 +9725,13 @@ def dashboard():
 @app.route("/api/coin-portfolio")
 @login_required
 def api_coin_portfolio():
-    """Get aggregated coin-by-coin trading statistics"""
+    """Get aggregated coin-by-coin trading statistics (real + shadow)"""
     uid = session["user_id"]
     conn = db()
     try:
         cur = conn.cursor()
-        # Get coin portfolio from cache
+
+        # First try real trades from cache
         cur.execute("""
             SELECT mint, name, total_entry_sol, total_exit_sol, buy_count, sell_count,
                    win_count, loss_count, avg_entry_price, avg_exit_price,
@@ -9723,40 +9740,130 @@ def api_coin_portfolio():
             WHERE user_id=%s
             ORDER BY total_entry_sol DESC
         """, (uid,))
-        coins = cur.fetchall() or []
+        real_coins = cur.fetchall() or []
 
-        # Get summary stats
-        total_spent = sum(float(c.get("total_entry_sol") or 0) for c in coins)
-        total_earned = sum(float(c.get("total_exit_sol") or 0) for c in coins)
-        total_wins = sum(int(c.get("win_count") or 0) for c in coins)
-        total_losses = sum(int(c.get("loss_count") or 0) for c in coins)
+        # Also get shadow trade data (simulated coins)
+        cur.execute("""
+            SELECT mint, name,
+                   COUNT(*) FILTER (WHERE status='closed') as sell_count,
+                   COUNT(*) as total_count,
+                   COUNT(*) FILTER (WHERE status='closed' AND realized_pnl_pct > 0) as win_count,
+                   COUNT(*) FILTER (WHERE status='closed' AND realized_pnl_pct <= 0) as loss_count,
+                   AVG(entry_price) as avg_entry_price,
+                   AVG(exit_price) FILTER (WHERE status='closed') as avg_exit_price,
+                   MAX(realized_pnl_pct) as best_pnl_pct,
+                   MIN(realized_pnl_pct) FILTER (WHERE status='closed') as worst_pnl_pct,
+                   MAX(closed_at) as last_trade_at,
+                   SUM(CASE WHEN entry_price > 0 THEN 0.04 ELSE 0 END) as est_entry_sol,
+                   SUM(CASE WHEN status='closed' AND realized_pnl_pct IS NOT NULL
+                       THEN 0.04 * (1 + realized_pnl_pct/100.0) ELSE 0 END) as est_exit_sol
+            FROM shadow_positions
+            WHERE status='closed' AND realized_pnl_pct IS NOT NULL
+            GROUP BY mint, name
+            ORDER BY MAX(closed_at) DESC NULLS LAST
+            LIMIT 100
+        """)
+        shadow_coins = cur.fetchall() or []
 
+        # Also get currently open positions
+        cur.execute("""
+            SELECT mint, name, entry_price, entry_sol, peak_price, tp1_hit, opened_at
+            FROM open_positions WHERE user_id=%s
+        """, (uid,))
+        open_positions = cur.fetchall() or []
+
+        # Build combined coin list
         coin_list = []
-        for c in coins:
-            total_trades = (c.get("buy_count") or 0) + (c.get("sell_count") or 0)
+        seen_mints = set()
+
+        # Real trades first
+        for c in real_coins:
+            mint = c.get("mint")
+            seen_mints.add(mint)
             win_count = c.get("win_count") or 0
             loss_count = c.get("loss_count") or 0
             sell_count = c.get("sell_count") or 0
-
             coin_list.append({
-                "mint": c.get("mint"),
+                "mint": mint,
                 "name": c.get("name"),
                 "total_spent_sol": float(c.get("total_entry_sol") or 0),
                 "total_earned_sol": float(c.get("total_exit_sol") or 0),
                 "net_pnl_sol": float(c.get("total_exit_sol") or 0) - float(c.get("total_entry_sol") or 0),
                 "pnl_pct": ((float(c.get("total_exit_sol") or 0) / float(c.get("total_entry_sol") or 1)) - 1) * 100 if c.get("total_entry_sol") else 0,
                 "buy_count": c.get("buy_count") or 0,
-                "sell_count": c.get("sell_count") or 0,
+                "sell_count": sell_count,
                 "win_count": win_count,
                 "loss_count": loss_count,
                 "win_rate": (win_count / sell_count * 100) if sell_count > 0 else 0,
                 "best_trade_pnl_pct": float(c.get("best_pnl_pct") or 0),
                 "worst_trade_pnl_pct": float(c.get("worst_pnl_pct") or 0),
                 "last_trade_at": c.get("last_trade_at").isoformat() if c.get("last_trade_at") else None,
+                "source": "live",
+            })
+
+        # Open positions (currently held)
+        for p in open_positions:
+            mint = p.get("mint")
+            if mint in seen_mints:
+                continue
+            seen_mints.add(mint)
+            entry_sol = float(p.get("entry_sol") or 0)
+            coin_list.append({
+                "mint": mint,
+                "name": p.get("name"),
+                "total_spent_sol": entry_sol,
+                "total_earned_sol": 0,
+                "net_pnl_sol": 0,
+                "pnl_pct": 0,
+                "buy_count": 1,
+                "sell_count": 0,
+                "win_count": 0,
+                "loss_count": 0,
+                "win_rate": 0,
+                "best_trade_pnl_pct": 0,
+                "worst_trade_pnl_pct": 0,
+                "last_trade_at": p.get("opened_at").isoformat() if p.get("opened_at") else None,
+                "source": "open",
+            })
+
+        # Shadow trades (simulated — shown when no real trades)
+        for s in shadow_coins:
+            mint = s.get("mint")
+            if mint in seen_mints:
+                continue
+            seen_mints.add(mint)
+            win_count = int(s.get("win_count") or 0)
+            loss_count = int(s.get("loss_count") or 0)
+            sell_count = int(s.get("sell_count") or 0)
+            est_in = float(s.get("est_entry_sol") or 0)
+            est_out = float(s.get("est_exit_sol") or 0)
+            best_pnl = float(s.get("best_pnl_pct") or 0)
+            worst_pnl = float(s.get("worst_pnl_pct") or 0)
+            coin_list.append({
+                "mint": mint,
+                "name": s.get("name"),
+                "total_spent_sol": round(est_in, 4),
+                "total_earned_sol": round(est_out, 4),
+                "net_pnl_sol": round(est_out - est_in, 4),
+                "pnl_pct": ((est_out / est_in) - 1) * 100 if est_in > 0 else best_pnl,
+                "buy_count": int(s.get("total_count") or 0),
+                "sell_count": sell_count,
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate": (win_count / sell_count * 100) if sell_count > 0 else 0,
+                "best_trade_pnl_pct": best_pnl,
+                "worst_trade_pnl_pct": worst_pnl,
+                "last_trade_at": s.get("last_trade_at").isoformat() if s.get("last_trade_at") else None,
+                "source": "shadow",
             })
     finally:
         db_return(conn)
 
+    # Compute summary
+    total_spent = sum(c.get("total_spent_sol", 0) for c in coin_list)
+    total_earned = sum(c.get("total_earned_sol", 0) for c in coin_list)
+    total_wins = sum(c.get("win_count", 0) for c in coin_list)
+    total_losses = sum(c.get("loss_count", 0) for c in coin_list)
     total_trades = total_wins + total_losses
     return jsonify({
         "coins": coin_list,
@@ -9773,27 +9880,51 @@ def api_coin_portfolio():
 @app.route("/api/coin-history/<mint>")
 @login_required
 def api_coin_history(mint):
-    """Get all trades for a specific coin"""
+    """Get all trades for a specific coin (real + shadow)"""
     uid = session["user_id"]
     conn = db()
     try:
         cur = conn.cursor()
-        # Get coin info
-        cur.execute("""
-            SELECT DISTINCT name FROM trades WHERE user_id=%s AND mint=%s LIMIT 1
-        """, (uid, mint))
-        coin_row = cur.fetchone()
-        coin_name = coin_row.get("name") if coin_row else mint
+        # Get coin info from trades or open_positions or shadow
+        coin_name = mint
+        cur.execute("SELECT DISTINCT name FROM trades WHERE user_id=%s AND mint=%s LIMIT 1", (uid, mint))
+        row = cur.fetchone()
+        if row:
+            coin_name = row.get("name") or mint
+        else:
+            cur.execute("SELECT name FROM open_positions WHERE user_id=%s AND mint=%s LIMIT 1", (uid, mint))
+            row = cur.fetchone()
+            if row:
+                coin_name = row.get("name") or mint
+            else:
+                cur.execute("SELECT DISTINCT name FROM shadow_positions WHERE mint=%s LIMIT 1", (mint,))
+                row = cur.fetchone()
+                if row:
+                    coin_name = row.get("name") or mint
 
-        # Get all trades for this coin
+        # Real trades
         cur.execute("""
             SELECT id, entry_price, exit_price, entry_sol, exit_sol,
-                   pnl_sol, pnl_pct, hold_time_min, tp1_hit, exit_reason, timestamp
+                   pnl_sol, pnl_pct, hold_time_min, tp1_hit, exit_reason, action, timestamp
             FROM trades
             WHERE user_id=%s AND mint=%s
             ORDER BY timestamp DESC
         """, (uid, mint))
         trades = cur.fetchall() or []
+
+        # If no real trades, check shadow positions
+        shadow_trades = []
+        if not trades:
+            cur.execute("""
+                SELECT id, entry_price, exit_price, realized_pnl_pct, exit_reason,
+                       opened_at, closed_at, strategy_name, status,
+                       EXTRACT(EPOCH FROM (COALESCE(closed_at, NOW()) - opened_at))/60 as hold_min
+                FROM shadow_positions
+                WHERE mint=%s AND status='closed' AND realized_pnl_pct IS NOT NULL
+                ORDER BY closed_at DESC NULLS LAST
+                LIMIT 50
+            """, (mint,))
+            shadow_trades = cur.fetchall() or []
     finally:
         db_return(conn)
 
@@ -9809,8 +9940,28 @@ def api_coin_history(mint):
             "pnl_pct": float(t.get("pnl_pct") or 0),
             "hold_time_min": t.get("hold_time_min") or 0,
             "tp1_hit": bool(t.get("tp1_hit")),
-            "exit_reason": t.get("exit_reason"),
+            "exit_reason": t.get("exit_reason") or t.get("action") or "--",
             "timestamp": t.get("timestamp").isoformat() if t.get("timestamp") else None,
+            "source": "live",
+        })
+
+    # Add shadow trades if no real ones
+    for s in shadow_trades:
+        pnl_pct = float(s.get("realized_pnl_pct") or 0)
+        est_sol = 0.04
+        trade_list.append({
+            "id": s.get("id"),
+            "entry_price": float(s.get("entry_price") or 0),
+            "exit_price": float(s.get("exit_price") or 0),
+            "entry_sol": est_sol,
+            "exit_sol": round(est_sol * (1 + pnl_pct / 100), 4),
+            "pnl_sol": round(est_sol * pnl_pct / 100, 4),
+            "pnl_pct": pnl_pct,
+            "hold_time_min": int(s.get("hold_min") or 0),
+            "tp1_hit": False,
+            "exit_reason": f"{s.get('exit_reason', '--')} ({s.get('strategy_name', '')})",
+            "timestamp": (s.get("closed_at") or s.get("opened_at")).isoformat() if (s.get("closed_at") or s.get("opened_at")) else None,
+            "source": "shadow",
         })
 
     return jsonify({
@@ -19142,7 +19293,7 @@ function renderPortfolioList(data) {
       </div>
       <div class="ptf-coin-pnl">
         <div class="ptf-coin-pnl-val ${isUp ? 'c-grn' : 'c-red'}">${isUp?'+':''}${pnl.toFixed(4)}</div>
-        <div class="ptf-coin-pnl-sub">${isUp?'+':''}${pnlPct.toFixed(1)}% | W${c.win_count}/L${c.loss_count}</div>
+        <div class="ptf-coin-pnl-sub">${isUp?'+':''}${pnlPct.toFixed(1)}% | W${c.win_count}/L${c.loss_count} ${c.source === 'shadow' ? '<span style="color:#f59e0b">SIM</span>' : c.source === 'open' ? '<span style="color:#3b82f6">OPEN</span>' : ''}</div>
       </div>
     </div>`;
   }).join('');
