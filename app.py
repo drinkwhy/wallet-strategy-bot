@@ -351,7 +351,7 @@ PRESETS = {
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
-        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,"peak_plateau_mode":True,"tp1_sell_pct":0.50,
         "min_composite_score":15,"min_confidence":0.35,"min_buy_sell_ratio":1.0,
         "min_smart_wallet_buys":0,"min_net_flow_sol":0,"min_unique_buyers":0,
@@ -402,7 +402,7 @@ PRESETS = {
         "offpeak_min_change":18,
         "max_hot_change":400.0,
         "nuclear_narrative_score":40,
-        "anti_rug":True,"check_holders":True,"max_correlated":3,"drawdown_limit_sol":0.5,
+        "anti_rug":True,"check_holders":True,"max_correlated":5,"drawdown_limit_sol":0.5,
         "listing_sniper":True,
     },
 }
@@ -10228,8 +10228,14 @@ def api_start():
             settings["max_correlated"] = bs["max_correlated"]
         if bs.get("drawdown_limit_sol") is not None:
             settings["drawdown_limit_sol"] = bs["drawdown_limit_sol"]
-        # Skip custom_settings entirely — use pure preset values for shadow trading optimization
-        # Custom settings could override tp1_mult, tp2_mult, stop_loss, etc. which breaks shadow trading
+        # Apply custom settings so user-configured values survive bot restarts
+        if bs.get("custom_settings"):
+            try:
+                custom = json.loads(bs["custom_settings"])
+                if isinstance(custom, dict):
+                    settings.update(custom)
+            except Exception:
+                pass
     max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
     settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
