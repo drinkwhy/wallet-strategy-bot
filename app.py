@@ -310,11 +310,11 @@ def safe_json_response(resp, default=None):
         return default
 
 PLAN_LIMITS = {
-    "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
-    "basic": {"max_buy_sol": 0.1,  "label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
-    "pro":   {"max_buy_sol": 1.0,  "label": "Pro — $99/mo",          "perf_fee": PERF_FEE_PRO},
-    "elite": {"max_buy_sol": 5.0,  "label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
-    "trial": {"max_buy_sol": 0.05, "label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
+    "free":  {"label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
+    "basic": {"label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
+    "pro":   {"label": "Pro — $99/mo",          "perf_fee": PERF_FEE_PRO},
+    "elite": {"label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
+    "trial": {"label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
 }
 PRICE_TO_PLAN = {}
 for _plan_name, _price_id in (("basic", STRIPE_PRICE_BASIC), ("pro", STRIPE_PRICE_PRO), ("elite", STRIPE_PRICE_ELITE)):
@@ -8362,8 +8362,6 @@ def _start_bot_from_row(row):
                 settings.update(custom)
         except Exception:
             pass
-    max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email", "")), PLAN_LIMITS["basic"])["max_buy_sol"]
-    settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(uid, kp, settings,
         run_mode=row["run_mode"],
         run_duration_min=row["run_duration_min"],
@@ -10251,8 +10249,6 @@ def api_start():
                     settings.update(custom)
             except Exception:
                 pass
-    max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
-    settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
         uid, kp, settings,
         run_mode          = bs["run_mode"] if bs else "indefinite",
@@ -13345,11 +13341,8 @@ def api_admin_change_plan():
         conn.commit()
     finally:
         db_return(conn)
-    # If the user has a running bot, update their max_buy_sol live
+    # If the user has a running bot, no max_buy_sol restrictions by plan
     bot = user_bots.get(int(target_user_id))
-    if bot:
-        max_sol = PLAN_LIMITS.get(new_plan, PLAN_LIMITS["free"])["max_buy_sol"]
-        bot.settings["max_buy_sol"] = min(bot.settings.get("max_buy_sol", max_sol), max_sol)
     print(f"[ADMIN] Plan change: user {target_user_id} ({user.get('email')}) {old_plan} -> {new_plan}", flush=True)
     return jsonify({"ok": True, "msg": f"Changed {user.get('email')} from {old_plan} to {new_plan}"})
 
