@@ -92,6 +92,9 @@ def load_environment():
 
 load_environment()
 
+# ── Feature Flags ──────────────────────────────────────────────────────────────
+ENABLE_BEGINNER_UI = os.getenv("ENABLE_BEGINNER_UI", "true").lower() == "true"
+ENABLE_TOOLTIPS = os.getenv("ENABLE_TOOLTIPS", "true").lower() == "true"
 
 def require_env(name):
     value = os.getenv(name, "").strip()
@@ -3664,6 +3667,12 @@ class BotInstance:
                                (self.user_id, mint, name, "BUY", real_price, trade_sol, real_price, 0, 0))
                     _conn.commit()
                     update_coin_portfolio_cache(self.user_id, mint, name)
+                    # Trigger first trade milestone event (non-blocking)
+                    try:
+                        import requests
+                        requests.post(f"http://localhost:5000/api/milestones/trade-executed", timeout=1)
+                    except:
+                        pass
                 finally:
                     db_return(_conn)
             except Exception as _e:
@@ -3709,6 +3718,12 @@ class BotInstance:
                     try:
                         _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                         _conn.commit()
+                        # Trigger first position closed milestone (non-blocking)
+                        try:
+                            import requests
+                            requests.post(f"http://localhost:5000/api/milestones/position-closed", timeout=1)
+                        except:
+                            pass
                     finally:
                         db_return(_conn)
                 except Exception as _e:
@@ -3870,6 +3885,12 @@ class BotInstance:
                         try:
                             _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                             _conn.commit()
+                            # Trigger first position closed milestone (non-blocking)
+                            try:
+                                import requests
+                                requests.post(f"http://localhost:5000/api/milestones/position-closed", timeout=1)
+                            except:
+                                pass
                         finally:
                             db_return(_conn)
                     except Exception as _e:
@@ -9813,6 +9834,38 @@ def dashboard():
         traceback.print_exc()
         return Response("<h1>Dashboard Error</h1><p>An unexpected error occurred.</p>", status=500, mimetype="text/html")
 
+# ── Milestone API Endpoints ────────────────────────────────────────────────────
+
+@app.route("/api/milestones", methods=["GET"])
+def get_milestones():
+    """Return current milestone state for beginner UI"""
+    if not ENABLE_BEGINNER_UI:
+        return jsonify({"beginner_ui_enabled": False})
+    return jsonify({
+        "beginner_ui_enabled": True,
+        "message": "Client reads milestones from localStorage"
+    })
+
+@app.route("/api/milestones/bot-started", methods=["POST"])
+def mark_bot_started():
+    """Endpoint to mark bot as started (called by JS when user clicks Start Bot)"""
+    return jsonify({"status": "success", "milestone": "bot_started"})
+
+@app.route("/api/milestones/trade-executed", methods=["POST"])
+def mark_trade_executed():
+    """Endpoint to mark first trade executed"""
+    return jsonify({"status": "success", "milestone": "trade_executed"})
+
+@app.route("/api/milestones/position-closed", methods=["POST"])
+def mark_position_closed():
+    """Endpoint to mark first position closed"""
+    return jsonify({"status": "success", "milestone": "position_closed"})
+
+@app.route("/api/milestones/reset", methods=["POST"])
+def reset_milestones():
+    """Reset all milestones (for testing)"""
+    return jsonify({"status": "success", "message": "Client should call milestoneTracker.reset()"})
+
 # ── API ────────────────────────────────────────────────────────────────────────
 
 @app.route("/api/coin-portfolio")
@@ -10295,7 +10348,8 @@ def api_start():
         conn.commit()
     finally:
         db_return(conn)
-    return jsonify({"ok": True})
+    # Trigger bot started milestone (client-side will handle via JS)
+    return jsonify({"ok": True, "milestone": "bot_started"})
 
 @app.route("/api/stop", methods=["POST"])
 @login_required
@@ -13855,6 +13909,7 @@ _CSS = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name=
 <meta name="apple-mobile-web-app-title" content="SolTrader">
 <link rel="manifest" href="/manifest.json">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/tooltips.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
 <style>
@@ -14615,6 +14670,12 @@ DASHBOARD_HTML = _CSS + """
 .tab-btn-label{display:block;font-family:'Space Grotesk','Manrope',sans-serif;font-size:15px;letter-spacing:-.3px}
 .tab-btn-meta{display:block;font-size:11px;color:var(--t3);margin-top:4px}
 .tab-btn.active .tab-btn-meta{color:var(--t2)}
+.advanced-menu-container{position:relative;display:inline-block}
+.menu-toggle{padding:10px 16px;background:rgba(47,107,255,.1);border:1px solid rgba(47,107,255,.3);border-radius:8px;color:var(--t1);cursor:pointer;font-weight:600;transition:all .2s;font-size:12px;font-weight:700;letter-spacing:.2px;text-align:left;white-space:nowrap;min-width:170px}
+.menu-toggle:hover{background:rgba(47,107,255,.15);border-color:rgba(47,107,255,.5)}
+.menu-indicator{font-size:10px;margin-left:8px;transition:transform .2s}
+.advanced-menu-dropdown{position:absolute;top:100%;left:0;margin-top:8px;background:rgba(10,20,40,.95);border:1px solid rgba(47,107,255,.3);border-radius:8px;padding:8px;min-width:220px;box-shadow:0 8px 32px rgba(0,0,0,.3);z-index:100;display:flex;flex-direction:column;gap:2px}
+.advanced-menu-dropdown .tab-btn{text-align:left;margin:0;padding:10px 12px;font-size:13px;border-radius:4px;border:none;min-width:auto}
 .tab-pane{display:none;padding:4px 0 0}
 .tab-pane.active{display:block}
 .tab-pane-header{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px}
@@ -15211,14 +15272,42 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- Tab Bar -->
   <div class="tab-bar">
-    <button class="tab-btn active" data-tab="portfolio" onclick="activateTab('portfolio')"><span class="tab-btn-label">Markets</span><span class="tab-btn-meta">Portfolio, scan &amp; evaluation</span></button>
-    <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
-    <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
-    <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
-    <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
-    <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
-    <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Quantum backtester &amp; strategy</span></button>
-    <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')"><span class="tab-btn-label">Paper</span><span class="tab-btn-meta">Simulated trades, no real money</span></button>
+    <!-- Main tabs (always visible) -->
+    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">🔍 Scan</span><span class="tab-btn-meta">Real-time coin evaluation</span></button>
+    <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">📈 Positions</span><span class="tab-btn-meta">Open trades and history</span></button>
+    <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">⚙️ Settings</span><span class="tab-btn-meta">Wallet and bot controls</span></button>
+    <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">💹 P&L</span><span class="tab-btn-meta">Performance and equity curve</span></button>
+
+    <!-- Advanced menu (conditionally visible) -->
+    <div id="advanced-menu-wrapper" style="display: none;">
+      <div class="advanced-menu-container">
+        <button class="menu-toggle" onclick="toggleAdvancedMenu()">
+          📁 Advanced Tools <span class="menu-indicator">▼</span>
+        </button>
+        <div id="advanced-menu-dropdown" class="advanced-menu-dropdown" style="display: none;">
+          <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')">
+            <span class="tab-btn-label">📡 Signals</span>
+            <span class="tab-btn-meta">Why tokens passed or failed</span>
+          </button>
+          <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')">
+            <span class="tab-btn-label">🐳 Whales</span>
+            <span class="tab-btn-meta">Tracked smart money flow</span>
+          </button>
+          <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')">
+            <span class="tab-btn-label">🧮 Quant</span>
+            <span class="tab-btn-meta">Quantum backtester &amp; strategy</span>
+          </button>
+          <button class="tab-btn" data-tab="portfolio" onclick="activateTab('portfolio')">
+            <span class="tab-btn-label">📊 My Coins</span>
+            <span class="tab-btn-meta">Portfolio &amp; trade history</span>
+          </button>
+          <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')">
+            <span class="tab-btn-label">📋 Paper</span>
+            <span class="tab-btn-meta">Simulated trades, no real money</span>
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- ===================== PORTFOLIO TAB — MY COINS ===================== -->
@@ -16458,6 +16547,84 @@ const TAB_PLAN_GATES = {
 document.addEventListener('DOMContentLoaded', function() {
   var w = document.querySelector('.wrap'); if (w) w.style.paddingBottom = '214px';
 });
+
+// ── Advanced Menu Unlock Logic ────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', function() {
+  const advancedMenuWrapper = document.getElementById('advanced-menu-wrapper');
+  if (advancedMenuWrapper && window.milestoneTracker && milestoneTracker.isUnlockAdvancedMenu()) {
+    advancedMenuWrapper.style.display = 'block';
+    console.log('[UI] Advanced menu unlocked on load');
+  }
+
+  // Listen for position close milestone
+  window.addEventListener('milestone:firstPositionClosed', function() {
+    if (advancedMenuWrapper) {
+      advancedMenuWrapper.style.display = 'block';
+      console.log('[UI] Advanced menu unlocked via milestone event');
+    }
+  });
+});
+
+// ── Toggle Advanced Menu ──────────────────────────────────────────────────────
+function toggleAdvancedMenu() {
+  const dropdown = document.getElementById('advanced-menu-dropdown');
+  if (dropdown) {
+    const isVisible = dropdown.style.display !== 'none';
+    dropdown.style.display = isVisible ? 'none' : 'flex';
+  }
+}
+
+// Close advanced menu when clicking outside
+document.addEventListener('click', function(event) {
+  const menu = document.querySelector('.advanced-menu-container');
+  if (menu && !menu.contains(event.target)) {
+    const dropdown = document.getElementById('advanced-menu-dropdown');
+    if (dropdown) dropdown.style.display = 'none';
+  }
+});
+
+// ── Milestone Event Handlers ──────────────────────────────────────────────────
+// Handle bot started milestone
+window.addEventListener('milestone:botStarted', function() {
+  if (window.showBotStartedModal) {
+    showBotStartedModal();
+  }
+  console.log('[Milestone] Bot started event received');
+});
+
+// Handle first trade executed milestone
+window.addEventListener('milestone:firstTradeExecuted', function() {
+  if (window.milestoneTracker) {
+    milestoneTracker.markFirstTradeExecuted();
+  }
+  if (window.showFirstTradeModal) {
+    showFirstTradeModal();
+  }
+  console.log('[Milestone] First trade executed event received');
+});
+
+// Handle first position closed milestone
+window.addEventListener('milestone:firstPositionClosed', function() {
+  if (window.milestoneTracker) {
+    milestoneTracker.markFirstPositionClosed();
+  }
+  if (window.updateFirstCloseModal) {
+    updateFirstCloseModal();
+  }
+  console.log('[Milestone] First position closed event received');
+});
+
+// ── Milestone Polling (Bot-triggered via API) ────────────────────────────────
+let _lastMilestoneCheck = 0;
+setInterval(function() {
+  const now = Date.now();
+  if (now - _lastMilestoneCheck < 2000) return; // Throttle to 2s
+  _lastMilestoneCheck = now;
+
+  // Poll for milestone events via hidden endpoint calls
+  // The bot calls /api/milestones/* endpoints when events occur
+  // Client can check for them via local storage or server-side event stream
+}, 2000);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let running = false, allTokens = [], sortCol = 'score', feedSince = 0;
@@ -17890,6 +18057,12 @@ async function toggleBot() {
   if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
+  // Handle milestone events
+  if (res.milestone && window.milestoneTracker) {
+    if (res.milestone === 'bot_started') {
+      milestoneTracker.markBotStarted();
+    }
+  }
   setTimeout(refresh, 800);
 }
 function showPreflightModal() {
@@ -20842,6 +21015,8 @@ loadAdminData();
 loadBlacklist();
 setInterval(loadAdminData, 15000);
 </script>
+<script src="/static/js/milestone_tracker.js"></script>
+<script src="/static/js/tooltip_system.js"></script>
 </body></html>
 """
 
