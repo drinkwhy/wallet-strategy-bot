@@ -1,0 +1,159 @@
+/* static/css/tooltips.css */
+/* Tooltip system styles */
+
+.tooltip {
+  position: fixed;
+  background: rgba(10, 20, 40, 0.98);
+  border: 1px solid rgba(47, 107, 255, 0.3);
+  border-radius: 10px;
+  padding: 12px 14px;
+  z-index: 150;
+  max-width: 280px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  animation: tooltipFadeIn 0.2s ease-out;
+  backdrop-filter: blur(8px);
+}
+
+@keyframes tooltipFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.tooltip-inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--t2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.tooltip-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.tooltip-text {
+  flex: 1;
+  color: var(--t2);
+}
+
+.tooltip-close {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--t3);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0;
+  transition: color 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tooltip-close:hover {
+  color: var(--t2);
+}
+
+.tooltip-arrow {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  background: rgba(10, 20, 40, 0.98);
+  border: 1px solid rgba(47, 107, 255, 0.3);
+  transform: rotate(45deg);
+  z-index: -1;
+}
+
+/* Position-specific arrow placement */
+.tooltip-top {
+  margin-bottom: 8px;
+}
+
+.tooltip-top .tooltip-arrow {
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.tooltip-bottom {
+  margin-top: 8px;
+}
+
+.tooltip-bottom .tooltip-arrow {
+  top: -5px;
+  left: 50%;
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.tooltip-left {
+  margin-right: 8px;
+}
+
+.tooltip-left .tooltip-arrow {
+  right: -5px;
+  top: 50%;
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.tooltip-right {
+  margin-left: 8px;
+}
+
+.tooltip-right .tooltip-arrow {
+  left: -5px;
+  top: 50%;
+  transform: translateY(-50%) rotate(45deg);
+}
+
+/* Responsive adjustments */
+@media (max-width: 640px) {
+  .tooltip {
+    max-width: 240px;
+    padding: 10px 12px;
+  }
+
+  .tooltip-inner {
+    font-size: 11px;
+    gap: 8px;
+  }
+
+  .tooltip-icon {
+    font-size: 14px;
+  }
+}
+
+/* Light mode support (if applicable) */
+@media (prefers-color-scheme: light) {
+  .tooltip {
+    background: rgba(255, 255, 255, 0.98);
+    border-color: rgba(47, 107, 255, 0.2);
+    color: rgba(9, 17, 29, 0.8);
+  }
+
+  .tooltip-arrow {
+    background: rgba(255, 255, 255, 0.98);
+    border-color: rgba(47, 107, 255, 0.2);
+  }
+
+  .tooltip-text {
+    color: rgba(9, 17, 29, 0.8);
+  }
+
+  .tooltip-close {
+    color: rgba(9, 17, 29, 0.5);
+  }
+
+  .tooltip-close:hover {
+    color: rgba(9, 17, 29, 0.8);
+  }
+}
