@@ -467,6 +467,151 @@ def shadow_position_update(position, current_price, settings, age_min):
     }
 
 
+def estimate_exit_friction(realized_pnl_pct, exit_price, entry_price, entry_sol,
+                           liq_usd=0, vol_usd=0, mc_usd=0, exit_reason="",
+                           peak_ratio=1.0):
+    """
+    Estimate realistic P&L by applying friction that shadow trading ignores:
+      1. Slippage based on liquidity tier
+      2. Price impact based on position size vs pool depth
+      3. Transaction failure probability (reduces expected value)
+      4. Execution delay penalty (price moves during 3-8s swap time)
+      5. Priority fee / Jito tip cost
+      6. Jupiter swap fee (0.5% platform fee)
+
+    Returns dict with friction breakdown and adjusted P&L.
+    """
+    if realized_pnl_pct is None:
+        return {"friction_pnl_pct": None, "slippage_pct": 0, "price_impact_pct": 0,
+                "tx_fail_haircut_pct": 0, "delay_penalty_pct": 0, "fee_pct": 0,
+                "total_friction_pct": 0, "exit_liq_usd": liq_usd, "exit_vol_usd": vol_usd}
+
+    liq = max(_safe_float(liq_usd, 0), 0)
+    vol = max(_safe_float(vol_usd, 0), 0)
+    entry_sol_f = max(_safe_float(entry_sol, 0.05), 0.001)
+    exit_price_f = max(_safe_float(exit_price, 0), 1e-15)
+    entry_price_f = max(_safe_float(entry_price, 0), 1e-15)
+
+    # ── 1. Slippage based on liquidity tier ──────────────────────────
+    # Mirrors dynamic_slippage_bps() from real bot but applied as P&L reduction
+    if liq > 100_000:
+        slippage_pct = 3.0       # 3%  — healthy pool
+    elif liq > 50_000:
+        slippage_pct = 5.0       # 5%
+    elif liq > 20_000:
+        slippage_pct = 8.0       # 8%
+    elif liq > 10_000:
+        slippage_pct = 12.0      # 12%
+    elif liq > 5_000:
+        slippage_pct = 18.0      # 18% — thin pool
+    elif liq > 1_000:
+        slippage_pct = 28.0      # 28% — barely tradeable
+    elif liq > 0:
+        slippage_pct = 45.0      # 45% — effectively illiquid
+    else:
+        # No liquidity data — use conservative estimate based on peak ratio
+        # Higher multiples usually mean micro-cap with thin pools
+        if peak_ratio >= 20:
+            slippage_pct = 30.0
+        elif peak_ratio >= 10:
+            slippage_pct = 20.0
+        elif peak_ratio >= 5:
+            slippage_pct = 15.0
+        else:
+            slippage_pct = 10.0
+
+    # ── 2. Price impact: your sell size relative to pool depth ────────
+    # Estimate position value in USD at exit
+    # Rough SOL price assumption: $150 (reasonable 2025-2026 range)
+    sol_price_usd = 150.0
+    ratio = exit_price_f / entry_price_f
+    position_value_usd = entry_sol_f * sol_price_usd * ratio
+    if liq > 0:
+        # AMM constant-product: selling X into pool of L causes ~(X/L * 100)% impact
+        impact_raw = (position_value_usd / liq) * 100.0
+        price_impact_pct = min(impact_raw * 1.2, 50.0)  # cap at 50%, 1.2x multiplier for realism
+    else:
+        # No liquidity data — estimate from trade size
+        if position_value_usd > 500:
+            price_impact_pct = 8.0
+        elif position_value_usd > 100:
+            price_impact_pct = 4.0
+        else:
+            price_impact_pct = 2.0
+
+    # ── 3. Transaction failure probability ───────────────────────────
+    # Real sells fail 10-30% of the time on meme coins.
+    # Model as expected-value haircut: if 20% chance of fail,
+    # and failure means position stays open (likely losing more),
+    # reduce expected P&L by (fail_rate * avg_loss_on_fail)
+    if liq > 50_000 and vol > 100_000:
+        fail_rate = 0.08   # 8% fail — healthy token
+    elif liq > 10_000:
+        fail_rate = 0.15   # 15% fail — moderate
+    elif liq > 2_000:
+        fail_rate = 0.25   # 25% fail — thin
+    else:
+        fail_rate = 0.35   # 35% fail — very thin, routes often missing
+
+    # When a sell fails, you typically lose 20-50% more before retry succeeds
+    avg_loss_on_fail_pct = 25.0
+    tx_fail_haircut_pct = fail_rate * avg_loss_on_fail_pct
+
+    # ── 4. Execution delay penalty ───────────────────────────────────
+    # Real execution takes 3-8 seconds. Meme coins move 2-10% per second
+    # during volatile exits (which is when trailing stops trigger)
+    if exit_reason in ("stop_loss", "time_stop"):
+        delay_penalty_pct = 3.0   # dumps are fast, extra slippage on panic exit
+    elif "trail" in str(exit_reason):
+        delay_penalty_pct = 2.0   # trailing exits happen during retraces
+    else:
+        delay_penalty_pct = 1.5   # normal TP exits are calmer
+
+    # Higher multiples = more volatile moments = bigger delay cost
+    if peak_ratio >= 20:
+        delay_penalty_pct *= 2.0
+    elif peak_ratio >= 10:
+        delay_penalty_pct *= 1.5
+    elif peak_ratio >= 5:
+        delay_penalty_pct *= 1.2
+
+    # ── 5. Fixed fees ────────────────────────────────────────────────
+    # Jupiter platform fee: ~0.5%
+    # Priority fee + Jito tip: ~0.001-0.01 SOL (negligible on % basis for most trades)
+    # Solana base fee: negligible
+    fee_pct = 0.6  # Jupiter fee + priority fee overhead
+
+    # ── Total friction ───────────────────────────────────────────────
+    total_friction_pct = slippage_pct + price_impact_pct + tx_fail_haircut_pct + delay_penalty_pct + fee_pct
+
+    # Apply friction to the realized P&L
+    # Friction reduces the exit price, not added to loss — so:
+    # If shadow says +100% (2x), and friction is 20%, realistic exit is at 1.8x = +80%
+    # If shadow says -20% (0.8x), friction makes it worse: -20% - friction on remaining value
+    if realized_pnl_pct >= 0:
+        # Winning trade: friction reduces the gain
+        exit_multiplier = 1.0 + (realized_pnl_pct / 100.0)
+        friction_multiplier = 1.0 - (total_friction_pct / 100.0)
+        realistic_multiplier = exit_multiplier * max(friction_multiplier, 0.01)
+        friction_pnl_pct = (realistic_multiplier - 1.0) * 100.0
+    else:
+        # Losing trade: friction makes the loss worse
+        friction_pnl_pct = realized_pnl_pct - (total_friction_pct * 0.5)
+        # (Half friction on losses — you're selling less value so impact is smaller)
+
+    return {
+        "friction_pnl_pct": round(friction_pnl_pct, 2),
+        "slippage_pct": round(slippage_pct, 2),
+        "price_impact_pct": round(price_impact_pct, 2),
+        "tx_fail_haircut_pct": round(tx_fail_haircut_pct, 2),
+        "delay_penalty_pct": round(delay_penalty_pct, 2),
+        "fee_pct": round(fee_pct, 2),
+        "total_friction_pct": round(total_friction_pct, 2),
+        "exit_liq_usd": round(liq, 2),
+        "exit_vol_usd": round(vol, 2),
+    }
+
+
 def _json_list(value):
     if isinstance(value, list):
         return value
