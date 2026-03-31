@@ -120,7 +120,7 @@ class QuantPlatformTests(unittest.TestCase):
             age_min=8,
         )
         self.assertEqual(update["status"], "closed")
-        self.assertEqual(update["exit_reason"], "take_profit")
+        self.assertEqual(update["exit_reason"], "take_profit_tp2")
         self.assertGreater(update["realized_pnl_pct"], 100)
 
     def test_flow_snapshot_summarizes_wallet_pressure(self):

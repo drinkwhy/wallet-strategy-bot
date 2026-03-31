@@ -73,7 +73,9 @@ class BacktestEngineTests(unittest.TestCase):
         trade = result["trades"][0]
         self.assertEqual(trade.strategy_name, "balanced")
         self.assertGreater(trade.realized_pnl_pct, 100)
-        self.assertEqual(trade.exit_reason, "take_profit")
+        self.assertIsNotNone(trade.friction_pnl_pct)
+        self.assertLess(trade.friction_pnl_pct, trade.realized_pnl_pct)
+        self.assertEqual(trade.exit_reason, "take_profit_tp2")
 
     def test_event_tape_backtest_replays_market_events(self):
         now = datetime.now(UTC)

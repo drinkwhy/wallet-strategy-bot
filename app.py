@@ -1396,6 +1396,7 @@ def init_db():
             max_upside_pct REAL,
             max_drawdown_pct REAL,
             realized_pnl_pct REAL,
+            friction_pnl_pct REAL,
             exit_reason TEXT,
             feature_json TEXT,
             decision_json TEXT,
@@ -1534,6 +1535,7 @@ def migrate_db():
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS buy_sell_ratio REAL DEFAULT 0",
             "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS replay_mode TEXT DEFAULT 'snapshot'",
             "ALTER TABLE token_flow_snapshots ADD COLUMN IF NOT EXISTS regime_label TEXT DEFAULT 'neutral'",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS friction_pnl_pct REAL",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_pnl_pct REAL DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS blocked_by_cooldown INTEGER DEFAULT 0",
@@ -1871,6 +1873,7 @@ def migrate_db():
                 max_upside_pct REAL,
                 max_drawdown_pct REAL,
                 realized_pnl_pct REAL,
+                friction_pnl_pct REAL,
                 exit_reason TEXT,
                 feature_json TEXT,
                 decision_json TEXT,
@@ -7104,14 +7107,21 @@ def _auto_tune_from_results(requested_by, summary, run_id):
     if not strategies and not per_strategy:
         return
 
-    # Score each strategy: weighted combo of win_rate and avg_pnl
+    # Score each strategy: weighted combo of win_rate and friction-adjusted avg P&L
     scored = []
     for strat_name, data in strategies.items():
         closed = data.get("trades_closed", data.get("closed", 0)) or 0
         if closed < 3:
             continue  # need minimum trades to be meaningful
         win_rate = float(data.get("win_rate", 0))
-        avg_pnl = float(data.get("avg_pnl_pct", 0))
+        # Prefer friction-adjusted P&L; discount shadow P&L by 50% if not available
+        avg_friction_pnl = data.get("avg_friction_pnl_pct")
+        avg_shadow_pnl = float(data.get("avg_pnl_pct", 0))
+        avg_pnl = float(avg_friction_pnl) if avg_friction_pnl is not None else avg_shadow_pnl * 0.5
+        # Require the friction-adjusted expected value to not be deeply negative
+        if avg_pnl < -30:
+            print(f"[AUTO-TUNE] skipping {strat_name}: friction P&L too negative ({avg_pnl:+.1f}%)", flush=True)
+            continue
         # Score: prioritize win rate but reward profitability
         score = (win_rate * 0.6) + (max(avg_pnl, -50) * 0.4)
         best_settings = None
@@ -7227,8 +7237,8 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
                         run_id, strategy_name, mint, name, opened_at, closed_at,
                         entry_price, exit_price, status, score, confidence,
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
-                        exit_reason, feature_json, decision_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        friction_pnl_pct, exit_reason, feature_json, decision_json
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, [trade.as_insert_tuple() for trade in trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
@@ -7345,16 +7355,21 @@ def _generate_sweep_levels(base_preset, num_levels=5):
 
 def _score_sweep_result(summary, strategy_name):
     """Score a backtest result for ranking sweep levels.
-    Higher = better. Balances win rate, profit, and trade count."""
+    Higher = better. Uses friction-adjusted P&L to avoid over-optimizing on
+    unrealistic shadow returns. Balances win rate, realistic profit, and trade count."""
     strat = (summary.get("strategies") or {}).get(strategy_name, {})
     closed = strat.get("trades_closed", 0)
     if closed == 0:
         return -999.0
     wins = strat.get("wins", 0)
     win_rate = (wins / closed) if closed else 0
-    avg_pnl = strat.get("avg_pnl_pct", 0) or 0
-    # Normalize trade count (more trades = more confidence, up to ~50)
-    trade_norm = min(closed / 50.0, 1.0)
+    # Prefer friction-adjusted P&L; fall back to shadow P&L discounted by 50%
+    avg_friction_pnl = strat.get("avg_friction_pnl_pct")
+    avg_shadow_pnl = strat.get("avg_pnl_pct", 0) or 0
+    avg_pnl = avg_friction_pnl if avg_friction_pnl is not None else avg_shadow_pnl * 0.5
+    # Normalize trade count: confidence grows linearly from 0→10 trades,
+    # then continues to full weight at 50 trades.  Penalises tiny samples heavily.
+    trade_norm = min(closed / 50.0, 1.0) * min(closed / 10.0, 1.0)
     return (win_rate * 40) + (avg_pnl * 0.4) + (trade_norm * 20)
 
 
@@ -7499,8 +7514,8 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                         run_id, strategy_name, mint, name, opened_at, closed_at,
                         entry_price, exit_price, status, score, confidence,
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
-                        exit_reason, feature_json, decision_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        friction_pnl_pct, exit_reason, feature_json, decision_json
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, [t.as_insert_tuple() for t in all_best_trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
