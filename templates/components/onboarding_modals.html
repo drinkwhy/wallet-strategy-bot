@@ -1,0 +1,230 @@
+<!-- templates/components/onboarding_modals.html -->
+<!-- Guided moment modals for beginner onboarding -->
+
+<!-- Modal 1: Bot Started -->
+<div id="onboarding-bot-started-modal" class="onboarding-modal" style="display: none;">
+  <div class="onboarding-modal-overlay"></div>
+  <div class="onboarding-modal-content">
+    <button class="onboarding-close" onclick="closeOnboardingModal('bot-started')">&times;</button>
+    <div class="onboarding-icon">🤖</div>
+    <h2>Your Bot is Live!</h2>
+    <p>The scanner is now running in real-time, evaluating coins on Solana based on your settings. Watch the <strong>Scan</strong> tab to see candidates as they appear.</p>
+    <div class="onboarding-highlight">
+      <strong>Next step:</strong> Review the top-ranked coins. When you're ready, click one and open a position to see your first trade.
+    </div>
+    <button class="onboarding-btn" onclick="closeOnboardingModal('bot-started')">Got it, let's go</button>
+  </div>
+</div>
+
+<!-- Modal 2: First Trade Executed -->
+<div id="onboarding-first-trade-modal" class="onboarding-modal" style="display: none;">
+  <div class="onboarding-modal-overlay"></div>
+  <div class="onboarding-modal-content">
+    <button class="onboarding-close" onclick="closeOnboardingModal('first-trade')">&times;</button>
+    <div class="onboarding-icon">🎯</div>
+    <h2>First Trade Opened!</h2>
+    <p>You've successfully opened your first position. The bot will now monitor this trade against your profit targets and stop loss levels.</p>
+    <div class="onboarding-highlight">
+      <strong>Check the <strong>Positions</strong> tab</strong> to see your open trade, current P&L, and projected exit levels.
+    </div>
+    <button class="onboarding-btn" onclick="closeOnboardingModal('first-trade')">Show me my position</button>
+  </div>
+</div>
+
+<!-- Modal 3: First Position Closed -->
+<div id="onboarding-first-close-modal" class="onboarding-modal" style="display: none;">
+  <div class="onboarding-modal-overlay"></div>
+  <div class="onboarding-modal-content">
+    <button class="onboarding-close" onclick="closeOnboardingModal('first-close')">&times;</button>
+    <div class="onboarding-icon">✨</div>
+    <h2>First Trade Closed!</h2>
+    <p>Congratulations! Your first position has been closed. You've earned your first real P&L. Advanced analytics are now unlocked.</p>
+    <div class="onboarding-highlight">
+      <strong>New tabs available:</strong> Signals, Whales, Quant, My Coins, and Paper — access them via the <strong>Advanced Tools</strong> menu.
+    </div>
+    <button class="onboarding-btn" onclick="closeOnboardingModal('first-close'); activateTab('pnl')">View my P&L</button>
+  </div>
+</div>
+
+<style>
+.onboarding-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.3s ease-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.onboarding-modal-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0,0,0,.6);
+  backdrop-filter: blur(4px);
+}
+.onboarding-modal-content {
+  position: relative;
+  background: linear-gradient(135deg, rgba(47,107,255,.1), rgba(96,165,250,.06));
+  border: 1px solid rgba(47,107,255,.3);
+  border-radius: 16px;
+  padding: 40px;
+  max-width: 420px;
+  width: 90%;
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(0,0,0,.4);
+  animation: slideUp 0.3s ease-out;
+}
+@keyframes slideUp {
+  from {
+    transform: translateY(40px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+.onboarding-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: rgba(255,255,255,.08);
+  border-radius: 50%;
+  color: var(--t2);
+  font-size: 24px;
+  cursor: pointer;
+  transition: all .2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.onboarding-close:hover {
+  background: rgba(255,255,255,.12);
+  color: var(--t1);
+}
+.onboarding-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  animation: bounce 0.6s ease-out;
+}
+@keyframes bounce {
+  0% { transform: scale(0); }
+  50% { transform: scale(1.1); }
+  100% { transform: scale(1); }
+}
+.onboarding-modal-content h2 {
+  font-family: 'Space Grotesk', 'Manrope', sans-serif;
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--t1);
+  margin: 0 0 12px 0;
+  letter-spacing: -0.5px;
+}
+.onboarding-modal-content p {
+  color: var(--t2);
+  font-size: 14px;
+  line-height: 1.6;
+  margin: 0 0 16px 0;
+}
+.onboarding-highlight {
+  background: rgba(47,107,255,.12);
+  border-left: 3px solid rgba(47,107,255,.4);
+  padding: 12px 14px;
+  border-radius: 8px;
+  color: var(--t2);
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 20px;
+  text-align: left;
+}
+.onboarding-highlight strong {
+  color: var(--t1);
+}
+.onboarding-btn {
+  padding: 12px 28px;
+  background: linear-gradient(135deg, rgba(47,107,255,.3), rgba(96,165,250,.2));
+  border: 1px solid rgba(47,107,255,.4);
+  border-radius: 10px;
+  color: var(--t1);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all .2s;
+  font-size: 14px;
+}
+.onboarding-btn:hover {
+  background: linear-gradient(135deg, rgba(47,107,255,.4), rgba(96,165,250,.3));
+  border-color: rgba(47,107,255,.6);
+  transform: translateY(-2px);
+}
+@media (max-width: 640px) {
+  .onboarding-modal-content {
+    padding: 32px 24px;
+    max-width: 95%;
+  }
+  .onboarding-modal-content h2 {
+    font-size: 20px;
+  }
+  .onboarding-icon {
+    font-size: 40px;
+  }
+}
+</style>
+
+<script>
+function closeOnboardingModal(modalType) {
+  const modalMap = {
+    'bot-started': 'onboarding-bot-started-modal',
+    'first-trade': 'onboarding-first-trade-modal',
+    'first-close': 'onboarding-first-close-modal'
+  };
+  const modalId = modalMap[modalType];
+  if (modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) {
+      modal.style.display = 'none';
+      if (window.milestoneTracker) {
+        window.milestoneTracker.dismissTooltip(modalId);
+      }
+    }
+  }
+}
+
+function showBotStartedModal() {
+  const modal = document.getElementById('onboarding-bot-started-modal');
+  if (modal && window.milestoneTracker && !window.milestoneTracker.isTooltipDismissed('onboarding-bot-started-modal')) {
+    modal.style.display = 'flex';
+  }
+}
+
+function showFirstTradeModal() {
+  const modal = document.getElementById('onboarding-first-trade-modal');
+  if (modal && window.milestoneTracker && !window.milestoneTracker.isTooltipDismissed('onboarding-first-trade-modal')) {
+    modal.style.display = 'flex';
+  }
+}
+
+function showFirstCloseModal() {
+  const modal = document.getElementById('onboarding-first-close-modal');
+  if (modal && window.milestoneTracker && !window.milestoneTracker.isTooltipDismissed('onboarding-first-close-modal')) {
+    modal.style.display = 'flex';
+  }
+}
+
+// Update first close modal when milestone fires
+function updateFirstCloseModal() {
+  showFirstCloseModal();
+}
+</script>

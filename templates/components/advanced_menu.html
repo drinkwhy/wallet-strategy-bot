@@ -1,0 +1,98 @@
+<!-- templates/components/advanced_menu.html -->
+<!-- Dropdown menu for advanced tabs (hidden until first position closed) -->
+
+<div id="advanced-menu-wrapper" style="display: none;">
+  <div class="advanced-menu-container">
+    <button class="menu-toggle" onclick="toggleAdvancedMenu()">
+      📁 Advanced Tools <span class="menu-indicator">▼</span>
+    </button>
+    <div id="advanced-menu-dropdown" class="advanced-menu-dropdown" style="display: none;">
+      <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')">
+        <span class="tab-btn-label">📡 Signals</span>
+        <span class="tab-btn-meta">Why tokens passed or failed</span>
+      </button>
+      <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')">
+        <span class="tab-btn-label">🐳 Whales</span>
+        <span class="tab-btn-meta">Tracked smart money flow</span>
+      </button>
+      <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')">
+        <span class="tab-btn-label">🧮 Quant</span>
+        <span class="tab-btn-meta">Quantum backtester &amp; strategy</span>
+      </button>
+      <button class="tab-btn" data-tab="portfolio" onclick="activateTab('portfolio')">
+        <span class="tab-btn-label">📊 My Coins</span>
+        <span class="tab-btn-meta">Portfolio &amp; trade history</span>
+      </button>
+      <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')">
+        <span class="tab-btn-label">📋 Paper</span>
+        <span class="tab-btn-meta">Simulated trades, no real money</span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<style>
+.advanced-menu-container {
+  position: relative;
+  display: inline-block;
+}
+.menu-toggle {
+  padding: 10px 16px;
+  background: rgba(47,107,255,.1);
+  border: 1px solid rgba(47,107,255,.3);
+  border-radius: 8px;
+  color: var(--t1);
+  cursor: pointer;
+  font-weight: 600;
+  transition: all .2s;
+}
+.menu-toggle:hover {
+  background: rgba(47,107,255,.15);
+  border-color: rgba(47,107,255,.5);
+}
+.menu-indicator {
+  font-size: 10px;
+  margin-left: 8px;
+  transition: transform .2s;
+}
+.advanced-menu-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 8px;
+  background: rgba(10,20,40,.95);
+  border: 1px solid rgba(47,107,255,.3);
+  border-radius: 8px;
+  padding: 8px;
+  min-width: 220px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.3);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.advanced-menu-dropdown .tab-btn {
+  text-align: left;
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  border-radius: 4px;
+  border: none;
+}
+</style>
+
+<script>
+function toggleAdvancedMenu() {
+  const dropdown = document.getElementById('advanced-menu-dropdown');
+  const isVisible = dropdown.style.display !== 'none';
+  dropdown.style.display = isVisible ? 'none' : 'flex';
+}
+
+// Close menu when clicking outside
+document.addEventListener('click', function(event) {
+  const menu = document.querySelector('.advanced-menu-container');
+  if (menu && !menu.contains(event.target)) {
+    document.getElementById('advanced-menu-dropdown').style.display = 'none';
+  }
+});
+</script>
