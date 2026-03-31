@@ -92,6 +92,9 @@ def load_environment():
 
 load_environment()
 
+# ── Feature Flags ──────────────────────────────────────────────────────────────
+ENABLE_BEGINNER_UI = os.getenv("ENABLE_BEGINNER_UI", "true").lower() == "true"
+ENABLE_TOOLTIPS = os.getenv("ENABLE_TOOLTIPS", "true").lower() == "true"
 
 def require_env(name):
     value = os.getenv(name, "").strip()
