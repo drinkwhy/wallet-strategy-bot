@@ -15197,8 +15197,7 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- Tab Bar -->
   <div class="tab-bar">
-    <button class="tab-btn" data-tab="portfolio" onclick="activateTab('portfolio')"><span class="tab-btn-label">My Coins</span><span class="tab-btn-meta">Portfolio &amp; trade history</span></button>
-    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">Scan</span><span class="tab-btn-meta">Evaluation ramp &amp; approved coins</span></button>
+    <button class="tab-btn active" data-tab="portfolio" onclick="activateTab('portfolio')"><span class="tab-btn-label">Markets</span><span class="tab-btn-meta">Portfolio, scan &amp; evaluation</span></button>
     <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
     <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
     <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
@@ -15209,17 +15208,18 @@ DASHBOARD_HTML = _CSS + """
   </div>
 
   <!-- ===================== PORTFOLIO TAB — MY COINS ===================== -->
-  <div id="tab-portfolio" class="tab-pane">
+  <div id="tab-portfolio" class="tab-pane active">
     <style>
-    .ptf-layout{display:grid;grid-template-columns:380px 1fr;gap:16px;min-height:520px}
+    /* ── Combined Markets tab layout ─────────────────────────────────────── */
+    .ptf-layout{display:grid;grid-template-columns:300px 1fr;gap:16px;align-items:start}
     @media(max-width:960px){.ptf-layout{grid-template-columns:1fr}}
-    .ptf-watchlist{overflow:hidden}
+    .ptf-watchlist{overflow:hidden;display:flex;flex-direction:column}
     .ptf-watchlist-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.06)}
     .ptf-watchlist-title{font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif;display:flex;align-items:center;gap:8px}
     .ptf-sort-btns{display:flex;gap:4px}
     .ptf-sort-btn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:6px;color:var(--t3);font-size:9px;font-weight:700;padding:3px 8px;cursor:pointer;transition:.12s}
     .ptf-sort-btn.active{background:rgba(20,199,132,.12);border-color:rgba(20,199,132,.3);color:#14c784}
-    .ptf-coin-list{overflow-y:auto;max-height:480px;padding:0}
+    .ptf-coin-list{overflow-y:auto;max-height:calc(100vh - 420px);min-height:260px;padding:0}
     .ptf-coin-row{display:grid;grid-template-columns:36px 1fr 90px 70px;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.03);cursor:pointer;transition:background .12s}
     .ptf-coin-row:hover{background:rgba(255,255,255,.03)}
     .ptf-coin-row.selected{background:rgba(47,107,255,.1);border-left:3px solid var(--blue2)}
@@ -15235,24 +15235,26 @@ DASHBOARD_HTML = _CSS + """
     .ptf-summary-cell{text-align:center}
     .ptf-summary-val{font-size:14px;font-weight:800;color:var(--t1);font-family:'Space Grotesk',sans-serif}
     .ptf-summary-lbl{font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;margin-top:2px}
+    /* Right main column */
+    .ptf-main{display:flex;flex-direction:column;gap:14px;min-width:0}
     .ptf-chart-area{overflow:hidden;display:flex;flex-direction:column}
     .ptf-chart-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.06)}
     .ptf-chart-title{font-size:16px;font-weight:800;color:var(--t1);font-family:'Space Grotesk','Manrope',sans-serif}
     .ptf-chart-badges{display:flex;gap:6px}
-    .ptf-chart-body{flex:1;padding:16px;position:relative;min-height:300px}
-    .ptf-chart-canvas{width:100%;height:280px}
+    .ptf-chart-body{flex:1;padding:16px;position:relative;min-height:260px}
+    .ptf-chart-canvas{width:100%;height:240px}
     .ptf-trade-table{width:100%;border-collapse:collapse;margin-top:16px}
     .ptf-trade-table th{font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:.1em;padding:6px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,.08);font-weight:700}
     .ptf-trade-table td{font-size:11px;color:var(--t2);padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.03)}
     .ptf-trade-table tr:hover td{background:rgba(255,255,255,.02)}
-    .ptf-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;color:var(--t3);text-align:center;gap:12px}
+    .ptf-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:200px;color:var(--t3);text-align:center;gap:12px}
     .ptf-empty-icon{font-size:48px;opacity:.3}
     .ptf-empty-title{font-size:16px;font-weight:700;color:var(--t2)}
     .ptf-empty-sub{font-size:12px;max-width:300px;line-height:1.6}
     </style>
 
     <div class="ptf-layout">
-      <!-- Left Panel: Coin Watchlist -->
+      <!-- LEFT: My Coins watchlist (like the Watchlist panel in the reference image) -->
       <div class="glass ptf-watchlist">
         <div class="ptf-watchlist-head">
           <div class="ptf-watchlist-title">My Coins <span class="badge bg-blue" id="ptf-coin-count">0</span></div>
@@ -15263,7 +15265,7 @@ DASHBOARD_HTML = _CSS + """
           </div>
         </div>
         <div class="ptf-coin-list" id="ptf-coin-list">
-          <div class="ptf-empty" style="min-height:300px">
+          <div class="ptf-empty" style="min-height:200px">
             <div class="ptf-empty-icon">&#x1F4B0;</div>
             <div class="ptf-empty-title">No trades yet</div>
             <div class="ptf-empty-sub">Add SOL to your wallet and the bot will start trading. All coins will appear here.</div>
@@ -15277,22 +15279,117 @@ DASHBOARD_HTML = _CSS + """
         </div>
       </div>
 
-      <!-- Right Panel: Chart + Trade Details -->
-      <div class="glass ptf-chart-area">
-        <div class="ptf-chart-head">
-          <div class="ptf-chart-title" id="ptf-chart-coin-name">Select a coin</div>
-          <div class="ptf-chart-badges" id="ptf-chart-badges"></div>
+      <!-- RIGHT: Main area — balance strip, pipeline, chart, evaluation feed -->
+      <div class="ptf-main">
+
+        <!-- Balance Strip (like the stats bar at top of image) -->
+        <div class="scan-bal-strip" id="scan-bal-strip">
+          <div class="scan-bal-item"><div class="scan-bal-lbl">Balance</div><div class="scan-bal-val" id="sbs-balance">—</div></div>
+          <div class="scan-bal-item"><div class="scan-bal-lbl">Open</div><div class="scan-bal-val" id="sbs-open">0</div></div>
+          <div class="scan-bal-item"><div class="scan-bal-lbl">Session P&amp;L</div><div class="scan-bal-val" id="sbs-pnl">—</div></div>
+          <div class="scan-bal-item"><div class="scan-bal-lbl">Wins</div><div class="scan-bal-val" id="sbs-wins" style="color:var(--grn)">0</div></div>
+          <div class="scan-bal-item"><div class="scan-bal-lbl">Losses</div><div class="scan-bal-val" id="sbs-losses" style="color:var(--red2)">0</div></div>
+          <div class="scan-bal-item"><div class="scan-bal-lbl">Win Rate</div><div class="scan-bal-val" id="sbs-wr">—</div></div>
         </div>
-        <div class="ptf-chart-body">
-          <canvas id="ptf-chart-canvas" class="ptf-chart-canvas"></canvas>
-          <div id="ptf-trade-details">
-            <div class="ptf-empty" style="min-height:200px">
-              <div style="font-size:24px;opacity:.3">&#x1F4CA;</div>
-              <div class="ptf-empty-sub">Click a coin from the watchlist to see trade history and price chart</div>
+
+        <!-- Pipeline Funnel -->
+        <div class="ev-pipeline" id="ev-pipeline">
+          <div class="ev-pipe-stage"><div class="ev-pipe-num" id="evp-scanned">0</div><div class="ev-pipe-lbl">Scanned</div></div>
+          <div class="ev-pipe-arrow">&rsaquo;</div>
+          <div class="ev-pipe-stage"><div class="ev-pipe-num" id="evp-evaluated">0</div><div class="ev-pipe-lbl">Evaluated</div></div>
+          <div class="ev-pipe-arrow">&rsaquo;</div>
+          <div class="ev-pipe-stage pass"><div class="ev-pipe-num" id="evp-passed">0</div><div class="ev-pipe-lbl">Approved</div></div>
+          <div class="ev-pipe-arrow">&rsaquo;</div>
+          <div class="ev-pipe-stage fail"><div class="ev-pipe-num" id="evp-rejected">0</div><div class="ev-pipe-lbl">Rejected</div></div>
+          <div class="ev-pipe-arrow">&rsaquo;</div>
+          <div class="ev-pipe-stage rate"><div class="ev-pipe-num" id="evp-rate">0%</div><div class="ev-pipe-lbl">Pass Rate</div></div>
+        </div>
+
+        <!-- Top Rejection Reasons -->
+        <div class="ev-reject-bar" id="ev-reject-bar"></div>
+
+        <!-- Chart panel (like the main candlestick chart area in the reference image) -->
+        <div class="glass ptf-chart-area">
+          <div class="ptf-chart-head">
+            <div class="ptf-chart-title" id="ptf-chart-coin-name">Select a coin</div>
+            <div class="ptf-chart-badges" id="ptf-chart-badges"></div>
+          </div>
+          <div class="ptf-chart-body">
+            <canvas id="ptf-chart-canvas" class="ptf-chart-canvas"></canvas>
+            <div id="ptf-trade-details">
+              <div class="ptf-empty" style="min-height:160px">
+                <div style="font-size:24px;opacity:.3">&#x1F4CA;</div>
+                <div class="ptf-empty-sub">Click a coin from the watchlist to see trade history and P&L chart</div>
+              </div>
             </div>
           </div>
         </div>
-      </div>
+
+        <!-- Evaluation Feed (like the Order Book section in the reference image) -->
+        <div class="glass ev-log-wrap">
+          <div class="ev-log-head">
+            <div>
+              <div class="ev-log-title"><span class="ev-pulse"></span> Evaluation Ramp</div>
+              <div class="ev-log-sub" id="ev-log-sub">Every coin the bot sees flows through here</div>
+            </div>
+            <div class="ev-filters">
+              <button class="ev-fbtn active" data-evf="all" onclick="evSetFilter(this)">All</button>
+              <button class="ev-fbtn" data-evf="passed" onclick="evSetFilter(this)">Approved</button>
+              <button class="ev-fbtn" data-evf="rejected" onclick="evSetFilter(this)">Rejected</button>
+            </div>
+          </div>
+          <div id="ev-log-list" class="ev-log-list">
+            <div class="ev-empty">Start the bot to see coin evaluations flow through the pipeline</div>
+          </div>
+        </div>
+
+      </div><!-- /ptf-main -->
+    </div><!-- /ptf-layout -->
+
+    <!-- Hidden stubs: scanner JS writes to these IDs; keep them alive but invisible -->
+    <div style="display:none">
+      <div id="ev-approved-list"></div>
+      <span id="sc-wallet-bal"></span>
+      <span id="sc-wallet-bal2"></span>
+      <span id="sc-open-trades"></span>
+      <span id="sc-session-pnl"></span>
+      <span id="sc-session-wr"></span>
+      <span id="sc-preset-name"></span>
+      <span id="sc-dd-limit"></span>
+      <span id="sc-max-pos"></span>
+      <span id="sc-stop-loss"></span>
+      <span id="sc-trail-pct"></span>
+      <div id="pos-tbl"></div>
+      <div id="pos-cards" class="pos-cards"></div>
+      <div id="scan-winners"></div>
+      <div id="scan-losers"></div>
+      <div id="scan-optimizer"></div>
+      <div id="filter-pipe"></div>
+      <div id="listing-feed"></div>
+      <span id="listing-stat">0</span>
+      <span id="listing-count-badge"></span>
+      <span id="scanner-filter-live">0</span>
+      <span id="scanner-position-live">0</span>
+      <span id="scanner-token-live">0</span>
+      <span id="scanner-listing-live">0</span>
+      <div id="launch-summary"></div>
+      <span id="enhanced-status-copy"></span>
+      <span id="scanner-last-market"></span>
+      <span id="scanner-last-listing"></span>
+      <span id="scanner-sync-copy"></span>
+      <span id="scanner-active-tab"></span>
+      <span id="sc-shadow-preset"></span>
+      <span id="sc-shadow-wr"></span>
+      <span id="sc-shadow-pnl2"></span>
+      <span id="sc-shadow-trades2"></span>
+      <span id="sc-budget-display"></span>
+      <div id="sc-settings-grid"></div>
+      <div id="sc-activity-feed"></div>
+      <div id="sc-feed-sub"></div>
+      <span id="token-count">0</span>
+      <div id="token-rows"></div>
+      <span id="ticker-inner"></span>
+      <input id="scan-search" type="hidden">
     </div>
   </div>
 
@@ -15451,153 +15548,8 @@ DASHBOARD_HTML = _CSS + """
   input[type=range].budget-slider{width:100%;accent-color:var(--blue2);cursor:pointer}
   </style>
 
-  <div id="tab-scanner" class="tab-pane active">
-
-    <!-- Balance Strip -->
-    <div class="scan-bal-strip" id="scan-bal-strip">
-      <div class="scan-bal-item"><div class="scan-bal-lbl">Balance</div><div class="scan-bal-val" id="sbs-balance">—</div></div>
-      <div class="scan-bal-item"><div class="scan-bal-lbl">Open</div><div class="scan-bal-val" id="sbs-open">0</div></div>
-      <div class="scan-bal-item"><div class="scan-bal-lbl">Session P&amp;L</div><div class="scan-bal-val" id="sbs-pnl">—</div></div>
-      <div class="scan-bal-item"><div class="scan-bal-lbl">Wins</div><div class="scan-bal-val" id="sbs-wins" style="color:var(--grn)">0</div></div>
-      <div class="scan-bal-item"><div class="scan-bal-lbl">Losses</div><div class="scan-bal-val" id="sbs-losses" style="color:var(--red2)">0</div></div>
-      <div class="scan-bal-item"><div class="scan-bal-lbl">Win Rate</div><div class="scan-bal-val" id="sbs-wr">—</div></div>
-    </div>
-
-    <!-- Pipeline Funnel -->
-    <div class="ev-pipeline" id="ev-pipeline">
-      <div class="ev-pipe-stage"><div class="ev-pipe-num" id="evp-scanned">0</div><div class="ev-pipe-lbl">Scanned</div></div>
-      <div class="ev-pipe-arrow">&rsaquo;</div>
-      <div class="ev-pipe-stage"><div class="ev-pipe-num" id="evp-evaluated">0</div><div class="ev-pipe-lbl">Evaluated</div></div>
-      <div class="ev-pipe-arrow">&rsaquo;</div>
-      <div class="ev-pipe-stage pass"><div class="ev-pipe-num" id="evp-passed">0</div><div class="ev-pipe-lbl">Approved</div></div>
-      <div class="ev-pipe-arrow">&rsaquo;</div>
-      <div class="ev-pipe-stage fail"><div class="ev-pipe-num" id="evp-rejected">0</div><div class="ev-pipe-lbl">Rejected</div></div>
-      <div class="ev-pipe-arrow">&rsaquo;</div>
-      <div class="ev-pipe-stage rate"><div class="ev-pipe-num" id="evp-rate">0%</div><div class="ev-pipe-lbl">Pass Rate</div></div>
-    </div>
-
-    <!-- Top Rejection Reasons -->
-    <div class="ev-reject-bar" id="ev-reject-bar"></div>
-
-    <!-- Main Layout -->
-    <div class="ev-layout">
-      <!-- Evaluation Log -->
-      <div class="glass ev-log-wrap">
-        <div class="ev-log-head">
-          <div>
-            <div class="ev-log-title"><span class="ev-pulse"></span> Evaluation Ramp</div>
-            <div class="ev-log-sub" id="ev-log-sub">Every coin the bot sees flows through here</div>
-          </div>
-          <div class="ev-filters">
-            <button class="ev-fbtn active" data-evf="all" onclick="evSetFilter(this)">All</button>
-            <button class="ev-fbtn" data-evf="passed" onclick="evSetFilter(this)">Approved</button>
-            <button class="ev-fbtn" data-evf="rejected" onclick="evSetFilter(this)">Rejected</button>
-          </div>
-        </div>
-        <div id="ev-log-list" class="ev-log-list">
-          <div class="ev-empty">Start the bot to see coin evaluations flow through the pipeline</div>
-        </div>
-      </div>
-
-      <!-- Sidebar -->
-      <div class="ev-sidebar">
-        <!-- Approved Coins -->
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div class="ev-approved-title">Approved Coins</div>
-          <div class="ev-approved-sub">Tokens that passed all filters</div>
-          <div id="ev-approved-list" class="ev-approved-list">
-            <div style="padding:20px;text-align:center;font-size:11px;color:var(--t3)">No approved coins yet</div>
-          </div>
-        </div>
-
-        <!-- Session Controls -->
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div class="ev-ctrl-title">Session</div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Balance</span><span class="ev-ctrl-val" id="sc-wallet-bal">—</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Open Trades</span><span class="ev-ctrl-val" id="sc-open-trades">0</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Session P&L</span><span class="ev-ctrl-val" id="sc-session-pnl" style="color:#14c784">+0.00</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Win Rate</span><span class="ev-ctrl-val" id="sc-session-wr">—</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Preset</span><span class="ev-ctrl-val" id="sc-preset-name">—</span></div>
-          <div style="padding:6px 14px 10px">
-            <button class="btn btn-ghost" style="width:100%;font-size:10px" onclick="activateTab('settings')">Settings &rarr;</button>
-          </div>
-        </div>
-
-        <!-- Risk Controls (from preset) -->
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div class="ev-ctrl-title">Risk Controls</div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Wallet</span><span class="ev-ctrl-val" id="sc-wallet-bal2">— SOL</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Drawdown Limit</span><span class="ev-ctrl-val" id="sc-dd-limit">—</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Max Positions</span><span class="ev-ctrl-val" id="sc-max-pos">—</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Stop Loss</span><span class="ev-ctrl-val" id="sc-stop-loss">—</span></div>
-          <div class="ev-ctrl-row"><span class="ev-ctrl-lbl">Trail %</span><span class="ev-ctrl-val" id="sc-trail-pct">—</span></div>
-        </div>
-
-        <!-- Open Positions — rich cards -->
-        <div class="glass" style="padding:0;overflow:hidden">
-          <div class="ev-ctrl-title">Open Positions</div>
-          <div id="pos-tbl" style="display:none"></div><!-- compat stub -->
-          <div id="pos-cards" class="pos-cards">
-            <div style="font-size:11px;color:var(--t3);padding:4px 0">No open positions</div>
-          </div>
-        </div>
-
-        <!-- hidden stubs for backward-compat JS references -->
-        <div style="display:none">
-          <div id="filter-pipe"></div>
-          <div id="listing-feed"></div>
-          <span id="listing-stat">0</span>
-          <span id="listing-count-badge"></span>
-          <span id="scanner-filter-live">0</span>
-          <span id="scanner-position-live">0</span>
-          <span id="scanner-token-live">0</span>
-          <span id="scanner-listing-live">0</span>
-          <div id="launch-summary"></div>
-          <span id="enhanced-status-copy"></span>
-          <span id="scanner-last-market"></span>
-          <span id="scanner-last-listing"></span>
-          <span id="scanner-sync-copy"></span>
-          <span id="scanner-active-tab"></span>
-          <span id="sc-shadow-preset"></span>
-          <span id="sc-shadow-wr"></span>
-          <span id="sc-shadow-pnl2"></span>
-          <span id="sc-shadow-trades2"></span>
-          <span id="sc-budget-display"></span>
-          <div id="sc-settings-grid"></div>
-          <div id="sc-activity-feed"></div>
-          <div id="sc-feed-sub"></div>
-          <span id="token-count">0</span>
-          <div id="token-rows"></div>
-          <span id="ticker-inner"></span>
-          <input id="scan-search" type="hidden">
-        </div>
-      </div>
-    </div>
-
-    <!-- Winners / Losers History -->
-    <div class="scan-hist-row">
-      <div class="scan-hist-card">
-        <div class="scan-hist-head win">Winners</div>
-        <div id="scan-winners" class="scan-hist-list">
-          <div style="padding:14px;font-size:11px;color:var(--t3)">No winners yet this session</div>
-        </div>
-      </div>
-      <div class="scan-hist-card">
-        <div class="scan-hist-head loss">Losers</div>
-        <div id="scan-losers" class="scan-hist-list">
-          <div style="padding:14px;font-size:11px;color:var(--t3)">No losses yet this session</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Live Close-Reason Optimizer -->
-    <div class="scan-opt-wrap">
-      <div class="scan-opt-head">Close Reason Win Rate</div>
-      <div id="scan-optimizer" class="scan-opt-body">
-        <div style="font-size:11px;color:var(--t3)">Accumulating trade data…</div>
-      </div>
-    </div>
-
+  <div id="tab-scanner" class="tab-pane">
+    <!-- Content merged into the Markets (portfolio) tab -->
   </div>
 
   <!-- ═══════════════════════ SETTINGS TAB ═══════════════════════ -->
@@ -16559,8 +16511,8 @@ function switchTab(tab, btn) {
   // Start tab-specific polling
   Object.values(_tabPollers).forEach(id => clearInterval(id));
   _tabPollers = {};
-  if (tab === 'portfolio') { loadPortfolio(); _tabPollers.ptf = setInterval(loadPortfolio, 15000); }
-  if (tab === 'scanner') { pollEvaluationFeed(); _tabPollers.ev = setInterval(pollEvaluationFeed, 6000); pollScanDetail(); _tabPollers.sd = setInterval(pollScanDetail, 7000); }
+  if (tab === 'portfolio') { loadPortfolio(); _tabPollers.ptf = setInterval(loadPortfolio, 15000); pollEvaluationFeed(); _tabPollers.ev = setInterval(pollEvaluationFeed, 6000); pollScanDetail(); _tabPollers.sd = setInterval(pollScanDetail, 7000); }
+  if (tab === 'scanner') { activateTab('portfolio'); return; }
   if (tab === 'signals') { pollSignals(); _tabPollers.sig = setInterval(pollSignals, 6000); }
   if (tab === 'whales') { pollWhales(); _tabPollers.whale = setInterval(pollWhales, 8000); }
   if (tab === 'positions') { pollPositions(); _tabPollers.pos = setInterval(pollPositions, 5000); }
@@ -16775,7 +16727,7 @@ function registerKeyboardShortcuts() {
       if (event.key === 'Escape') document.activeElement?.blur?.();
       return;
     }
-    const tabMap = { '1': 'scanner', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl', '7': 'quant', '8': 'paper' };
+    const tabMap = { '1': 'portfolio', '2': 'settings', '3': 'signals', '4': 'whales', '5': 'positions', '6': 'pnl', '7': 'quant', '8': 'paper' };
     if (tabMap[event.key]) {
       event.preventDefault();
       activateTab(tabMap[event.key]);
@@ -17398,9 +17350,9 @@ function renderScannerTab(d) {
   const s = d.settings || {};
   renderRiskControls(s);
 
-  // Poll evaluation feed when scanner tab active
-  if (_activeTab === 'scanner') pollEvaluationFeed();
-  if (_activeTab === 'scanner') pollScanDetail();
+  // Poll evaluation feed when markets tab active
+  if (_activeTab === 'portfolio') pollEvaluationFeed();
+  if (_activeTab === 'portfolio') pollScanDetail();
 }
 
 // ── Scan Balance Strip ────────────────────────────────────────────────────────
