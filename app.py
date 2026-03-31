@@ -1540,6 +1540,7 @@ def migrate_db():
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS cooldown_setting_min INTEGER DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS would_have_been_winner INTEGER DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS friction_pnl_pct REAL",
+            "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS ideal_pnl_pct REAL",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS slippage_pct REAL DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS price_impact_pct REAL DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS total_friction_pct REAL DEFAULT 0",
@@ -6373,11 +6374,12 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                 age_min = ((time.time() - opened_at.timestamp()) / 60.0) if opened_at else 0.0
                 update = shadow_position_update(row, price, settings, age_min)
                 if update["status"] == "closed":
-                    # ── Estimate realistic friction ──────────────────
-                    entry_sol_val = 0.05  # default shadow position size
+                    # ── Apply realistic friction — this IS the P&L now ──
+                    ideal_pnl = update["realized_pnl_pct"]
+                    entry_sol_val = 0.05
                     peak_r = update["peak_price"] / max(row.get("entry_price", 1e-12), 1e-12)
                     friction = estimate_exit_friction(
-                        realized_pnl_pct=update["realized_pnl_pct"],
+                        realized_pnl_pct=ideal_pnl,
                         exit_price=update["current_price"],
                         entry_price=row.get("entry_price", 0),
                         entry_sol=entry_sol_val,
@@ -6387,24 +6389,29 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                         exit_reason=update["exit_reason"],
                         peak_ratio=peak_r,
                     )
+                    # realized_pnl_pct = what you'd ACTUALLY get (with friction)
+                    # ideal_pnl_pct = perfect execution (for reference only)
+                    realistic_pnl = friction["friction_pnl_pct"]
                     cur.execute("""
                         UPDATE shadow_positions
                         SET status='closed', closed_at=NOW(), exit_price=%s,
                             exit_reason=%s, realized_pnl_pct=%s,
+                            ideal_pnl_pct=%s, friction_pnl_pct=%s,
                             peak_price=%s, trough_price=%s,
                             max_upside_pct=%s, max_drawdown_pct=%s,
                             tp1_hit=%s, tp1_pnl_pct=%s,
-                            friction_pnl_pct=%s, slippage_pct=%s,
-                            price_impact_pct=%s, total_friction_pct=%s,
+                            slippage_pct=%s, price_impact_pct=%s,
+                            total_friction_pct=%s,
                             exit_liq_usd=%s, exit_vol_usd=%s
                         WHERE id=%s
                     """, (
-                        update["current_price"], update["exit_reason"], update["realized_pnl_pct"],
+                        update["current_price"], update["exit_reason"], realistic_pnl,
+                        ideal_pnl, realistic_pnl,
                         update["peak_price"], update["trough_price"],
                         update["max_upside_pct"], update["max_drawdown_pct"],
                         1 if update.get("tp1_hit") else 0, update.get("tp1_pnl_pct", 0),
-                        friction["friction_pnl_pct"], friction["slippage_pct"],
-                        friction["price_impact_pct"], friction["total_friction_pct"],
+                        friction["slippage_pct"], friction["price_impact_pct"],
+                        friction["total_friction_pct"],
                         friction["exit_liq_usd"], friction["exit_vol_usd"],
                         row["id"],
                     ))
@@ -6497,13 +6504,15 @@ def reconcile_shadow_positions(limit=40):
             age_min = ((now - opened_at.timestamp()) / 60.0) if opened_at else 0.0
             update = shadow_position_update(row, current_price, settings, age_min)
 
-            # Calculate friction for closed positions
+            # Apply friction — realized_pnl_pct IS the realistic number
             mkt = market_cache.get(mint, {})
+            ideal_pnl = update["realized_pnl_pct"]
+            realistic_pnl = ideal_pnl  # fallback if friction calc fails
             friction = None
-            if update["status"] == "closed":
+            if update["status"] == "closed" and ideal_pnl is not None:
                 peak_r = update["peak_price"] / max(row.get("entry_price", 1e-12), 1e-12)
                 friction = estimate_exit_friction(
-                    realized_pnl_pct=update["realized_pnl_pct"],
+                    realized_pnl_pct=ideal_pnl,
                     exit_price=update["current_price"],
                     entry_price=row.get("entry_price", 0),
                     entry_sol=0.05,
@@ -6513,6 +6522,7 @@ def reconcile_shadow_positions(limit=40):
                     exit_reason=update["exit_reason"],
                     peak_ratio=peak_r,
                 )
+                realistic_pnl = friction["friction_pnl_pct"]
 
             cur.execute("""
                 UPDATE shadow_positions
@@ -6528,6 +6538,7 @@ def reconcile_shadow_positions(limit=40):
                     exit_price=CASE WHEN %s='closed' THEN %s ELSE exit_price END,
                     exit_reason=CASE WHEN %s='closed' THEN %s ELSE exit_reason END,
                     realized_pnl_pct=CASE WHEN %s='closed' THEN %s ELSE realized_pnl_pct END,
+                    ideal_pnl_pct=CASE WHEN %s='closed' THEN %s ELSE ideal_pnl_pct END,
                     tp1_hit=CASE WHEN %s=1 THEN 1 ELSE tp1_hit END,
                     tp1_pnl_pct=CASE WHEN %s=1 AND tp1_hit=0 THEN %s ELSE tp1_pnl_pct END,
                     friction_pnl_pct=CASE WHEN %s='closed' THEN %s ELSE friction_pnl_pct END,
@@ -6541,10 +6552,12 @@ def reconcile_shadow_positions(limit=40):
                 update["current_price"], update["peak_price"], update["trough_price"],
                 update["max_upside_pct"], update["max_drawdown_pct"], update["status"],
                 update["status"], update["status"], update["current_price"],
-                update["status"], update["exit_reason"], update["status"], update["realized_pnl_pct"],
+                update["status"], update["exit_reason"],
+                update["status"], realistic_pnl,
+                update["status"], ideal_pnl,
                 1 if update.get("tp1_hit") else 0,
                 1 if update.get("tp1_hit") else 0, update.get("tp1_pnl_pct", 0),
-                update["status"], friction["friction_pnl_pct"] if friction else None,
+                update["status"], realistic_pnl,
                 update["status"], friction["slippage_pct"] if friction else 0,
                 update["status"], friction["price_impact_pct"] if friction else 0,
                 update["status"], friction["total_friction_pct"] if friction else 0,
@@ -11202,8 +11215,7 @@ def api_quant_shadow_performance():
                    ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_trade,
                    ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_trade,
                    ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct))::numeric, 2) AS median_pnl,
-                   ROUND(AVG(COALESCE(friction_pnl_pct, realized_pnl_pct))::numeric, 2) AS avg_realistic_pnl,
-                   SUM(CASE WHEN COALESCE(friction_pnl_pct, realized_pnl_pct) > 0 THEN 1 ELSE 0 END) AS realistic_wins,
+                   ROUND(AVG(COALESCE(ideal_pnl_pct, realized_pnl_pct))::numeric, 2) AS avg_ideal_pnl,
                    ROUND(AVG(COALESCE(total_friction_pct, 0))::numeric, 2) AS avg_friction,
                    ROUND(AVG(COALESCE(slippage_pct, 0))::numeric, 2) AS avg_slippage,
                    ROUND(AVG(COALESCE(exit_liq_usd, 0))::numeric, 0) AS avg_exit_liq
@@ -11270,10 +11282,8 @@ def api_quant_shadow_performance():
             "best_trade_pct": float(row.get("best_trade") or 0),
             "worst_trade_pct": float(row.get("worst_trade") or 0),
             "median_pnl_pct": float(row.get("median_pnl") or 0),
-            # Realistic (friction-adjusted) metrics
-            "avg_realistic_pnl_pct": float(row.get("avg_realistic_pnl") or row.get("avg_pnl") or 0),
-            "realistic_wins": int(row.get("realistic_wins") or row.get("wins") or 0),
-            "realistic_win_rate": round((int(row.get("realistic_wins") or 0) / int(row.get("closed_trades") or 1)) * 100, 1) if int(row.get("closed_trades") or 0) else 0,
+            # Friction details (realized_pnl_pct already includes friction)
+            "avg_ideal_pnl_pct": float(row.get("avg_ideal_pnl") or row.get("avg_pnl") or 0),
             "avg_friction_pct": float(row.get("avg_friction") or 0),
             "avg_slippage_pct": float(row.get("avg_slippage") or 0),
             "avg_exit_liq_usd": float(row.get("avg_exit_liq") or 0),
@@ -11367,8 +11377,6 @@ def api_quant_shadow_activity():
                    ROUND(MAX(realized_pnl_pct)::numeric, 2) AS best_pnl,
                    ROUND(MIN(realized_pnl_pct)::numeric, 2) AS worst_pnl,
                    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY realized_pnl_pct)::numeric, 2) AS median_pnl,
-                   ROUND(AVG(COALESCE(friction_pnl_pct, realized_pnl_pct))::numeric, 2) AS avg_realistic_pnl,
-                   SUM(CASE WHEN COALESCE(friction_pnl_pct, realized_pnl_pct) > 0 THEN 1 ELSE 0 END) AS realistic_wins,
                    ROUND(AVG(COALESCE(total_friction_pct, 0))::numeric, 2) AS avg_friction
             FROM shadow_positions WHERE status='closed'
         """)
@@ -11414,11 +11422,9 @@ def api_quant_shadow_activity():
             base["closed_at"] = row["closed_at"].isoformat() if row.get("closed_at") else None
             base["exit_reason"] = row.get("exit_reason")
             base["hold_min"] = round(float(row.get("hold_min") or 0), 1)
-            # Friction-adjusted realistic P&L
-            base["friction_pnl_pct"] = float(row.get("friction_pnl_pct") or 0) if row.get("friction_pnl_pct") is not None else None
+            # Friction details (realized_pnl_pct already has friction baked in)
             base["total_friction_pct"] = float(row.get("total_friction_pct") or 0)
             base["slippage_pct"] = float(row.get("slippage_pct") or 0)
-            base["price_impact_pct"] = float(row.get("price_impact_pct") or 0)
             base["exit_liq_usd"] = float(row.get("exit_liq_usd") or 0)
         return base
 
@@ -11438,12 +11444,8 @@ def api_quant_shadow_activity():
             "worst_pnl_pct": float(agg.get("worst_pnl") or 0),
             "avg_excl_best_pct": float(excl.get("avg_excl_best") or 0),
             "wins_excl_best": int(excl.get("wins_excl_best") or 0),
-            # Friction-adjusted realistic metrics
-            "avg_realistic_pnl_pct": float(agg.get("avg_realistic_pnl") or agg.get("avg_pnl") or 0),
-            "realistic_wins": int(agg.get("realistic_wins") or agg.get("wins") or 0),
-            "realistic_win_rate": round((int(agg.get("realistic_wins") or 0) / total_closed) * 100, 1) if total_closed > 0 else 0,
             "avg_friction_pct": float(agg.get("avg_friction") or 0),
-            "disclaimer": "Shadow P&L = perfect execution. Realistic P&L accounts for slippage, price impact, tx failures, and fees.",
+            "disclaimer": "All P&L includes estimated slippage, price impact, tx failure rate, and fees.",
         },
     })
 
@@ -15168,18 +15170,16 @@ DASHBOARD_HTML = _CSS + """
     </div>
     <div class="shadow-activity-body" id="sa-body">
       <div class="shadow-stats-strip" id="sa-stats-strip">
-        <div class="shadow-stat-card"><div class="val neu" id="sa-wr">—</div><div class="lbl">Shadow Win Rate</div></div>
-        <div class="shadow-stat-card"><div class="val neu" id="sa-avg-pnl">—</div><div class="lbl">Shadow Avg P&L</div></div>
-        <div class="shadow-stat-card" style="border-color:rgba(245,158,11,.25)"><div class="val c-gold" id="sa-real-wr">—</div><div class="lbl">Realistic Win Rate</div></div>
-        <div class="shadow-stat-card" style="border-color:rgba(245,158,11,.25)"><div class="val c-gold" id="sa-real-pnl">—</div><div class="lbl">Realistic Avg P&L</div></div>
+        <div class="shadow-stat-card"><div class="val neu" id="sa-wr">—</div><div class="lbl">Win Rate</div></div>
+        <div class="shadow-stat-card"><div class="val neu" id="sa-avg-pnl">—</div><div class="lbl">Avg P&L</div></div>
         <div class="shadow-stat-card"><div class="val c-grn" id="sa-best">—</div><div class="lbl">Best Trade</div></div>
         <div class="shadow-stat-card"><div class="val c-red" id="sa-worst">—</div><div class="lbl">Worst Trade</div></div>
         <div class="shadow-stat-card"><div class="val neu" id="sa-total-pnl">—</div><div class="lbl">Median P&L</div></div>
         <div class="shadow-stat-card"><div class="val neu" id="sa-total-closed">0</div><div class="lbl">Trades Closed</div></div>
-        <div class="shadow-stat-card"><div class="val neu" id="sa-avg-friction">—</div><div class="lbl">Avg Friction</div></div>
+        <div class="shadow-stat-card"><div class="val c-gold" id="sa-avg-friction">—</div><div class="lbl">Avg Friction</div></div>
       </div>
-        <div style="font-size:10px;color:var(--gold2);padding:4px 0 10px;line-height:1.5;font-weight:600">
-          Gold stats = realistic estimates accounting for slippage, price impact, tx failures, and fees. Shadow = perfect execution (theoretical max).
+        <div style="font-size:10px;color:var(--t2);padding:4px 0 10px;line-height:1.5">
+          All P&L numbers include estimated slippage, price impact, transaction failure rate, and fees. These reflect what you would realistically get in live trading.
         </div>
       <div class="shadow-activity-tabs">
         <div class="shadow-activity-tab active" onclick="switchShadowTab('open')">Open Positions</div>
