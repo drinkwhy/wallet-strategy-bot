@@ -9803,6 +9803,38 @@ def dashboard():
         traceback.print_exc()
         return Response("<h1>Dashboard Error</h1><p>An unexpected error occurred.</p>", status=500, mimetype="text/html")
 
+# ── Milestone API Endpoints ────────────────────────────────────────────────────
+
+@app.route("/api/milestones", methods=["GET"])
+def get_milestones():
+    """Return current milestone state for beginner UI"""
+    if not ENABLE_BEGINNER_UI:
+        return jsonify({"beginner_ui_enabled": False})
+    return jsonify({
+        "beginner_ui_enabled": True,
+        "message": "Client reads milestones from localStorage"
+    })
+
+@app.route("/api/milestones/bot-started", methods=["POST"])
+def mark_bot_started():
+    """Endpoint to mark bot as started (called by JS when user clicks Start Bot)"""
+    return jsonify({"status": "success", "milestone": "bot_started"})
+
+@app.route("/api/milestones/trade-executed", methods=["POST"])
+def mark_trade_executed():
+    """Endpoint to mark first trade executed"""
+    return jsonify({"status": "success", "milestone": "trade_executed"})
+
+@app.route("/api/milestones/position-closed", methods=["POST"])
+def mark_position_closed():
+    """Endpoint to mark first position closed"""
+    return jsonify({"status": "success", "milestone": "position_closed"})
+
+@app.route("/api/milestones/reset", methods=["POST"])
+def reset_milestones():
+    """Reset all milestones (for testing)"""
+    return jsonify({"status": "success", "message": "Client should call milestoneTracker.reset()"})
+
 # ── API ────────────────────────────────────────────────────────────────────────
 
 @app.route("/api/coin-portfolio")
