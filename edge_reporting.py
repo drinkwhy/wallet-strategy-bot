@@ -365,12 +365,15 @@ def derive_edge_guard_state(history_summary):
         or (delta_model_edge_pct is not None and _safe_float(delta_model_edge_pct) < -4.0)
         or (delta_regime_edge_pct is not None and _safe_float(delta_regime_edge_pct) < -4.0)
     ):
+        # Edge is still technically positive but the trend is softening.
+        # Reduce position sizing by 25% to limit exposure while keeping entries open.
+        _THROTTLED_SIZE_MULTIPLIER = 0.75
         state.update({
             "status": "throttled",
             "action_label": "Lightly throttled",
             "reason": "Edge is positive but trend softening; slight size reduction, preset filters handle quality.",
             "allow_new_entries": True,
-            "size_multiplier": 1.0,
+            "size_multiplier": _THROTTLED_SIZE_MULTIPLIER,
             "risk_multiplier": 1.0,
             "max_positions_cap": 5,
             "drawdown_multiplier": 1.0,

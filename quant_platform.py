@@ -421,10 +421,15 @@ def shadow_position_update(position, current_price, settings, age_min):
     else:
         # Standard mode with TP1/TP2
         if not tp1_hit and ratio >= tp1_mult:
-            # TP1 hit — record partial profit, keep position open for TP2
+            # TP1 hit — record partial profit
             new_tp1_hit = True
             new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
-            exit_reason = ""
+            # If price is already at or above TP2 in the same tick, close immediately
+            if ratio >= tp2_mult:
+                status = "closed"
+                exit_reason = "take_profit"
+            else:
+                exit_reason = ""  # not closing yet — waiting for TP2
         elif tp1_hit and ratio >= tp2_mult:
             status = "closed"
             exit_reason = "take_profit_tp2"
