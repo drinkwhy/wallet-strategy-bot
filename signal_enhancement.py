@@ -1,7 +1,7 @@
 """
 Signal Enhancement Module
 Scores tokens 0-100 on momentum, volume, holders, smart money
-Only buys if score > 50 (filters ~25% of false entries)
+Only buys if score >= 50 (filters ~25% of false entries)
 Provides confidence metric (0-1) and edge probability
 """
 
@@ -40,7 +40,7 @@ class SignalResult:
     token_name: str
     token_mint: str
     signal_score: int  # 0-100
-    buy_signal: bool  # True if score > 50
+    buy_signal: bool  # True if score >= 50
     confidence: float  # 0-1
     edge_probability: float  # P(win), 0-1
     components: SignalComponents
@@ -63,7 +63,7 @@ class SignalEnhancer:
     
     MOMENTUM_WINDOW_MINUTES = 60
     VOLUME_MA_PERIOD = 20
-    MIN_SCORE_FOR_SIGNAL = 50  # Buy only if score > 50
+    MIN_SCORE_FOR_SIGNAL = 50  # Buy only if score >= 50
     
     def __init__(self, historical_trades: Optional[List[Dict]] = None):
         """
@@ -344,8 +344,8 @@ class SignalEnhancer:
         # Calculate overall score
         signal_score = int(components.average())
         
-        # Buy signal: score > 50
-        buy_signal = signal_score > self.MIN_SCORE_FOR_SIGNAL
+        # Buy signal: score >= 50
+        buy_signal = signal_score >= self.MIN_SCORE_FOR_SIGNAL
         
         # Calculate confidence and edge probability
         confidence = self.calculate_confidence(components)

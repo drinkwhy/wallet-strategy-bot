@@ -2427,6 +2427,9 @@ class BotInstance:
                     avg_win_loss_ratio=_hist_wl,
                 )
                 self.execution_optimizer = ExecutionOptimizer(cache_ttl_seconds=30)
+                # Rolling window of recent realized slippage values (bps) used to
+                # calibrate the execution optimizer's smart slippage calculation.
+                self._recent_slippage_bps: deque = deque(maxlen=20)
                 self.log_msg("📊 Optimization modules initialized (signal enhancement, position sizing, execution)")
             except Exception as _opt_err:
                 self.opt_modules_enabled = False
@@ -3604,11 +3607,12 @@ class BotInstance:
         # ── Execution Optimization ────────────────────────────────────────────
         if self.opt_modules_enabled:
             try:
+                _hist_slip = list(self._recent_slippage_bps) if self._recent_slippage_bps else None
                 _exec_params = self.execution_optimizer.optimize_execution(
                     token_mint=mint,
                     order_size_sol=trade_sol,
                     orderbook=None,
-                    historical_slippage=None,
+                    historical_slippage=_hist_slip,
                 )
                 slippage = max(slippage, _exec_params.slippage_tolerance_bps)
                 self.log_msg(
@@ -3739,6 +3743,9 @@ class BotInstance:
                         realized_slip_bps = int(round((1 - (tokens_received / max(expected_out, 1))) * 10000))
                         if abs(slip_ratio - 1) > 0.01:
                             self.log_msg(f"📊 Entry adjusted: ${price:.8f} → ${real_price:.8f} (slip {(slip_ratio-1)*100:+.1f}%)")
+                        # Track realized slippage so the execution optimizer can calibrate
+                        if self.opt_modules_enabled and realized_slip_bps is not None:
+                            self._recent_slippage_bps.append(realized_slip_bps)
             except Exception as _ep:
                 self.log_msg(f"[WARN] Could not compute real entry: {_ep}")
             self.log_execution_event(
@@ -4409,13 +4416,43 @@ class BotInstance:
         # ── Signal Enhancement filter ─────────────────────────────────────────
         if self.opt_modules_enabled:
             try:
+                # Build OHLCV candles from the in-memory price history so that
+                # momentum (RSI/MACD) and volume scoring have real data to work with.
+                # Each entry in _price_history is (unix_ts, price); we aggregate into
+                # 1-minute buckets. Volume is not available here so it is left as 0.0,
+                # which causes score_volume to return its neutral fallback (50).
+                # We require at least 14 raw ticks (minimum for RSI) before attempting
+                # to build candles; fewer ticks will leave _candles empty and both
+                # momentum and volume scoring will fall back to their neutral (50) value.
+                _ph = _price_history.get(mint, [])
+                _candles: list = []
+                if len(_ph) >= 14:  # 14 = minimum period needed by score_momentum's RSI
+                    _ph_buckets: dict = {}
+                    for _pts, _pp in _ph:
+                        _pb = int(_pts // 60) * 60
+                        if _pb not in _ph_buckets:
+                            _ph_buckets[_pb] = {"o": _pp, "h": _pp, "l": _pp, "c": _pp}
+                        else:
+                            _ph_buckets[_pb]["h"] = max(_ph_buckets[_pb]["h"], _pp)
+                            _ph_buckets[_pb]["l"] = min(_ph_buckets[_pb]["l"], _pp)
+                            _ph_buckets[_pb]["c"] = _pp
+                    for _pbts in sorted(_ph_buckets):
+                        _pbv = _ph_buckets[_pbts]
+                        _candles.append(OHLCV(
+                            timestamp=datetime.fromtimestamp(_pbts),
+                            open=_pbv["o"],
+                            high=_pbv["h"],
+                            low=_pbv["l"],
+                            close=_pbv["c"],
+                            volume=0.0,
+                        ))
                 # whale_action_score (0-100) → approximate buy/sell counts (0-5 each).
                 # Dividing by 20 maps the 0-100 scale to 0-5 discrete count buckets.
                 _whale_action = int(intel.get("whale_action_score") or 50)
                 _enh_signal = self.signal_enhancer.analyze_token(
                     token_name=name,
                     token_mint=mint,
-                    candles=[],  # No OHLCV candle history at this point; scoring falls back to neutral (50)
+                    candles=_candles,
                     current_price=price,
                     current_volume=vol,
                     holder_concentration_pct=self._estimate_holder_concentration_pct(intel),
@@ -4427,10 +4464,11 @@ class BotInstance:
                 )
                 self.log_msg(
                     f"[SIGNAL] {name} | score={_enh_signal.signal_score} | "
-                    f"confidence={_enh_signal.confidence:.2f} | buy={_enh_signal.buy_signal}"
+                    f"confidence={_enh_signal.confidence:.2f} | buy={_enh_signal.buy_signal} | "
+                    f"candles={len(_candles)}"
                 )
                 if not _enh_signal.buy_signal:
-                    sig_entry["reason"] = f"Signal enhancement: score {_enh_signal.signal_score}/100 < 50"
+                    sig_entry["reason"] = f"Signal enhancement: score {_enh_signal.signal_score}/100 below threshold (50)"
                     self.log_signal_entry(sig_entry)
                     self.log_filter(name, mint, False, sig_entry["reason"])
                     self.log_msg(f"SKIP {name} — {sig_entry['reason']}")
