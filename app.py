@@ -2682,10 +2682,10 @@ class BotInstance:
             self.log.pop()
         print(f"[U{self.user_id}] {msg}")
 
-    def log_filter(self, name, mint, passed, reason, score=0):
+    def log_filter(self, name, mint, passed, reason, score=0, price=0):
         entry = {
             "name": name, "mint": mint, "passed": passed,
-            "reason": reason, "score": score,
+            "reason": reason, "score": score, "price": price,
             "ts": time.strftime("%H:%M:%S")
         }
         self.filter_log.appendleft(entry)
@@ -4391,7 +4391,7 @@ class BotInstance:
         sig_entry["reason"] = f"Passed all filters · {execution_prefix} · {policy_label}"
         self.log_signal_entry(sig_entry)
         self.log_msg(f"🟢 SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
-        self.log_filter(name, mint, True, "Signal passed all filters")
+        self.log_filter(name, mint, True, "Signal passed all filters", price=price)
         # ── Build human-readable buy reason for dashboard cards ────────────────
         _br = []
         if change >= 30: _br.append(f"+{change:.0f}% momentum")
@@ -4445,7 +4445,7 @@ class BotInstance:
             if execution_decision.get("model_score") is not None:
                 detail += f" @ {float(execution_decision.get('model_score') or 0):.1f}"
             self.log_msg(f"PAPER BUY {name} — {detail}")
-            self.log_filter(name, mint, True, f"PAPER {detail}")
+            self.log_filter(name, mint, True, f"PAPER {detail}", price=price)
             return
         self.buy(
             mint,
@@ -20434,10 +20434,11 @@ function paperProcessFilterLog(logs) {
   logs.forEach(f => {
     if (!f.passed || !f.mint) return;
     if (_paperPositions[f.mint] || _paperSeenMints[f.mint]) return;
-    // Find price from allTokens
+    // Find price from allTokens, fall back to price recorded in filter log entry
     const tok = allTokens.find(t => t.mint === f.mint);
-    if (!tok || !tok.price || tok.price <= 0) return;
-    paperBuy(f.mint, tok.name || f.name, tok.symbol, tok.price);
+    const price = (tok && tok.price > 0) ? tok.price : (f.price ?? 0);
+    if (!price || price <= 0) return;
+    paperBuy(f.mint, (tok && tok.name) || f.name, (tok && tok.symbol) || f.symbol, price);
   });
 }
 
