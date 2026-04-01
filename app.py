@@ -2408,10 +2408,23 @@ class BotInstance:
             try:
                 _hist_trades = self._load_historical_trades()
                 self.signal_enhancer = SignalEnhancer(historical_trades=_hist_trades)
+                # Derive actual win rate and win/loss ratio from historical trades.
+                # Bounds: win rate clamped to 35–75% and ratio to 0.5–3x to avoid
+                # extreme Kelly fractions that would over- or under-size positions.
+                if _hist_trades:
+                    _wins = [t for t in _hist_trades if t["pnl_pct"] > 0]
+                    _losses = [t for t in _hist_trades if t["pnl_pct"] < 0]
+                    _hist_wr = max(0.35, min(len(_wins) / len(_hist_trades), 0.75))
+                    _avg_win = (sum(t["pnl_pct"] for t in _wins) / len(_wins)) if _wins else 1.0
+                    _avg_loss_raw = abs(sum(t["pnl_pct"] for t in _losses) / len(_losses)) if _losses else 1.0
+                    _hist_wl = max(0.5, min(_avg_win / max(_avg_loss_raw, 0.01), 3.0))
+                else:
+                    _hist_wr = 0.50  # neutral default when no history exists
+                    _hist_wl = 1.2
                 self.position_sizer = DynamicPositionSizer(
                     account_balance_sol=1.0,
-                    win_rate=0.52,
-                    avg_win_loss_ratio=1.2,
+                    win_rate=_hist_wr,
+                    avg_win_loss_ratio=_hist_wl,
                 )
                 self.execution_optimizer = ExecutionOptimizer(cache_ttl_seconds=30)
                 self.log_msg("📊 Optimization modules initialized (signal enhancement, position sizing, execution)")
