@@ -8182,7 +8182,6 @@ def _run_enhanced_ws_sniper():
                 "method": "transactionSubscribe",
                 "params": [{
                     "accountInclude": [PUMP_FUN],
-                    "type": "all",
                 }, {
                     "commitment": "processed",
                     "maxSupportedTransactionVersion": 0,
@@ -8194,7 +8193,6 @@ def _run_enhanced_ws_sniper():
                 "method": "transactionSubscribe",
                 "params": [{
                     "accountInclude": [RAYDIUM_AMM],
-                    "type": "all",
                 }, {
                     "commitment": "processed",
                     "maxSupportedTransactionVersion": 0,
@@ -8209,9 +8207,17 @@ def _run_enhanced_ws_sniper():
                 if data.get("error"):
                     err = data["error"]
                     err_msg = str(err.get("message", ""))
-                    if "business" in err_msg.lower() or err.get("code") == -32403:
+                    err_code = err.get("code")
+                    if "business" in err_msg.lower() or err_code == -32403:
                         state["plan_blocked"] = True
                         print(f"[Sniper] Enhanced WS blocked: {err_msg} — falling back", flush=True)
+                        ws.close()
+                        return
+                    if err_code == -32602:
+                        # Invalid subscription params — our subscription was rejected; close and
+                        # fall back to logsSubscribe rather than leaving a dead connection open.
+                        state["plan_blocked"] = True
+                        print(f"[Sniper] Enhanced WS invalid params: {err_msg} — falling back", flush=True)
                         ws.close()
                         return
                     print(f"[Sniper] Enhanced WS error: {err}", flush=True)
