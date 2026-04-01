@@ -78,16 +78,6 @@ except ImportError as _import_err:
     print(f"[WARN] Enhanced trading systems not available: {_import_err}")
     ENHANCED_SYSTEMS_AVAILABLE = False
 
-# ── Optimization Modules (Signal Enhancement, Position Sizing, Execution) ────
-try:
-    from dynamic_position_sizing import DynamicPositionSizer, TokenRisk as SizingTokenRisk
-    from signal_enhancement import SignalEnhancer, OHLCV
-    from execution_optimization import ExecutionOptimizer
-    OPTIMIZATION_MODULES_AVAILABLE = True
-except ImportError as _opt_import_err:
-    print(f"[WARN] Optimization modules not available: {_opt_import_err}")
-    OPTIMIZATION_MODULES_AVAILABLE = False
-
 
 def load_environment():
     # Prefer the project-local .env and keep the legacy Desktop path as fallback.
@@ -2402,71 +2392,8 @@ class BotInstance:
                 self.enhanced_enabled = False
                 print(f"[WARN] Enhanced systems init failed: {_enh_err}")
 
-        # ── Optimization Modules (Signal Enhancement, Position Sizing, Execution) ──
-        self.opt_modules_enabled = OPTIMIZATION_MODULES_AVAILABLE
-        if self.opt_modules_enabled:
-            try:
-                _hist_trades = self._load_historical_trades()
-                self.signal_enhancer = SignalEnhancer(historical_trades=_hist_trades)
-                # Derive actual win rate and win/loss ratio from historical trades.
-                # Bounds: win rate clamped to 35–75% and ratio to 0.5–3x to avoid
-                # extreme Kelly fractions that would over- or under-size positions.
-                if _hist_trades:
-                    _wins = [t for t in _hist_trades if t["pnl_pct"] > 0]
-                    _losses = [t for t in _hist_trades if t["pnl_pct"] < 0]
-                    _hist_wr = max(0.35, min(len(_wins) / len(_hist_trades), 0.75))
-                    _avg_win = (sum(t["pnl_pct"] for t in _wins) / len(_wins)) if _wins else 1.0
-                    _avg_loss_raw = abs(sum(t["pnl_pct"] for t in _losses) / len(_losses)) if _losses else 1.0
-                    _hist_wl = max(0.5, min(_avg_win / max(_avg_loss_raw, 0.01), 3.0))
-                else:
-                    _hist_wr = 0.50  # neutral default when no history exists
-                    _hist_wl = 1.2
-                self.position_sizer = DynamicPositionSizer(
-                    account_balance_sol=1.0,
-                    win_rate=_hist_wr,
-                    avg_win_loss_ratio=_hist_wl,
-                )
-                self.execution_optimizer = ExecutionOptimizer(cache_ttl_seconds=30)
-                # Rolling window of recent realized slippage values (bps) used to
-                # calibrate the execution optimizer's smart slippage calculation.
-                self._recent_slippage_bps: deque = deque(maxlen=20)
-                self.log_msg("📊 Optimization modules initialized (signal enhancement, position sizing, execution)")
-            except Exception as _opt_err:
-                self.opt_modules_enabled = False
-                print(f"[WARN] Optimization modules init failed: {_opt_err}")
-
     def relax_entry_guards(self):
         return None
-
-    def _load_historical_trades(self):
-        """Load recent closed trades to seed the SignalEnhancer win-rate calculation."""
-        try:
-            conn = db()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT pnl_pct FROM trades WHERE user_id=%s AND action ILIKE 'SELL%%' "
-                    "AND pnl_pct IS NOT NULL ORDER BY timestamp DESC LIMIT 100",
-                    (self.user_id,),
-                )
-                rows = cur.fetchall()
-            finally:
-                db_return(conn)
-            return [{"pnl_pct": float(r["pnl_pct"])} for r in rows]
-        except Exception as e:
-            print(f"[OPT] Failed to load historical trades for user {self.user_id}: {e}", flush=True)
-            return []
-
-    @staticmethod
-    def _estimate_holder_concentration_pct(intel):
-        """
-        Estimate top-holder concentration % from token intel for the optimization modules.
-        Uses threat_risk_score as a proxy since the full concentration check (>70%) is already
-        enforced by pre_buy_safety_check. Range is clamped to 0–50% because tokens with >70%
-        concentration are rejected before reaching this point.
-        Formula: base 15% + 0.5× threat score (0–60 → 15%–45%).
-        """
-        return min(50.0, 15.0 + float(intel.get("threat_risk_score") or 0) * 0.5)
 
     def persist_runtime_settings(self):
         persist_bot_settings(
@@ -3507,37 +3434,6 @@ class BotInstance:
             self.log_filter(name, mint, False, reason)
             self.log_msg(f"SKIP {name} — {reason}")
             return
-        # ── Dynamic Position Sizing ───────────────────────────────────────────
-        if self.opt_modules_enabled and self.sol_balance > 0:
-            try:
-                self.position_sizer.account_balance_sol = self.sol_balance
-                _intel_for_sizing = ensure_token_intel(mint)
-                _sizing_token_risk = SizingTokenRisk(
-                    holder_concentration_pct=self._estimate_holder_concentration_pct(_intel_for_sizing),
-                    liquidity_usd=liq,
-                    market_cap_usd=float((decision_context or {}).get("mc") or 0),
-                    age_minutes=int(age_min),
-                    volume_24h_usd=float((decision_context or {}).get("vol") or 0),
-                    price_change_pct=float((decision_context or {}).get("change") or 0),
-                    volatility_score=float(_intel_for_sizing.get("threat_risk_score") or 25),
-                )
-                _sig_conf = float((decision_context or {}).get("signal_confidence") or 0.5)
-                _sizing_result = self.position_sizer.size_position(
-                    signal_confidence=_sig_conf,
-                    token_risk=_sizing_token_risk,
-                    estimated_stop_loss_pct=2.0,
-                )
-                # Only reduce trade_sol — never increase beyond the user's configured maximum
-                opt_size = round(min(trade_sol, max(self.position_sizer.MIN_POSITION_SOL, _sizing_result.risk_adjusted_size_sol)), 4)
-                if opt_size < trade_sol:
-                    trade_sol = opt_size
-                    self.log_msg(
-                        f"[SIZING] {name} | {trade_sol:.4f} SOL | "
-                        f"kelly={_sizing_result.kelly_fraction:.2%} | "
-                        f"risk={_sizing_result.account_risk_pct:.2f}%"
-                    )
-            except Exception as _sz_err:
-                print(f"[OPT] Position sizing error for {name}: {_sz_err}", flush=True)
         print(f"[BUY U{self.user_id}] Attempting {name} | bal={self.sol_balance:.4f} need={trade_sol+0.01:.4f}", flush=True)
 
         # ── Circuit breakers ─────────────────────────────────────────────────
@@ -3604,24 +3500,6 @@ class BotInstance:
             return
         # ── Parallel: live re-validation + Jupiter order simultaneously ──
         slippage = dynamic_slippage_bps(liq)
-        # ── Execution Optimization ────────────────────────────────────────────
-        if self.opt_modules_enabled:
-            try:
-                _hist_slip = list(self._recent_slippage_bps) if self._recent_slippage_bps else None
-                _exec_params = self.execution_optimizer.optimize_execution(
-                    token_mint=mint,
-                    order_size_sol=trade_sol,
-                    orderbook=None,
-                    historical_slippage=_hist_slip,
-                )
-                slippage = max(slippage, _exec_params.slippage_tolerance_bps)
-                self.log_msg(
-                    f"[EXEC] {name} | slippage={slippage}bps | "
-                    f"fee={_exec_params.priority_fee_lamports} | "
-                    f"type={_exec_params.order_type}"
-                )
-            except Exception as _exec_err:
-                print(f"[OPT] Execution optimization error for {name}: {_exec_err}", flush=True)
         self.log_msg(f"Quoting {name} | size={trade_sol:.4f} SOL | slippage={slippage}bps ...")
 
         def _revalidate():
@@ -3743,9 +3621,6 @@ class BotInstance:
                         realized_slip_bps = int(round((1 - (tokens_received / max(expected_out, 1))) * 10000))
                         if abs(slip_ratio - 1) > 0.01:
                             self.log_msg(f"📊 Entry adjusted: ${price:.8f} → ${real_price:.8f} (slip {(slip_ratio-1)*100:+.1f}%)")
-                        # Track realized slippage so the execution optimizer can calibrate
-                        if self.opt_modules_enabled and realized_slip_bps is not None:
-                            self._recent_slippage_bps.append(realized_slip_bps)
             except Exception as _ep:
                 self.log_msg(f"[WARN] Could not compute real entry: {_ep}")
             self.log_execution_event(
@@ -4413,71 +4288,6 @@ class BotInstance:
         elif _src not in ("scanner", "new_pairs", "helius-ws"): _br.append(_src)
         execution_decision["buy_reason"] = ", ".join(_br) if _br else "rules passed"
         execution_decision["source_tag"] = _src
-        # ── Signal Enhancement filter ─────────────────────────────────────────
-        if self.opt_modules_enabled:
-            try:
-                # Build OHLCV candles from the in-memory price history so that
-                # momentum (RSI/MACD) and volume scoring have real data to work with.
-                # Each entry in _price_history is (unix_ts, price); we aggregate into
-                # 1-minute buckets. Volume is not available here so it is left as 0.0,
-                # which causes score_volume to return its neutral fallback (50).
-                # We require at least 14 raw ticks (minimum for RSI) before attempting
-                # to build candles; fewer ticks will leave _candles empty and both
-                # momentum and volume scoring will fall back to their neutral (50) value.
-                _ph = _price_history.get(mint, [])
-                _candles: list = []
-                if len(_ph) >= 14:  # 14 = minimum period needed by score_momentum's RSI
-                    _ph_buckets: dict = {}
-                    for _pts, _pp in _ph:
-                        _pb = int(_pts // 60) * 60
-                        if _pb not in _ph_buckets:
-                            _ph_buckets[_pb] = {"o": _pp, "h": _pp, "l": _pp, "c": _pp}
-                        else:
-                            _ph_buckets[_pb]["h"] = max(_ph_buckets[_pb]["h"], _pp)
-                            _ph_buckets[_pb]["l"] = min(_ph_buckets[_pb]["l"], _pp)
-                            _ph_buckets[_pb]["c"] = _pp
-                    for _pbts in sorted(_ph_buckets):
-                        _pbv = _ph_buckets[_pbts]
-                        _candles.append(OHLCV(
-                            timestamp=datetime.fromtimestamp(_pbts),
-                            open=_pbv["o"],
-                            high=_pbv["h"],
-                            low=_pbv["l"],
-                            close=_pbv["c"],
-                            volume=0.0,
-                        ))
-                # whale_action_score (0-100) → approximate buy/sell counts (0-5 each).
-                # Dividing by 20 maps the 0-100 scale to 0-5 discrete count buckets.
-                _whale_action = int(intel.get("whale_action_score") or 50)
-                _enh_signal = self.signal_enhancer.analyze_token(
-                    token_name=name,
-                    token_mint=mint,
-                    candles=_candles,
-                    current_price=price,
-                    current_volume=vol,
-                    holder_concentration_pct=self._estimate_holder_concentration_pct(intel),
-                    holder_count=int(intel.get("holder_count") or 100),
-                    whale_buys_last_hour=round(_whale_action / 20),
-                    whale_sells_last_hour=round((100 - _whale_action) / 20),
-                    large_holder_growth_pct=float(intel.get("holder_growth_1h") or 0),
-                    token_age_minutes=int(age_min),
-                )
-                self.log_msg(
-                    f"[SIGNAL] {name} | score={_enh_signal.signal_score} | "
-                    f"confidence={_enh_signal.confidence:.2f} | buy={_enh_signal.buy_signal} | "
-                    f"candles={len(_candles)}"
-                )
-                if not _enh_signal.buy_signal:
-                    sig_entry["reason"] = f"Signal enhancement: score {_enh_signal.signal_score}/100 below threshold (50)"
-                    self.log_signal_entry(sig_entry)
-                    self.log_filter(name, mint, False, sig_entry["reason"])
-                    self.log_msg(f"SKIP {name} — {sig_entry['reason']}")
-                    return
-                execution_decision["signal_score"] = _enh_signal.signal_score
-                execution_decision["signal_confidence"] = _enh_signal.confidence
-                execution_decision["signal_edge"] = _enh_signal.edge_probability
-            except Exception as _sig_err:
-                print(f"[OPT] Signal enhancement error for {name}: {_sig_err}", flush=True)
         if execution_decision.get("execution_mode") == "paper":
             detail = f"{policy_label} accepted"
             if execution_decision.get("model_score") is not None:
