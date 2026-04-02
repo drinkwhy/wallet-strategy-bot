@@ -9008,7 +9008,7 @@ _TUNE_THRESHOLD_PLAN = {
 }
 
 
-def _evaluate_all_recorded_coins(days=7):
+def _evaluate_all_recorded_coins(days=30):
     """Load all recorded token data, label outcomes, sweep filter thresholds, and return optimized settings.
 
     Returns a dict with:
@@ -9377,7 +9377,7 @@ def _shadow_auto_tune():
 
             # --- NEW: Evaluate all recorded coins to find optimal filter thresholds ---
             print(f"[SHADOW-TUNE] running coin evaluation on all recorded tokens...", flush=True)
-            coin_eval = _evaluate_all_recorded_coins(days=7)
+            coin_eval = _evaluate_all_recorded_coins(days=30)
 
             # --- NEW: Analyze cooldown optimization to reduce regret and catch exponential growers ---
             print(f"[SHADOW-TUNE] analyzing cooldown optimization across strategies...", flush=True)
