@@ -2337,6 +2337,83 @@ def get_market_stats():
         }
     except: return {}
 
+def get_shadow_vs_backtest_divergence():
+    """Compare shadow trading results vs backtest predictions to validate friction estimates.
+    Returns divergence metrics before risking real SOL."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Get shadow positions from last 7 days (closed trades only)
+            cur.execute("""
+                SELECT realized_pnl_pct FROM shadow_positions
+                WHERE status='closed' AND closed_at >= NOW() - INTERVAL '7 days'
+            """)
+            shadow_trades = cur.fetchall()
+
+            # Get last backtest run
+            cur.execute("""
+                SELECT summary_json FROM backtest_runs
+                WHERE status = 'completed'
+                ORDER BY completed_at DESC LIMIT 1
+            """)
+            backtest_row = cur.fetchone()
+            if backtest_row:
+                try:
+                    backtest_summary = json.loads(backtest_row.get("summary_json") or "{}") or {}
+                except:
+                    backtest_summary = {}
+            else:
+                backtest_summary = {}
+        finally:
+            db_return(conn)
+
+        if not shadow_trades:
+            return {"status": "insufficient_shadow_data", "trades": 0}
+
+        # Calculate shadow performance
+        shadow_wins = len([t for t in shadow_trades if (t.get("realized_pnl_pct") or 0) > 0])
+        shadow_wr = (shadow_wins / len(shadow_trades) * 100) if shadow_trades else 0
+        shadow_avg_pnl = sum(t.get("realized_pnl_pct") or 0 for t in shadow_trades) / len(shadow_trades)
+
+        # Extract backtest predictions
+        strategies = backtest_summary.get("strategies", {}) if isinstance(backtest_summary, dict) else {}
+        all_strategies = list(strategies.values()) if strategies else []
+
+        if all_strategies:
+            avg_wr = sum(float(s.get("win_rate", 0) or 0) for s in all_strategies) / len(all_strategies)
+            avg_pnl = sum(float(s.get("avg_pnl_pct", 0) or 0) for s in all_strategies) / len(all_strategies)
+            backtest_wr = avg_wr
+            backtest_avg_pnl = avg_pnl
+        else:
+            backtest_wr = 0
+            backtest_avg_pnl = 0
+
+        # Calculate divergence
+        wr_divergence = backtest_wr - shadow_wr
+        pnl_divergence = backtest_avg_pnl - shadow_avg_pnl
+
+        return {
+            "status": "ok",
+            "shadow_trades": len(shadow_trades),
+            "shadow_win_rate": round(shadow_wr, 1),
+            "shadow_avg_pnl_pct": round(shadow_avg_pnl, 2),
+            "backtest_win_rate": round(backtest_wr, 1),
+            "backtest_avg_pnl_pct": round(backtest_avg_pnl, 2),
+            "wr_divergence": round(wr_divergence, 1),
+            "pnl_divergence": round(pnl_divergence, 2),
+            "friction_estimate_accuracy": "GOOD" if abs(wr_divergence) < 5 and abs(pnl_divergence) < 1 else (
+                "FAIR" if abs(wr_divergence) < 10 and abs(pnl_divergence) < 2 else "POOR"
+            ),
+            "recommendation": (
+                "✅ Friction estimates are accurate! Safe to deploy with real SOL." if abs(wr_divergence) < 5 and abs(pnl_divergence) < 1
+                else ("⚠️ Friction estimates are slightly off. Monitor first real trades carefully." if abs(wr_divergence) < 10 else
+                "❌ Major divergence detected. Friction estimates are significantly wrong. Do NOT deploy yet.")
+            )
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 def get_backtest_vs_live_divergence():
     """Compare last 30-day backtest predictions vs actual live results.
     Returns divergence metrics to detect overfitting."""
@@ -12394,6 +12471,12 @@ def api_circuit_breaker():
         return jsonify({"error": str(e)})
 
 
+@app.route("/api/shadow-validation")
+@login_required
+def api_shadow_validation():
+    """Pre-deployment check: compare shadow trading vs backtest predictions."""
+    return jsonify(get_shadow_vs_backtest_divergence())
+
 @app.route("/api/overfitting-check")
 @login_required
 def api_overfitting_check():
@@ -21416,9 +21499,57 @@ ADMIN_HTML = _CSS + """
 
   <!-- Overfitting Analysis Tab -->
   <div id="adm-tab-overfit" class="adm-section" style="display:none">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
-      <div class="adm-section-title">Model Validation: Backtest vs Live Performance</div>
-      <button class="btn btn-primary" onclick="runOverfitAnalysis()" style="margin:0">📊 Analyze Now</button>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <!-- Shadow Validation -->
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0">
+        <div style="flex:1">
+          <div class="adm-section-title">Phase 1: Shadow Validation (FREE)</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:4px">Compare shadow trades vs backtest predictions<br/>No real SOL needed</div>
+        </div>
+        <button class="btn btn-primary" onclick="runShadowValidation()" style="margin:0;white-space:nowrap">🧪 Validate</button>
+      </div>
+
+      <!-- Live Overfitting Check -->
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:0">
+        <div style="flex:1">
+          <div class="adm-section-title">Phase 2: Live Validation (REAL SOL)</div>
+          <div style="font-size:12px;color:var(--t3);margin-top:4px">Compare real trades vs backtest<br/>After 30 days of trading</div>
+        </div>
+        <button class="btn btn-primary" onclick="runOverfitAnalysis()" style="margin:0;white-space:nowrap">📊 Check</button>
+      </div>
+    </div>
+
+    <!-- Shadow Validation Results -->
+    <div id="shadow-results" style="display:none;margin-bottom:20px">
+      <div class="adm-section" style="background:rgba(139,92,246,.08);border-color:rgba(139,92,246,.2)">
+        <div class="adm-section-title" style="color:#c084fc">🧪 Shadow vs Backtest Comparison</div>
+
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px">
+          <div class="adm-card">
+            <div class="val" style="font-size:20px" id="shadow-trade-count">-</div>
+            <div class="lbl">Shadow Trades (7d)</div>
+          </div>
+          <div class="adm-card">
+            <div class="val" style="font-size:20px" id="shadow-wr">-</div>
+            <div class="lbl">Shadow Win Rate</div>
+          </div>
+          <div class="adm-card">
+            <div class="val" style="font-size:20px" id="shadow-backtest-wr">-</div>
+            <div class="lbl">Backtest WR</div>
+          </div>
+          <div class="adm-card">
+            <div class="val" style="font-size:20px;color:var(--blue2)" id="shadow-accuracy">-</div>
+            <div class="lbl">Friction Accuracy</div>
+          </div>
+        </div>
+
+        <div style="background:rgba(0,0,0,.2);padding:14px;border-radius:8px;margin-bottom:12px">
+          <div style="font-size:12px;color:var(--t2);margin-bottom:8px;font-weight:600">Analysis</div>
+          <div style="font-size:12px;color:var(--t2);line-height:1.6" id="shadow-recommendation"></div>
+        </div>
+
+        <button class="btn btn-primary" onclick="runShadowValidation()" style="width:100%">🔄 Re-validate</button>
+      </div>
     </div>
 
     <div id="overfit-loading" style="text-align:center;color:var(--t3);padding:40px;font-size:13px">
@@ -21720,6 +21851,77 @@ async function runOverfitAnalysis() {
   } finally {
     btn.disabled = false;
     btn.textContent = '📊 Analyze Now';
+  }
+}
+
+async function runShadowValidation() {
+  const btns = document.querySelectorAll('button[onclick="runShadowValidation()"]');
+  const results = document.getElementById('shadow-results');
+
+  btns.forEach(btn => { btn.disabled = true; btn.textContent = '⏳ Validating...'; });
+
+  try {
+    const resp = await fetch('/api/shadow-validation');
+    const data = await resp.json();
+
+    if (data.status !== 'ok') {
+      const resultText = data.status === 'insufficient_shadow_data' 
+        ? 'Not enough shadow trades yet (need 7+ days of data)' 
+        : (data.error || 'Unknown error');
+      results.style.display = 'none';
+      
+      // Show message in a temporary notification or update the initial message
+      const msgDiv = document.createElement('div');
+      msgDiv.style.cssText = 'background:rgba(255,159,64,.1);border:1px solid rgba(255,159,64,.3);padding:12px;border-radius:6px;color:var(--t2);font-size:12px';
+      msgDiv.textContent = '⏳ ' + resultText;
+      const parent = document.getElementById('adm-tab-overfit');
+      const existingMsg = parent.querySelector('[data-shadow-msg]');
+      if (existingMsg) existingMsg.remove();
+      msgDiv.setAttribute('data-shadow-msg', '1');
+      parent.insertBefore(msgDiv, parent.firstChild);
+      return;
+    }
+
+    // Update UI with shadow validation metrics
+    document.getElementById('shadow-trade-count').textContent = data.shadow_trades;
+    document.getElementById('shadow-wr').textContent = data.shadow_win_rate.toFixed(1) + '%';
+    document.getElementById('shadow-backtest-wr').textContent = data.backtest_win_rate.toFixed(1) + '%';
+    
+    // Color-code the accuracy badge
+    const accuracyEl = document.getElementById('shadow-accuracy');
+    accuracyEl.textContent = data.friction_estimate_accuracy;
+    if (data.friction_estimate_accuracy === 'GOOD') {
+      accuracyEl.style.color = 'var(--grn)';
+    } else if (data.friction_estimate_accuracy === 'FAIR') {
+      accuracyEl.style.color = 'var(--gold2)';
+    } else {
+      accuracyEl.style.color = 'var(--red2)';
+    }
+
+    // Update recommendation text
+    const recEl = document.getElementById('shadow-recommendation');
+    recEl.textContent = data.recommendation || 'No recommendation available';
+    
+    // Clear any temporary messages
+    const existingMsg = document.querySelector('[data-shadow-msg]');
+    if (existingMsg) existingMsg.remove();
+    
+    results.style.display = '';
+  } catch (e) {
+    results.style.display = 'none';
+    const msgDiv = document.createElement('div');
+    msgDiv.style.cssText = 'background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);padding:12px;border-radius:6px;color:var(--red2);font-size:12px';
+    msgDiv.textContent = '❌ Error: ' + e.message;
+    const parent = document.getElementById('adm-tab-overfit');
+    const existingMsg = parent.querySelector('[data-shadow-msg]');
+    if (existingMsg) existingMsg.remove();
+    msgDiv.setAttribute('data-shadow-msg', '1');
+    parent.insertBefore(msgDiv, parent.firstChild);
+  } finally {
+    btns.forEach(btn => {
+      btn.disabled = false;
+      btn.textContent = btn.textContent.includes('Re-validate') ? '🔄 Re-validate' : '🧪 Validate';
+    });
   }
 }
 
