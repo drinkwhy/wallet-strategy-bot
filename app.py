@@ -2248,6 +2248,34 @@ def blacklist_dev(dev_wallet, reason="rugged"):
     except Exception as _e:
         print(f"[ERROR] {_e}", flush=True)
 
+def calculate_kelly_position_size(base_size_sol, avg_win_pct, avg_loss_pct, win_rate_pct):
+    """Calculate position size using Kelly criterion: f* = (p*b - q) / b
+    Where p=win_rate, q=loss_rate, b=win/loss ratio
+    Applied as fraction of available capital, clamped to [0.5%, 5%] for safety."""
+    if win_rate_pct <= 0 or avg_loss_pct <= 0:
+        return base_size_sol  # Fallback to base size
+
+    p_win = win_rate_pct / 100.0
+    p_lose = 1.0 - p_win
+
+    # Calculate odds: average win size / average loss size
+    odds = avg_win_pct / max(avg_loss_pct, 0.1) if avg_loss_pct > 0 else 1.0
+
+    # Kelly formula: f* = (p*b - q) / b
+    kelly_f = (p_win * odds - p_lose) / max(odds, 0.01)
+
+    # Apply safety limits: quarter-Kelly (more conservative)
+    quarter_kelly = kelly_f * 0.25
+
+    # Clamp to safe range: 0.5% to 5% of bankroll
+    kelly_pct = max(0.005, min(0.05, quarter_kelly))
+
+    # Return: base size scaled by Kelly fraction
+    kelly_size = base_size_sol * kelly_pct
+
+    # But not less than 50% of base or more than 150% of base (don't deviate too much)
+    return max(base_size_sol * 0.5, min(kelly_size, base_size_sol * 1.5))
+
 def detect_market_regime():
     """Detect current market regime: bull (winners), bear (losers), or sideways (neutral).
     Returns 'bull', 'bear', or 'sideways' based on last 24h trade outcomes."""
@@ -3465,6 +3493,24 @@ class BotInstance:
             self.log_msg(f"SKIP {name} — {reason}")
             return
         trade_sol = round(float(s.get("max_buy_sol") or 0), 4)
+
+        # ── Kelly criterion position sizing based on recent performance ─────────
+        try:
+            stats = get_market_stats()
+            if stats.get("total_trades", 0) >= 8:  # Only apply if we have enough data
+                avg_win = float(stats.get("avg_win_sol") or 0)
+                avg_loss = abs(float(stats.get("avg_loss_sol") or 0))
+                win_rate = float(stats.get("win_rate") or 50)
+                if avg_win > 0 and avg_loss > 0:
+                    avg_win_pct = (avg_win / trade_sol) * 100  # Normalize to percentage
+                    avg_loss_pct = (avg_loss / trade_sol) * 100
+                    kelly_size = calculate_kelly_position_size(trade_sol, avg_win_pct, avg_loss_pct, win_rate)
+                    if abs(kelly_size - trade_sol) > 0.001:
+                        self.log_msg(f"Kelly sizing: {trade_sol:.4f} SOL → {kelly_size:.4f} SOL (WR={win_rate:.0f}%)")
+                    trade_sol = kelly_size
+        except Exception as e:
+            pass  # Fall back to base size if Kelly calc fails
+
         # ── Risk-per-trade cap (risk_per_trade_pct setting) ───────────────────
         risk_pct = float(s.get("risk_per_trade_pct") or 0)
         if risk_pct > 0 and self.sol_balance > 0:
