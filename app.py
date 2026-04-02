@@ -46,7 +46,7 @@ from learning_engine import (
     score_recent_candidates_for_regime,
     train_regime_model_family,
 )
-from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters
+from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters, sweep_exit_params
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_flow_snapshot,
@@ -466,6 +466,10 @@ BOT_OVERRIDE_FIELDS = [
     ("max_age_min", int), ("time_stop_min", int), ("min_liq", float),
     ("min_mc", float), ("max_mc", float), ("priority_fee", int),
     ("min_vol", float), ("min_score", int), ("risk_per_trade_pct", float),
+    ("min_composite_score", float), ("min_confidence", float),
+    ("min_buy_sell_ratio", float), ("min_smart_wallet_buys", int),
+    ("min_net_flow_sol", float), ("min_unique_buyers", int),
+    ("max_threat_score", int),
     ("min_holder_growth_pct", float), ("min_narrative_score", int),
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
@@ -6058,6 +6062,24 @@ def _process_dex_pair(p):
         return None
 
 
+def _pick_best_solana_pair(pairs, mint_hint=None):
+    """Pick the best Solana pair, preferring the requested mint and highest liquidity."""
+    if not pairs:
+        return None
+    sol_pairs = [p for p in pairs if (p or {}).get("chainId") == "solana"]
+    candidates = sol_pairs or list(pairs)
+    if mint_hint:
+        mint_matches = [
+            p for p in candidates
+            if ((p.get("baseToken") or {}).get("address") == mint_hint)
+        ]
+        if mint_matches:
+            candidates = mint_matches
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: float(((p.get("liquidity") or {}).get("usd") or 0)))
+
+
 def _shadow_strategy_settings(user_id=None):
     strategies = {
         strategy_name: dict(PRESETS.get(strategy_name, {}))
@@ -7562,7 +7584,7 @@ def _all_known_presets():
     return merged
 
 
-def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="snapshot"):
+def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="event_tape"):
     all_presets = _all_known_presets()
     all_strategy_names = list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES
     strategy_names = [s for s in (strategy_names or all_strategy_names) if s in all_presets]
@@ -7830,8 +7852,6 @@ def global_scanner():
             sol_tokens = [t for t in tokens if t.get("chainId") == "solana"]
             with seen_tokens_lock:
                 new_tokens  = [t for t in sol_tokens if t.get("tokenAddress") and t["tokenAddress"] not in seen_tokens]
-                for t in new_tokens:
-                    seen_tokens.add(t["tokenAddress"])
             if new_tokens:
                 print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
             def _scan_token(t):
@@ -7846,8 +7866,13 @@ def global_scanner():
                     pairs = resp.json().get("pairs") or []
                     if not pairs:
                         return
-                    info = _process_dex_pair(pairs[0])
+                    best_pair = _pick_best_solana_pair(pairs, mint_hint=mint)
+                    if not best_pair:
+                        return
+                    info = _process_dex_pair(best_pair)
                     if info:
+                        with seen_tokens_lock:
+                            seen_tokens.add(mint)
                         _broadcast_signal(info)
                 except Exception:
                     pass
@@ -7886,8 +7911,6 @@ def new_pairs_scanner():
                     sol = [i for i in items if i.get("chainId") == "solana"]
                     with seen_tokens_lock:
                         new = [i for i in sol if i.get("tokenAddress") and i["tokenAddress"] not in seen_tokens]
-                        for item in new:
-                            seen_tokens.add(item["tokenAddress"])
                     if new:
                         print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
                     def _scan2_token(item):
@@ -7901,8 +7924,13 @@ def new_pairs_scanner():
                                 return
                             pairs = r2.json().get("pairs") or []
                             if pairs:
-                                info = _process_dex_pair(pairs[0])
+                                best_pair = _pick_best_solana_pair(pairs, mint_hint=mint)
+                                if not best_pair:
+                                    return
+                                info = _process_dex_pair(best_pair)
                                 if info:
+                                    with seen_tokens_lock:
+                                        seen_tokens.add(mint)
                                     _broadcast_signal(info)
                         except Exception:
                             pass
@@ -8843,24 +8871,23 @@ _last_shadow_tune_at = 0
 
 # Map sweep feature names → bot setting names so optimized thresholds can be applied
 _SWEEP_FEATURE_TO_SETTING = {
-    "composite_score": ("min_score", int),
-    "volume_spike_ratio": ("min_volume_spike_mult", float),
+    "score":            ("min_score", int),
+    "composite_score":  ("min_composite_score", int),
+    "confidence":       ("min_confidence", float),
+    "liq":              ("min_liq", float),
+    "vol":              ("min_vol", float),
+    "mc":               ("min_mc", float),
+    "age_min":          ("max_age_min", int),
+    "threat_risk_score":("max_threat_score", int),
+    "green_lights":     ("min_green_lights", int),
+    "narrative_score":  ("min_narrative_score", int),
+    "change":           ("max_hot_change", float),
+    "volume_spike_ratio":("min_volume_spike_mult", float),
     "holder_growth_1h": ("min_holder_growth_pct", float),
-    "confidence": ("min_confidence", float),
-    "buy_sell_ratio": ("min_buy_sell_ratio", float),
-    "smart_wallet_buys": ("min_smart_wallet_buys", int),
-    "net_flow_sol": ("min_net_flow_sol", float),
-    "unique_buyer_count": ("min_unique_buyers", int),
-    # Entry filters added to the sweep
-    "liq": ("min_liq", float),
-    "vol": ("min_vol", float),
-    "mc": ("min_mc", float),
-    "green_lights": ("min_green_lights", int),
-    "narrative_score": ("min_narrative_score", int),
-    # Inverted (max) filters — sweep finds the best upper-bound threshold
-    "threat_risk_score": ("max_threat_score", float),
-    "age_min": ("max_age_min", int),
-    "change": ("max_hot_change", float),
+    "buy_sell_ratio":   ("min_buy_sell_ratio", float),
+    "smart_wallet_buys":("min_smart_wallet_buys", int),
+    "net_flow_sol":     ("min_net_flow_sol", float),
+    "unique_buyer_count":("min_unique_buyers", int),
 }
 
 # Features where the filter direction is "max" (value <= threshold).
@@ -8873,24 +8900,23 @@ _SWEEP_DIRECTION_MAP = {
 
 # Expanded threshold plan covering more granular values than the default
 _TUNE_THRESHOLD_PLAN = {
-    "composite_score": [30, 40, 50, 60, 70, 80],
-    "confidence": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-    "buy_sell_ratio": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],
-    "smart_wallet_buys": [0, 1, 2, 3, 4],
-    "net_flow_sol": [0.0, 1.0, 2.0, 5.0, 10.0],
-    "volume_spike_ratio": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
-    "holder_growth_1h": [10, 20, 30, 40, 50],
-    "unique_buyer_count": [5, 10, 15, 20, 30],
-    # Newly added entry filters
-    "liq": [1_000, 3_000, 5_000, 10_000, 25_000, 50_000],
-    "vol": [1_000, 3_000, 5_000, 10_000, 25_000, 50_000],
-    "mc": [5_000, 10_000, 50_000, 100_000, 250_000],
-    "green_lights": [1, 2, 3],
-    "narrative_score": [3, 5, 10, 15, 20, 30],
-    # Inverted (max) filters — thresholds represent upper bounds
-    "threat_risk_score": [30, 40, 50, 60, 70, 80],
-    "age_min": [15, 30, 60, 120, 240, 480],
-    "change": [50, 100, 150, 200, 300, 400],
+    "score":            {"thresholds": [10, 20, 30, 40, 50, 60],            "direction": "gte", "min_selected": 8},
+    "composite_score":  {"thresholds": [30, 40, 50, 60, 70, 80],            "direction": "gte", "min_selected": 8},
+    "confidence":       {"thresholds": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],     "direction": "gte", "min_selected": 8},
+    "liq":              {"thresholds": [1000, 3000, 5000, 10000, 25000, 50000], "direction": "gte", "min_selected": 8},
+    "vol":              {"thresholds": [1000, 3000, 5000, 10000, 25000, 50000], "direction": "gte", "min_selected": 8},
+    "mc":               {"thresholds": [5000, 10000, 50000, 100000, 250000], "direction": "gte", "min_selected": 8},
+    "age_min":          {"thresholds": [15, 30, 60, 120, 240, 480],         "direction": "lte", "min_selected": 8},
+    "threat_risk_score":{"thresholds": [35, 45, 55, 65, 75],                "direction": "lte", "min_selected": 8},
+    "change":           {"thresholds": [50, 100, 150, 200, 300, 400],       "direction": "lte", "min_selected": 8},
+    "green_lights":     {"thresholds": [0, 1, 2, 3],                        "direction": "gte", "min_selected": 8},
+    "narrative_score":  {"thresholds": [3, 5, 10, 15, 20, 30],             "direction": "gte", "min_selected": 8},
+    "buy_sell_ratio":   {"thresholds": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],    "direction": "gte", "min_selected": 8},
+    "smart_wallet_buys":{"thresholds": [0, 1, 2, 3, 4],                    "direction": "gte", "min_selected": 8},
+    "net_flow_sol":     {"thresholds": [0.0, 1.0, 2.0, 5.0, 10.0],        "direction": "gte", "min_selected": 8},
+    "volume_spike_ratio":{"thresholds": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],  "direction": "gte", "min_selected": 8},
+    "holder_growth_1h": {"thresholds": [10, 20, 30, 40, 50],               "direction": "gte", "min_selected": 8},
+    "unique_buyer_count":{"thresholds": [5, 10, 15, 20, 30],               "direction": "gte", "min_selected": 8},
 }
 
 
@@ -8971,13 +8997,18 @@ def _evaluate_all_recorded_coins(days=7):
             edge_score = best.get("edge_score", 0)
             winner_rate = best.get("winner_rate_pct", 0)
             rug_rate = best.get("rug_rate_pct", 0)
+            min_selected = int(best.get("min_selected") or 8)
 
             # Only apply if the sweep had enough samples and a positive edge
-            if selected < 5 or edge_score <= 0:
+            if selected < min_selected or edge_score <= 2:
                 continue
 
             # Only apply if rug rate dropped meaningfully (filter is actually helping)
             if rug_rate > 40:
+                continue
+
+            # Require at least a minimal winner density so we do not overfit to tiny slices.
+            if winner_rate < 20:
                 continue
 
             mapping = _SWEEP_FEATURE_TO_SETTING.get(feat_name)
@@ -8996,6 +9027,50 @@ def _evaluate_all_recorded_coins(days=7):
             for edge in feature_edges[:5]:
                 print(f"[COIN-EVAL]   {edge['label']}: winner_avg={edge['winner_avg']}, "
                       f"rug_avg={edge['rug_avg']}, edge={edge['edge']}", flush=True)
+
+        # ── Step 5b: Exit-parameter sweep over the full position lifecycle ──────
+        # Load the event tape and run all tp/stop/trail combos in one backtest pass.
+        print(f"[COIN-EVAL] running exit-parameter sweep (tp/stop/trail grid)...", flush=True)
+        try:
+            exit_event_rows = _load_backtest_event_tape(days=days)
+            if exit_event_rows:
+                # Use balanced preset as the base so entry filters are neutral;
+                # we want to isolate the impact of exit params, not entry selection.
+                _base_for_exit_sweep = dict(PRESETS.get("balanced") or list(PRESETS.values())[0])
+                # Overlay any entry settings already optimized this cycle
+                _base_for_exit_sweep.update(optimized_settings)
+                exit_sweep = sweep_exit_params(
+                    event_rows=exit_event_rows,
+                    base_settings=_base_for_exit_sweep,
+                    min_trades=8,
+                )
+                if exit_sweep and exit_sweep.get("best_exit_settings"):
+                    _best_exit = exit_sweep["best_exit_settings"]
+                    _best_pnl  = exit_sweep["best_avg_pnl"]
+                    _best_wr   = exit_sweep["best_win_rate"]
+                    _n         = exit_sweep["best_trades"]
+                    _combos    = exit_sweep["combos_tested"]
+                    _kelly     = exit_sweep.get("kelly_risk_pct", 2.0)
+                    print(
+                        f"[COIN-EVAL] exit sweep: {_combos} combos tested, "
+                        f"best avg_pnl={_best_pnl:+.1f}% win_rate={_best_wr:.0f}% n={_n} — "
+                        f"tp1={_best_exit.get('tp1_mult')}, tp2={_best_exit.get('tp2_mult')}, "
+                        f"stop={_best_exit.get('stop_loss')}, trail={_best_exit.get('trail_pct')}, "
+                        f"time_stop={_best_exit.get('time_stop_min')}min", flush=True
+                    )
+                    # Merge best exit params into optimized_settings
+                    for _k, _v in _best_exit.items():
+                        optimized_settings[_k] = _v
+                    # Quarter-Kelly position sizing recommendation
+                    if _kelly != 2.0:
+                        optimized_settings["risk_per_trade_pct"] = _kelly
+                        print(f"[COIN-EVAL]   Kelly risk_per_trade_pct → {_kelly}%", flush=True)
+                else:
+                    print(f"[COIN-EVAL] exit sweep: not enough trades to pick a winner (need ≥8 per combo)", flush=True)
+            else:
+                print(f"[COIN-EVAL] exit sweep skipped — no event tape rows (bot needs to run first)", flush=True)
+        except Exception as _exit_sweep_err:
+            print(f"[COIN-EVAL] exit sweep error: {_exit_sweep_err}", flush=True)
 
         # Determine current regime for context
         current_regime = "neutral"
@@ -11719,7 +11794,7 @@ def api_quant_backtests():
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         days = int(data.get("days") or 7)
-        replay_mode = (data.get("replay_mode") or "snapshot").strip().lower()
+        replay_mode = (data.get("replay_mode") or "event_tape").strip().lower()
         strategies = data.get("strategies") or (list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES)
         if not isinstance(strategies, list):
             strategies = [str(strategies)]

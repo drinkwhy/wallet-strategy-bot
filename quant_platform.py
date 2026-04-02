@@ -283,6 +283,22 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     _vol_spike_min = _safe_float(settings.get("min_volume_spike_mult", 0))
     if _vol_spike_min > 0 and _vol_spike_val > 0 and _vol_spike_val < _vol_spike_min:
         blocker_reasons.append("volume_spike_below_threshold")
+    _buy_sell_ratio_val = _safe_float(snapshot.get("buy_sell_ratio"))
+    _buy_sell_ratio_min = _safe_float(settings.get("min_buy_sell_ratio", 0))
+    if _buy_sell_ratio_min > 0 and _buy_sell_ratio_val > 0 and _buy_sell_ratio_val < _buy_sell_ratio_min:
+        blocker_reasons.append("buy_sell_ratio_below_threshold")
+    _smart_wallet_buys_val = _safe_int(snapshot.get("smart_wallet_buys"))
+    _smart_wallet_buys_min = _safe_int(settings.get("min_smart_wallet_buys", 0))
+    if _smart_wallet_buys_min > 0 and _smart_wallet_buys_val > 0 and _smart_wallet_buys_val < _smart_wallet_buys_min:
+        blocker_reasons.append("smart_wallet_buys_below_threshold")
+    _net_flow_val = _safe_float(snapshot.get("net_flow_sol"))
+    _net_flow_min = _safe_float(settings.get("min_net_flow_sol", 0))
+    if _net_flow_min > 0 and _net_flow_val > 0 and _net_flow_val < _net_flow_min:
+        blocker_reasons.append("net_flow_below_threshold")
+    _unique_buyers_val = _safe_int(snapshot.get("unique_buyer_count"))
+    _unique_buyers_min = _safe_int(settings.get("min_unique_buyers", 0))
+    if _unique_buyers_min > 0 and _unique_buyers_val > 0 and _unique_buyers_val < _unique_buyers_min:
+        blocker_reasons.append("unique_buyers_below_threshold")
     if settings.get("anti_rug") and snapshot.get("can_exit") is False:
         blocker_reasons.append("cannot_exit")
     if settings.get("anti_rug") and snapshot.get("transfer_hook_enabled"):
@@ -305,6 +321,14 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         pass_reasons.append("holder_growth_ok")
     if _vol_spike_val >= _vol_spike_min or _vol_spike_val == 0:
         pass_reasons.append("volume_spike_ok")
+    if _buy_sell_ratio_val >= _buy_sell_ratio_min or _buy_sell_ratio_val == 0:
+        pass_reasons.append("buy_sell_ratio_ok")
+    if _smart_wallet_buys_val >= _smart_wallet_buys_min or _smart_wallet_buys_val == 0:
+        pass_reasons.append("smart_wallet_buys_ok")
+    if _net_flow_val >= _net_flow_min or _net_flow_val == 0:
+        pass_reasons.append("net_flow_ok")
+    if _unique_buyers_val >= _unique_buyers_min or _unique_buyers_val == 0:
+        pass_reasons.append("unique_buyers_ok")
     if _safe_int(snapshot.get("threat_risk_score")) < 45:
         pass_reasons.append("threat_risk_ok")
 
@@ -313,6 +337,10 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     score += _normalize(snapshot["vol"], 0, max(_safe_float(settings.get("min_vol", 0)) * 2, 1.0)) * 5
     score += _normalize(snapshot["green_lights"], 0, 3) * 8
     score += _normalize(snapshot["narrative_score"], 0, max(_safe_float(settings.get("min_narrative_score", 0)) + 30, 30)) * 6
+    score += _normalize(snapshot.get("buy_sell_ratio", 0), 0, max(_safe_float(settings.get("min_buy_sell_ratio", 0)) * 2, 1.0)) * 4
+    score += _normalize(snapshot.get("smart_wallet_buys", 0), 0, max(_safe_float(settings.get("min_smart_wallet_buys", 0)) + 6, 6.0)) * 4
+    score += _normalize(snapshot.get("net_flow_sol", 0), 0, max(_safe_float(settings.get("min_net_flow_sol", 0)) + 10, 10.0)) * 3
+    score += _normalize(snapshot.get("unique_buyer_count", 0), 0, max(_safe_float(settings.get("min_unique_buyers", 0)) + 30, 30.0)) * 3
     score -= len(blocker_reasons) * 5
     score = max(0.0, min(100.0, score))
 
