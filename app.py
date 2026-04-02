@@ -8954,7 +8954,7 @@ def _auto_prune_db():
         _run_db_prune()
 
 
-_SHADOW_TUNE_INTERVAL = 3600  # auto-tune from shadow results every 1 hour
+_SHADOW_TUNE_INTERVAL = 1200  # auto-tune from shadow results every 20 minutes
 _last_shadow_tune_at = 0
 
 # ---------- Coin evaluation: sweep all recorded tokens to find optimal filter thresholds ----------
@@ -15838,7 +15838,7 @@ DASHBOARD_HTML = _CSS + """
       <div>
         <div class="tab-kicker">Configuration</div>
         <div class="tab-pane-title">Bot Settings</div>
-        <div class="tab-pane-copy">Pick a strategy, adjust the key numbers, and save. The AI auto-tunes these from shadow trading results every hour.</div>
+        <div class="tab-pane-copy">Pick a strategy, adjust the key numbers, and save. The AI auto-tunes these from shadow trading results every 20 minutes.</div>
       </div>
       <div class="shortcut-row">
         <span class="badge bg-muted" id="settings-header-preset">Preset loading…</span>
@@ -15850,18 +15850,18 @@ DASHBOARD_HTML = _CSS + """
       <div class="settings-stack settings-simple">
 
         <!-- Auto-Tune Status -->
-        <div class="s-autotune-status" data-tip="The bot watches shadow trades (paper trades using real prices) and every hour picks the strategy that performed best over the last 48 hours. It then automatically updates your settings so you're always running the winning strategy.">
+        <div class="s-autotune-status" data-tip="The bot watches shadow trades (paper trades using real prices) and every 20 minutes picks the strategy that performed best over the last 48 hours. It then automatically updates your settings so you're always running the winning strategy.">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
             <div class="live-dot"></div>
             <div style="font-size:13px;font-weight:800;color:#14c784">AI Auto-Tune Active</div>
           </div>
           <div style="font-size:11px;color:var(--t2);line-height:1.6">
-            Shadow trading runs all 4 strategies on real market data. Every hour, the AI picks the best-performing one and applies it to your bot automatically. You can still override below.
+            Shadow trading runs all 4 strategies on real market data. Every 20 minutes, the AI picks the best-performing one and applies it to your bot automatically. You can still override below.
           </div>
           <div class="shortcut-row" style="margin-top:10px">
             <span class="badge bg-muted" id="s-tune-preset">—</span>
             <span class="badge bg-muted" id="s-tune-last">Last tune: —</span>
-            <span class="badge bg-muted">Interval: 1 hour</span>
+            <span class="badge bg-muted">Interval: 20 min</span>
           </div>
         </div>
 
