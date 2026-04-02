@@ -12160,7 +12160,10 @@ def api_risk_check(mint):
     
     try:
         risk_engine = get_risk_engine(HELIUS_RPC)
-        assessment = risk_engine.token_analyzer.analyze_token(mint)
+        # Check if whales have avoided this coin
+        whale_bought = any(b.get("mint") == mint for b in _whale_buys)
+        whale_avoided = not whale_bought  # if whales didn't buy and token is >2h old, it's avoided
+        assessment = risk_engine.token_analyzer.analyze_token(mint, whale_avoided=whale_avoided)
         return jsonify(assessment.to_dict())
     except Exception as e:
         return jsonify({"error": str(e)})
