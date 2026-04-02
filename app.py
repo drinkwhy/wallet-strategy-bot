@@ -8997,7 +8997,7 @@ _TUNE_THRESHOLD_PLAN = {
     "age_min":          {"thresholds": [15, 30, 60, 120, 240, 480],         "direction": "lte", "min_selected": 8},
     "threat_risk_score":{"thresholds": [35, 45, 55, 65, 75],                "direction": "lte", "min_selected": 8},
     "change":           {"thresholds": [50, 100, 150, 200, 300, 400],       "direction": "lte", "min_selected": 8},
-    "green_lights":     {"thresholds": [0, 1, 2, 3],                        "direction": "gte", "min_selected": 8},
+    "green_lights":     {"thresholds": [0],                                 "direction": "gte", "min_selected": 8},
     "narrative_score":  {"thresholds": [3, 5, 10, 15, 20, 30],             "direction": "gte", "min_selected": 8},
     "buy_sell_ratio":   {"thresholds": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],    "direction": "gte", "min_selected": 8},
     "smart_wallet_buys":{"thresholds": [0, 1, 2, 3, 4],                    "direction": "gte", "min_selected": 8},
