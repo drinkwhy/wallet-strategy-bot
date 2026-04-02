@@ -4148,6 +4148,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
+        self.log_msg(f"🔍 SCAN {name} | Score: {score_total} MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m — fetching intel…")
         intel = ensure_token_intel(mint, base_info={
             "mint": mint,
             "name": name,
@@ -4224,26 +4225,31 @@ class BotInstance:
             sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"⚠️ SKIP {name} — Transfer hook / exit risk")
             return
         if can_exit is False:
             sig_entry["reason"] = "No exit route available"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"⚠️ SKIP {name} — No exit route")
             return
         if threat_score >= 60:
             sig_entry["reason"] = f"Threat risk {threat_score}/100 ({', '.join(threat_flags[:3]) or 'risk'})"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"🚨 SKIP {name} — Threat {threat_score}/100 {', '.join(threat_flags[:2]) if threat_flags else ''}")
             return
         if checklist["green_lights"] < min_green_lights and not adaptive_green_override:
             sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"❌ SKIP {name} — {checklist['green_lights']}/3 green lights (need {min_green_lights})")
             return
         if float(intel.get("max_multiple") or 1) > late_entry_mult and int(intel.get("narrative_score") or 0) < nuclear_narrative_score:
             sig_entry["reason"] = f"Late entry ({float(intel.get('max_multiple') or 1):.2f}x) without nuclear narrative"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"⏱️ SKIP {name} — Late entry {float(intel.get('max_multiple') or 1):.1f}x")
             return
         snapshot_info = {
             "mint": mint,
@@ -15430,6 +15436,60 @@ DASHBOARD_HTML = _CSS + """
         <!-- Top Rejection Reasons -->
         <div class="ev-reject-bar" id="ev-reject-bar"></div>
 
+        <!-- Cockpit Live Positions + Closed Trades -->
+        <style>
+        .ckpt-panels{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:4px}
+        @media(max-width:700px){.ckpt-panels{grid-template-columns:1fr}}
+        .ckpt-panel{background:rgba(8,16,32,.7);border:1px solid rgba(255,255,255,.06);border-radius:14px;overflow:hidden}
+        .ckpt-panel-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+        .ckpt-panel-title{font-size:12px;font-weight:800;color:var(--t1);display:flex;align-items:center;gap:6px}
+        .ckpt-panel-badge{font-size:9px;padding:2px 7px;border-radius:10px;background:rgba(20,199,132,.15);color:#14c784;font-weight:700}
+        .ckpt-panel-body{padding:8px 6px;max-height:200px;overflow-y:auto}
+        .ckpt-pos-row{display:grid;grid-template-columns:1fr 70px 70px 30px;gap:4px;align-items:center;padding:5px 8px;border-radius:8px;font-size:11px;border-bottom:1px solid rgba(255,255,255,.03)}
+        .ckpt-pos-row:last-child{border-bottom:none}
+        .ckpt-pos-name{font-weight:700;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .ckpt-pos-meta{font-size:9px;color:var(--t3);margin-top:1px}
+        .ckpt-pos-pnl{text-align:right;font-weight:700;font-size:12px}
+        .ckpt-pos-age{text-align:right;color:var(--t3);font-size:10px}
+        .ckpt-pos-exit{background:rgba(239,68,68,.15);color:#f87171;border:none;border-radius:4px;padding:2px 6px;font-size:9px;cursor:pointer;font-weight:700}
+        .ckpt-pos-exit:hover{background:rgba(239,68,68,.3)}
+        .ckpt-empty{text-align:center;color:var(--t3);font-size:11px;padding:18px 0}
+        .ckpt-closed-row{display:grid;grid-template-columns:1fr 60px 50px;gap:4px;align-items:center;padding:5px 8px;font-size:11px;border-bottom:1px solid rgba(255,255,255,.03)}
+        .ckpt-closed-row:last-child{border-bottom:none}
+        .ckpt-closed-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .ckpt-closed-pnl{text-align:right;font-weight:700}
+        .ckpt-closed-reason{text-align:right;font-size:9px;color:var(--t3)}
+        </style>
+        <div class="ckpt-panels">
+          <!-- Open Positions -->
+          <div class="ckpt-panel">
+            <div class="ckpt-panel-head">
+              <div class="ckpt-panel-title">
+                <span style="width:7px;height:7px;border-radius:50%;background:#14c784;display:inline-block;animation:blink 2s infinite"></span>
+                Open Positions
+                <span class="ckpt-panel-badge" id="ckpt-open-badge">0</span>
+              </div>
+              <span style="font-size:10px;color:var(--t3)" id="ckpt-open-pnl"></span>
+            </div>
+            <div class="ckpt-panel-body" id="ckpt-open-list">
+              <div class="ckpt-empty">No open positions &mdash; bot is scanning</div>
+            </div>
+          </div>
+          <!-- Session Closed -->
+          <div class="ckpt-panel">
+            <div class="ckpt-panel-head">
+              <div class="ckpt-panel-title">
+                &#128197; Closed This Session
+                <span class="ckpt-panel-badge" id="ckpt-closed-badge" style="background:rgba(99,102,241,.15);color:#a78bfa">0</span>
+              </div>
+              <span style="font-size:10px;color:var(--t3)" id="ckpt-closed-wr"></span>
+            </div>
+            <div class="ckpt-panel-body" id="ckpt-closed-list">
+              <div class="ckpt-empty">No closed trades this session</div>
+            </div>
+          </div>
+        </div>
+
         <!-- Chart panel (like the main candlestick chart area in the reference image) -->
         <div class="glass ptf-chart-area">
           <div class="ptf-chart-head">
@@ -17399,6 +17459,87 @@ function renderEvApproved(approved) {
   }).join('');
 }
 
+// ── Cockpit: live open positions + session-closed panels ────────────────────
+
+let _ckptClosedCache = [];  // recent closed trades fetched from API
+
+function renderCockpitPositions(positions) {
+  const el = document.getElementById('ckpt-open-list');
+  const badge = document.getElementById('ckpt-open-badge');
+  const pnlEl = document.getElementById('ckpt-open-pnl');
+  if (!el) return;
+  const list = Array.isArray(positions) ? positions : [];
+  if (badge) badge.textContent = list.length;
+  if (!list.length) {
+    el.innerHTML = '<div class="ckpt-empty">No open positions &mdash; bot is scanning</div>';
+    if (pnlEl) pnlEl.textContent = '';
+    return;
+  }
+  let totalPnl = 0;
+  el.innerHTML = list.map(p => {
+    const pnlPct = p.profit_pct || 0;
+    const pnlCol = pnlPct >= 0 ? 'var(--grn)' : 'var(--red)';
+    const heldFor = p.held_for || '—';
+    totalPnl += pnlPct;
+    return `<div class="ckpt-pos-row">
+      <div>
+        <div class="ckpt-pos-name" title="${p.mint || ''}">${p.name || '?'}</div>
+        <div class="ckpt-pos-meta">${fmtPrice(p.current_price || p.bought_at_price)} · ${(p.amount_sol || 0).toFixed(3)} SOL</div>
+      </div>
+      <div class="ckpt-pos-pnl" style="color:${pnlCol}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%</div>
+      <div class="ckpt-pos-age">${heldFor}</div>
+      <div></div>
+    </div>`;
+  }).join('');
+  if (pnlEl) {
+    const avg = totalPnl / list.length;
+    pnlEl.textContent = `Avg ${avg >= 0 ? '+' : ''}${avg.toFixed(1)}%`;
+    pnlEl.style.color = avg >= 0 ? 'var(--grn)' : 'var(--red)';
+  }
+}
+
+async function fetchCockpitClosed() {
+  try {
+    const d = await fetch('/api/my-trades').then(r => r.json()).catch(() => null);
+    if (!d) return;
+    _ckptClosedCache = d.recent_sells || [];
+    renderCockpitClosed(_ckptClosedCache, d.totals || {});
+  } catch(e) {}
+}
+
+function renderCockpitClosed(sells, totals) {
+  const el = document.getElementById('ckpt-closed-list');
+  const badge = document.getElementById('ckpt-closed-badge');
+  const wrEl = document.getElementById('ckpt-closed-wr');
+  if (!el) return;
+  const list = Array.isArray(sells) ? sells.slice(0, 15) : [];
+  if (badge) badge.textContent = list.length;
+  if (!list.length) {
+    el.innerHTML = '<div class="ckpt-empty">No closed trades this session</div>';
+    if (wrEl) wrEl.textContent = '';
+    return;
+  }
+  if (wrEl && totals) {
+    const wr = totals.win_rate || 0;
+    wrEl.textContent = `${wr.toFixed(0)}% win rate`;
+    wrEl.style.color = wr >= 50 ? 'var(--grn)' : 'var(--red)';
+  }
+  el.innerHTML = list.map(t => {
+    const pnl = t.profit_sol || 0;
+    const pnlCol = pnl >= 0 ? 'var(--grn)' : 'var(--red)';
+    const winLoss = t.result === 'Won' ? '&#10003;' : '&#10007;';
+    const winCol = t.result === 'Won' ? 'var(--grn)' : 'var(--red)';
+    return `<div class="ckpt-closed-row">
+      <div>
+        <div class="ckpt-closed-name" style="color:${winCol}">${winLoss} ${t.name || '?'}</div>
+        <div style="font-size:9px;color:var(--t3)">${t.sold_when || ''}</div>
+      </div>
+      <div class="ckpt-closed-pnl" style="color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</div>
+      <div class="ckpt-closed-reason">${t.result || ''}</div>
+    </div>`;
+  }).join('');
+}
+
 function renderScEvents() {} // stub
 function buildScEvents() { return []; } // stub
 
@@ -17923,6 +18064,9 @@ async function refresh() {
     dot.className='sdot sdot-off'; txt.textContent='Bot Stopped'; btn.textContent='\u25b6 Start Bot'; btn.className='btn btn-success';
     setText('hero-live-state', 'Bot parked');
   }
+
+  // Update cockpit live positions panel
+  renderCockpitPositions(d.positions || []);
 
   // pos-tbl compat stub (hidden; pos-cards used instead)
   document.getElementById('pos-tbl').innerHTML = '';
@@ -19722,6 +19866,10 @@ window.addEventListener('resize', () => {
 refresh();
 setInterval(refresh, 5000);
 
+// Fetch closed trades for cockpit panel (less frequent)
+fetchCockpitClosed();
+setInterval(fetchCockpitClosed, 20000);
+
 // ══════════════════════════ FLOATING PORTFOLIO WIDGET ══════════════════════════
 let _portfolioOpen = false;
 function togglePortfolioPanel() {
@@ -20401,13 +20549,43 @@ function paperProcessFilterLog(logs) {
   });
 }
 
+function paperGetScore(t) {
+  if (typeof t.score === 'number') return t.score;
+  if (t.score && typeof t.score === 'object') return t.score.total || 0;
+  return 0;
+}
+
+function paperPassesBalancedFilter(t) {
+  // Returns true if the token meets the balanced entry criteria.
+  // Thresholds vary by preset: conservative, balanced (default), degen.
+  const preset = _paperSettings.preset || 'balanced';
+  const score = paperGetScore(t);
+  const liq = t.liq || 0;
+  const vol = t.vol || 0;
+  const age = t.age_min || 0;
+  const change = t.change || 0;
+
+  if (preset === 'degen') {
+    // Degen: only basic sanity checks — positive price change, some volume
+    return change > 0 && vol >= 500;
+  } else if (preset === 'conservative') {
+    // Conservative: strict score, liquidity and volume floors; only fresh tokens
+    return score >= 55 && liq >= 20000 && vol >= 10000 && age <= 20 && change > 0;
+  } else {
+    // Balanced (default): moderate thresholds
+    return score >= 40 && liq >= 8000 && vol >= 3000 && age <= 60 && change > 0;
+  }
+}
+
 function paperProcessFeedTokens(tokens) {
-  // Auto-buy new scanner tokens for paper trading so it works even when the live
-  // bot isn't running or its filters are very strict.
+  // Auto-buy new scanner tokens for paper trading, applying the balanced entry
+  // filter so not every coin is purchased — only those that meet the current
+  // preset's quality criteria.
   if (!_paperActive || !tokens || !tokens.length) return;
   tokens.forEach(t => {
     if (!t.mint || !t.price || t.price <= 0) return;
     if (_paperPositions[t.mint] || _paperSeenMints[t.mint]) return;
+    if (!paperPassesBalancedFilter(t)) return;
     paperBuy(t.mint, t.name, t.symbol, t.price);
   });
 }
