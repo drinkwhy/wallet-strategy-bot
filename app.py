@@ -7955,6 +7955,84 @@ def new_pairs_scanner():
             print(f"[SCANNER2] outer error: {e}", flush=True)
             time.sleep(20)
 
+
+def pumpfun_scanner():
+    """Tertiary scanner: polls Pump.fun for genuinely fresh token launches (seconds to minutes old).
+
+    Unlike token-profiles and token-boosts endpoints (which surface established tokens
+    with profiles/ads), this endpoint returns coins sorted by creation_time — ensuring
+    the scanner feeds truly new tokens to the bots rather than re-evaluating stale coins.
+    Targets a 15-second polling cadence regardless of processing time.
+    """
+    PUMPFUN_URL = (
+        "https://frontend-api.pump.fun/coins"
+        "?sort=creation_time&order=DESC&limit=50&includeNsfw=false"
+    )
+    _POLL_INTERVAL = 15
+    time.sleep(20)
+    print("[SCANNER3] Pump.fun fresh-launch scanner started", flush=True)
+    while True:
+        cycle_start = time.time()
+        try:
+            resp = requests.get(PUMPFUN_URL, headers=HEADERS, timeout=10)
+            if resp.status_code == 429:
+                time.sleep(60)
+                continue
+            if resp.status_code != 200:
+                print(f"[SCANNER3] pump.fun HTTP {resp.status_code}", flush=True)
+                time.sleep(30)
+                continue
+            try:
+                coins = resp.json()
+                if not isinstance(coins, list):
+                    coins = []
+            except Exception:
+                coins = []
+
+            with seen_tokens_lock:
+                new_coins = [c for c in coins if c.get("mint") and c["mint"] not in seen_tokens]
+
+            if new_coins:
+                print(f"[SCANNER3] pump.fun: {len(coins)} total, {len(new_coins)} new to evaluate", flush=True)
+
+            def _scan_pumpfun_token(coin):
+                mint = coin.get("mint")
+                if not mint:
+                    return
+                try:
+                    r2 = dex_get(
+                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                        timeout=5,
+                    )
+                    if r2.status_code != 200:
+                        return
+                    pairs = r2.json().get("pairs") or []
+                    if not pairs:
+                        return
+                    best_pair = _pick_best_solana_pair(pairs, mint_hint=mint)
+                    if not best_pair:
+                        return
+                    info = _process_dex_pair(best_pair)
+                    if info:
+                        info.setdefault("source", "pumpfun-scanner")
+                        with seen_tokens_lock:
+                            seen_tokens.add(mint)
+                        _broadcast_signal(info)
+                except Exception as inner_e:
+                    print(f"[SCANNER3] token {mint} error: {inner_e}", flush=True)
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                pool.map(_scan_pumpfun_token, new_coins)
+
+            elapsed = time.time() - cycle_start
+            sleep_for = max(0, _POLL_INTERVAL - elapsed)
+            if sleep_for:
+                time.sleep(sleep_for)
+        except Exception as e:
+            print(f"[SCANNER3] error: {e}", flush=True)
+            time.sleep(30)
+
+
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
 def _sniper_emit_token(mint, source_label="helius-ws"):
     if not mint or mint == SOL_MINT:
@@ -9405,6 +9483,7 @@ def ensure_background_workers_started():
             check_whale_wallets,
             global_scanner,
             new_pairs_scanner,
+            pumpfun_scanner,
             helius_pool_sniper,
             token_pattern_monitor,
             momentum_sniper,
