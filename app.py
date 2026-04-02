@@ -13703,8 +13703,9 @@ def api_admin_reset_evaluations():
     reset_signal_log = data.get("signal_explorer_log", True)
     reset_shadow = data.get("shadow_decisions", True)
 
-    conn = db()
+    conn = None
     try:
+        conn = db()
         cur = conn.cursor()
         counts_before = {}
         counts_after = {}
@@ -13743,7 +13744,8 @@ def api_admin_reset_evaluations():
         print(f"[RESET] Error: {e}", flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
-        db_return(conn)
+        if conn is not None:
+            db_return(conn)
 
     return jsonify({
         "ok": True,
