@@ -2346,12 +2346,18 @@ def get_backtest_vs_live_divergence():
             cur = conn.cursor()
             # Get last backtest run results
             cur.execute("""
-                SELECT summary FROM backtest_runs
-                WHERE run_id >= 0  -- ephemeral sweeps use -1
-                ORDER BY created_at DESC LIMIT 1
+                SELECT summary_json FROM backtest_runs
+                WHERE status = 'completed'
+                ORDER BY completed_at DESC LIMIT 1
             """)
             backtest_row = cur.fetchone()
-            backtest_summary = backtest_row.get("summary") or {} if backtest_row else {}
+            if backtest_row:
+                try:
+                    backtest_summary = json.loads(backtest_row.get("summary_json") or "{}") or {}
+                except:
+                    backtest_summary = {}
+            else:
+                backtest_summary = {}
 
             # Get actual live trades from last 30 days
             cur.execute("""
@@ -2370,9 +2376,20 @@ def get_backtest_vs_live_divergence():
         live_wr = (live_wins / len(live_trades) * 100) if live_trades else 0
         live_avg_pnl = sum(t.get("pnl_pct") or 0 for t in live_trades) / len(live_trades)
 
-        # Extract backtest predictions (from sweep results)
-        backtest_wr = float(backtest_summary.get("win_rate") or 0) if isinstance(backtest_summary, dict) else 0
-        backtest_avg_pnl = float(backtest_summary.get("avg_pnl_pct") or 0) if isinstance(backtest_summary, dict) else 0
+        # Extract backtest predictions (from summary_json)
+        # summary_json structure: {"strategies": {strategy_name: {win_rate, avg_pnl_pct, ...}}}
+        strategies = backtest_summary.get("strategies", {}) if isinstance(backtest_summary, dict) else {}
+        all_strategies = list(strategies.values()) if strategies else []
+
+        if all_strategies:
+            # Average across all tested strategies
+            avg_wr = sum(float(s.get("win_rate", 0) or 0) for s in all_strategies) / len(all_strategies)
+            avg_pnl = sum(float(s.get("avg_pnl_pct", 0) or 0) for s in all_strategies) / len(all_strategies)
+            backtest_wr = avg_wr
+            backtest_avg_pnl = avg_pnl
+        else:
+            backtest_wr = 0
+            backtest_avg_pnl = 0
 
         # Calculate divergence
         wr_divergence = backtest_wr - live_wr  # Positive = backtest was too optimistic
