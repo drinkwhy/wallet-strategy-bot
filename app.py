@@ -13713,18 +13713,18 @@ def api_admin_reset_evaluations():
         # Count before reset
         if reset_signal_log:
             try:
-                cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
+                cur.execute("SELECT COUNT(*) as cnt FROM signal_explorer_log")
                 row = cur.fetchone()
-                counts_before["signal_explorer_log"] = row[0] if row else 0
+                counts_before["signal_explorer_log"] = row['cnt'] if row else 0
             except Exception as e:
                 print(f"[RESET] Failed to count signal_explorer_log: {e}", flush=True)
                 raise
 
         if reset_shadow:
             try:
-                cur.execute("SELECT COUNT(*) FROM shadow_decisions")
+                cur.execute("SELECT COUNT(*) as cnt FROM shadow_decisions")
                 row = cur.fetchone()
-                counts_before["shadow_decisions"] = row[0] if row else 0
+                counts_before["shadow_decisions"] = row['cnt'] if row else 0
             except Exception as e:
                 print(f"[RESET] Failed to count shadow_decisions: {e}", flush=True)
                 raise
@@ -13748,18 +13748,18 @@ def api_admin_reset_evaluations():
         # Verify deletion
         if reset_signal_log:
             try:
-                cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
+                cur.execute("SELECT COUNT(*) as cnt FROM signal_explorer_log")
                 row = cur.fetchone()
-                counts_after["signal_explorer_log"] = row[0] if row else 0
+                counts_after["signal_explorer_log"] = row['cnt'] if row else 0
             except Exception as e:
                 print(f"[RESET] Failed to verify signal_explorer_log: {e}", flush=True)
                 raise
 
         if reset_shadow:
             try:
-                cur.execute("SELECT COUNT(*) FROM shadow_decisions")
+                cur.execute("SELECT COUNT(*) as cnt FROM shadow_decisions")
                 row = cur.fetchone()
-                counts_after["shadow_decisions"] = row[0] if row else 0
+                counts_after["shadow_decisions"] = row['cnt'] if row else 0
             except Exception as e:
                 print(f"[RESET] Failed to verify shadow_decisions: {e}", flush=True)
                 raise
