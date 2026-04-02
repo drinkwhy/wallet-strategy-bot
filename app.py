@@ -21957,7 +21957,27 @@ setInterval(loadAdminData, 15000);
 </body></html>
 """
 
+def run_startup_migrations():
+    """Run database migrations at app startup (not at build time)."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Add columns to users table if they don't exist
+            cur.execute("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS custom_settings TEXT")
+            cur.execute("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0")
+            cur.execute("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0")
+            conn.commit()
+            print("[MIGRATION] Schema updated successfully", flush=True)
+        except Exception as e:
+            print(f"[MIGRATION] Warning: {e}", flush=True)
+        finally:
+            db_return(conn)
+    except Exception as e:
+        print(f"[MIGRATION] Failed to connect for migrations: {e}", flush=True)
+
 if __name__ == "__main__":
+    run_startup_migrations()
     ensure_background_workers_started()
     print(f"\n  SolTrader Platform → http://localhost:5000")
     print(f"  Admin account: {ADMIN_EMAIL}")

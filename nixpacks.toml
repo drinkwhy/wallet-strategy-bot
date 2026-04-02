@@ -5,9 +5,7 @@ nixPkgs = ["python311", "rustc", "cargo", "gcc"]
 cmds = ["pip install -r requirements.txt"]
 
 [phases.build]
-cmds = [
-  "python -c \"import os, psycopg2, json; conn = psycopg2.connect(os.environ.get('DATABASE_URL')); cur = conn.cursor(); cur.execute('ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS custom_settings TEXT'); cur.execute('ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS wins INTEGER DEFAULT 0'); cur.execute('ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS losses INTEGER DEFAULT 0'); conn.commit(); cur.close(); conn.close(); print('Schema updated')\" || echo 'Migration skipped'"
-]
+cmds = []
 
 [start]
 cmd = "gunicorn app:app --bind 0.0.0.0:${PORT:-5000} --workers 1 --threads 8 --timeout 300 --keep-alive 30 --graceful-timeout 60"
