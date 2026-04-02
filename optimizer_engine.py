@@ -215,7 +215,17 @@ def summarize_regime_edges(snapshot_rows, outcome_labels, flow_rows, top_n=6):
     return result
 
 
-def sweep_entry_filters(snapshot_rows, outcome_labels, threshold_plan=None):
+def sweep_entry_filters(snapshot_rows, outcome_labels, threshold_plan=None, direction_map=None):
+    """Sweep entry filter thresholds to find values that best separate winners from rugs.
+
+    Args:
+        snapshot_rows: token feature snapshots
+        outcome_labels: labelled outcomes from build_outcome_labels
+        threshold_plan: dict mapping feature name -> list of threshold values to test
+        direction_map: dict mapping feature name -> "min" or "max". Features with "max"
+            select tokens where value <= threshold (inverted filters like max_age_min,
+            max_threat_score, max_hot_change). All other features default to "min" (>=).
+    """
     labels_by_mint = {row["mint"]: row for row in outcome_labels if row.get("mint")}
     entries = _entry_rows(snapshot_rows)
     if threshold_plan is None:
@@ -227,14 +237,17 @@ def sweep_entry_filters(snapshot_rows, outcome_labels, threshold_plan=None):
             "net_flow_sol": [0.0, 2.0, 5.0, 10.0],
             "green_lights": [1, 2, 3],
         }
+    direction_map = direction_map or {}
 
     sweeps = []
     for feature_name, thresholds in threshold_plan.items():
+        use_max = direction_map.get(feature_name) == "max"
         for threshold in thresholds:
             selected = []
             for entry in entries:
                 value = _safe_float(entry["features"].get(feature_name))
-                if value >= threshold:
+                passes = value <= threshold if use_max else value >= threshold
+                if passes:
                     outcome = labels_by_mint.get(entry["mint"])
                     if outcome:
                         selected.append((entry, outcome))

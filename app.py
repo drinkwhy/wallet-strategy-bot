@@ -470,6 +470,7 @@ BOT_OVERRIDE_FIELDS = [
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
     ("offpeak_min_change", float), ("max_hot_change", float),
+    ("max_threat_score", float),
     ("peak_plateau_mode", bool), ("tp1_sell_pct", float),
     ("anti_rug", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
     ("check_holders", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
@@ -8850,6 +8851,24 @@ _SWEEP_FEATURE_TO_SETTING = {
     "smart_wallet_buys": ("min_smart_wallet_buys", int),
     "net_flow_sol": ("min_net_flow_sol", float),
     "unique_buyer_count": ("min_unique_buyers", int),
+    # Entry filters added to the sweep
+    "liq": ("min_liq", float),
+    "vol": ("min_vol", float),
+    "mc": ("min_mc", float),
+    "green_lights": ("min_green_lights", int),
+    "narrative_score": ("min_narrative_score", int),
+    # Inverted (max) filters — sweep finds the best upper-bound threshold
+    "threat_risk_score": ("max_threat_score", float),
+    "age_min": ("max_age_min", int),
+    "change": ("max_hot_change", float),
+}
+
+# Features where the filter direction is "max" (value <= threshold).
+# All other features use "min" (value >= threshold).
+_SWEEP_DIRECTION_MAP = {
+    "threat_risk_score": "max",
+    "age_min": "max",
+    "change": "max",
 }
 
 # Expanded threshold plan covering more granular values than the default
@@ -8862,6 +8881,16 @@ _TUNE_THRESHOLD_PLAN = {
     "volume_spike_ratio": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
     "holder_growth_1h": [10, 20, 30, 40, 50],
     "unique_buyer_count": [5, 10, 15, 20, 30],
+    # Newly added entry filters
+    "liq": [1_000, 3_000, 5_000, 10_000, 25_000, 50_000],
+    "vol": [1_000, 3_000, 5_000, 10_000, 25_000, 50_000],
+    "mc": [5_000, 10_000, 50_000, 100_000, 250_000],
+    "green_lights": [1, 2, 3],
+    "narrative_score": [3, 5, 10, 15, 20, 30],
+    # Inverted (max) filters — thresholds represent upper bounds
+    "threat_risk_score": [30, 40, 50, 60, 70, 80],
+    "age_min": [15, 30, 60, 120, 240, 480],
+    "change": [50, 100, 150, 200, 300, 400],
 }
 
 
@@ -8908,7 +8937,7 @@ def _evaluate_all_recorded_coins(days=7):
         flow_rows = model_rows.get("flow_rows") or []
 
         # Step 2: sweep every feature × threshold to find optimal entry filters
-        sweep_results = sweep_entry_filters(entry_rows, outcomes, threshold_plan=_TUNE_THRESHOLD_PLAN)
+        sweep_results = sweep_entry_filters(entry_rows, outcomes, threshold_plan=_TUNE_THRESHOLD_PLAN, direction_map=_SWEEP_DIRECTION_MAP)
 
         # Step 3: identify top feature edges (which features best separate winners from rugs)
         feature_edges = summarize_feature_edges(entry_rows, outcomes, top_n=8)
