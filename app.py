@@ -2127,7 +2127,7 @@ user_bots    = {}
 user_bots_lock = threading.Lock()
 seen_tokens  = set()
 seen_tokens_lock = threading.Lock()
-market_feed  = deque(maxlen=100)   # live token stream for market board
+market_feed  = deque(maxlen=400)   # live token stream for market board
 shadow_market_queue = deque(maxlen=400)
 shadow_market_lock = threading.Lock()
 _backtest_jobs = {}
@@ -10295,7 +10295,7 @@ def api_state():
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
         "stats":      stats,
-        "filter_log": list(bot.filter_log)[:10] if bot else [],
+        "filter_log": list(bot.filter_log)[:30] if bot else [],
         "settings":   db_settings,
         "adaptive": {
             "relax_level": 0,
@@ -10693,7 +10693,7 @@ def api_market_feed():
                 merged["narrative_score"] = intel.get("narrative_score", 0)
             latest[mint] = merged
     tokens = sorted(latest.values(), key=lambda item: int(item.get("ts", 0) or 0), reverse=True)
-    return jsonify(tokens[:40])
+    return jsonify(tokens[:60])
 
 @app.route("/api/paper-prices", methods=["POST"])
 @login_required
@@ -17058,11 +17058,12 @@ async function pollFeed() {
         const prev = byMint.get(t.mint) || {};
         byMint.set(t.mint, { ...prev, ...t, intel: { ...(prev.intel||{}), ...(t.intel||{}) } });
       });
-      allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 100);
+      allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 200);
       feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
       renderTokenRows();
       updateTicker();
       paperUpdatePrices();
+      paperProcessFeedTokens(tokens);
       setText('scanner-last-market', `Feed ${fmtClock()}`);
     }
   } catch(e) {}
@@ -19799,7 +19800,7 @@ async function pollPortfolioWidget() {
 pollPortfolioWidget();
 setInterval(pollPortfolioWidget, 6000);
 
-pollFeed(); setInterval(pollFeed, 8000);
+pollFeed(); setInterval(pollFeed, 3000);
 pollEvaluationFeed(); setInterval(pollEvaluationFeed, 6000);
 pollScanDetail(); setInterval(pollScanDetail, 7000);
 pollListings(); setInterval(pollListings, 6000);
@@ -20397,6 +20398,17 @@ function paperProcessFilterLog(logs) {
     const price = (tok && tok.price > 0) ? tok.price : (f.price ?? 0);
     if (!price || price <= 0) return;
     paperBuy(f.mint, (tok && tok.name) || f.name, (tok && tok.symbol) || f.symbol, price);
+  });
+}
+
+function paperProcessFeedTokens(tokens) {
+  // Auto-buy new scanner tokens for paper trading so it works even when the live
+  // bot isn't running or its filters are very strict.
+  if (!_paperActive || !tokens || !tokens.length) return;
+  tokens.forEach(t => {
+    if (!t.mint || !t.price || t.price <= 0) return;
+    if (_paperPositions[t.mint] || _paperSeenMints[t.mint]) return;
+    paperBuy(t.mint, t.name, t.symbol, t.price);
   });
 }
 
