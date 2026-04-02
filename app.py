@@ -13712,37 +13712,61 @@ def api_admin_reset_evaluations():
 
         # Count before reset
         if reset_signal_log:
-            cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
-            row = cur.fetchone()
-            counts_before["signal_explorer_log"] = row[0] if row else 0
+            try:
+                cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
+                row = cur.fetchone()
+                counts_before["signal_explorer_log"] = row[0] if row else 0
+            except Exception as e:
+                print(f"[RESET] Failed to count signal_explorer_log: {e}", flush=True)
+                raise
 
         if reset_shadow:
-            cur.execute("SELECT COUNT(*) FROM shadow_decisions")
-            row = cur.fetchone()
-            counts_before["shadow_decisions"] = row[0] if row else 0
+            try:
+                cur.execute("SELECT COUNT(*) FROM shadow_decisions")
+                row = cur.fetchone()
+                counts_before["shadow_decisions"] = row[0] if row else 0
+            except Exception as e:
+                print(f"[RESET] Failed to count shadow_decisions: {e}", flush=True)
+                raise
 
         # RESET: Delete all rows (safer than TRUNCATE)
         if reset_signal_log:
-            cur.execute("DELETE FROM signal_explorer_log")
+            try:
+                cur.execute("DELETE FROM signal_explorer_log")
+            except Exception as e:
+                print(f"[RESET] Failed to delete signal_explorer_log: {e}", flush=True)
+                raise
         if reset_shadow:
-            cur.execute("DELETE FROM shadow_decisions")
+            try:
+                cur.execute("DELETE FROM shadow_decisions")
+            except Exception as e:
+                print(f"[RESET] Failed to delete shadow_decisions: {e}", flush=True)
+                raise
 
         conn.commit()
 
         # Verify deletion
         if reset_signal_log:
-            cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
-            row = cur.fetchone()
-            counts_after["signal_explorer_log"] = row[0] if row else 0
+            try:
+                cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
+                row = cur.fetchone()
+                counts_after["signal_explorer_log"] = row[0] if row else 0
+            except Exception as e:
+                print(f"[RESET] Failed to verify signal_explorer_log: {e}", flush=True)
+                raise
 
         if reset_shadow:
-            cur.execute("SELECT COUNT(*) FROM shadow_decisions")
-            row = cur.fetchone()
-            counts_after["shadow_decisions"] = row[0] if row else 0
+            try:
+                cur.execute("SELECT COUNT(*) FROM shadow_decisions")
+                row = cur.fetchone()
+                counts_after["shadow_decisions"] = row[0] if row else 0
+            except Exception as e:
+                print(f"[RESET] Failed to verify shadow_decisions: {e}", flush=True)
+                raise
 
     except Exception as e:
-        print(f"[RESET] Error: {e}", flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
+        print(f"[RESET] Endpoint error: {type(e).__name__}: {e}", flush=True)
+        return jsonify({"ok": False, "error": str(e), "type": type(e).__name__}), 500
     finally:
         if conn is not None:
             db_return(conn)
