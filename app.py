@@ -4098,7 +4098,7 @@ class BotInstance:
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
                 {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "pumpfun bypass" if pumpfun_liq_bypass else ("off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}")},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
+                {"name": "Price Change", "passed": change >= 0 and change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"\u2265 0% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
                 {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
             ],
@@ -4121,7 +4121,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change <= 0:
+        if change < 0:
             sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
