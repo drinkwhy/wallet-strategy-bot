@@ -8952,7 +8952,7 @@ def _auto_prune_db():
         _run_db_prune()
 
 
-_SHADOW_TUNE_INTERVAL = 1200  # auto-tune from shadow results every 20 minutes
+_SHADOW_TUNE_INTERVAL = 3600  # auto-tune from shadow results every 1 hour
 _last_shadow_tune_at = 0
 
 # ---------- Coin evaluation: sweep all recorded tokens to find optimal filter thresholds ----------
