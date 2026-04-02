@@ -478,7 +478,7 @@ _RISK_THRESHOLD_SWEEP_PLAN = {
     "age_min": {
         # Thresholds are in days; they are converted to seconds when applied.
         # Direction "lte" means: accept tokens where age_min <= threshold (max age cap)
-        "thresholds": [7, 14, 30, 60, 90, 180],
+        "thresholds": [30, 60, 90, 180, 365, 730],
         "direction": "lte",
         "risk_key": "max_token_age_sec",
         "cast": lambda x: int(float(x) * 86400),  # days → seconds

@@ -8994,7 +8994,7 @@ _TUNE_THRESHOLD_PLAN = {
     "liq":              {"thresholds": [1000, 3000, 5000, 10000, 25000, 50000], "direction": "gte", "min_selected": 8},
     "vol":              {"thresholds": [1000, 3000, 5000, 10000, 25000, 50000], "direction": "gte", "min_selected": 8},
     "mc":               {"thresholds": [5000, 10000, 50000, 100000, 250000], "direction": "gte", "min_selected": 8},
-    "age_min":          {"thresholds": [15, 30, 60, 120, 240, 480],         "direction": "lte", "min_selected": 8},
+    "age_min":          {"thresholds": [30, 60, 120, 240, 480, 1440],       "direction": "lte", "min_selected": 8},
     "threat_risk_score":{"thresholds": [35, 45, 55, 65, 75],                "direction": "lte", "min_selected": 8},
     "change":           {"thresholds": [50, 100, 150, 200, 300, 400],       "direction": "lte", "min_selected": 8},
     "green_lights":     {"thresholds": [0],                                 "direction": "gte", "min_selected": 8},
