@@ -13712,29 +13712,36 @@ def api_admin_reset_evaluations():
         # Count before reset
         if reset_signal_log:
             cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
-            counts_before["signal_explorer_log"] = cur.fetchone()[0]
+            row = cur.fetchone()
+            counts_before["signal_explorer_log"] = row[0] if row else 0
 
         if reset_shadow:
             cur.execute("SELECT COUNT(*) FROM shadow_decisions")
-            counts_before["shadow_decisions"] = cur.fetchone()[0]
+            row = cur.fetchone()
+            counts_before["shadow_decisions"] = row[0] if row else 0
 
-        # RESET: Truncate tables
+        # RESET: Delete all rows (safer than TRUNCATE)
         if reset_signal_log:
-            cur.execute("TRUNCATE TABLE signal_explorer_log")
+            cur.execute("DELETE FROM signal_explorer_log")
         if reset_shadow:
-            cur.execute("TRUNCATE TABLE shadow_decisions")
+            cur.execute("DELETE FROM shadow_decisions")
 
         conn.commit()
 
-        # Verify truncation
+        # Verify deletion
         if reset_signal_log:
             cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
-            counts_after["signal_explorer_log"] = cur.fetchone()[0]
+            row = cur.fetchone()
+            counts_after["signal_explorer_log"] = row[0] if row else 0
 
         if reset_shadow:
             cur.execute("SELECT COUNT(*) FROM shadow_decisions")
-            counts_after["shadow_decisions"] = cur.fetchone()[0]
+            row = cur.fetchone()
+            counts_after["shadow_decisions"] = row[0] if row else 0
 
+    except Exception as e:
+        db_return(conn)
+        return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         db_return(conn)
 
