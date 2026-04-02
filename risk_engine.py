@@ -547,6 +547,7 @@ class TokenRiskAnalyzer:
         liquidity_usd: float = 0,
         deployer_wallet: Optional[str] = None,
         token_age_sec: float = 0,
+        whale_avoided: bool = False,
     ) -> TokenRiskAssessment:
         """
         Perform comprehensive risk analysis on a token.
@@ -565,7 +566,12 @@ class TokenRiskAnalyzer:
             assessment.can_exit = False
             assessment.blockers.extend(hp_reasons)
             assessment.contract_risk = 100
-        
+
+        # 1b. Whale avoidance signal (if tracked whales avoided this coin, be cautious)
+        if whale_avoided:
+            assessment.warnings.append("Whale avoidance: tracked whales haven't bought this token")
+            assessment.market_risk += 15
+
         # 2. Exit simulation
         if not is_honeypot:
             exit_result = self.exit_simulator.simulate_exit(mint, int(0.01 * 1e9 * 1000))
