@@ -332,6 +332,9 @@ _EXIT_SWEEP_GRID = {
     "stop_loss":     [0.65, 0.72, 0.80, 0.88],
     "trail_pct":     [0.12, 0.20, 0.30],
     "time_stop_min": [15, 25, 40],
+    # Position size — no longer tier-locked; optimizer picks the best SOL amount
+    # given actual friction/slippage from historical event tape.
+    "max_buy_sol":   [0.02, 0.04, 0.07, 0.10, 0.20, 0.50],
 }
 
 
@@ -450,3 +453,113 @@ def sweep_exit_params(event_rows, base_settings, exit_grid=None, min_trades=8):
         "kelly_risk_pct": kelly_risk_pct,
     }
 
+
+# ---------------------------------------------------------------------------
+# Risk-threshold sweep — tests different values for RISK_THRESHOLDS entries
+# that can be validated against historical winner/rug outcome data.
+#
+# Only thresholds whose corresponding feature is recorded in token_feature_snapshots
+# (via feature_json) are included. Safety circuit-breaker thresholds are intentionally
+# excluded and remain fixed.
+#
+# Tunable thresholds:
+#   min_liquidity_usd  ← driven by "liq" in feature_json
+#   min_token_age_sec  ← driven by "age_min" (minutes) in feature_json; stored as seconds
+# ---------------------------------------------------------------------------
+
+_RISK_THRESHOLD_SWEEP_PLAN = {
+    "liq": {
+        "thresholds": [1000, 2000, 3000, 5000, 7500, 10000],
+        "direction": "gte",
+        "risk_key": "min_liquidity_usd",
+        "cast": float,
+        "min_selected": 8,
+    },
+    "age_min": {
+        # Thresholds are in minutes; they are converted to seconds when applied.
+        "thresholds": [0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
+        "direction": "gte",
+        "risk_key": "min_token_age_sec",
+        "cast": lambda x: int(float(x) * 60),  # minutes → seconds
+        "min_selected": 8,
+    },
+}
+
+
+def sweep_risk_thresholds(snapshot_rows, outcome_labels, plan=None):
+    """Sweep risk-engine threshold values to find settings that best separate
+    winners from rugs using the same edge-scoring logic as sweep_entry_filters.
+
+    Only thresholds for which feature data exists in token_feature_snapshots are
+    tested.  Safety circuit-breaker thresholds (slippage, fees, circuit-breaker
+    loss %, fail rate) are intentionally left out and stay fixed.
+
+    Args:
+        snapshot_rows: token feature snapshots (same format as sweep_entry_filters)
+        outcome_labels: labelled outcomes from build_outcome_labels
+        plan: optional override for _RISK_THRESHOLD_SWEEP_PLAN
+
+    Returns:
+        dict mapping RISK_THRESHOLDS key → optimized value, or {} if insufficient data.
+    """
+    sweep_plan = plan if isinstance(plan, dict) else _RISK_THRESHOLD_SWEEP_PLAN
+    labels_by_mint = {row["mint"]: row for row in outcome_labels if row.get("mint")}
+    entries = _entry_rows(snapshot_rows)
+
+    if not entries or not labels_by_mint:
+        return {}
+
+    best_values = {}
+
+    for feature_name, spec in sweep_plan.items():
+        thresholds = list(spec.get("thresholds") or [])
+        direction = str(spec.get("direction") or "gte").strip().lower()
+        risk_key = spec.get("risk_key")
+        cast_fn = spec.get("cast", float)
+        min_selected = _safe_int(spec.get("min_selected"), 8)
+
+        if not thresholds or not risk_key:
+            continue
+
+        best_score = None
+        best_threshold = None
+
+        for threshold in thresholds:
+            selected = []
+            for entry in entries:
+                raw_value = entry["features"].get(feature_name)
+                if raw_value in (None, ""):
+                    continue
+                value = _safe_float(raw_value)
+                passed = value >= threshold if direction == "gte" else value <= threshold
+                if passed:
+                    outcome = labels_by_mint.get(entry["mint"])
+                    if outcome:
+                        selected.append((entry, outcome))
+
+            if len(selected) < min_selected:
+                continue
+
+            winners = [item for item in selected if item[1]["label"] in {"winner", "volatile_winner"}]
+            rugs = [item for item in selected if item[1]["label"] == "rug"]
+            avg_peak = sum(item[1]["peak_return_pct"] for item in selected) / len(selected)
+            avg_last = sum(item[1]["last_return_pct"] for item in selected) / len(selected)
+            rug_rate = len(rugs) / len(selected)
+            winner_rate = len(winners) / len(selected)
+            edge_score = (avg_last * 0.45) + (avg_peak * 0.25) + (winner_rate * 100.0 * 0.35) - (rug_rate * 100.0 * 0.55)
+
+            # Require a meaningful positive edge and reasonable rug suppression
+            if edge_score <= 2 or rug_rate > 0.40 or winner_rate < 0.20:
+                continue
+
+            if best_score is None or edge_score > best_score:
+                best_score = edge_score
+                best_threshold = threshold
+
+        if best_threshold is not None:
+            try:
+                best_values[risk_key] = cast_fn(best_threshold)
+            except Exception:
+                pass
+
+    return best_values
