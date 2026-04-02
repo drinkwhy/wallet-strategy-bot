@@ -40,7 +40,7 @@ RISK_THRESHOLDS = {
     "max_deployer_holding_pct": 20,  # Max deployer can hold
     "min_holders": 50,               # Minimum holder count
     "max_lp_single_holder_pct": 90,  # Max % of LP by single wallet
-    "min_token_age_sec": 5,          # Minimum token age (5s) — auto-tuned by shadow optimization
+    "max_token_age_sec": 2592000,    # Maximum token age (30 days) — auto-tuned by shadow optimization
     "max_failed_exits_consecutive": 3,
     "circuit_breaker_loss_pct": 30,  # Trip after 30% drawdown
     "circuit_breaker_fail_rate": 0.5,  # Trip after 50% tx failures
@@ -49,7 +49,7 @@ RISK_THRESHOLDS = {
 }
 
 # Keys that the optimizer is allowed to tune — safety/circuit-breaker thresholds are excluded.
-_TUNABLE_RISK_KEYS = frozenset({"min_liquidity_usd", "min_token_age_sec"})
+_TUNABLE_RISK_KEYS = frozenset({"min_liquidity_usd", "max_token_age_sec"})
 
 
 def apply_optimized_risk_thresholds(values):
@@ -607,10 +607,10 @@ class TokenRiskAnalyzer:
         else:
             assessment.liquidity_risk = max(0, int(50 - (liquidity_usd / 500)))
         
-        # 5. Token age risk
-        if token_age_sec < RISK_THRESHOLDS["min_token_age_sec"]:
-            assessment.warnings.append(f"Very new token: {token_age_sec:.0f}s old")
-            assessment.market_risk += 30
+        # 5. Token age risk — check maximum age to avoid dead/stale tokens
+        if token_age_sec > RISK_THRESHOLDS["max_token_age_sec"]:
+            assessment.warnings.append(f"Token too old: {token_age_sec/86400:.1f} days old")
+            assessment.market_risk += 20
         
         # 6. Calculate overall risk score
         assessment.risk_score = self._calculate_risk_score(assessment)

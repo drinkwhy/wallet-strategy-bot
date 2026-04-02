@@ -464,7 +464,7 @@ def sweep_exit_params(event_rows, base_settings, exit_grid=None, min_trades=8):
 #
 # Tunable thresholds:
 #   min_liquidity_usd  ← driven by "liq" in feature_json
-#   min_token_age_sec  ← driven by "age_min" (minutes) in feature_json; stored as seconds
+#   max_token_age_sec  ← driven by "age_min" (minutes) in feature_json; converted to days for thresholds
 # ---------------------------------------------------------------------------
 
 _RISK_THRESHOLD_SWEEP_PLAN = {
@@ -476,11 +476,12 @@ _RISK_THRESHOLD_SWEEP_PLAN = {
         "min_selected": 8,
     },
     "age_min": {
-        # Thresholds are in minutes; they are converted to seconds when applied.
-        "thresholds": [0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
-        "direction": "gte",
-        "risk_key": "min_token_age_sec",
-        "cast": lambda x: int(float(x) * 60),  # minutes → seconds
+        # Thresholds are in days; they are converted to seconds when applied.
+        # Direction "lte" means: accept tokens where age_min <= threshold (max age cap)
+        "thresholds": [7, 14, 30, 60, 90, 180],
+        "direction": "lte",
+        "risk_key": "max_token_age_sec",
+        "cast": lambda x: int(float(x) * 86400),  # days → seconds
         "min_selected": 8,
     },
 }
