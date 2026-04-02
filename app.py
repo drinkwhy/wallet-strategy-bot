@@ -2248,6 +2248,40 @@ def blacklist_dev(dev_wallet, reason="rugged"):
     except Exception as _e:
         print(f"[ERROR] {_e}", flush=True)
 
+def detect_market_regime():
+    """Detect current market regime: bull (winners), bear (losers), or sideways (neutral).
+    Returns 'bull', 'bear', or 'sideways' based on last 24h trade outcomes."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT pnl_pct FROM trades
+                WHERE timestamp >= NOW() - INTERVAL '24 hours'
+                ORDER BY timestamp DESC LIMIT 50
+            """)
+            trades = cur.fetchall()
+        finally:
+            db_return(conn)
+        if not trades: return 'sideways'
+
+        pnls = [float(t.get('pnl_pct') or 0) for t in trades]
+        avg_pnl = sum(pnls) / len(pnls) if pnls else 0
+        wins = len([p for p in pnls if p > 0])
+        win_rate = wins / len(pnls) if pnls else 0
+
+        # Bull: avg_pnl > +5% OR win_rate > 60%
+        if avg_pnl > 5.0 or win_rate > 0.60:
+            return 'bull'
+        # Bear: avg_pnl < -5% OR win_rate < 30%
+        elif avg_pnl < -5.0 or win_rate < 0.30:
+            return 'bear'
+        # Sideways: everything else
+        else:
+            return 'sideways'
+    except:
+        return 'sideways'
+
 def get_market_stats():
     """Aggregate recent trade stats for AI settings suggestion."""
     try:
@@ -3947,6 +3981,10 @@ class BotInstance:
             moonshot_trail = float(s.get("moonshot_trail_pct", 0) or 0)
             moonshot_active = moonshot_trigger > 0 and ratio >= moonshot_trigger
 
+            # Market regime adjustment: wider trails in bull, tighter in bear
+            market_regime = detect_market_regime()
+            regime_multiplier = 1.2 if market_regime == 'bull' else (0.8 if market_regime == 'bear' else 1.0)
+
             if s.get("peak_plateau_mode"):
                 # Progressive trailing that tightens at higher multiples
                 if peak_ratio >= 50:
@@ -3963,11 +4001,14 @@ class BotInstance:
                     effective_trail = moonshot_trail           # 50%+ surge — wide trail, let it moon
                 else:
                     effective_trail = base_trail               # Default trail early
+                # Apply regime adjustment (wider in bull, tighter in bear)
+                effective_trail = effective_trail * regime_multiplier
             else:
                 if moonshot_active and moonshot_trail > 0:
                     effective_trail = moonshot_trail
                 else:
                     effective_trail = base_trail
+                effective_trail = effective_trail * regime_multiplier
             trail_line = pos["peak_price"] * (1 - effective_trail)
 
             # ── Enhanced position monitoring (whale + rug detection) ─────────
