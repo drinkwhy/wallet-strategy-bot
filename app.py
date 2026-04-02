@@ -13740,7 +13740,7 @@ def api_admin_reset_evaluations():
             counts_after["shadow_decisions"] = row[0] if row else 0
 
     except Exception as e:
-        db_return(conn)
+        print(f"[RESET] Error: {e}", flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         db_return(conn)
