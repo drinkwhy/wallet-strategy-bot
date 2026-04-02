@@ -4148,7 +4148,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        self.log_msg(f"🔍 SCAN {name} | Score:{score_total} MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m — fetching intel…")
+        self.log_msg(f"🔍 SCAN {name} | Score: {score_total} MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m — fetching intel…")
         intel = ensure_token_intel(mint, base_info={
             "mint": mint,
             "name": name,
@@ -17481,7 +17481,6 @@ function renderCockpitPositions(positions) {
     const pnlCol = pnlPct >= 0 ? 'var(--grn)' : 'var(--red)';
     const heldFor = p.held_for || '—';
     totalPnl += pnlPct;
-    const mintShort = (p.mint || '').slice(0, 8);
     return `<div class="ckpt-pos-row">
       <div>
         <div class="ckpt-pos-name" title="${p.mint || ''}">${p.name || '?'}</div>
@@ -20550,11 +20549,17 @@ function paperProcessFilterLog(logs) {
   });
 }
 
+function paperGetScore(t) {
+  if (typeof t.score === 'number') return t.score;
+  if (t.score && typeof t.score === 'object') return t.score.total || 0;
+  return 0;
+}
+
 function paperPassesBalancedFilter(t) {
   // Returns true if the token meets the balanced entry criteria.
   // Thresholds vary by preset: conservative, balanced (default), degen.
   const preset = _paperSettings.preset || 'balanced';
-  const score = typeof t.score === 'number' ? t.score : (t.score && typeof t.score === 'object' ? (t.score.total || 0) : 0);
+  const score = paperGetScore(t);
   const liq = t.liq || 0;
   const vol = t.vol || 0;
   const age = t.age_min || 0;
