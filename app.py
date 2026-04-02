@@ -46,7 +46,7 @@ from learning_engine import (
     score_recent_candidates_for_regime,
     train_regime_model_family,
 )
-from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters, sweep_exit_params
+from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters, sweep_exit_params, sweep_risk_thresholds
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_flow_snapshot,
@@ -63,7 +63,7 @@ from quant_platform import (
 # and observability as recommended by the research paper
 try:
     from whale_detection import get_whale_detection_system, WhaleDetectionSystem
-    from risk_engine import get_risk_engine, RiskEngine, RiskLevel
+    from risk_engine import get_risk_engine, RiskEngine, RiskLevel, apply_optimized_risk_thresholds
     from mev_protection import get_mev_protection, MEVProtectionSystem, SubmissionStrategy
     from observability import get_observability, ObservabilitySystem, AlertSeverity
     from enhanced_trading import (
@@ -8472,8 +8472,6 @@ def _start_bot_from_row(row):
                 settings.update(custom)
         except Exception:
             pass
-    max_sol = PLAN_LIMITS.get(effective_plan(row["plan"], row.get("email", "")), PLAN_LIMITS["basic"])["max_buy_sol"]
-    settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(uid, kp, settings,
         run_mode=row["run_mode"],
         run_duration_min=row["run_duration_min"],
@@ -9161,6 +9159,21 @@ def _evaluate_all_recorded_coins(days=7):
                 print(f"[COIN-EVAL] exit sweep skipped — no event tape rows (bot needs to run first)", flush=True)
         except Exception as _exit_sweep_err:
             print(f"[COIN-EVAL] exit sweep error: {_exit_sweep_err}", flush=True)
+
+        # ── Step 5c: Risk threshold sweep ────────────────────────────────────
+        # Test different values for token-quality RISK_THRESHOLDS using the same
+        # winner/rug outcome data.  Results are applied globally so all bots benefit.
+        print(f"[COIN-EVAL] running risk threshold sweep (min_liquidity_usd, min_token_age_sec)...", flush=True)
+        try:
+            risk_threshold_updates = sweep_risk_thresholds(entry_rows, outcomes)
+            if risk_threshold_updates:
+                apply_optimized_risk_thresholds(risk_threshold_updates)
+                for _rk, _rv in risk_threshold_updates.items():
+                    print(f"[COIN-EVAL]   RISK_THRESHOLDS[{_rk!r}] → {_rv}", flush=True)
+            else:
+                print(f"[COIN-EVAL] risk threshold sweep: no improvements found (not enough data)", flush=True)
+        except Exception as _risk_sweep_err:
+            print(f"[COIN-EVAL] risk threshold sweep error: {_risk_sweep_err}", flush=True)
 
         # Determine current regime for context
         current_regime = "neutral"
@@ -10437,8 +10450,6 @@ def api_start():
                     settings.update(custom)
             except Exception:
                 pass
-    max_sol  = PLAN_LIMITS.get(plan, PLAN_LIMITS["basic"])["max_buy_sol"]
-    settings["max_buy_sol"] = min(settings["max_buy_sol"], max_sol)
     bot = BotInstance(
         uid, kp, settings,
         run_mode          = bs["run_mode"] if bs else "indefinite",
@@ -13531,11 +13542,7 @@ def api_admin_change_plan():
         conn.commit()
     finally:
         db_return(conn)
-    # If the user has a running bot, update their max_buy_sol live
-    bot = user_bots.get(int(target_user_id))
-    if bot:
-        max_sol = PLAN_LIMITS.get(new_plan, PLAN_LIMITS["free"])["max_buy_sol"]
-        bot.settings["max_buy_sol"] = min(bot.settings.get("max_buy_sol", max_sol), max_sol)
+    # max_buy_sol is now optimizer-controlled — plan changes no longer cap it.
     print(f"[ADMIN] Plan change: user {target_user_id} ({user.get('email')}) {old_plan} -> {new_plan}", flush=True)
     return jsonify({"ok": True, "msg": f"Changed {user.get('email')} from {old_plan} to {new_plan}"})
 
