@@ -645,6 +645,113 @@ def estimate_exit_friction(realized_pnl_pct, exit_price, entry_price, entry_sol,
     }
 
 
+def estimate_entry_friction(entry_price, liq_usd=0, entry_sol=0.05, priority_fee=30000):
+    """Estimate the effective (inflated) entry price after buy-side friction:
+
+    1. Entry slippage — buying into the pool raises the price you pay
+    2. MEV sandwich front-run — attacker buys before you, sells after
+       Probability and magnitude modelled from observed Solana mainnet data
+    3. Entry price impact — your buy moves the pool price against you
+    4. Jupiter platform fee (0.5%) on the buy side
+
+    Returns:
+        effective_entry_price  — use this instead of the clean market price
+        mev_probability        — estimated chance a sandwich happened (0-1)
+        entry_friction_pct     — total cost as % of notional
+        breakdown              — dict with individual components
+    """
+    liq = max(_safe_float(liq_usd, 0), 0)
+    sol = max(_safe_float(entry_sol, 0.05), 0.001)
+    price = max(_safe_float(entry_price, 0), 1e-15)
+    prio = max(_safe_float(priority_fee, 0), 0)
+
+    # ── 1. Entry slippage (buy side) ─────────────────────────────────
+    # Mirrors exit slippage tiers but slightly lower — AMM impact is
+    # symmetric but MEV is directionally worse on exit (more sellers watching)
+    if liq > 100_000:
+        entry_slippage_pct = 2.0
+    elif liq > 50_000:
+        entry_slippage_pct = 4.0
+    elif liq > 20_000:
+        entry_slippage_pct = 6.0
+    elif liq > 10_000:
+        entry_slippage_pct = 9.0
+    elif liq > 5_000:
+        entry_slippage_pct = 14.0
+    elif liq > 1_000:
+        entry_slippage_pct = 22.0
+    elif liq > 0:
+        entry_slippage_pct = 35.0
+    else:
+        entry_slippage_pct = 8.0   # unknown pool — conservative estimate
+
+    # ── 2. MEV sandwich attack ────────────────────────────────────────
+    # Front-runner probability is driven by:
+    #   - Pool thinness (thin pools are easier/more profitable to sandwich)
+    #   - Priority fee (high fees = more visible in mempool = more MEV)
+    #   - Trade size vs pool (larger relative size = bigger sandwich profit)
+    sol_price_usd = 150.0
+    trade_usd = sol * sol_price_usd
+    pool_ratio = (trade_usd / liq) if liq > 0 else 0.5
+
+    # Base sandwich probability
+    if liq > 100_000:
+        mev_prob = 0.05   # 5% — deep pool, less profitable to sandwich
+    elif liq > 20_000:
+        mev_prob = 0.15
+    elif liq > 5_000:
+        mev_prob = 0.30
+    elif liq > 1_000:
+        mev_prob = 0.45
+    else:
+        mev_prob = 0.60   # 60% — micro pool, nearly always sandwiched
+
+    # High priority fee = you broadcast urgency = attracts MEV bots
+    if prio > 200_000:     # >0.0002 SOL tip
+        mev_prob = min(mev_prob + 0.10, 0.80)
+    elif prio > 50_000:
+        mev_prob = min(mev_prob + 0.05, 0.75)
+
+    # Large relative trade size = bigger sandwich profit = more competition
+    if pool_ratio > 0.10:
+        mev_prob = min(mev_prob + 0.10, 0.85)
+    elif pool_ratio > 0.02:
+        mev_prob = min(mev_prob + 0.05, 0.80)
+
+    # MEV cost: attacker front-runs by ~1-4%, then sells after your fill
+    # The cost to you is the front-runner's profit = ~1-3% on your fill price
+    mev_cost_if_hit_pct = min(2.0 + pool_ratio * 15.0, 8.0)
+    mev_expected_cost_pct = mev_prob * mev_cost_if_hit_pct
+
+    # ── 3. Entry price impact ─────────────────────────────────────────
+    if liq > 0:
+        impact_raw = (trade_usd / liq) * 100.0
+        entry_impact_pct = min(impact_raw, 25.0)
+    else:
+        entry_impact_pct = 2.0
+
+    # ── 4. Jupiter buy fee ────────────────────────────────────────────
+    entry_fee_pct = 0.5
+
+    # ── Total entry friction ─────────────────────────────────────────
+    total_entry_friction_pct = (
+        entry_slippage_pct + mev_expected_cost_pct + entry_impact_pct + entry_fee_pct
+    )
+
+    # Effective entry price: you paid this much more than the clean price
+    effective_entry_price = price * (1.0 + total_entry_friction_pct / 100.0)
+
+    return {
+        "effective_entry_price": effective_entry_price,
+        "mev_probability": round(mev_prob, 3),
+        "entry_friction_pct": round(total_entry_friction_pct, 2),
+        "entry_slippage_pct": round(entry_slippage_pct, 2),
+        "mev_cost_pct": round(mev_expected_cost_pct, 2),
+        "entry_impact_pct": round(entry_impact_pct, 2),
+        "entry_fee_pct": entry_fee_pct,
+    }
+
+
 def _json_list(value):
     if isinstance(value, list):
         return value

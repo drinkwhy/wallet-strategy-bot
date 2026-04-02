@@ -1562,6 +1562,10 @@ def migrate_db():
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tx_signature TEXT",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS friction_pnl_pct REAL DEFAULT 0",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS entry_friction_pct REAL DEFAULT 0",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS exit_friction_pct REAL DEFAULT 0",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS mev_probability REAL DEFAULT 0",
         ]
         for m in migrations:
             try:
@@ -7250,8 +7254,9 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
                         run_id, strategy_name, mint, name, opened_at, closed_at,
                         entry_price, exit_price, status, score, confidence,
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
-                        exit_reason, feature_json, decision_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        exit_reason, feature_json, decision_json,
+                        friction_pnl_pct, entry_friction_pct, exit_friction_pct, mev_probability
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, [trade.as_insert_tuple() for trade in trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
@@ -7522,8 +7527,9 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                         run_id, strategy_name, mint, name, opened_at, closed_at,
                         entry_price, exit_price, status, score, confidence,
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
-                        exit_reason, feature_json, decision_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        exit_reason, feature_json, decision_json,
+                        friction_pnl_pct, entry_friction_pct, exit_friction_pct, mev_probability
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, [t.as_insert_tuple() for t in all_best_trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
