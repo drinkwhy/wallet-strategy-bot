@@ -3953,6 +3953,33 @@ class BotInstance:
                     prices[m] = p
         return prices
 
+    def _calculate_position_volatility(self, pos, cur_price):
+        """Calculate rolling volatility of a position based on price history.
+        Returns volatility as std dev of recent price changes (0.0-1.0 scale)."""
+        price_history = pos.get("price_history", [])
+        if not price_history or len(price_history) < 2:
+            return 0.5  # Default to medium volatility if insufficient data
+
+        # Calculate returns from recent price history
+        returns = []
+        for i in range(1, min(len(price_history), 20)):  # Last 20 price checks
+            prev_price = price_history[i-1]
+            curr_price = price_history[i]
+            if prev_price > 0:
+                ret = (curr_price - prev_price) / prev_price
+                returns.append(ret)
+
+        if not returns:
+            return 0.5
+
+        # Calculate standard deviation of returns (volatility)
+        avg_ret = sum(returns) / len(returns)
+        variance = sum((r - avg_ret) ** 2 for r in returns) / len(returns)
+        volatility = variance ** 0.5
+
+        # Clamp to 0-1 range: 0=very stable, 1=very volatile
+        return min(1.0, max(0.0, volatility * 10))  # Scale up to 0-1
+
     def check_positions(self):
         s = self.settings
         mints = list(self.positions.keys())
@@ -3966,6 +3993,14 @@ class BotInstance:
             cur = prices.get(mint)
             if not cur or not pos["entry_price"]:
                 continue
+
+            # Update price history for volatility calculation
+            if "price_history" not in pos:
+                pos["price_history"] = []
+            pos["price_history"].append(cur)
+            if len(pos["price_history"]) > 50:  # Keep last 50 prices
+                pos["price_history"].pop(0)
+
             if cur > pos["peak_price"]:
                 self.positions[mint]["peak_price"] = cur
                 _peak_updates.append((cur, self.user_id, mint))
@@ -3985,6 +4020,11 @@ class BotInstance:
             market_regime = detect_market_regime()
             regime_multiplier = 1.2 if market_regime == 'bull' else (0.8 if market_regime == 'bear' else 1.0)
 
+            # Volatility-based exit: high volatility → wider stops, low volatility → tighter stops
+            volatility = self._calculate_position_volatility(pos, cur)
+            # volatility ranges 0-1: apply as a multiplier between 0.7 (tight) and 1.3 (wide)
+            volatility_multiplier = 0.7 + (volatility * 0.6)  # Maps [0, 1] to [0.7, 1.3]
+
             if s.get("peak_plateau_mode"):
                 # Progressive trailing that tightens at higher multiples
                 if peak_ratio >= 50:
@@ -4001,14 +4041,14 @@ class BotInstance:
                     effective_trail = moonshot_trail           # 50%+ surge — wide trail, let it moon
                 else:
                     effective_trail = base_trail               # Default trail early
-                # Apply regime adjustment (wider in bull, tighter in bear)
-                effective_trail = effective_trail * regime_multiplier
+                # Apply regime and volatility adjustments
+                effective_trail = effective_trail * regime_multiplier * volatility_multiplier
             else:
                 if moonshot_active and moonshot_trail > 0:
                     effective_trail = moonshot_trail
                 else:
                     effective_trail = base_trail
-                effective_trail = effective_trail * regime_multiplier
+                effective_trail = effective_trail * regime_multiplier * volatility_multiplier
             trail_line = pos["peak_price"] * (1 - effective_trail)
 
             # ── Enhanced position monitoring (whale + rug detection) ─────────
