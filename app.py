@@ -13694,6 +13694,62 @@ def api_admin_recalc_shadow():
     })
 
 
+@app.route("/api/admin/reset-evaluations", methods=["POST"])
+@admin_required
+def api_admin_reset_evaluations():
+    """Reset signal explorer and shadow decision logs to align with new approval methods.
+    Clears old evaluations so coins are re-evaluated with updated filters."""
+    data = request.json or {}
+    reset_signal_log = data.get("signal_explorer_log", True)
+    reset_shadow = data.get("shadow_decisions", True)
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        counts_before = {}
+        counts_after = {}
+
+        # Count before reset
+        if reset_signal_log:
+            cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
+            counts_before["signal_explorer_log"] = cur.fetchone()[0]
+
+        if reset_shadow:
+            cur.execute("SELECT COUNT(*) FROM shadow_decisions")
+            counts_before["shadow_decisions"] = cur.fetchone()[0]
+
+        # RESET: Truncate tables
+        if reset_signal_log:
+            cur.execute("TRUNCATE TABLE signal_explorer_log")
+        if reset_shadow:
+            cur.execute("TRUNCATE TABLE shadow_decisions")
+
+        conn.commit()
+
+        # Verify truncation
+        if reset_signal_log:
+            cur.execute("SELECT COUNT(*) FROM signal_explorer_log")
+            counts_after["signal_explorer_log"] = cur.fetchone()[0]
+
+        if reset_shadow:
+            cur.execute("SELECT COUNT(*) FROM shadow_decisions")
+            counts_after["shadow_decisions"] = cur.fetchone()[0]
+
+    finally:
+        db_return(conn)
+
+    return jsonify({
+        "ok": True,
+        "reset_tables": {
+            "signal_explorer_log": reset_signal_log,
+            "shadow_decisions": reset_shadow,
+        },
+        "counts_before": counts_before,
+        "counts_after": counts_after,
+        "msg": "Evaluation data reset. Coins will be re-evaluated with new approval methods (no green_lights blocking, relaxed token age, etc.)"
+    })
+
+
 @app.route("/api/admin/override-preset", methods=["POST"])
 @admin_required
 def api_override_preset():
