@@ -13702,6 +13702,7 @@ def api_admin_reset_evaluations():
     data = request.json or {}
     reset_signal_log = data.get("signal_explorer_log", True)
     reset_shadow = data.get("shadow_decisions", True)
+    reset_shadow_positions = data.get("shadow_positions", True)
 
     conn = None
     try:
@@ -13729,6 +13730,15 @@ def api_admin_reset_evaluations():
                 print(f"[RESET] Failed to count shadow_decisions: {e}", flush=True)
                 raise
 
+        if reset_shadow_positions:
+            try:
+                cur.execute("SELECT COUNT(*) as cnt FROM shadow_positions")
+                row = cur.fetchone()
+                counts_before["shadow_positions"] = row['cnt'] if row else 0
+            except Exception as e:
+                print(f"[RESET] Failed to count shadow_positions: {e}", flush=True)
+                raise
+
         # RESET: Delete all rows (safer than TRUNCATE)
         if reset_signal_log:
             try:
@@ -13741,6 +13751,12 @@ def api_admin_reset_evaluations():
                 cur.execute("DELETE FROM shadow_decisions")
             except Exception as e:
                 print(f"[RESET] Failed to delete shadow_decisions: {e}", flush=True)
+                raise
+        if reset_shadow_positions:
+            try:
+                cur.execute("DELETE FROM shadow_positions")
+            except Exception as e:
+                print(f"[RESET] Failed to delete shadow_positions: {e}", flush=True)
                 raise
 
         conn.commit()
@@ -13764,6 +13780,15 @@ def api_admin_reset_evaluations():
                 print(f"[RESET] Failed to verify shadow_decisions: {e}", flush=True)
                 raise
 
+        if reset_shadow_positions:
+            try:
+                cur.execute("SELECT COUNT(*) as cnt FROM shadow_positions")
+                row = cur.fetchone()
+                counts_after["shadow_positions"] = row['cnt'] if row else 0
+            except Exception as e:
+                print(f"[RESET] Failed to verify shadow_positions: {e}", flush=True)
+                raise
+
     except Exception as e:
         print(f"[RESET] Endpoint error: {type(e).__name__}: {e}", flush=True)
         return jsonify({"ok": False, "error": str(e), "type": type(e).__name__}), 500
@@ -13776,6 +13801,7 @@ def api_admin_reset_evaluations():
         "reset_tables": {
             "signal_explorer_log": reset_signal_log,
             "shadow_decisions": reset_shadow,
+            "shadow_positions": reset_shadow_positions,
         },
         "counts_before": counts_before,
         "counts_after": counts_after,
