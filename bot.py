@@ -43,6 +43,20 @@ headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 seen_tokens = set()
 positions = {}  # {address: {name, entry_price, timestamp}}
+token_last_checked = {}
+
+MIN_MC = 5000
+MAX_MC = 250000
+MIN_VOLUME_24H = 10000
+MIN_LIQUIDITY = 3000
+RETRY_SECONDS = 300
+
+
+def to_float(value, default=0.0):
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def get_sol_balance():
@@ -97,21 +111,43 @@ def get_token_info(address):
             f"https://api.dexscreener.com/latest/dex/tokens/{address}",
             headers=headers, timeout=5
         )
-        pairs = resp.json().get("pairs")
+        payload = resp.json()
+        pairs = payload.get("pairs") if isinstance(payload, dict) else []
         if pairs:
-            p = pairs[0]
+            # Prefer Solana pairs and then pick the deepest liquidity pool.
+            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+            ranked_pairs = sol_pairs or pairs
+            p = max(ranked_pairs, key=lambda pair: to_float((pair.get("liquidity") or {}).get("usd"), 0))
             return {
                 "name":        p.get("baseToken", {}).get("name", "Unknown"),
                 "symbol":      p.get("baseToken", {}).get("symbol", "?"),
-                "price":       float(p.get("priceUsd") or 0),
-                "marketcap":   p.get("marketCap", 0) or 0,
-                "volume":      (p.get("volume") or {}).get("h24", 0) or 0,
-                "liquidity":   (p.get("liquidity") or {}).get("usd", 0) or 0,
-                "priceChange": (p.get("priceChange") or {}).get("h24", 0) or 0,
+                "price":       to_float(p.get("priceUsd"), 0),
+                "marketcap":   to_float(p.get("marketCap"), 0),
+                "volume":      to_float((p.get("volume") or {}).get("h24"), 0),
+                "liquidity":   to_float((p.get("liquidity") or {}).get("usd"), 0),
+                "priceChange": to_float((p.get("priceChange") or {}).get("h24"), 0),
             }
-    except:
+    except Exception:
         pass
     return None
+
+
+def fetch_latest_profile_tokens():
+    try:
+        response = requests.get(
+            "https://api.dexscreener.com/token-profiles/latest/v1",
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            print(f"   ⚠️  Unexpected scanner payload type: {type(payload).__name__}")
+            return []
+        return payload
+    except Exception as e:
+        print(f"   ⚠️  Scanner request failed: {e}")
+        return []
 
 
 def get_token_balance(address):
@@ -255,32 +291,74 @@ while True:
         if positions:
             check_positions()
 
-        response = requests.get(
-            "https://api.dexscreener.com/token-profiles/latest/v1",
-            headers=headers, timeout=10
-        )
-        tokens = response.json()
+        tokens = fetch_latest_profile_tokens()
+        now = time.time()
+        scanned_total = 0
+        scanned_solana = 0
+        checked_candidates = 0
+        throttled = 0
+        info_ready = 0
+        filtered_out = 0
+        pass_filters = 0
+        trade_failed = 0
 
-        for token in tokens:
+        for token in (tokens if isinstance(tokens, list) else []):
+            if not isinstance(token, dict):
+                continue
+            scanned_total += 1
             address = token.get("tokenAddress")
             chain   = token.get("chainId")
+            if not address:
+                continue
 
-            if chain == "solana" and address not in seen_tokens:
-                seen_tokens.add(address)
+            address_key = str(address).lower()
+
+            if chain == "solana":
+                scanned_solana += 1
+
+            if chain == "solana" and address_key not in seen_tokens:
+                if address_key in token_last_checked and (now - token_last_checked[address_key]) < RETRY_SECONDS:
+                    throttled += 1
+                    continue
+
+                token_last_checked[address_key] = now
+                checked_candidates += 1
                 info = get_token_info(address)
 
                 if info:
+                    info_ready += 1
                     mc     = info["marketcap"]
                     vol    = info["volume"]
                     liq    = info["liquidity"]
                     change = info["priceChange"]
 
-                    if 5000 <= mc <= 100000 and vol >= 50000 and liq >= 10000:
+                    if MIN_MC <= mc <= MAX_MC and vol >= MIN_VOLUME_24H and liq >= MIN_LIQUIDITY:
+                        pass_filters += 1
                         print(f"🚨 {info['name']} ({info['symbol']})")
                         print(f"   MC: ${mc:,.0f} | Vol: ${vol:,.0f} | Liq: ${liq:,.0f} | {change:+.1f}%")
                         print(f"   https://dexscreener.com/solana/{address}")
-                        buy_token(address, info["name"], info["price"])
+                        bought = buy_token(address, info["name"], info["price"])
+                        if bought:
+                            # Mark as seen only after a successful buy so filtered tokens can be retried later.
+                            seen_tokens.add(address_key)
+                        else:
+                            trade_failed += 1
                         print("---")
+                    else:
+                        filtered_out += 1
+
+        print(
+            "🔎 Scan "
+            f"total={scanned_total} "
+            f"sol={scanned_solana} "
+            f"checked={checked_candidates} "
+            f"throttled={throttled} "
+            f"with_info={info_ready} "
+            f"filtered={filtered_out} "
+            f"buy_candidates={pass_filters} "
+            f"trade_failed={trade_failed} "
+            f"positions={len(positions)}"
+        )
 
         time.sleep(10)
 

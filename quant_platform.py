@@ -283,6 +283,22 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     _vol_spike_min = _safe_float(settings.get("min_volume_spike_mult", 0))
     if _vol_spike_min > 0 and _vol_spike_val > 0 and _vol_spike_val < _vol_spike_min:
         blocker_reasons.append("volume_spike_below_threshold")
+    _buy_sell_ratio_val = _safe_float(snapshot.get("buy_sell_ratio"))
+    _buy_sell_ratio_min = _safe_float(settings.get("min_buy_sell_ratio", 0))
+    if _buy_sell_ratio_min > 0 and _buy_sell_ratio_val > 0 and _buy_sell_ratio_val < _buy_sell_ratio_min:
+        blocker_reasons.append("buy_sell_ratio_below_threshold")
+    _smart_wallet_buys_val = _safe_int(snapshot.get("smart_wallet_buys"))
+    _smart_wallet_buys_min = _safe_int(settings.get("min_smart_wallet_buys", 0))
+    if _smart_wallet_buys_min > 0 and _smart_wallet_buys_val > 0 and _smart_wallet_buys_val < _smart_wallet_buys_min:
+        blocker_reasons.append("smart_wallet_buys_below_threshold")
+    _net_flow_val = _safe_float(snapshot.get("net_flow_sol"))
+    _net_flow_min = _safe_float(settings.get("min_net_flow_sol", 0))
+    if _net_flow_min > 0 and _net_flow_val > 0 and _net_flow_val < _net_flow_min:
+        blocker_reasons.append("net_flow_below_threshold")
+    _unique_buyers_val = _safe_int(snapshot.get("unique_buyer_count"))
+    _unique_buyers_min = _safe_int(settings.get("min_unique_buyers", 0))
+    if _unique_buyers_min > 0 and _unique_buyers_val > 0 and _unique_buyers_val < _unique_buyers_min:
+        blocker_reasons.append("unique_buyers_below_threshold")
     if settings.get("anti_rug") and snapshot.get("can_exit") is False:
         blocker_reasons.append("cannot_exit")
     if settings.get("anti_rug") and snapshot.get("transfer_hook_enabled"):
@@ -305,6 +321,14 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
         pass_reasons.append("holder_growth_ok")
     if _vol_spike_val >= _vol_spike_min or _vol_spike_val == 0:
         pass_reasons.append("volume_spike_ok")
+    if _buy_sell_ratio_val >= _buy_sell_ratio_min or _buy_sell_ratio_val == 0:
+        pass_reasons.append("buy_sell_ratio_ok")
+    if _smart_wallet_buys_val >= _smart_wallet_buys_min or _smart_wallet_buys_val == 0:
+        pass_reasons.append("smart_wallet_buys_ok")
+    if _net_flow_val >= _net_flow_min or _net_flow_val == 0:
+        pass_reasons.append("net_flow_ok")
+    if _unique_buyers_val >= _unique_buyers_min or _unique_buyers_val == 0:
+        pass_reasons.append("unique_buyers_ok")
     if _safe_int(snapshot.get("threat_risk_score")) < 45:
         pass_reasons.append("threat_risk_ok")
 
@@ -313,6 +337,10 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     score += _normalize(snapshot["vol"], 0, max(_safe_float(settings.get("min_vol", 0)) * 2, 1.0)) * 5
     score += _normalize(snapshot["green_lights"], 0, 3) * 8
     score += _normalize(snapshot["narrative_score"], 0, max(_safe_float(settings.get("min_narrative_score", 0)) + 30, 30)) * 6
+    score += _normalize(snapshot.get("buy_sell_ratio", 0), 0, max(_safe_float(settings.get("min_buy_sell_ratio", 0)) * 2, 1.0)) * 4
+    score += _normalize(snapshot.get("smart_wallet_buys", 0), 0, max(_safe_float(settings.get("min_smart_wallet_buys", 0)) + 6, 6.0)) * 4
+    score += _normalize(snapshot.get("net_flow_sol", 0), 0, max(_safe_float(settings.get("min_net_flow_sol", 0)) + 10, 10.0)) * 3
+    score += _normalize(snapshot.get("unique_buyer_count", 0), 0, max(_safe_float(settings.get("min_unique_buyers", 0)) + 30, 30.0)) * 3
     score -= len(blocker_reasons) * 5
     score = max(0.0, min(100.0, score))
 
@@ -424,13 +452,12 @@ def shadow_position_update(position, current_price, settings, age_min):
             # TP1 hit — record partial profit
             new_tp1_hit = True
             new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
-            # If TP2 is also reached on the same tick (e.g. same mult, or gap skipped),
-            # close the full position immediately rather than leaving it open forever.
+            # If price is already at or above TP2 in the same tick, close immediately
             if ratio >= tp2_mult:
                 status = "closed"
-                exit_reason = "take_profit_tp2"
+                exit_reason = "take_profit"
             else:
-                exit_reason = ""
+                exit_reason = ""  # not closing yet — waiting for TP2
         elif tp1_hit and ratio >= tp2_mult:
             status = "closed"
             exit_reason = "take_profit_tp2"
@@ -615,6 +642,113 @@ def estimate_exit_friction(realized_pnl_pct, exit_price, entry_price, entry_sol,
         "total_friction_pct": round(total_friction_pct, 2),
         "exit_liq_usd": round(liq, 2),
         "exit_vol_usd": round(vol, 2),
+    }
+
+
+def estimate_entry_friction(entry_price, liq_usd=0, entry_sol=0.05, priority_fee=30000):
+    """Estimate the effective (inflated) entry price after buy-side friction:
+
+    1. Entry slippage — buying into the pool raises the price you pay
+    2. MEV sandwich front-run — attacker buys before you, sells after
+       Probability and magnitude modelled from observed Solana mainnet data
+    3. Entry price impact — your buy moves the pool price against you
+    4. Jupiter platform fee (0.5%) on the buy side
+
+    Returns:
+        effective_entry_price  — use this instead of the clean market price
+        mev_probability        — estimated chance a sandwich happened (0-1)
+        entry_friction_pct     — total cost as % of notional
+        breakdown              — dict with individual components
+    """
+    liq = max(_safe_float(liq_usd, 0), 0)
+    sol = max(_safe_float(entry_sol, 0.05), 0.001)
+    price = max(_safe_float(entry_price, 0), 1e-15)
+    prio = max(_safe_float(priority_fee, 0), 0)
+
+    # ── 1. Entry slippage (buy side) ─────────────────────────────────
+    # Mirrors exit slippage tiers but slightly lower — AMM impact is
+    # symmetric but MEV is directionally worse on exit (more sellers watching)
+    if liq > 100_000:
+        entry_slippage_pct = 2.0
+    elif liq > 50_000:
+        entry_slippage_pct = 4.0
+    elif liq > 20_000:
+        entry_slippage_pct = 6.0
+    elif liq > 10_000:
+        entry_slippage_pct = 9.0
+    elif liq > 5_000:
+        entry_slippage_pct = 14.0
+    elif liq > 1_000:
+        entry_slippage_pct = 22.0
+    elif liq > 0:
+        entry_slippage_pct = 35.0
+    else:
+        entry_slippage_pct = 8.0   # unknown pool — conservative estimate
+
+    # ── 2. MEV sandwich attack ────────────────────────────────────────
+    # Front-runner probability is driven by:
+    #   - Pool thinness (thin pools are easier/more profitable to sandwich)
+    #   - Priority fee (high fees = more visible in mempool = more MEV)
+    #   - Trade size vs pool (larger relative size = bigger sandwich profit)
+    sol_price_usd = 150.0
+    trade_usd = sol * sol_price_usd
+    pool_ratio = (trade_usd / liq) if liq > 0 else 0.5
+
+    # Base sandwich probability
+    if liq > 100_000:
+        mev_prob = 0.05   # 5% — deep pool, less profitable to sandwich
+    elif liq > 20_000:
+        mev_prob = 0.15
+    elif liq > 5_000:
+        mev_prob = 0.30
+    elif liq > 1_000:
+        mev_prob = 0.45
+    else:
+        mev_prob = 0.60   # 60% — micro pool, nearly always sandwiched
+
+    # High priority fee = you broadcast urgency = attracts MEV bots
+    if prio > 200_000:     # >0.0002 SOL tip
+        mev_prob = min(mev_prob + 0.10, 0.80)
+    elif prio > 50_000:
+        mev_prob = min(mev_prob + 0.05, 0.75)
+
+    # Large relative trade size = bigger sandwich profit = more competition
+    if pool_ratio > 0.10:
+        mev_prob = min(mev_prob + 0.10, 0.85)
+    elif pool_ratio > 0.02:
+        mev_prob = min(mev_prob + 0.05, 0.80)
+
+    # MEV cost: attacker front-runs by ~1-4%, then sells after your fill
+    # The cost to you is the front-runner's profit = ~1-3% on your fill price
+    mev_cost_if_hit_pct = min(2.0 + pool_ratio * 15.0, 8.0)
+    mev_expected_cost_pct = mev_prob * mev_cost_if_hit_pct
+
+    # ── 3. Entry price impact ─────────────────────────────────────────
+    if liq > 0:
+        impact_raw = (trade_usd / liq) * 100.0
+        entry_impact_pct = min(impact_raw, 25.0)
+    else:
+        entry_impact_pct = 2.0
+
+    # ── 4. Jupiter buy fee ────────────────────────────────────────────
+    entry_fee_pct = 0.5
+
+    # ── Total entry friction ─────────────────────────────────────────
+    total_entry_friction_pct = (
+        entry_slippage_pct + mev_expected_cost_pct + entry_impact_pct + entry_fee_pct
+    )
+
+    # Effective entry price: you paid this much more than the clean price
+    effective_entry_price = price * (1.0 + total_entry_friction_pct / 100.0)
+
+    return {
+        "effective_entry_price": effective_entry_price,
+        "mev_probability": round(mev_prob, 3),
+        "entry_friction_pct": round(total_entry_friction_pct, 2),
+        "entry_slippage_pct": round(entry_slippage_pct, 2),
+        "mev_cost_pct": round(mev_expected_cost_pct, 2),
+        "entry_impact_pct": round(entry_impact_pct, 2),
+        "entry_fee_pct": entry_fee_pct,
     }
 
 

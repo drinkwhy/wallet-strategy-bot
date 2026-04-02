@@ -1,8 +1,11 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from learning_engine import classify_flow_regime_row, score_feature_snapshot_with_family
-from quant_platform import build_feature_snapshot, estimate_exit_friction, evaluate_shadow_strategy, shadow_position_update
+from quant_platform import (
+    build_feature_snapshot, evaluate_shadow_strategy, shadow_position_update,
+    estimate_exit_friction, estimate_entry_friction,
+)
 
 
 @dataclass
@@ -21,10 +24,14 @@ class BacktestTrade:
     max_upside_pct: float
     max_drawdown_pct: float
     realized_pnl_pct: float
-    friction_pnl_pct: float
     exit_reason: str
     feature_json: str
     decision_json: str
+    # Friction-adjusted fields — realistic P&L after slippage/MEV/fees
+    friction_pnl_pct: float = 0.0
+    entry_friction_pct: float = 0.0
+    exit_friction_pct: float = 0.0
+    mev_probability: float = 0.0
 
     def as_insert_tuple(self):
         return (
@@ -42,47 +49,14 @@ class BacktestTrade:
             self.max_upside_pct,
             self.max_drawdown_pct,
             self.realized_pnl_pct,
-            self.friction_pnl_pct,
             self.exit_reason,
             self.feature_json,
             self.decision_json,
+            self.friction_pnl_pct,
+            self.entry_friction_pct,
+            self.exit_friction_pct,
+            self.mev_probability,
         )
-
-
-# Default entry size (SOL) used for friction calculations in backtests where the
-# actual trade size is not recorded.  Mirrors the typical `max_buy_sol` setting.
-_DEFAULT_BACKTEST_ENTRY_SOL = 0.1
-
-
-def _apply_backtest_friction(realized_pnl_pct, position, update, snapshot):
-    """Wrap estimate_exit_friction for use inside simulate_* functions.
-
-    Uses the snapshot's liq/vol at exit time (best available proxy).
-    Returns friction_pnl_pct (float) or None if P&L is unknown.
-    """
-    if realized_pnl_pct is None:
-        return None
-    entry_price = float(position.get("entry_price") or 0)
-    exit_price = float(update.get("current_price") or 0)
-    peak_price = float(update.get("peak_price") or entry_price)
-    peak_ratio = (peak_price / entry_price) if entry_price else 1.0
-    liq_usd = float(snapshot.get("liq") or 0)
-    vol_usd = float(snapshot.get("vol") or 0)
-    entry_sol = float(position.get("entry_sol") or _DEFAULT_BACKTEST_ENTRY_SOL)
-    result = estimate_exit_friction(
-        realized_pnl_pct=realized_pnl_pct,
-        exit_price=exit_price,
-        entry_price=entry_price,
-        entry_sol=entry_sol,
-        liq_usd=liq_usd,
-        vol_usd=vol_usd,
-        exit_reason=update.get("exit_reason") or "",
-        peak_ratio=peak_ratio,
-    )
-    # estimate_exit_friction always returns a value when realized_pnl_pct is not None;
-    # the fallback of None here would only occur if the function itself raised, which
-    # is guarded by the check at the top of this function.
-    return result.get("friction_pnl_pct")
 
 
 def _to_snapshot(row):
@@ -168,6 +142,39 @@ def _to_event_snapshot(row, previous_snapshot=None):
     return snapshot
 
 
+def _apply_trade_friction(ideal_pnl_pct, entry_price, exit_price, entry_friction, snapshot, settings, exit_reason):
+    """Compute friction-adjusted P&L for a completed backtest trade.
+
+    Combines:
+    - Entry friction already baked into the effective entry price (stored separately)
+    - Exit friction: slippage, price impact, tx failure, delay, fees
+    Returns dict with friction_pnl_pct and breakdown components.
+    """
+    liq_usd = float(snapshot.get("liq") or 0) * 1000 if float(snapshot.get("liq") or 0) < 1000 else float(snapshot.get("liq") or 0)
+    vol_usd = float(snapshot.get("vol") or 0)
+    entry_sol = float(settings.get("max_buy_sol") or 0.04)
+    exit_f = estimate_exit_friction(
+        realized_pnl_pct=ideal_pnl_pct,
+        exit_price=exit_price,
+        entry_price=entry_price,
+        entry_sol=entry_sol,
+        liq_usd=liq_usd,
+        vol_usd=vol_usd,
+        exit_reason=exit_reason,
+        peak_ratio=max((exit_price / entry_price) if entry_price else 1.0, 1.0),
+    )
+    # The entry friction already inflated the entry price, so the ideal_pnl_pct
+    # is already lower than clean price would imply. Exit friction compounds on top.
+    friction_pnl_pct = exit_f.get("friction_pnl_pct")
+    if friction_pnl_pct is None:
+        friction_pnl_pct = ideal_pnl_pct
+    return {
+        "friction_pnl_pct": round(friction_pnl_pct, 2),
+        "exit_friction_pct": round(exit_f.get("total_friction_pct", 0), 2),
+        "entry_friction_pct": round(entry_friction, 2),
+    }
+
+
 def simulate_backtest(run_id, snapshot_rows, strategy_settings):
     open_positions = {}
     completed = []
@@ -210,13 +217,15 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
                     "trough_price": update["trough_price"],
                     "max_upside_pct": update["max_upside_pct"],
                     "max_drawdown_pct": update["max_drawdown_pct"],
-                    "tp1_hit": update["tp1_hit"],
-                    "tp1_pnl_pct": update["tp1_pnl_pct"],
                 })
                 if update["status"] == "closed":
                     tracker["trades_closed"] += 1
-                    shadow_pnl = update["realized_pnl_pct"] or 0.0
-                    friction_pnl = _apply_backtest_friction(shadow_pnl, position, update, snapshot)
+                    ideal_pnl = update["realized_pnl_pct"] or 0.0
+                    _frict = _apply_trade_friction(
+                        ideal_pnl, position["entry_price"], update["current_price"],
+                        position.get("entry_friction_pct", 0.0), snapshot, settings,
+                        update["exit_reason"] or "rule_exit",
+                    )
                     completed.append(BacktestTrade(
                         run_id=run_id,
                         strategy_name=strategy_name,
@@ -231,11 +240,14 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
                         confidence=position["confidence"],
                         max_upside_pct=update["max_upside_pct"],
                         max_drawdown_pct=update["max_drawdown_pct"],
-                        realized_pnl_pct=shadow_pnl,
-                        friction_pnl_pct=friction_pnl if friction_pnl is not None else shadow_pnl,
+                        realized_pnl_pct=ideal_pnl,
                         exit_reason=update["exit_reason"] or "rule_exit",
                         feature_json=position["feature_json"],
                         decision_json=position["decision_json"],
+                        friction_pnl_pct=_frict["friction_pnl_pct"],
+                        entry_friction_pct=_frict["entry_friction_pct"],
+                        exit_friction_pct=_frict["exit_friction_pct"],
+                        mev_probability=position.get("mev_probability", 0.0),
                     ))
                     del open_positions[key]
                 continue
@@ -245,12 +257,20 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
             if decision.passed:
                 tracker["passed"] += 1
                 tracker["trades_opened"] += 1
+                # Apply entry friction (MEV + slippage) — inflates the effective entry price
+                _entry_f = estimate_entry_friction(
+                    snapshot.get("price") or 0.0,
+                    liq_usd=float(snapshot.get("liq") or 0),
+                    entry_sol=float(settings.get("max_buy_sol") or 0.04),
+                    priority_fee=float(settings.get("priority_fee") or 30000),
+                )
+                _eff_entry = _entry_f["effective_entry_price"]
                 open_positions[key] = {
                     "opened_at": created_at,
-                    "entry_price": snapshot.get("price") or 0.0,
-                    "current_price": snapshot.get("price") or 0.0,
-                    "peak_price": snapshot.get("price") or 0.0,
-                    "trough_price": snapshot.get("price") or 0.0,
+                    "entry_price": _eff_entry,
+                    "current_price": _eff_entry,
+                    "peak_price": _eff_entry,
+                    "trough_price": _eff_entry,
                     "take_profit_mult": decision.metrics.get("take_profit_mult"),
                     "stop_loss_ratio": decision.metrics.get("stop_loss_ratio"),
                     "time_stop_min": decision.metrics.get("time_stop_min"),
@@ -258,6 +278,8 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
                     "confidence": decision.confidence,
                     "feature_json": json.dumps(snapshot),
                     "decision_json": json.dumps(decision.as_dict()),
+                    "entry_friction_pct": _entry_f["entry_friction_pct"],
+                    "mev_probability": _entry_f["mev_probability"],
                 }
             else:
                 tracker["blocked"] += 1
@@ -272,22 +294,21 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
     if snapshot_rows:
         final_ts = snapshot_rows[-1].get("created_at")
         final_prices = {}
-        final_snapshots = {}
         for row in snapshot_rows:
-            mint = row.get("mint")
-            if not mint:
-                continue
-            final_prices[mint] = float(row.get("price") or 0.0)
-            final_snapshots[mint] = _to_snapshot(row)
+            final_prices[row.get("mint")] = float(row.get("price") or 0.0)
         for (strategy_name, mint), position in list(open_positions.items()):
             settings = strategy_settings[strategy_name]
             last_price = final_prices.get(mint) or position["current_price"]
-            last_snapshot = final_snapshots.get(mint, {})
             age_min = max(0.0, (final_ts - position["opened_at"]).total_seconds() / 60.0) if final_ts else 0.0
             update = shadow_position_update(position, last_price, settings, age_min)
             metrics["strategies"][strategy_name]["trades_closed"] += 1
-            shadow_pnl = ((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0
-            friction_pnl = _apply_backtest_friction(shadow_pnl, position, update, last_snapshot)
+            _last_snap = {"liq": 0, "vol": 0}  # no snapshot available at run end
+            ideal_pnl = ((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0
+            _frict = _apply_trade_friction(
+                ideal_pnl, position["entry_price"], update["current_price"],
+                position.get("entry_friction_pct", 0.0), _last_snap, settings,
+                update["exit_reason"] or "run_end",
+            )
             completed.append(BacktestTrade(
                 run_id=run_id,
                 strategy_name=strategy_name,
@@ -302,20 +323,25 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
                 confidence=position["confidence"],
                 max_upside_pct=update["max_upside_pct"],
                 max_drawdown_pct=update["max_drawdown_pct"],
-                realized_pnl_pct=shadow_pnl,
-                friction_pnl_pct=friction_pnl if friction_pnl is not None else shadow_pnl,
+                realized_pnl_pct=ideal_pnl,
                 exit_reason=update["exit_reason"] or "run_end",
                 feature_json=position["feature_json"],
                 decision_json=position["decision_json"],
+                friction_pnl_pct=_frict["friction_pnl_pct"],
+                entry_friction_pct=_frict["entry_friction_pct"],
+                exit_friction_pct=_frict["exit_friction_pct"],
+                mev_probability=position.get("mev_probability", 0.0),
             ))
 
     summaries = {}
     for strategy_name in strategy_settings:
         trades = [trade for trade in completed if trade.strategy_name == strategy_name]
-        wins = [trade for trade in trades if trade.friction_pnl_pct > 0]
-        losses = [trade for trade in trades if trade.friction_pnl_pct <= 0]
+        wins = [trade for trade in trades if trade.realized_pnl_pct > 0]
+        losses = [trade for trade in trades if trade.realized_pnl_pct <= 0]
+        friction_wins = [trade for trade in trades if trade.friction_pnl_pct > 0]
         avg_pnl = round(sum(t.realized_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
         avg_friction_pnl = round(sum(t.friction_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
+        avg_mev_prob = round(sum(t.mev_probability for t in trades) / len(trades), 3) if trades else 0.0
         avg_upside = round(sum(t.max_upside_pct for t in trades) / len(trades), 2) if trades else 0.0
         avg_drawdown = round(sum(t.max_drawdown_pct for t in trades) / len(trades), 2) if trades else 0.0
         summaries[strategy_name] = {
@@ -326,10 +352,12 @@ def simulate_backtest(run_id, snapshot_rows, strategy_settings):
             "win_rate": round((len(wins) / len(trades)) * 100, 1) if trades else 0.0,
             "avg_pnl_pct": avg_pnl,
             "avg_friction_pnl_pct": avg_friction_pnl,
+            "friction_win_rate": round((len(friction_wins) / len(trades)) * 100, 1) if trades else 0.0,
+            "avg_mev_probability": avg_mev_prob,
             "avg_upside_pct": avg_upside,
             "avg_drawdown_pct": avg_drawdown,
-            "best_trade_pct": max((trade.friction_pnl_pct for trade in trades), default=0.0),
-            "worst_trade_pct": min((trade.friction_pnl_pct for trade in trades), default=0.0),
+            "best_trade_pct": max((trade.realized_pnl_pct for trade in trades), default=0.0),
+            "worst_trade_pct": min((trade.realized_pnl_pct for trade in trades), default=0.0),
         }
 
     return {
@@ -394,13 +422,15 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
                     "trough_price": update["trough_price"],
                     "max_upside_pct": update["max_upside_pct"],
                     "max_drawdown_pct": update["max_drawdown_pct"],
-                    "tp1_hit": update["tp1_hit"],
-                    "tp1_pnl_pct": update["tp1_pnl_pct"],
                 })
                 if update["status"] == "closed":
                     tracker["trades_closed"] += 1
-                    shadow_pnl = update["realized_pnl_pct"] or 0.0
-                    friction_pnl = _apply_backtest_friction(shadow_pnl, position, update, snapshot)
+                    ideal_pnl_et_mid = update["realized_pnl_pct"] or 0.0
+                    _frict_et = _apply_trade_friction(
+                        ideal_pnl_et_mid, position["entry_price"], update["current_price"],
+                        position.get("entry_friction_pct", 0.0), snapshot, settings,
+                        update["exit_reason"] or event_type,
+                    )
                     completed.append(BacktestTrade(
                         run_id=run_id,
                         strategy_name=strategy_name,
@@ -415,11 +445,14 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
                         confidence=position["confidence"],
                         max_upside_pct=update["max_upside_pct"],
                         max_drawdown_pct=update["max_drawdown_pct"],
-                        realized_pnl_pct=shadow_pnl,
-                        friction_pnl_pct=friction_pnl if friction_pnl is not None else shadow_pnl,
+                        realized_pnl_pct=update["realized_pnl_pct"] or 0.0,
                         exit_reason=update["exit_reason"] or event_type,
                         feature_json=position["feature_json"],
                         decision_json=position["decision_json"],
+                        friction_pnl_pct=_frict_et["friction_pnl_pct"],
+                        entry_friction_pct=_frict_et["entry_friction_pct"],
+                        exit_friction_pct=_frict_et["exit_friction_pct"],
+                        mev_probability=position.get("mev_probability", 0.0),
                     ))
                     del open_positions[key]
                 continue
@@ -429,12 +462,19 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
             if decision.passed:
                 tracker["passed"] += 1
                 tracker["trades_opened"] += 1
+                _entry_f_et = estimate_entry_friction(
+                    snapshot.get("price") or 0.0,
+                    liq_usd=float(snapshot.get("liq") or 0),
+                    entry_sol=float(settings.get("max_buy_sol") or 0.04),
+                    priority_fee=float(settings.get("priority_fee") or 30000),
+                )
+                _eff_entry_et = _entry_f_et["effective_entry_price"]
                 open_positions[key] = {
                     "opened_at": created_at,
-                    "entry_price": snapshot.get("price") or 0.0,
-                    "current_price": snapshot.get("price") or 0.0,
-                    "peak_price": snapshot.get("price") or 0.0,
-                    "trough_price": snapshot.get("price") or 0.0,
+                    "entry_price": _eff_entry_et,
+                    "current_price": _eff_entry_et,
+                    "peak_price": _eff_entry_et,
+                    "trough_price": _eff_entry_et,
                     "take_profit_mult": decision.metrics.get("take_profit_mult"),
                     "stop_loss_ratio": decision.metrics.get("stop_loss_ratio"),
                     "time_stop_min": decision.metrics.get("time_stop_min"),
@@ -442,6 +482,8 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
                     "confidence": decision.confidence,
                     "feature_json": json.dumps(snapshot),
                     "decision_json": json.dumps(decision.as_dict()),
+                    "entry_friction_pct": _entry_f_et["entry_friction_pct"],
+                    "mev_probability": _entry_f_et["mev_probability"],
                 }
             else:
                 tracker["blocked"] += 1
@@ -457,23 +499,24 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
         final_ts = event_rows[-1].get("created_at")
         final_prices = {}
         final_names = {}
-        final_snapshots = {}
         for row in event_rows:
             mint = row.get("mint")
             if not mint:
                 continue
             final_prices[mint] = float(row.get("price") or 0.0)
             final_names[mint] = row.get("name") or final_names.get(mint) or "Unknown"
-        # Use last_snapshots (built during the event loop) for liq/vol data at run end
         for (strategy_name, mint), position in list(open_positions.items()):
             settings = strategy_settings[strategy_name]
             last_price = final_prices.get(mint) or position["current_price"]
-            last_snapshot = last_snapshots.get(mint, {})
             age_min = max(0.0, (final_ts - position["opened_at"]).total_seconds() / 60.0) if final_ts else 0.0
             update = shadow_position_update(position, last_price, settings, age_min)
             metrics["strategies"][strategy_name]["trades_closed"] += 1
-            shadow_pnl = ((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0
-            friction_pnl = _apply_backtest_friction(shadow_pnl, position, update, last_snapshot)
+            ideal_pnl_et = ((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0
+            _frict_end = _apply_trade_friction(
+                ideal_pnl_et, position["entry_price"], update["current_price"],
+                position.get("entry_friction_pct", 0.0), {}, settings,
+                update["exit_reason"] or "run_end",
+            )
             completed.append(BacktestTrade(
                 run_id=run_id,
                 strategy_name=strategy_name,
@@ -488,20 +531,25 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
                 confidence=position["confidence"],
                 max_upside_pct=update["max_upside_pct"],
                 max_drawdown_pct=update["max_drawdown_pct"],
-                realized_pnl_pct=shadow_pnl,
-                friction_pnl_pct=friction_pnl if friction_pnl is not None else shadow_pnl,
+                realized_pnl_pct=ideal_pnl_et,
                 exit_reason=update["exit_reason"] or "run_end",
                 feature_json=position["feature_json"],
                 decision_json=position["decision_json"],
+                friction_pnl_pct=_frict_end["friction_pnl_pct"],
+                entry_friction_pct=_frict_end["entry_friction_pct"],
+                exit_friction_pct=_frict_end["exit_friction_pct"],
+                mev_probability=position.get("mev_probability", 0.0),
             ))
 
     summaries = {}
     for strategy_name in strategy_settings:
         trades = [trade for trade in completed if trade.strategy_name == strategy_name]
-        wins = [trade for trade in trades if trade.friction_pnl_pct > 0]
-        losses = [trade for trade in trades if trade.friction_pnl_pct <= 0]
+        wins = [trade for trade in trades if trade.realized_pnl_pct > 0]
+        losses = [trade for trade in trades if trade.realized_pnl_pct <= 0]
+        friction_wins = [trade for trade in trades if trade.friction_pnl_pct > 0]
         avg_pnl = round(sum(t.realized_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
         avg_friction_pnl = round(sum(t.friction_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
+        avg_mev_prob = round(sum(t.mev_probability for t in trades) / len(trades), 3) if trades else 0.0
         avg_upside = round(sum(t.max_upside_pct for t in trades) / len(trades), 2) if trades else 0.0
         avg_drawdown = round(sum(t.max_drawdown_pct for t in trades) / len(trades), 2) if trades else 0.0
         summaries[strategy_name] = {
@@ -512,10 +560,12 @@ def simulate_event_tape_backtest(run_id, event_rows, strategy_settings):
             "win_rate": round((len(wins) / len(trades)) * 100, 1) if trades else 0.0,
             "avg_pnl_pct": avg_pnl,
             "avg_friction_pnl_pct": avg_friction_pnl,
+            "friction_win_rate": round((len(friction_wins) / len(trades)) * 100, 1) if trades else 0.0,
+            "avg_mev_probability": avg_mev_prob,
             "avg_upside_pct": avg_upside,
             "avg_drawdown_pct": avg_drawdown,
-            "best_trade_pct": max((trade.friction_pnl_pct for trade in trades), default=0.0),
-            "worst_trade_pct": min((trade.friction_pnl_pct for trade in trades), default=0.0),
+            "best_trade_pct": max((trade.realized_pnl_pct for trade in trades), default=0.0),
+            "worst_trade_pct": min((trade.realized_pnl_pct for trade in trades), default=0.0),
         }
 
     return {
@@ -600,13 +650,9 @@ def simulate_policy_comparison(run_id, snapshot_rows, flow_rows, rule_settings, 
                     "trough_price": update["trough_price"],
                     "max_upside_pct": update["max_upside_pct"],
                     "max_drawdown_pct": update["max_drawdown_pct"],
-                    "tp1_hit": update["tp1_hit"],
-                    "tp1_pnl_pct": update["tp1_pnl_pct"],
                 })
                 if update["status"] == "closed":
                     tracker["trades_closed"] += 1
-                    shadow_pnl = update["realized_pnl_pct"] or 0.0
-                    friction_pnl = _apply_backtest_friction(shadow_pnl, position, update, snapshot)
                     completed.append(BacktestTrade(
                         run_id=run_id,
                         strategy_name=policy_name,
@@ -621,8 +667,7 @@ def simulate_policy_comparison(run_id, snapshot_rows, flow_rows, rule_settings, 
                         confidence=position["confidence"],
                         max_upside_pct=update["max_upside_pct"],
                         max_drawdown_pct=update["max_drawdown_pct"],
-                        realized_pnl_pct=shadow_pnl,
-                        friction_pnl_pct=friction_pnl if friction_pnl is not None else shadow_pnl,
+                        realized_pnl_pct=update["realized_pnl_pct"] or 0.0,
                         exit_reason=update["exit_reason"] or "rule_exit",
                         feature_json=position["feature_json"],
                         decision_json=position["decision_json"],
@@ -676,21 +721,13 @@ def simulate_policy_comparison(run_id, snapshot_rows, flow_rows, rule_settings, 
     if snapshot_rows:
         final_ts = snapshot_rows[-1].get("created_at")
         final_prices = {}
-        final_snapshots = {}
         for row in snapshot_rows:
-            mint = row.get("mint")
-            if not mint:
-                continue
-            final_prices[mint] = float(row.get("price") or 0.0)
-            final_snapshots[mint] = _to_snapshot(row)
+            final_prices[row.get("mint")] = float(row.get("price") or 0.0)
         for (policy_name, mint), position in list(open_positions.items()):
             last_price = final_prices.get(mint) or position["current_price"]
-            last_snapshot = final_snapshots.get(mint, {})
             age_min = max(0.0, (final_ts - position["opened_at"]).total_seconds() / 60.0) if final_ts else 0.0
             update = shadow_position_update(position, last_price, rule_settings, age_min)
             metrics["policies"][policy_name]["trades_closed"] += 1
-            shadow_pnl = ((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0
-            friction_pnl = _apply_backtest_friction(shadow_pnl, position, update, last_snapshot)
             completed.append(BacktestTrade(
                 run_id=run_id,
                 strategy_name=policy_name,
@@ -705,8 +742,7 @@ def simulate_policy_comparison(run_id, snapshot_rows, flow_rows, rule_settings, 
                 confidence=position["confidence"],
                 max_upside_pct=update["max_upside_pct"],
                 max_drawdown_pct=update["max_drawdown_pct"],
-                realized_pnl_pct=shadow_pnl,
-                friction_pnl_pct=friction_pnl if friction_pnl is not None else shadow_pnl,
+                realized_pnl_pct=((update["current_price"] / position["entry_price"]) - 1.0) * 100.0 if position["entry_price"] else 0.0,
                 exit_reason=update["exit_reason"] or "run_end",
                 feature_json=position["feature_json"],
                 decision_json=position["decision_json"],
@@ -715,9 +751,8 @@ def simulate_policy_comparison(run_id, snapshot_rows, flow_rows, rule_settings, 
     summaries = []
     for policy_name in policies:
         trades = [trade for trade in completed if trade.strategy_name == policy_name]
-        wins = [trade for trade in trades if trade.friction_pnl_pct > 0]
+        wins = [trade for trade in trades if trade.realized_pnl_pct > 0]
         avg_pnl = round(sum(t.realized_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
-        avg_friction_pnl = round(sum(t.friction_pnl_pct for t in trades) / len(trades), 2) if trades else 0.0
         avg_upside = round(sum(t.max_upside_pct for t in trades) / len(trades), 2) if trades else 0.0
         avg_drawdown = round(sum(t.max_drawdown_pct for t in trades) / len(trades), 2) if trades else 0.0
         summaries.append({
@@ -727,11 +762,10 @@ def simulate_policy_comparison(run_id, snapshot_rows, flow_rows, rule_settings, 
             "wins": len(wins),
             "win_rate": round((len(wins) / len(trades)) * 100.0, 1) if trades else 0.0,
             "avg_pnl_pct": avg_pnl,
-            "avg_friction_pnl_pct": avg_friction_pnl,
             "avg_upside_pct": avg_upside,
             "avg_drawdown_pct": avg_drawdown,
-            "best_trade_pct": max((trade.friction_pnl_pct for trade in trades), default=0.0),
-            "worst_trade_pct": min((trade.friction_pnl_pct for trade in trades), default=0.0),
+            "best_trade_pct": max((trade.realized_pnl_pct for trade in trades), default=0.0),
+            "worst_trade_pct": min((trade.realized_pnl_pct for trade in trades), default=0.0),
         })
 
     return {

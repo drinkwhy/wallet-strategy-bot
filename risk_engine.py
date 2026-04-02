@@ -48,6 +48,26 @@ RISK_THRESHOLDS = {
     "honeypot_buy_tax_threshold": 15,   # >15% buy tax suspicious
 }
 
+# Keys that the optimizer is allowed to tune — safety/circuit-breaker thresholds are excluded.
+_TUNABLE_RISK_KEYS = frozenset({"min_liquidity_usd", "min_token_age_sec"})
+
+
+def apply_optimized_risk_thresholds(values):
+    """Apply optimizer-derived values to the global RISK_THRESHOLDS dict.
+
+    Only keys present in _TUNABLE_RISK_KEYS are updated; safety and
+    circuit-breaker thresholds are intentionally excluded so they cannot
+    be relaxed by the optimizer.
+
+    Args:
+        values: dict mapping RISK_THRESHOLDS key → new value (from sweep_risk_thresholds)
+    """
+    if not isinstance(values, dict):
+        return
+    for key, value in values.items():
+        if key in _TUNABLE_RISK_KEYS and key in RISK_THRESHOLDS:
+            RISK_THRESHOLDS[key] = value
+
 # Known rug pull patterns
 RUG_PATTERNS = {
     "instant_lp_removal": {

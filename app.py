@@ -46,7 +46,7 @@ from learning_engine import (
     score_recent_candidates_for_regime,
     train_regime_model_family,
 )
-from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters
+from optimizer_engine import build_outcome_labels, summarize_feature_edges, summarize_regime_edges, sweep_entry_filters, sweep_exit_params, sweep_risk_thresholds
 from quant_platform import (
     CANONICAL_STRATEGIES,
     build_flow_snapshot,
@@ -63,7 +63,7 @@ from quant_platform import (
 # and observability as recommended by the research paper
 try:
     from whale_detection import get_whale_detection_system, WhaleDetectionSystem
-    from risk_engine import get_risk_engine, RiskEngine, RiskLevel
+    from risk_engine import get_risk_engine, RiskEngine, RiskLevel, apply_optimized_risk_thresholds
     from mev_protection import get_mev_protection, MEVProtectionSystem, SubmissionStrategy
     from observability import get_observability, ObservabilitySystem, AlertSeverity
     from enhanced_trading import (
@@ -92,9 +92,6 @@ def load_environment():
 
 load_environment()
 
-# ── Feature Flags ──────────────────────────────────────────────────────────────
-ENABLE_BEGINNER_UI = os.getenv("ENABLE_BEGINNER_UI", "true").lower() == "true"
-ENABLE_TOOLTIPS = os.getenv("ENABLE_TOOLTIPS", "true").lower() == "true"
 
 def require_env(name):
     value = os.getenv(name, "").strip()
@@ -313,11 +310,11 @@ def safe_json_response(resp, default=None):
         return default
 
 PLAN_LIMITS = {
-    "free":  {"label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
-    "basic": {"label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
-    "pro":   {"label": "Pro — $99/mo",          "perf_fee": PERF_FEE_PRO},
-    "elite": {"label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
-    "trial": {"label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
+    "free":  {"max_buy_sol": 0.05, "label": "Profit Only — 25% fee", "perf_fee": PERF_FEE_FREE},
+    "basic": {"max_buy_sol": 0.1,  "label": "Basic — $49/mo",        "perf_fee": PERF_FEE_BASIC},
+    "pro":   {"max_buy_sol": 1.0,  "label": "Pro — $99/mo",          "perf_fee": PERF_FEE_PRO},
+    "elite": {"max_buy_sol": 5.0,  "label": "Elite — $199/mo",       "perf_fee": PERF_FEE_ELITE},
+    "trial": {"max_buy_sol": 0.05, "label": "Free Trial (7 days)",   "perf_fee": PERF_FEE_BASIC},
 }
 PRICE_TO_PLAN = {}
 for _plan_name, _price_id in (("basic", STRIPE_PRICE_BASIC), ("pro", STRIPE_PRICE_PRO), ("elite", STRIPE_PRICE_ELITE)):
@@ -469,10 +466,15 @@ BOT_OVERRIDE_FIELDS = [
     ("max_age_min", int), ("time_stop_min", int), ("min_liq", float),
     ("min_mc", float), ("max_mc", float), ("priority_fee", int),
     ("min_vol", float), ("min_score", int), ("risk_per_trade_pct", float),
+    ("min_composite_score", float), ("min_confidence", float),
+    ("min_buy_sell_ratio", float), ("min_smart_wallet_buys", int),
+    ("min_net_flow_sol", float), ("min_unique_buyers", int),
+    ("max_threat_score", int),
     ("min_holder_growth_pct", float), ("min_narrative_score", int),
     ("min_green_lights", int), ("min_volume_spike_mult", float),
     ("late_entry_mult", float), ("nuclear_narrative_score", int),
     ("offpeak_min_change", float), ("max_hot_change", float),
+    ("max_threat_score", float),
     ("peak_plateau_mode", bool), ("tp1_sell_pct", float),
     ("anti_rug", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
     ("check_holders", lambda v: bool(v) if isinstance(v, bool) else str(v or "").strip().lower() in {"1", "true", "yes", "on"}),
@@ -1399,7 +1401,6 @@ def init_db():
             max_upside_pct REAL,
             max_drawdown_pct REAL,
             realized_pnl_pct REAL,
-            friction_pnl_pct REAL,
             exit_reason TEXT,
             feature_json TEXT,
             decision_json TEXT,
@@ -1538,7 +1539,6 @@ def migrate_db():
             "ALTER TABLE token_intel ADD COLUMN IF NOT EXISTS buy_sell_ratio REAL DEFAULT 0",
             "ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS replay_mode TEXT DEFAULT 'snapshot'",
             "ALTER TABLE token_flow_snapshots ADD COLUMN IF NOT EXISTS regime_label TEXT DEFAULT 'neutral'",
-            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS friction_pnl_pct REAL",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS tp1_pnl_pct REAL DEFAULT 0",
             "ALTER TABLE shadow_positions ADD COLUMN IF NOT EXISTS blocked_by_cooldown INTEGER DEFAULT 0",
@@ -1562,6 +1562,10 @@ def migrate_db():
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp1_hit INTEGER DEFAULT 0",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_reason TEXT",
             "ALTER TABLE trades ADD COLUMN IF NOT EXISTS tx_signature TEXT",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS friction_pnl_pct REAL DEFAULT 0",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS entry_friction_pct REAL DEFAULT 0",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS exit_friction_pct REAL DEFAULT 0",
+            "ALTER TABLE backtest_trades ADD COLUMN IF NOT EXISTS mev_probability REAL DEFAULT 0",
         ]
         for m in migrations:
             try:
@@ -1876,7 +1880,6 @@ def migrate_db():
                 max_upside_pct REAL,
                 max_drawdown_pct REAL,
                 realized_pnl_pct REAL,
-                friction_pnl_pct REAL,
                 exit_reason TEXT,
                 feature_json TEXT,
                 decision_json TEXT,
@@ -2124,7 +2127,7 @@ user_bots    = {}
 user_bots_lock = threading.Lock()
 seen_tokens  = set()
 seen_tokens_lock = threading.Lock()
-market_feed  = deque(maxlen=100)   # live token stream for market board
+market_feed  = deque(maxlen=400)   # live token stream for market board
 shadow_market_queue = deque(maxlen=400)
 shadow_market_lock = threading.Lock()
 _backtest_jobs = {}
@@ -2618,10 +2621,10 @@ class BotInstance:
             self.log.pop()
         print(f"[U{self.user_id}] {msg}")
 
-    def log_filter(self, name, mint, passed, reason, score=0):
+    def log_filter(self, name, mint, passed, reason, score=0, price=0):
         entry = {
             "name": name, "mint": mint, "passed": passed,
-            "reason": reason, "score": score,
+            "reason": reason, "score": score, "price": price,
             "ts": time.strftime("%H:%M:%S")
         }
         self.filter_log.appendleft(entry)
@@ -3667,12 +3670,6 @@ class BotInstance:
                                (self.user_id, mint, name, "BUY", real_price, trade_sol, real_price, 0, 0))
                     _conn.commit()
                     update_coin_portfolio_cache(self.user_id, mint, name)
-                    # Trigger first trade milestone event (non-blocking)
-                    try:
-                        import requests
-                        requests.post(f"http://localhost:5000/api/milestones/trade-executed", timeout=1)
-                    except:
-                        pass
                 finally:
                     db_return(_conn)
             except Exception as _e:
@@ -3718,12 +3715,6 @@ class BotInstance:
                     try:
                         _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                         _conn.commit()
-                        # Trigger first position closed milestone (non-blocking)
-                        try:
-                            import requests
-                            requests.post(f"http://localhost:5000/api/milestones/position-closed", timeout=1)
-                        except:
-                            pass
                     finally:
                         db_return(_conn)
                 except Exception as _e:
@@ -3885,12 +3876,6 @@ class BotInstance:
                         try:
                             _conn.cursor().execute("DELETE FROM open_positions WHERE user_id=%s AND mint=%s", (self.user_id, mint))
                             _conn.commit()
-                            # Trigger first position closed milestone (non-blocking)
-                            try:
-                                import requests
-                                requests.post(f"http://localhost:5000/api/milestones/position-closed", timeout=1)
-                            except:
-                                pass
                         finally:
                             db_return(_conn)
                     except Exception as _e:
@@ -4113,7 +4098,7 @@ class BotInstance:
                 {"name": "Market Cap", "passed": min_mc <= mc <= max_mc, "value": f"${mc:,.0f}", "threshold": f"${min_mc:,}\u2013${max_mc:,}"},
                 {"name": "Liquidity", "passed": (not liq_filter_on) or liq >= min_liq, "value": f"${liq:,.0f}", "threshold": "pumpfun bypass" if pumpfun_liq_bypass else ("off" if not liq_filter_on else f"\u2265 ${min_liq:,.0f}")},
                 {"name": "Token Age", "passed": age_min <= max_age, "value": f"{age_min:.0f}m", "threshold": f"\u2264 {max_age}m"},
-                {"name": "Price Change", "passed": 0 < change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"> 0% and \u2264 {max_hot_change:.0f}%"},
+                {"name": "Price Change", "passed": change >= 0 and change <= max_hot_change, "value": f"{change:+.0f}%", "threshold": f"\u2265 0% and \u2264 {max_hot_change:.0f}%"},
                 {"name": "Volume", "passed": vol >= min_vol, "value": f"${vol:,.0f}", "threshold": f"\u2265 ${min_vol:,}"},
                 {"name": "AI Score", "passed": score_total >= min_score, "value": f"{score_total}/100", "threshold": f"\u2265 {min_score}"},
             ],
@@ -4136,7 +4121,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if change <= 0:
+        if change < 0:
             sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
@@ -4163,6 +4148,7 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
+        self.log_msg(f"🔍 SCAN {name} | Score: {score_total} MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m — fetching intel…")
         intel = ensure_token_intel(mint, base_info={
             "mint": mint,
             "name": name,
@@ -4239,26 +4225,31 @@ class BotInstance:
             sig_entry["reason"] = "Transfer hook / Token-2022 exit risk"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"⚠️ SKIP {name} — Transfer hook / exit risk")
             return
         if can_exit is False:
             sig_entry["reason"] = "No exit route available"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"⚠️ SKIP {name} — No exit route")
             return
         if threat_score >= 60:
             sig_entry["reason"] = f"Threat risk {threat_score}/100 ({', '.join(threat_flags[:3]) or 'risk'})"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"🚨 SKIP {name} — Threat {threat_score}/100 {', '.join(threat_flags[:2]) if threat_flags else ''}")
             return
         if checklist["green_lights"] < min_green_lights and not adaptive_green_override:
             sig_entry["reason"] = f"Only {checklist['green_lights']}/3 green lights"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"❌ SKIP {name} — {checklist['green_lights']}/3 green lights (need {min_green_lights})")
             return
         if float(intel.get("max_multiple") or 1) > late_entry_mult and int(intel.get("narrative_score") or 0) < nuclear_narrative_score:
             sig_entry["reason"] = f"Late entry ({float(intel.get('max_multiple') or 1):.2f}x) without nuclear narrative"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
+            self.log_msg(f"⏱️ SKIP {name} — Late entry {float(intel.get('max_multiple') or 1):.1f}x")
             return
         snapshot_info = {
             "mint": mint,
@@ -4297,7 +4288,7 @@ class BotInstance:
         sig_entry["reason"] = f"Passed all filters · {execution_prefix} · {policy_label}"
         self.log_signal_entry(sig_entry)
         self.log_msg(f"🟢 SIGNAL {name} | MC:${mc:,.0f} Liq:${liq:,.0f} Age:{age_min:.0f}m Chg:{change:+.0f}% Score:{score_total}")
-        self.log_filter(name, mint, True, "Signal passed all filters")
+        self.log_filter(name, mint, True, "Signal passed all filters", price=price)
         # ── Build human-readable buy reason for dashboard cards ────────────────
         _br = []
         if change >= 30: _br.append(f"+{change:.0f}% momentum")
@@ -4317,7 +4308,7 @@ class BotInstance:
             if execution_decision.get("model_score") is not None:
                 detail += f" @ {float(execution_decision.get('model_score') or 0):.1f}"
             self.log_msg(f"PAPER BUY {name} — {detail}")
-            self.log_filter(name, mint, True, f"PAPER {detail}")
+            self.log_filter(name, mint, True, f"PAPER {detail}", price=price)
             return
         self.buy(
             mint,
@@ -6081,6 +6072,24 @@ def _process_dex_pair(p):
         return None
 
 
+def _pick_best_solana_pair(pairs, mint_hint=None):
+    """Pick the best Solana pair, preferring the requested mint and highest liquidity."""
+    if not pairs:
+        return None
+    sol_pairs = [p for p in pairs if (p or {}).get("chainId") == "solana"]
+    candidates = sol_pairs or list(pairs)
+    if mint_hint:
+        mint_matches = [
+            p for p in candidates
+            if ((p.get("baseToken") or {}).get("address") == mint_hint)
+        ]
+        if mint_matches:
+            candidates = mint_matches
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: float(((p.get("liquidity") or {}).get("usd") or 0)))
+
+
 def _shadow_strategy_settings(user_id=None):
     strategies = {
         strategy_name: dict(PRESETS.get(strategy_name, {}))
@@ -7128,21 +7137,14 @@ def _auto_tune_from_results(requested_by, summary, run_id):
     if not strategies and not per_strategy:
         return
 
-    # Score each strategy: weighted combo of win_rate and friction-adjusted avg P&L
+    # Score each strategy: weighted combo of win_rate and avg_pnl
     scored = []
     for strat_name, data in strategies.items():
         closed = data.get("trades_closed", data.get("closed", 0)) or 0
         if closed < 3:
             continue  # need minimum trades to be meaningful
         win_rate = float(data.get("win_rate", 0))
-        # Prefer friction-adjusted P&L; discount shadow P&L by 50% if not available
-        avg_friction_pnl = data.get("avg_friction_pnl_pct")
-        avg_shadow_pnl = float(data.get("avg_pnl_pct", 0))
-        avg_pnl = float(avg_friction_pnl) if avg_friction_pnl is not None else avg_shadow_pnl * 0.5
-        # Require the friction-adjusted expected value to not be deeply negative
-        if avg_pnl < -30:
-            print(f"[AUTO-TUNE] skipping {strat_name}: friction P&L too negative ({avg_pnl:+.1f}%)", flush=True)
-            continue
+        avg_pnl = float(data.get("avg_pnl_pct", 0))
         # Score: prioritize win rate but reward profitability
         score = (win_rate * 0.6) + (max(avg_pnl, -50) * 0.4)
         best_settings = None
@@ -7258,8 +7260,9 @@ def _execute_backtest_run(run_id, requested_by, days, strategy_names, name, repl
                         run_id, strategy_name, mint, name, opened_at, closed_at,
                         entry_price, exit_price, status, score, confidence,
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
-                        friction_pnl_pct, exit_reason, feature_json, decision_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        exit_reason, feature_json, decision_json,
+                        friction_pnl_pct, entry_friction_pct, exit_friction_pct, mev_probability
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, [trade.as_insert_tuple() for trade in trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
@@ -7376,21 +7379,16 @@ def _generate_sweep_levels(base_preset, num_levels=5):
 
 def _score_sweep_result(summary, strategy_name):
     """Score a backtest result for ranking sweep levels.
-    Higher = better. Uses friction-adjusted P&L to avoid over-optimizing on
-    unrealistic shadow returns. Balances win rate, realistic profit, and trade count."""
+    Higher = better. Balances win rate, profit, and trade count."""
     strat = (summary.get("strategies") or {}).get(strategy_name, {})
     closed = strat.get("trades_closed", 0)
     if closed == 0:
         return -999.0
     wins = strat.get("wins", 0)
     win_rate = (wins / closed) if closed else 0
-    # Prefer friction-adjusted P&L; fall back to shadow P&L discounted by 50%
-    avg_friction_pnl = strat.get("avg_friction_pnl_pct")
-    avg_shadow_pnl = strat.get("avg_pnl_pct", 0) or 0
-    avg_pnl = avg_friction_pnl if avg_friction_pnl is not None else avg_shadow_pnl * 0.5
-    # Normalize trade count: confidence grows linearly from 0→10 trades,
-    # then continues to full weight at 50 trades.  Penalises tiny samples heavily.
-    trade_norm = min(closed / 50.0, 1.0) * min(closed / 10.0, 1.0)
+    avg_pnl = strat.get("avg_pnl_pct", 0) or 0
+    # Normalize trade count (more trades = more confidence, up to ~50)
+    trade_norm = min(closed / 50.0, 1.0)
     return (win_rate * 40) + (avg_pnl * 0.4) + (trade_norm * 20)
 
 
@@ -7535,8 +7533,9 @@ def _execute_optimization_run(run_id, requested_by, days, strategy_names, name):
                         run_id, strategy_name, mint, name, opened_at, closed_at,
                         entry_price, exit_price, status, score, confidence,
                         max_upside_pct, max_drawdown_pct, realized_pnl_pct,
-                        friction_pnl_pct, exit_reason, feature_json, decision_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        exit_reason, feature_json, decision_json,
+                        friction_pnl_pct, entry_friction_pct, exit_friction_pct, mev_probability
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, [t.as_insert_tuple() for t in all_best_trades], page_size=200)
             cur.execute("""
                 UPDATE backtest_runs
@@ -7597,7 +7596,7 @@ def _all_known_presets():
     return merged
 
 
-def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="snapshot"):
+def launch_backtest_run(requested_by, days=7, strategy_names=None, name="", replay_mode="event_tape"):
     all_presets = _all_known_presets()
     all_strategy_names = list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES
     strategy_names = [s for s in (strategy_names or all_strategy_names) if s in all_presets]
@@ -7865,8 +7864,6 @@ def global_scanner():
             sol_tokens = [t for t in tokens if t.get("chainId") == "solana"]
             with seen_tokens_lock:
                 new_tokens  = [t for t in sol_tokens if t.get("tokenAddress") and t["tokenAddress"] not in seen_tokens]
-                for t in new_tokens:
-                    seen_tokens.add(t["tokenAddress"])
             if new_tokens:
                 print(f"[SCANNER] token-profiles: {len(tokens)} total, {len(sol_tokens)} solana, {len(new_tokens)} new", flush=True)
             def _scan_token(t):
@@ -7881,8 +7878,13 @@ def global_scanner():
                     pairs = resp.json().get("pairs") or []
                     if not pairs:
                         return
-                    info = _process_dex_pair(pairs[0])
+                    best_pair = _pick_best_solana_pair(pairs, mint_hint=mint)
+                    if not best_pair:
+                        return
+                    info = _process_dex_pair(best_pair)
                     if info:
+                        with seen_tokens_lock:
+                            seen_tokens.add(mint)
                         _broadcast_signal(info)
                 except Exception:
                     pass
@@ -7921,8 +7923,6 @@ def new_pairs_scanner():
                     sol = [i for i in items if i.get("chainId") == "solana"]
                     with seen_tokens_lock:
                         new = [i for i in sol if i.get("tokenAddress") and i["tokenAddress"] not in seen_tokens]
-                        for item in new:
-                            seen_tokens.add(item["tokenAddress"])
                     if new:
                         print(f"[SCANNER2] {label}: {len(items)} total, {len(sol)} solana, {len(new)} new", flush=True)
                     def _scan2_token(item):
@@ -7936,8 +7936,13 @@ def new_pairs_scanner():
                                 return
                             pairs = r2.json().get("pairs") or []
                             if pairs:
-                                info = _process_dex_pair(pairs[0])
+                                best_pair = _pick_best_solana_pair(pairs, mint_hint=mint)
+                                if not best_pair:
+                                    return
+                                info = _process_dex_pair(best_pair)
                                 if info:
+                                    with seen_tokens_lock:
+                                        seen_tokens.add(mint)
                                     _broadcast_signal(info)
                         except Exception:
                             pass
@@ -7949,6 +7954,84 @@ def new_pairs_scanner():
         except Exception as e:
             print(f"[SCANNER2] outer error: {e}", flush=True)
             time.sleep(20)
+
+
+def pumpfun_scanner():
+    """Tertiary scanner: polls Pump.fun for genuinely fresh token launches (seconds to minutes old).
+
+    Unlike token-profiles and token-boosts endpoints (which surface established tokens
+    with profiles/ads), this endpoint returns coins sorted by creation_time — ensuring
+    the scanner feeds truly new tokens to the bots rather than re-evaluating stale coins.
+    Targets a 15-second polling cadence regardless of processing time.
+    """
+    PUMPFUN_URL = (
+        "https://frontend-api.pump.fun/coins"
+        "?sort=creation_time&order=DESC&limit=50&includeNsfw=false"
+    )
+    _POLL_INTERVAL = 15
+    time.sleep(20)
+    print("[SCANNER3] Pump.fun fresh-launch scanner started", flush=True)
+    while True:
+        cycle_start = time.time()
+        try:
+            resp = requests.get(PUMPFUN_URL, headers=HEADERS, timeout=10)
+            if resp.status_code == 429:
+                time.sleep(60)
+                continue
+            if resp.status_code != 200:
+                print(f"[SCANNER3] pump.fun HTTP {resp.status_code}", flush=True)
+                time.sleep(30)
+                continue
+            try:
+                coins = resp.json()
+                if not isinstance(coins, list):
+                    coins = []
+            except Exception:
+                coins = []
+
+            with seen_tokens_lock:
+                new_coins = [c for c in coins if c.get("mint") and c["mint"] not in seen_tokens]
+
+            if new_coins:
+                print(f"[SCANNER3] pump.fun: {len(coins)} total, {len(new_coins)} new to evaluate", flush=True)
+
+            def _scan_pumpfun_token(coin):
+                mint = coin.get("mint")
+                if not mint:
+                    return
+                try:
+                    r2 = dex_get(
+                        f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+                        timeout=5,
+                    )
+                    if r2.status_code != 200:
+                        return
+                    pairs = r2.json().get("pairs") or []
+                    if not pairs:
+                        return
+                    best_pair = _pick_best_solana_pair(pairs, mint_hint=mint)
+                    if not best_pair:
+                        return
+                    info = _process_dex_pair(best_pair)
+                    if info:
+                        info.setdefault("source", "pumpfun-scanner")
+                        with seen_tokens_lock:
+                            seen_tokens.add(mint)
+                        _broadcast_signal(info)
+                except Exception as inner_e:
+                    print(f"[SCANNER3] token {mint} error: {inner_e}", flush=True)
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                pool.map(_scan_pumpfun_token, new_coins)
+
+            elapsed = time.time() - cycle_start
+            sleep_for = max(0, _POLL_INTERVAL - elapsed)
+            if sleep_for:
+                time.sleep(sleep_for)
+        except Exception as e:
+            print(f"[SCANNER3] error: {e}", flush=True)
+            time.sleep(30)
+
 
 # ── Helius websocket pool sniping ──────────────────────────────────────────────
 def _sniper_emit_token(mint, source_label="helius-ws"):
@@ -8066,7 +8149,6 @@ def _run_enhanced_ws_sniper():
                 "method": "transactionSubscribe",
                 "params": [{
                     "accountInclude": [PUMP_FUN],
-                    "type": "all",
                 }, {
                     "commitment": "processed",
                     "maxSupportedTransactionVersion": 0,
@@ -8078,7 +8160,6 @@ def _run_enhanced_ws_sniper():
                 "method": "transactionSubscribe",
                 "params": [{
                     "accountInclude": [RAYDIUM_AMM],
-                    "type": "all",
                 }, {
                     "commitment": "processed",
                     "maxSupportedTransactionVersion": 0,
@@ -8093,9 +8174,17 @@ def _run_enhanced_ws_sniper():
                 if data.get("error"):
                     err = data["error"]
                     err_msg = str(err.get("message", ""))
-                    if "business" in err_msg.lower() or err.get("code") == -32403:
+                    err_code = err.get("code")
+                    if "business" in err_msg.lower() or err_code == -32403:
                         state["plan_blocked"] = True
                         print(f"[Sniper] Enhanced WS blocked: {err_msg} — falling back", flush=True)
+                        ws.close()
+                        return
+                    if err_code == -32602:
+                        # Invalid subscription params — our subscription was rejected; close and
+                        # fall back to logsSubscribe rather than leaving a dead connection open.
+                        state["plan_blocked"] = True
+                        print(f"[Sniper] Enhanced WS invalid params: {err_msg} — falling back", flush=True)
                         ws.close()
                         return
                     print(f"[Sniper] Enhanced WS error: {err}", flush=True)
@@ -8863,33 +8952,59 @@ def _auto_prune_db():
         _run_db_prune()
 
 
-_SHADOW_TUNE_INTERVAL = 3600  # auto-tune from shadow results every 1 hour
+_SHADOW_TUNE_INTERVAL = 1200  # auto-tune from shadow results every 20 minutes
 _last_shadow_tune_at = 0
 
 # ---------- Coin evaluation: sweep all recorded tokens to find optimal filter thresholds ----------
 
 # Map sweep feature names → bot setting names so optimized thresholds can be applied
 _SWEEP_FEATURE_TO_SETTING = {
-    "composite_score": ("min_score", int),
-    "volume_spike_ratio": ("min_volume_spike_mult", float),
+    "score":            ("min_score", int),
+    "composite_score":  ("min_composite_score", int),
+    "confidence":       ("min_confidence", float),
+    "liq":              ("min_liq", float),
+    "vol":              ("min_vol", float),
+    "mc":               ("min_mc", float),
+    "age_min":          ("max_age_min", int),
+    "threat_risk_score":("max_threat_score", int),
+    "green_lights":     ("min_green_lights", int),
+    "narrative_score":  ("min_narrative_score", int),
+    "change":           ("max_hot_change", float),
+    "volume_spike_ratio":("min_volume_spike_mult", float),
     "holder_growth_1h": ("min_holder_growth_pct", float),
-    "confidence": ("min_confidence", float),
-    "buy_sell_ratio": ("min_buy_sell_ratio", float),
-    "smart_wallet_buys": ("min_smart_wallet_buys", int),
-    "net_flow_sol": ("min_net_flow_sol", float),
-    "unique_buyer_count": ("min_unique_buyers", int),
+    "buy_sell_ratio":   ("min_buy_sell_ratio", float),
+    "smart_wallet_buys":("min_smart_wallet_buys", int),
+    "net_flow_sol":     ("min_net_flow_sol", float),
+    "unique_buyer_count":("min_unique_buyers", int),
+}
+
+# Features where the filter direction is "max" (value <= threshold).
+# All other features use "min" (value >= threshold).
+_SWEEP_DIRECTION_MAP = {
+    "threat_risk_score": "max",
+    "age_min": "max",
+    "change": "max",
 }
 
 # Expanded threshold plan covering more granular values than the default
 _TUNE_THRESHOLD_PLAN = {
-    "composite_score": [30, 40, 50, 60, 70, 80],
-    "confidence": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-    "buy_sell_ratio": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],
-    "smart_wallet_buys": [0, 1, 2, 3, 4],
-    "net_flow_sol": [0.0, 1.0, 2.0, 5.0, 10.0],
-    "volume_spike_ratio": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
-    "holder_growth_1h": [10, 20, 30, 40, 50],
-    "unique_buyer_count": [5, 10, 15, 20, 30],
+    "score":            {"thresholds": [10, 20, 30, 40, 50, 60],            "direction": "gte", "min_selected": 8},
+    "composite_score":  {"thresholds": [30, 40, 50, 60, 70, 80],            "direction": "gte", "min_selected": 8},
+    "confidence":       {"thresholds": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8],     "direction": "gte", "min_selected": 8},
+    "liq":              {"thresholds": [1000, 3000, 5000, 10000, 25000, 50000], "direction": "gte", "min_selected": 8},
+    "vol":              {"thresholds": [1000, 3000, 5000, 10000, 25000, 50000], "direction": "gte", "min_selected": 8},
+    "mc":               {"thresholds": [5000, 10000, 50000, 100000, 250000], "direction": "gte", "min_selected": 8},
+    "age_min":          {"thresholds": [15, 30, 60, 120, 240, 480],         "direction": "lte", "min_selected": 8},
+    "threat_risk_score":{"thresholds": [35, 45, 55, 65, 75],                "direction": "lte", "min_selected": 8},
+    "change":           {"thresholds": [50, 100, 150, 200, 300, 400],       "direction": "lte", "min_selected": 8},
+    "green_lights":     {"thresholds": [0, 1, 2, 3],                        "direction": "gte", "min_selected": 8},
+    "narrative_score":  {"thresholds": [3, 5, 10, 15, 20, 30],             "direction": "gte", "min_selected": 8},
+    "buy_sell_ratio":   {"thresholds": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],    "direction": "gte", "min_selected": 8},
+    "smart_wallet_buys":{"thresholds": [0, 1, 2, 3, 4],                    "direction": "gte", "min_selected": 8},
+    "net_flow_sol":     {"thresholds": [0.0, 1.0, 2.0, 5.0, 10.0],        "direction": "gte", "min_selected": 8},
+    "volume_spike_ratio":{"thresholds": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],  "direction": "gte", "min_selected": 8},
+    "holder_growth_1h": {"thresholds": [10, 20, 30, 40, 50],               "direction": "gte", "min_selected": 8},
+    "unique_buyer_count":{"thresholds": [5, 10, 15, 20, 30],               "direction": "gte", "min_selected": 8},
 }
 
 
@@ -8936,7 +9051,7 @@ def _evaluate_all_recorded_coins(days=7):
         flow_rows = model_rows.get("flow_rows") or []
 
         # Step 2: sweep every feature × threshold to find optimal entry filters
-        sweep_results = sweep_entry_filters(entry_rows, outcomes, threshold_plan=_TUNE_THRESHOLD_PLAN)
+        sweep_results = sweep_entry_filters(entry_rows, outcomes, threshold_plan=_TUNE_THRESHOLD_PLAN, direction_map=_SWEEP_DIRECTION_MAP)
 
         # Step 3: identify top feature edges (which features best separate winners from rugs)
         feature_edges = summarize_feature_edges(entry_rows, outcomes, top_n=8)
@@ -8970,13 +9085,18 @@ def _evaluate_all_recorded_coins(days=7):
             edge_score = best.get("edge_score", 0)
             winner_rate = best.get("winner_rate_pct", 0)
             rug_rate = best.get("rug_rate_pct", 0)
+            min_selected = int(best.get("min_selected") or 8)
 
             # Only apply if the sweep had enough samples and a positive edge
-            if selected < 5 or edge_score <= 0:
+            if selected < min_selected or edge_score <= 2:
                 continue
 
             # Only apply if rug rate dropped meaningfully (filter is actually helping)
             if rug_rate > 40:
+                continue
+
+            # Require at least a minimal winner density so we do not overfit to tiny slices.
+            if winner_rate < 20:
                 continue
 
             mapping = _SWEEP_FEATURE_TO_SETTING.get(feat_name)
@@ -8995,6 +9115,65 @@ def _evaluate_all_recorded_coins(days=7):
             for edge in feature_edges[:5]:
                 print(f"[COIN-EVAL]   {edge['label']}: winner_avg={edge['winner_avg']}, "
                       f"rug_avg={edge['rug_avg']}, edge={edge['edge']}", flush=True)
+
+        # ── Step 5b: Exit-parameter sweep over the full position lifecycle ──────
+        # Load the event tape and run all tp/stop/trail combos in one backtest pass.
+        print(f"[COIN-EVAL] running exit-parameter sweep (tp/stop/trail grid)...", flush=True)
+        try:
+            exit_event_rows = _load_backtest_event_tape(days=days)
+            if exit_event_rows:
+                # Use balanced preset as the base so entry filters are neutral;
+                # we want to isolate the impact of exit params, not entry selection.
+                _base_for_exit_sweep = dict(PRESETS.get("balanced") or list(PRESETS.values())[0])
+                # Overlay any entry settings already optimized this cycle
+                _base_for_exit_sweep.update(optimized_settings)
+                exit_sweep = sweep_exit_params(
+                    event_rows=exit_event_rows,
+                    base_settings=_base_for_exit_sweep,
+                    min_trades=8,
+                )
+                if exit_sweep and exit_sweep.get("best_exit_settings"):
+                    _best_exit = exit_sweep["best_exit_settings"]
+                    _best_pnl  = exit_sweep["best_avg_pnl"]
+                    _best_wr   = exit_sweep["best_win_rate"]
+                    _n         = exit_sweep["best_trades"]
+                    _combos    = exit_sweep["combos_tested"]
+                    _kelly     = exit_sweep.get("kelly_risk_pct", 2.0)
+                    print(
+                        f"[COIN-EVAL] exit sweep: {_combos} combos tested, "
+                        f"best avg_pnl={_best_pnl:+.1f}% win_rate={_best_wr:.0f}% n={_n} — "
+                        f"tp1={_best_exit.get('tp1_mult')}, tp2={_best_exit.get('tp2_mult')}, "
+                        f"stop={_best_exit.get('stop_loss')}, trail={_best_exit.get('trail_pct')}, "
+                        f"time_stop={_best_exit.get('time_stop_min')}min", flush=True
+                    )
+                    # Merge best exit params into optimized_settings
+                    for _k, _v in _best_exit.items():
+                        optimized_settings[_k] = _v
+                    # Quarter-Kelly position sizing recommendation
+                    if _kelly != 2.0:
+                        optimized_settings["risk_per_trade_pct"] = _kelly
+                        print(f"[COIN-EVAL]   Kelly risk_per_trade_pct → {_kelly}%", flush=True)
+                else:
+                    print(f"[COIN-EVAL] exit sweep: not enough trades to pick a winner (need ≥8 per combo)", flush=True)
+            else:
+                print(f"[COIN-EVAL] exit sweep skipped — no event tape rows (bot needs to run first)", flush=True)
+        except Exception as _exit_sweep_err:
+            print(f"[COIN-EVAL] exit sweep error: {_exit_sweep_err}", flush=True)
+
+        # ── Step 5c: Risk threshold sweep ────────────────────────────────────
+        # Test different values for token-quality RISK_THRESHOLDS using the same
+        # winner/rug outcome data.  Results are applied globally so all bots benefit.
+        print(f"[COIN-EVAL] running risk threshold sweep (min_liquidity_usd, min_token_age_sec)...", flush=True)
+        try:
+            risk_threshold_updates = sweep_risk_thresholds(entry_rows, outcomes)
+            if risk_threshold_updates:
+                apply_optimized_risk_thresholds(risk_threshold_updates)
+                for _rk, _rv in risk_threshold_updates.items():
+                    print(f"[COIN-EVAL]   RISK_THRESHOLDS[{_rk!r}] → {_rv}", flush=True)
+            else:
+                print(f"[COIN-EVAL] risk threshold sweep: no improvements found (not enough data)", flush=True)
+        except Exception as _risk_sweep_err:
+            print(f"[COIN-EVAL] risk threshold sweep error: {_risk_sweep_err}", flush=True)
 
         # Determine current regime for context
         current_regime = "neutral"
@@ -9317,6 +9496,7 @@ def ensure_background_workers_started():
             check_whale_wallets,
             global_scanner,
             new_pairs_scanner,
+            pumpfun_scanner,
             helius_pool_sniper,
             token_pattern_monitor,
             momentum_sniper,
@@ -9834,38 +10014,6 @@ def dashboard():
         traceback.print_exc()
         return Response("<h1>Dashboard Error</h1><p>An unexpected error occurred.</p>", status=500, mimetype="text/html")
 
-# ── Milestone API Endpoints ────────────────────────────────────────────────────
-
-@app.route("/api/milestones", methods=["GET"])
-def get_milestones():
-    """Return current milestone state for beginner UI"""
-    if not ENABLE_BEGINNER_UI:
-        return jsonify({"beginner_ui_enabled": False})
-    return jsonify({
-        "beginner_ui_enabled": True,
-        "message": "Client reads milestones from localStorage"
-    })
-
-@app.route("/api/milestones/bot-started", methods=["POST"])
-def mark_bot_started():
-    """Endpoint to mark bot as started (called by JS when user clicks Start Bot)"""
-    return jsonify({"status": "success", "milestone": "bot_started"})
-
-@app.route("/api/milestones/trade-executed", methods=["POST"])
-def mark_trade_executed():
-    """Endpoint to mark first trade executed"""
-    return jsonify({"status": "success", "milestone": "trade_executed"})
-
-@app.route("/api/milestones/position-closed", methods=["POST"])
-def mark_position_closed():
-    """Endpoint to mark first position closed"""
-    return jsonify({"status": "success", "milestone": "position_closed"})
-
-@app.route("/api/milestones/reset", methods=["POST"])
-def reset_milestones():
-    """Reset all milestones (for testing)"""
-    return jsonify({"status": "success", "message": "Client should call milestoneTracker.reset()"})
-
 # ── API ────────────────────────────────────────────────────────────────────────
 
 @app.route("/api/coin-portfolio")
@@ -10245,7 +10393,7 @@ def api_state():
         "positions":  pos_list,
         "log":        bot.log[:120] if bot else [],
         "stats":      stats,
-        "filter_log": list(bot.filter_log)[:10] if bot else [],
+        "filter_log": list(bot.filter_log)[:30] if bot else [],
         "settings":   db_settings,
         "adaptive": {
             "relax_level": 0,
@@ -10348,8 +10496,7 @@ def api_start():
         conn.commit()
     finally:
         db_return(conn)
-    # Trigger bot started milestone (client-side will handle via JS)
-    return jsonify({"ok": True, "milestone": "bot_started"})
+    return jsonify({"ok": True})
 
 @app.route("/api/stop", methods=["POST"])
 @login_required
@@ -10642,7 +10789,7 @@ def api_market_feed():
                 merged["narrative_score"] = intel.get("narrative_score", 0)
             latest[mint] = merged
     tokens = sorted(latest.values(), key=lambda item: int(item.get("ts", 0) or 0), reverse=True)
-    return jsonify(tokens[:40])
+    return jsonify(tokens[:60])
 
 @app.route("/api/paper-prices", methods=["POST"])
 @login_required
@@ -11749,7 +11896,7 @@ def api_quant_backtests():
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         days = int(data.get("days") or 7)
-        replay_mode = (data.get("replay_mode") or "snapshot").strip().lower()
+        replay_mode = (data.get("replay_mode") or "event_tape").strip().lower()
         strategies = data.get("strategies") or (list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES)
         if not isinstance(strategies, list):
             strategies = [str(strategies)]
@@ -13395,8 +13542,7 @@ def api_admin_change_plan():
         conn.commit()
     finally:
         db_return(conn)
-    # If the user has a running bot, no max_buy_sol restrictions by plan
-    bot = user_bots.get(int(target_user_id))
+    # max_buy_sol is now optimizer-controlled — plan changes no longer cap it.
     print(f"[ADMIN] Plan change: user {target_user_id} ({user.get('email')}) {old_plan} -> {new_plan}", flush=True)
     return jsonify({"ok": True, "msg": f"Changed {user.get('email')} from {old_plan} to {new_plan}"})
 
@@ -13909,7 +14055,6 @@ _CSS = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name=
 <meta name="apple-mobile-web-app-title" content="SolTrader">
 <link rel="manifest" href="/manifest.json">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/css/tooltips.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
 <style>
@@ -14670,12 +14815,6 @@ DASHBOARD_HTML = _CSS + """
 .tab-btn-label{display:block;font-family:'Space Grotesk','Manrope',sans-serif;font-size:15px;letter-spacing:-.3px}
 .tab-btn-meta{display:block;font-size:11px;color:var(--t3);margin-top:4px}
 .tab-btn.active .tab-btn-meta{color:var(--t2)}
-.advanced-menu-container{position:relative;display:inline-block}
-.menu-toggle{padding:10px 16px;background:rgba(47,107,255,.1);border:1px solid rgba(47,107,255,.3);border-radius:8px;color:var(--t1);cursor:pointer;font-weight:600;transition:all .2s;font-size:12px;font-weight:700;letter-spacing:.2px;text-align:left;white-space:nowrap;min-width:170px}
-.menu-toggle:hover{background:rgba(47,107,255,.15);border-color:rgba(47,107,255,.5)}
-.menu-indicator{font-size:10px;margin-left:8px;transition:transform .2s}
-.advanced-menu-dropdown{position:absolute;top:100%;left:0;margin-top:8px;background:rgba(10,20,40,.95);border:1px solid rgba(47,107,255,.3);border-radius:8px;padding:8px;min-width:220px;box-shadow:0 8px 32px rgba(0,0,0,.3);z-index:100;display:flex;flex-direction:column;gap:2px}
-.advanced-menu-dropdown .tab-btn{text-align:left;margin:0;padding:10px 12px;font-size:13px;border-radius:4px;border:none;min-width:auto}
 .tab-pane{display:none;padding:4px 0 0}
 .tab-pane.active{display:block}
 .tab-pane-header{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px}
@@ -15272,42 +15411,14 @@ DASHBOARD_HTML = _CSS + """
 
   <!-- Tab Bar -->
   <div class="tab-bar">
-    <!-- Main tabs (always visible) -->
-    <button class="tab-btn active" data-tab="scanner" onclick="activateTab('scanner')"><span class="tab-btn-label">🔍 Scan</span><span class="tab-btn-meta">Real-time coin evaluation</span></button>
-    <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">📈 Positions</span><span class="tab-btn-meta">Open trades and history</span></button>
-    <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">⚙️ Settings</span><span class="tab-btn-meta">Wallet and bot controls</span></button>
-    <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">💹 P&L</span><span class="tab-btn-meta">Performance and equity curve</span></button>
-
-    <!-- Advanced menu (conditionally visible) -->
-    <div id="advanced-menu-wrapper" style="display: none;">
-      <div class="advanced-menu-container">
-        <button class="menu-toggle" onclick="toggleAdvancedMenu()">
-          📁 Advanced Tools <span class="menu-indicator">▼</span>
-        </button>
-        <div id="advanced-menu-dropdown" class="advanced-menu-dropdown" style="display: none;">
-          <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')">
-            <span class="tab-btn-label">📡 Signals</span>
-            <span class="tab-btn-meta">Why tokens passed or failed</span>
-          </button>
-          <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')">
-            <span class="tab-btn-label">🐳 Whales</span>
-            <span class="tab-btn-meta">Tracked smart money flow</span>
-          </button>
-          <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')">
-            <span class="tab-btn-label">🧮 Quant</span>
-            <span class="tab-btn-meta">Quantum backtester &amp; strategy</span>
-          </button>
-          <button class="tab-btn" data-tab="portfolio" onclick="activateTab('portfolio')">
-            <span class="tab-btn-label">📊 My Coins</span>
-            <span class="tab-btn-meta">Portfolio &amp; trade history</span>
-          </button>
-          <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')">
-            <span class="tab-btn-label">📋 Paper</span>
-            <span class="tab-btn-meta">Simulated trades, no real money</span>
-          </button>
-        </div>
-      </div>
-    </div>
+    <button class="tab-btn active" data-tab="portfolio" onclick="activateTab('portfolio')"><span class="tab-btn-label">Markets</span><span class="tab-btn-meta">Portfolio, scan &amp; evaluation</span></button>
+    <button class="tab-btn" data-tab="settings" onclick="activateTab('settings')"><span class="tab-btn-label">Settings</span><span class="tab-btn-meta">Saved checkpoint controls</span></button>
+    <button class="tab-btn" data-tab="signals" onclick="activateTab('signals')"><span class="tab-btn-label">Signals</span><span class="tab-btn-meta">Why tokens passed or failed</span></button>
+    <button class="tab-btn" data-tab="whales" onclick="activateTab('whales')"><span class="tab-btn-label">Whales</span><span class="tab-btn-meta">Tracked smart money flow</span></button>
+    <button class="tab-btn" data-tab="positions" onclick="activateTab('positions')"><span class="tab-btn-label">Positions</span><span class="tab-btn-meta">Open trades and risk posture</span></button>
+    <button class="tab-btn" data-tab="pnl" onclick="activateTab('pnl')"><span class="tab-btn-label">P&L</span><span class="tab-btn-meta">Equity curve and drawdown</span></button>
+    <button class="tab-btn" data-tab="quant" onclick="activateTab('quant')"><span class="tab-btn-label">Quant</span><span class="tab-btn-meta">Quantum backtester &amp; strategy</span></button>
+    <button class="tab-btn" data-tab="paper" onclick="activateTab('paper')"><span class="tab-btn-label">Paper</span><span class="tab-btn-meta">Simulated trades, no real money</span></button>
   </div>
 
   <!-- ===================== PORTFOLIO TAB — MY COINS ===================== -->
@@ -15410,6 +15521,60 @@ DASHBOARD_HTML = _CSS + """
 
         <!-- Top Rejection Reasons -->
         <div class="ev-reject-bar" id="ev-reject-bar"></div>
+
+        <!-- Cockpit Live Positions + Closed Trades -->
+        <style>
+        .ckpt-panels{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:4px}
+        @media(max-width:700px){.ckpt-panels{grid-template-columns:1fr}}
+        .ckpt-panel{background:rgba(8,16,32,.7);border:1px solid rgba(255,255,255,.06);border-radius:14px;overflow:hidden}
+        .ckpt-panel-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.06)}
+        .ckpt-panel-title{font-size:12px;font-weight:800;color:var(--t1);display:flex;align-items:center;gap:6px}
+        .ckpt-panel-badge{font-size:9px;padding:2px 7px;border-radius:10px;background:rgba(20,199,132,.15);color:#14c784;font-weight:700}
+        .ckpt-panel-body{padding:8px 6px;max-height:200px;overflow-y:auto}
+        .ckpt-pos-row{display:grid;grid-template-columns:1fr 70px 70px 30px;gap:4px;align-items:center;padding:5px 8px;border-radius:8px;font-size:11px;border-bottom:1px solid rgba(255,255,255,.03)}
+        .ckpt-pos-row:last-child{border-bottom:none}
+        .ckpt-pos-name{font-weight:700;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .ckpt-pos-meta{font-size:9px;color:var(--t3);margin-top:1px}
+        .ckpt-pos-pnl{text-align:right;font-weight:700;font-size:12px}
+        .ckpt-pos-age{text-align:right;color:var(--t3);font-size:10px}
+        .ckpt-pos-exit{background:rgba(239,68,68,.15);color:#f87171;border:none;border-radius:4px;padding:2px 6px;font-size:9px;cursor:pointer;font-weight:700}
+        .ckpt-pos-exit:hover{background:rgba(239,68,68,.3)}
+        .ckpt-empty{text-align:center;color:var(--t3);font-size:11px;padding:18px 0}
+        .ckpt-closed-row{display:grid;grid-template-columns:1fr 60px 50px;gap:4px;align-items:center;padding:5px 8px;font-size:11px;border-bottom:1px solid rgba(255,255,255,.03)}
+        .ckpt-closed-row:last-child{border-bottom:none}
+        .ckpt-closed-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .ckpt-closed-pnl{text-align:right;font-weight:700}
+        .ckpt-closed-reason{text-align:right;font-size:9px;color:var(--t3)}
+        </style>
+        <div class="ckpt-panels">
+          <!-- Open Positions -->
+          <div class="ckpt-panel">
+            <div class="ckpt-panel-head">
+              <div class="ckpt-panel-title">
+                <span style="width:7px;height:7px;border-radius:50%;background:#14c784;display:inline-block;animation:blink 2s infinite"></span>
+                Open Positions
+                <span class="ckpt-panel-badge" id="ckpt-open-badge">0</span>
+              </div>
+              <span style="font-size:10px;color:var(--t3)" id="ckpt-open-pnl"></span>
+            </div>
+            <div class="ckpt-panel-body" id="ckpt-open-list">
+              <div class="ckpt-empty">No open positions &mdash; bot is scanning</div>
+            </div>
+          </div>
+          <!-- Session Closed -->
+          <div class="ckpt-panel">
+            <div class="ckpt-panel-head">
+              <div class="ckpt-panel-title">
+                &#128197; Closed This Session
+                <span class="ckpt-panel-badge" id="ckpt-closed-badge" style="background:rgba(99,102,241,.15);color:#a78bfa">0</span>
+              </div>
+              <span style="font-size:10px;color:var(--t3)" id="ckpt-closed-wr"></span>
+            </div>
+            <div class="ckpt-panel-body" id="ckpt-closed-list">
+              <div class="ckpt-empty">No closed trades this session</div>
+            </div>
+          </div>
+        </div>
 
         <!-- Chart panel (like the main candlestick chart area in the reference image) -->
         <div class="glass ptf-chart-area">
@@ -15680,7 +15845,7 @@ DASHBOARD_HTML = _CSS + """
       <div>
         <div class="tab-kicker">Configuration</div>
         <div class="tab-pane-title">Bot Settings</div>
-        <div class="tab-pane-copy">Pick a strategy, adjust the key numbers, and save. The AI auto-tunes these from shadow trading results every hour.</div>
+        <div class="tab-pane-copy">Pick a strategy, adjust the key numbers, and save. The AI auto-tunes these from shadow trading results every 20 minutes.</div>
       </div>
       <div class="shortcut-row">
         <span class="badge bg-muted" id="settings-header-preset">Preset loading…</span>
@@ -15692,18 +15857,18 @@ DASHBOARD_HTML = _CSS + """
       <div class="settings-stack settings-simple">
 
         <!-- Auto-Tune Status -->
-        <div class="s-autotune-status" data-tip="The bot watches shadow trades (paper trades using real prices) and every hour picks the strategy that performed best over the last 48 hours. It then automatically updates your settings so you're always running the winning strategy.">
+        <div class="s-autotune-status" data-tip="The bot watches shadow trades (paper trades using real prices) and every 20 minutes picks the strategy that performed best over the last 48 hours. It then automatically updates your settings so you're always running the winning strategy.">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
             <div class="live-dot"></div>
             <div style="font-size:13px;font-weight:800;color:#14c784">AI Auto-Tune Active</div>
           </div>
           <div style="font-size:11px;color:var(--t2);line-height:1.6">
-            Shadow trading runs all 4 strategies on real market data. Every hour, the AI picks the best-performing one and applies it to your bot automatically. You can still override below.
+            Shadow trading runs all 4 strategies on real market data. Every 20 minutes, the AI picks the best-performing one and applies it to your bot automatically. You can still override below.
           </div>
           <div class="shortcut-row" style="margin-top:10px">
             <span class="badge bg-muted" id="s-tune-preset">—</span>
             <span class="badge bg-muted" id="s-tune-last">Last tune: —</span>
-            <span class="badge bg-muted">Interval: 1 hour</span>
+            <span class="badge bg-muted">Interval: 20 min</span>
           </div>
         </div>
 
@@ -16548,84 +16713,6 @@ document.addEventListener('DOMContentLoaded', function() {
   var w = document.querySelector('.wrap'); if (w) w.style.paddingBottom = '214px';
 });
 
-// ── Advanced Menu Unlock Logic ────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', function() {
-  const advancedMenuWrapper = document.getElementById('advanced-menu-wrapper');
-  if (advancedMenuWrapper && window.milestoneTracker && milestoneTracker.isUnlockAdvancedMenu()) {
-    advancedMenuWrapper.style.display = 'block';
-    console.log('[UI] Advanced menu unlocked on load');
-  }
-
-  // Listen for position close milestone
-  window.addEventListener('milestone:firstPositionClosed', function() {
-    if (advancedMenuWrapper) {
-      advancedMenuWrapper.style.display = 'block';
-      console.log('[UI] Advanced menu unlocked via milestone event');
-    }
-  });
-});
-
-// ── Toggle Advanced Menu ──────────────────────────────────────────────────────
-function toggleAdvancedMenu() {
-  const dropdown = document.getElementById('advanced-menu-dropdown');
-  if (dropdown) {
-    const isVisible = dropdown.style.display !== 'none';
-    dropdown.style.display = isVisible ? 'none' : 'flex';
-  }
-}
-
-// Close advanced menu when clicking outside
-document.addEventListener('click', function(event) {
-  const menu = document.querySelector('.advanced-menu-container');
-  if (menu && !menu.contains(event.target)) {
-    const dropdown = document.getElementById('advanced-menu-dropdown');
-    if (dropdown) dropdown.style.display = 'none';
-  }
-});
-
-// ── Milestone Event Handlers ──────────────────────────────────────────────────
-// Handle bot started milestone
-window.addEventListener('milestone:botStarted', function() {
-  if (window.showBotStartedModal) {
-    showBotStartedModal();
-  }
-  console.log('[Milestone] Bot started event received');
-});
-
-// Handle first trade executed milestone
-window.addEventListener('milestone:firstTradeExecuted', function() {
-  if (window.milestoneTracker) {
-    milestoneTracker.markFirstTradeExecuted();
-  }
-  if (window.showFirstTradeModal) {
-    showFirstTradeModal();
-  }
-  console.log('[Milestone] First trade executed event received');
-});
-
-// Handle first position closed milestone
-window.addEventListener('milestone:firstPositionClosed', function() {
-  if (window.milestoneTracker) {
-    milestoneTracker.markFirstPositionClosed();
-  }
-  if (window.updateFirstCloseModal) {
-    updateFirstCloseModal();
-  }
-  console.log('[Milestone] First position closed event received');
-});
-
-// ── Milestone Polling (Bot-triggered via API) ────────────────────────────────
-let _lastMilestoneCheck = 0;
-setInterval(function() {
-  const now = Date.now();
-  if (now - _lastMilestoneCheck < 2000) return; // Throttle to 2s
-  _lastMilestoneCheck = now;
-
-  // Poll for milestone events via hidden endpoint calls
-  // The bot calls /api/milestones/* endpoints when events occur
-  // Client can check for them via local storage or server-side event stream
-}, 2000);
-
 // ── State ─────────────────────────────────────────────────────────────────────
 let running = false, allTokens = [], sortCol = 'score', feedSince = 0;
 let selectedMint = null, logBarExpanded = true;
@@ -17117,11 +17204,12 @@ async function pollFeed() {
         const prev = byMint.get(t.mint) || {};
         byMint.set(t.mint, { ...prev, ...t, intel: { ...(prev.intel||{}), ...(t.intel||{}) } });
       });
-      allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 100);
+      allTokens = [...byMint.values()].sort((a, b) => (b.ts||0) - (a.ts||0)).slice(0, 200);
       feedSince = Math.max(...tokens.map(t => t.ts||0), feedSince);
       renderTokenRows();
       updateTicker();
       paperUpdatePrices();
+      paperProcessFeedTokens(tokens);
       setText('scanner-last-market', `Feed ${fmtClock()}`);
     }
   } catch(e) {}
@@ -17453,6 +17541,87 @@ function renderEvApproved(approved) {
         ${checks.map(ck => `<div class="ev-ck ${ck.passed?'p':'f'}" title="${ck.name||''}">${ck.passed?'&#10003;':'&#10007;'}</div>`).join('')}
         ${(c.narrative_tags||[]).slice(0,2).map(t => `<span class="ev-tag">${t}</span>`).join('')}
       </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Cockpit: live open positions + session-closed panels ────────────────────
+
+let _ckptClosedCache = [];  // recent closed trades fetched from API
+
+function renderCockpitPositions(positions) {
+  const el = document.getElementById('ckpt-open-list');
+  const badge = document.getElementById('ckpt-open-badge');
+  const pnlEl = document.getElementById('ckpt-open-pnl');
+  if (!el) return;
+  const list = Array.isArray(positions) ? positions : [];
+  if (badge) badge.textContent = list.length;
+  if (!list.length) {
+    el.innerHTML = '<div class="ckpt-empty">No open positions &mdash; bot is scanning</div>';
+    if (pnlEl) pnlEl.textContent = '';
+    return;
+  }
+  let totalPnl = 0;
+  el.innerHTML = list.map(p => {
+    const pnlPct = p.profit_pct || 0;
+    const pnlCol = pnlPct >= 0 ? 'var(--grn)' : 'var(--red)';
+    const heldFor = p.held_for || '—';
+    totalPnl += pnlPct;
+    return `<div class="ckpt-pos-row">
+      <div>
+        <div class="ckpt-pos-name" title="${p.mint || ''}">${p.name || '?'}</div>
+        <div class="ckpt-pos-meta">${fmtPrice(p.current_price || p.bought_at_price)} · ${(p.amount_sol || 0).toFixed(3)} SOL</div>
+      </div>
+      <div class="ckpt-pos-pnl" style="color:${pnlCol}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%</div>
+      <div class="ckpt-pos-age">${heldFor}</div>
+      <div></div>
+    </div>`;
+  }).join('');
+  if (pnlEl) {
+    const avg = totalPnl / list.length;
+    pnlEl.textContent = `Avg ${avg >= 0 ? '+' : ''}${avg.toFixed(1)}%`;
+    pnlEl.style.color = avg >= 0 ? 'var(--grn)' : 'var(--red)';
+  }
+}
+
+async function fetchCockpitClosed() {
+  try {
+    const d = await fetch('/api/my-trades').then(r => r.json()).catch(() => null);
+    if (!d) return;
+    _ckptClosedCache = d.recent_sells || [];
+    renderCockpitClosed(_ckptClosedCache, d.totals || {});
+  } catch(e) {}
+}
+
+function renderCockpitClosed(sells, totals) {
+  const el = document.getElementById('ckpt-closed-list');
+  const badge = document.getElementById('ckpt-closed-badge');
+  const wrEl = document.getElementById('ckpt-closed-wr');
+  if (!el) return;
+  const list = Array.isArray(sells) ? sells.slice(0, 15) : [];
+  if (badge) badge.textContent = list.length;
+  if (!list.length) {
+    el.innerHTML = '<div class="ckpt-empty">No closed trades this session</div>';
+    if (wrEl) wrEl.textContent = '';
+    return;
+  }
+  if (wrEl && totals) {
+    const wr = totals.win_rate || 0;
+    wrEl.textContent = `${wr.toFixed(0)}% win rate`;
+    wrEl.style.color = wr >= 50 ? 'var(--grn)' : 'var(--red)';
+  }
+  el.innerHTML = list.map(t => {
+    const pnl = t.profit_sol || 0;
+    const pnlCol = pnl >= 0 ? 'var(--grn)' : 'var(--red)';
+    const winLoss = t.result === 'Won' ? '&#10003;' : '&#10007;';
+    const winCol = t.result === 'Won' ? 'var(--grn)' : 'var(--red)';
+    return `<div class="ckpt-closed-row">
+      <div>
+        <div class="ckpt-closed-name" style="color:${winCol}">${winLoss} ${t.name || '?'}</div>
+        <div style="font-size:9px;color:var(--t3)">${t.sold_when || ''}</div>
+      </div>
+      <div class="ckpt-closed-pnl" style="color:${pnlCol}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}</div>
+      <div class="ckpt-closed-reason">${t.result || ''}</div>
     </div>`;
   }).join('');
 }
@@ -17982,6 +18151,9 @@ async function refresh() {
     setText('hero-live-state', 'Bot parked');
   }
 
+  // Update cockpit live positions panel
+  renderCockpitPositions(d.positions || []);
+
   // pos-tbl compat stub (hidden; pos-cards used instead)
   document.getElementById('pos-tbl').innerHTML = '';
 
@@ -18057,12 +18229,6 @@ async function toggleBot() {
   if (!res) { document.getElementById('stxt').textContent = '\u26a0\ufe0f Server error'; return; }
   if (!res.ok && res.msg) { document.getElementById('stxt').textContent = '\u26a0\ufe0f ' + res.msg; document.getElementById('stxt').style.color='#f23645'; return; }
   document.getElementById('stxt').style.color = '';
-  // Handle milestone events
-  if (res.milestone && window.milestoneTracker) {
-    if (res.milestone === 'bot_started') {
-      milestoneTracker.markBotStarted();
-    }
-  }
   setTimeout(refresh, 800);
 }
 function showPreflightModal() {
@@ -19786,6 +19952,10 @@ window.addEventListener('resize', () => {
 refresh();
 setInterval(refresh, 5000);
 
+// Fetch closed trades for cockpit panel (less frequent)
+fetchCockpitClosed();
+setInterval(fetchCockpitClosed, 20000);
+
 // ══════════════════════════ FLOATING PORTFOLIO WIDGET ══════════════════════════
 let _portfolioOpen = false;
 function togglePortfolioPanel() {
@@ -19864,7 +20034,7 @@ async function pollPortfolioWidget() {
 pollPortfolioWidget();
 setInterval(pollPortfolioWidget, 6000);
 
-pollFeed(); setInterval(pollFeed, 8000);
+pollFeed(); setInterval(pollFeed, 3000);
 pollEvaluationFeed(); setInterval(pollEvaluationFeed, 6000);
 pollScanDetail(); setInterval(pollScanDetail, 7000);
 pollListings(); setInterval(pollListings, 6000);
@@ -20457,10 +20627,52 @@ function paperProcessFilterLog(logs) {
   logs.forEach(f => {
     if (!f.passed || !f.mint) return;
     if (_paperPositions[f.mint] || _paperSeenMints[f.mint]) return;
-    // Find price from allTokens
+    // Find price from allTokens, fall back to price recorded in filter log entry
     const tok = allTokens.find(t => t.mint === f.mint);
-    if (!tok || !tok.price || tok.price <= 0) return;
-    paperBuy(f.mint, tok.name || f.name, tok.symbol, tok.price);
+    const price = (tok && tok.price > 0) ? tok.price : (f.price ?? 0);
+    if (!price || price <= 0) return;
+    paperBuy(f.mint, (tok && tok.name) || f.name, (tok && tok.symbol) || f.symbol, price);
+  });
+}
+
+function paperGetScore(t) {
+  if (typeof t.score === 'number') return t.score;
+  if (t.score && typeof t.score === 'object') return t.score.total || 0;
+  return 0;
+}
+
+function paperPassesBalancedFilter(t) {
+  // Returns true if the token meets the balanced entry criteria.
+  // Thresholds vary by preset: conservative, balanced (default), degen.
+  const preset = _paperSettings.preset || 'balanced';
+  const score = paperGetScore(t);
+  const liq = t.liq || 0;
+  const vol = t.vol || 0;
+  const age = t.age_min || 0;
+  const change = t.change || 0;
+
+  if (preset === 'degen') {
+    // Degen: only basic sanity checks — positive price change, some volume
+    return change > 0 && vol >= 500;
+  } else if (preset === 'conservative') {
+    // Conservative: strict score, liquidity and volume floors; only fresh tokens
+    return score >= 55 && liq >= 20000 && vol >= 10000 && age <= 20 && change > 0;
+  } else {
+    // Balanced (default): moderate thresholds
+    return score >= 40 && liq >= 8000 && vol >= 3000 && age <= 60 && change > 0;
+  }
+}
+
+function paperProcessFeedTokens(tokens) {
+  // Auto-buy new scanner tokens for paper trading, applying the balanced entry
+  // filter so not every coin is purchased — only those that meet the current
+  // preset's quality criteria.
+  if (!_paperActive || !tokens || !tokens.length) return;
+  tokens.forEach(t => {
+    if (!t.mint || !t.price || t.price <= 0) return;
+    if (_paperPositions[t.mint] || _paperSeenMints[t.mint]) return;
+    if (!paperPassesBalancedFilter(t)) return;
+    paperBuy(t.mint, t.name, t.symbol, t.price);
   });
 }
 
@@ -21015,8 +21227,6 @@ loadAdminData();
 loadBlacklist();
 setInterval(loadAdminData, 15000);
 </script>
-<script src="/static/js/milestone_tracker.js"></script>
-<script src="/static/js/tooltip_system.js"></script>
 </body></html>
 """
 
