@@ -2337,6 +2337,63 @@ def get_market_stats():
         }
     except: return {}
 
+def get_backtest_vs_live_divergence():
+    """Compare last 30-day backtest predictions vs actual live results.
+    Returns divergence metrics to detect overfitting."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Get last backtest run results
+            cur.execute("""
+                SELECT summary FROM backtest_runs
+                WHERE run_id >= 0  -- ephemeral sweeps use -1
+                ORDER BY created_at DESC LIMIT 1
+            """)
+            backtest_row = cur.fetchone()
+            backtest_summary = backtest_row.get("summary") or {} if backtest_row else {}
+
+            # Get actual live trades from last 30 days
+            cur.execute("""
+                SELECT pnl_pct, pnl_sol FROM trades
+                WHERE timestamp >= NOW() - INTERVAL '30 days'
+            """)
+            live_trades = cur.fetchall()
+        finally:
+            db_return(conn)
+
+        if not live_trades:
+            return {"status": "insufficient_live_data", "trades": 0}
+
+        # Calculate live performance
+        live_wins = len([t for t in live_trades if (t.get("pnl_pct") or 0) > 0])
+        live_wr = (live_wins / len(live_trades) * 100) if live_trades else 0
+        live_avg_pnl = sum(t.get("pnl_pct") or 0 for t in live_trades) / len(live_trades)
+
+        # Extract backtest predictions (from sweep results)
+        backtest_wr = float(backtest_summary.get("win_rate") or 0) if isinstance(backtest_summary, dict) else 0
+        backtest_avg_pnl = float(backtest_summary.get("avg_pnl_pct") or 0) if isinstance(backtest_summary, dict) else 0
+
+        # Calculate divergence
+        wr_divergence = backtest_wr - live_wr  # Positive = backtest was too optimistic
+        pnl_divergence = backtest_avg_pnl - live_avg_pnl
+
+        return {
+            "status": "ok",
+            "live_trades": len(live_trades),
+            "live_win_rate": round(live_wr, 1),
+            "live_avg_pnl_pct": round(live_avg_pnl, 2),
+            "backtest_win_rate": round(backtest_wr, 1),
+            "backtest_avg_pnl_pct": round(backtest_avg_pnl, 2),
+            "wr_divergence": round(wr_divergence, 1),  # Should be < 10%
+            "pnl_divergence": round(pnl_divergence, 2),  # Should be < 2%
+            "overfitting_risk": "HIGH" if abs(wr_divergence) > 15 or abs(pnl_divergence) > 3 else (
+                "MEDIUM" if abs(wr_divergence) > 8 or abs(pnl_divergence) > 1.5 else "LOW"
+            ),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 def ai_suggest_settings(stats):
     """Given market stats, return suggested preset name + rationale."""
     if not stats:
@@ -12319,6 +12376,12 @@ def api_circuit_breaker():
     except Exception as e:
         return jsonify({"error": str(e)})
 
+
+@app.route("/api/overfitting-check")
+@login_required
+def api_overfitting_check():
+    """Monitor backtest vs live divergence to detect overfitting."""
+    return jsonify(get_backtest_vs_live_divergence())
 
 @app.route("/api/enhanced/mev-stats")
 @login_required
