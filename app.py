@@ -9448,18 +9448,18 @@ def _evaluate_all_recorded_coins(days=7):
             rug_rate = best.get("rug_rate_pct", 0)
             min_selected = int(best.get("min_selected") or 8)
 
-            # Relaxed quality gates to allow optimization even during low-volume periods
-            # Apply if EITHER: (1) strong signal (edge > 2 AND selected >= 8) OR (2) any positive edge with reasonable coverage
+            # Balanced quality gates — allow tuning but maintain quality floor
+            # Apply if: strong signal (edge > 2 AND selected >= 8) OR modest signal (edge >= 1.5 AND selected >= 5)
             has_strong_signal = selected >= min_selected and edge_score > 2
-            has_weak_signal = edge_score > 0.5 and selected >= 3  # Lower bar: any positive edge with 3+ samples
+            has_modest_signal = edge_score >= 1.5 and selected >= 5
 
             rejection_reason = None
-            if not (has_strong_signal or has_weak_signal):
-                rejection_reason = f"weak signal (edge={edge_score:.1f}, n={selected}, min_signal=0.5/3 or 2.0/{min_selected})"
-            elif rug_rate > 50:
-                rejection_reason = f"high rug rate ({rug_rate:.0f}% > 50%)"
+            if not (has_strong_signal or has_modest_signal):
+                rejection_reason = f"insufficient signal (edge={edge_score:.1f}, n={selected}, need: 2.0/8 or 1.5/5)"
+            elif rug_rate > 40:
+                rejection_reason = f"high rug rate ({rug_rate:.0f}% > 40%)"
             else:
-                min_winner_rate = 20 if has_strong_signal else 15
+                min_winner_rate = 20 if has_strong_signal else 18  # Tighter: 18% minimum
                 if winner_rate < min_winner_rate:
                     rejection_reason = f"low winner rate ({winner_rate:.0f}% < {min_winner_rate}%)"
 
