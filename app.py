@@ -7533,25 +7533,6 @@ def _auto_tune_from_results(requested_by, summary, run_id):
                 apply_settings[field_name] = best_settings[field_name]
         print(f"[AUTO-TUNE] applying optimized filter values from sweep", flush=True)
 
-    # Check if user has manually locked their preset to Balanced
-    # If so, respect their choice and don't auto-deploy aggressive settings
-    try:
-        _check_conn = db()
-        try:
-            _check_cur = _check_conn.cursor()
-            _check_cur.execute("SELECT preset FROM bot_settings WHERE user_id=%s", (requested_by,))
-            _current_row = _check_cur.fetchone()
-            _current_preset = _current_row.get("preset") if _current_row else None
-        finally:
-            db_return(_check_conn)
-
-        # If user manually set to Balanced, skip auto-tune override
-        if _current_preset == "balanced":
-            print(f"[AUTO-TUNE] User {requested_by} has Balanced manually selected — skipping auto-deploy of {best_name}", flush=True)
-            return
-    except Exception as e:
-        print(f"[AUTO-TUNE] Could not check preset lock: {e}", flush=True)
-
     # Save to DB
     try:
         persist_bot_settings(
