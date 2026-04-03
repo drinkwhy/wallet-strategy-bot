@@ -40,7 +40,7 @@ RISK_THRESHOLDS = {
     "max_deployer_holding_pct": 20,  # Max deployer can hold
     "min_holders": 50,               # Minimum holder count
     "max_lp_single_holder_pct": 90,  # Max % of LP by single wallet
-    "min_token_age_sec": 60,         # Minimum token age (60 seconds) — prevents evaluation of brand-new tokens
+    "min_token_age_sec": 30,         # Minimum token age (30 seconds) — prevents evaluation of brand-new tokens
     "max_failed_exits_consecutive": 3,
     "circuit_breaker_loss_pct": 30,  # Trip after 30% drawdown
     "circuit_breaker_fail_rate": 0.5,  # Trip after 50% tx failures
