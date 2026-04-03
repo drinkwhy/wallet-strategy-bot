@@ -9437,6 +9437,8 @@ def _evaluate_all_recorded_coins(days=7):
         optimized_settings = {}
         best_by_feature = sweep_results.get("best_by_feature") or []
 
+        print(f"[COIN-EVAL] evaluating {len(best_by_feature)} feature thresholds for deployment:", flush=True)
+
         for best in best_by_feature:
             feat_name = best.get("feature")
             threshold = best.get("threshold")
@@ -9446,16 +9448,23 @@ def _evaluate_all_recorded_coins(days=7):
             rug_rate = best.get("rug_rate_pct", 0)
             min_selected = int(best.get("min_selected") or 8)
 
-            # Only apply if the sweep had enough samples and a positive edge
-            if selected < min_selected or edge_score <= 2:
-                continue
+            # Relaxed quality gates to allow optimization even during low-volume periods
+            # Apply if EITHER: (1) strong signal (edge > 2 AND selected >= 8) OR (2) any positive edge with reasonable coverage
+            has_strong_signal = selected >= min_selected and edge_score > 2
+            has_weak_signal = edge_score > 0.5 and selected >= 3  # Lower bar: any positive edge with 3+ samples
 
-            # Only apply if rug rate dropped meaningfully (filter is actually helping)
-            if rug_rate > 40:
-                continue
+            rejection_reason = None
+            if not (has_strong_signal or has_weak_signal):
+                rejection_reason = f"weak signal (edge={edge_score:.1f}, n={selected}, min_signal=0.5/3 or 2.0/{min_selected})"
+            elif rug_rate > 50:
+                rejection_reason = f"high rug rate ({rug_rate:.0f}% > 50%)"
+            else:
+                min_winner_rate = 20 if has_strong_signal else 15
+                if winner_rate < min_winner_rate:
+                    rejection_reason = f"low winner rate ({winner_rate:.0f}% < {min_winner_rate}%)"
 
-            # Require at least a minimal winner density so we do not overfit to tiny slices.
-            if winner_rate < 20:
+            if rejection_reason:
+                print(f"[COIN-EVAL]   ❌ {feat_name} → REJECTED: {rejection_reason}", flush=True)
                 continue
 
             mapping = _SWEEP_FEATURE_TO_SETTING.get(feat_name)
@@ -9463,10 +9472,11 @@ def _evaluate_all_recorded_coins(days=7):
                 setting_name, cast_fn = mapping
                 try:
                     optimized_settings[setting_name] = cast_fn(threshold)
-                    print(f"[COIN-EVAL]   {feat_name} >= {threshold} → {setting_name}={cast_fn(threshold)} "
+                    signal_type = "strong" if has_strong_signal else "weak"
+                    print(f"[COIN-EVAL]   ✓ {feat_name} ({signal_type}) → {setting_name}={cast_fn(threshold)} "
                           f"(edge={edge_score:.1f}, wr={winner_rate:.0f}%, rr={rug_rate:.0f}%, n={selected})", flush=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[COIN-EVAL]   ❌ {feat_name} → mapping failed: {e}", flush=True)
 
         # Log the top feature edges for insight
         if feature_edges:
