@@ -14263,9 +14263,12 @@ def api_reset_shadow_live():
         conn = db()
         try:
             cur = conn.cursor()
-            cur.execute("DELETE FROM shadow_positions")
-            cur.execute("DELETE FROM shadow_decisions")
-            cur.execute("DELETE FROM shadow_zero_movement_closes")
+            # Delete from tables that exist
+            for table in ["shadow_positions", "shadow_decisions", "shadow_zero_movement_closes"]:
+                try:
+                    cur.execute(f"DELETE FROM {table}")
+                except Exception:
+                    pass  # Table might not exist, continue
             conn.commit()
             return jsonify({"ok": True, "msg": "Shadow trading reset to zero"})
         finally:
