@@ -9,3 +9,8 @@ cmds = []
 
 [start]
 cmd = "gunicorn app:app --bind 0.0.0.0:${PORT:-5000} --workers 1 --threads 8 --timeout 300 --keep-alive 30 --graceful-timeout 60"
+
+# For Railway: add a separate background worker service
+# Deploy with: railway up --service workers
+[services.workers]
+cmd = "WORKERS_ONLY=true python app.py"

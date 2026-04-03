@@ -22289,9 +22289,27 @@ def run_startup_migrations():
 
 if __name__ == "__main__":
     run_startup_migrations()
-    ensure_background_workers_started()
-    print(f"\n  SolTrader Platform → http://localhost:5000")
-    print(f"  Admin account: {ADMIN_EMAIL}")
-    print(f"  Database: {DATABASE_URL}\n")
-    port = int(os.getenv("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port)
+
+    # Check if running in background-workers-only mode (for Railway worker dyno)
+    workers_only = os.getenv("WORKERS_ONLY", "").lower() in {"true", "1", "yes"}
+
+    if workers_only:
+        # Background workers only — no Flask web server
+        print(f"\n[WORKERS-ONLY] Starting background workers (auto-tune, scanners, etc.)...", flush=True)
+        print(f"[WORKERS-ONLY] Database: {DATABASE_URL}\n", flush=True)
+        ensure_background_workers_started()
+        print(f"[WORKERS-ONLY] Background workers running. Ctrl+C to stop.", flush=True)
+        # Keep alive indefinitely
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            print(f"\n[WORKERS-ONLY] Shutdown requested.", flush=True)
+    else:
+        # Normal Flask web server mode
+        ensure_background_workers_started()
+        print(f"\n  SolTrader Platform → http://localhost:5000")
+        print(f"  Admin account: {ADMIN_EMAIL}")
+        print(f"  Database: {DATABASE_URL}\n")
+        port = int(os.getenv("PORT", 5000))
+        app.run(debug=False, host="0.0.0.0", port=port)
