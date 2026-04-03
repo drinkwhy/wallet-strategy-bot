@@ -1363,8 +1363,28 @@ def init_db():
             feature_json TEXT,
             decision_json TEXT,
             tp1_hit INTEGER DEFAULT 0,
-            tp1_pnl_pct REAL DEFAULT 0
+            tp1_pnl_pct REAL DEFAULT 0,
+            time_in_band_sec INTEGER DEFAULT 0
         )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS shadow_zero_movement_closes (
+            id SERIAL PRIMARY KEY,
+            mint TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
+            opened_at TIMESTAMP NOT NULL,
+            closed_at TIMESTAMP NOT NULL,
+            entry_price REAL NOT NULL,
+            peak_price REAL NOT NULL,
+            close_price REAL NOT NULL,
+            time_stuck_sec INTEGER NOT NULL,
+            realized_pnl_pct REAL,
+            entry_vol_usd REAL,
+            peak_drawdown_pct REAL,
+            reason TEXT DEFAULT 'zero_movement_stuck'
+        )""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_zero_movement_closes_mint ON shadow_zero_movement_closes(mint)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_zero_movement_closes_strategy ON shadow_zero_movement_closes(strategy_name)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_zero_movement_closes_closed_at ON shadow_zero_movement_closes(closed_at DESC)""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS backtest_runs (
             id SERIAL PRIMARY KEY,
