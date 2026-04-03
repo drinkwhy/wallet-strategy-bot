@@ -9344,7 +9344,7 @@ _TUNE_THRESHOLD_PLAN = {
     "age_min":          {"thresholds": [30, 60, 120, 240, 480, 1440],       "direction": "lte", "min_selected": 8},
     "threat_risk_score":{"thresholds": [35, 45, 55, 65, 75],                "direction": "lte", "min_selected": 8},
     "change":           {"thresholds": [50, 100, 150, 200, 300, 400],       "direction": "lte", "min_selected": 8},
-    "green_lights":     {"thresholds": [0],                                 "direction": "gte", "min_selected": 8},
+    "green_lights":     {"thresholds": [0, 1, 2, 3],                        "direction": "gte", "min_selected": 8},
     "narrative_score":  {"thresholds": [3, 5, 10, 15, 20, 30],             "direction": "gte", "min_selected": 8},
     "buy_sell_ratio":   {"thresholds": [0.8, 1.0, 1.5, 2.0, 2.5, 3.0],    "direction": "gte", "min_selected": 8},
     "smart_wallet_buys":{"thresholds": [0, 1, 2, 3, 4],                    "direction": "gte", "min_selected": 8},
@@ -9355,7 +9355,7 @@ _TUNE_THRESHOLD_PLAN = {
 }
 
 
-def _evaluate_all_recorded_coins(days=30):
+def _evaluate_all_recorded_coins(days=7):
     """Load all recorded token data, label outcomes, sweep filter thresholds, and return optimized settings.
 
     Returns a dict with:
@@ -9724,7 +9724,7 @@ def _shadow_auto_tune():
 
             # --- NEW: Evaluate all recorded coins to find optimal filter thresholds ---
             print(f"[SHADOW-TUNE] running coin evaluation on all recorded tokens...", flush=True)
-            coin_eval = _evaluate_all_recorded_coins(days=30)
+            coin_eval = _evaluate_all_recorded_coins(days=7)
 
             # --- NEW: Analyze cooldown optimization to reduce regret and catch exponential growers ---
             print(f"[SHADOW-TUNE] analyzing cooldown optimization across strategies...", flush=True)

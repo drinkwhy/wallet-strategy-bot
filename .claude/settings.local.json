@@ -31,7 +31,9 @@
       "Bash(python -m py_compile app.py)",
       "Bash(python -m py_compile quant_platform.py)",
       "Bash(python -m py_compile tests/test_shadow_zero_movement.py)",
-      "mcp__Desktop_Commander__get_more_search_results"
+      "mcp__Desktop_Commander__get_more_search_results",
+      "Bash(grep -r \"auto.tune\\\\|auto_promote\\\\|optimization deployed\" . --include=*.py)",
+      "Bash(ls -lah *.log)"
     ]
   }
 }
