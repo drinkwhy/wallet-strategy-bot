@@ -14878,12 +14878,11 @@ def api_optimization_decisions():
         db_return(conn)
 
 
-@app.route("/api/disable-auto-optimize", methods=['POST'])
+@app.route("/api/disable-auto-optimize", methods=['POST', 'GET'])
 @login_required
 def api_disable_auto_optimize():
-    """Temporarily disable Spark auto-optimization if parameters are bad."""
+    """Temporarily disable Spark auto-optimization if parameters are bad (POST), or check status (GET)."""
     user_id = session['user_id']
-    duration_minutes = request.json.get('duration_minutes', 60) if request.json else 60
 
     try:
         import redis
@@ -14892,18 +14891,37 @@ def api_disable_auto_optimize():
             port=int(os.environ.get('REDIS_PORT', 6379)),
             decode_responses=True
         )
+
+        # GET: Check current status
+        if request.method == 'GET':
+            disabled_flag = redis_client.get(f"auto_optimize_disabled:{user_id}")
+            if disabled_flag:
+                ttl = redis_client.ttl(f"auto_optimize_disabled:{user_id}")
+                disabled_until = datetime.utcnow() + timedelta(seconds=ttl) if ttl > 0 else None
+                return jsonify({
+                    'status': 'disabled',
+                    'disabled_until': disabled_until.isoformat() if disabled_until else None,
+                    'ttl_seconds': max(0, ttl)
+                })
+            else:
+                return jsonify({'status': 'enabled'})
+
+        # POST: Disable for duration
+        duration_minutes = request.json.get('duration_minutes', 60) if request.json else 60
         redis_client.set(f"auto_optimize_disabled:{user_id}", "true", ex=int(duration_minutes * 60))
+        disabled_until = datetime.utcnow() + timedelta(minutes=duration_minutes)
         print(f"[API] U{user_id} auto-optimization disabled for {duration_minutes}m", flush=True)
+
+        return jsonify({
+            'status': 'disabled',
+            'duration_minutes': duration_minutes,
+            'duration_seconds': duration_minutes * 60,
+            'disabled_until': disabled_until.isoformat(),
+            'message': f'Auto-optimization disabled for {duration_minutes} minutes'
+        })
     except Exception as e:
         print(f"[API] Failed to set disable flag for U{user_id}: {e}", flush=True)
         return jsonify({'status': 'error', 'error': 'Redis unavailable'}), 503
-
-    return jsonify({
-        'status': 'disabled',
-        'duration_minutes': duration_minutes,
-        'duration_seconds': duration_minutes * 60,
-        'message': f'Auto-optimization disabled for {duration_minutes} minutes'
-    })
 
 
 # ── Stripe ─────────────────────────────────────────────────────────────────────
@@ -16507,8 +16525,85 @@ DASHBOARD_HTML = _CSS + """
         <div style="display:flex;gap:16px" id="lv-compare-stats"></div>
       </div>
     </div>
+    <!-- ═══════════ OPTIMIZATION METRICS ═══════════ -->
+    <div style="border-top:1px solid rgba(255,255,255,.06);padding:12px 18px;font-size:10px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:8px">
+        <div>
+          <div style="color:var(--t3);text-transform:uppercase;letter-spacing:.05em;font-size:8px;margin-bottom:3px">Last Optimization</div>
+          <div style="color:var(--t1);font-weight:700;font-size:11px" id="lv-last-opt-time">—</div>
+        </div>
+        <div>
+          <div style="color:var(--t3);text-transform:uppercase;letter-spacing:.05em;font-size:8px;margin-bottom:3px">Next Optimization</div>
+          <div style="color:var(--t1);font-weight:700;font-size:11px" id="lv-next-opt-countdown">—</div>
+        </div>
+        <div>
+          <div style="color:var(--t3);text-transform:uppercase;letter-spacing:.05em;font-size:8px;margin-bottom:3px">Parameters Changed</div>
+          <div style="color:var(--t1);font-weight:700;font-size:11px" id="lv-params-changed-time">—</div>
+        </div>
+        <div>
+          <div style="color:var(--t3);text-transform:uppercase;letter-spacing:.05em;font-size:8px;margin-bottom:3px">Circuit Breaker</div>
+          <div style="color:var(--grn);font-weight:700;font-size:11px" id="lv-circuit-breaker-status">ENABLED</div>
+        </div>
+      </div>
+      <button onclick="disableAutoOptimize()" style="padding:6px 10px;border:1px solid rgba(200,50,50,.3);background:rgba(200,50,50,.05);color:#ff6b6b;font-size:10px;font-weight:700;border-radius:4px;cursor:pointer;transition:all .2s;width:100%;margin-top:6px" onmouseover="this.style.background='rgba(200,50,50,.15)'" onmouseout="this.style.background='rgba(200,50,50,.05)'">⊘ Disable Auto-Optimize (60 min)</button>
+    </div>
   </div>
   <!-- ═══════════ END LIVE BANNER ═══════════ -->
+
+  <!-- ═══════════ OPTIMIZATION DECISIONS LOG ═══════════ -->
+  <style>
+  .opt-decisions-panel{background:rgba(8,16,32,.92);border:1px solid rgba(59,130,246,.12);border-radius:16px;padding:0;margin-bottom:16px;overflow:hidden}
+  .opt-decisions-header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer;user-select:none}
+  .opt-decisions-title{display:flex;align-items:center;gap:10px;font-size:14px;font-weight:800;color:var(--t1)}
+  .opt-decisions-chevron{transition:transform .25s;font-size:16px;color:var(--t3)}
+  .opt-decisions-chevron.open{transform:rotate(180deg)}
+  .opt-decisions-body{display:none;padding:0 18px 18px}
+  .opt-decisions-body.open{display:block}
+  .opt-decisions-table{width:100%;font-size:11px;border-collapse:collapse}
+  .opt-decisions-table thead{border-bottom:1px solid rgba(255,255,255,.1)}
+  .opt-decisions-table th{text-align:left;padding:10px 8px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.05em;font-size:9px}
+  .opt-decisions-table tbody tr{border-bottom:1px solid rgba(255,255,255,.05);transition:background .2s}
+  .opt-decisions-table tbody tr:hover{background:rgba(255,255,255,.02)}
+  .opt-decisions-table td{padding:10px 8px;color:var(--t1)}
+  .opt-decisions-time{font-family:'Courier New',monospace;color:var(--t3);font-size:10px}
+  .opt-decisions-status{font-weight:700;padding:4px 8px;border-radius:4px;display:inline-block;font-size:9px;text-transform:uppercase}
+  .opt-decisions-status.pending{background:rgba(107,114,128,.2);color:#d1d5db}
+  .opt-decisions-status.deployed{background:rgba(20,184,166,.15);color:#2dd4bf}
+  .opt-decisions-status.reverted{background:rgba(239,68,68,.15);color:#ef4444}
+  .opt-decisions-reason{color:var(--t2);font-size:10px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .opt-decisions-improvement{font-weight:700;font-size:10px}
+  .opt-decisions-improvement.positive{color:#14c784}
+  .opt-decisions-improvement.negative{color:#ef4444}
+  .opt-decisions-improvement.neutral{color:var(--t3)}
+  .opt-decisions-action{padding:4px 8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:var(--t2);font-size:9px;border-radius:4px;cursor:pointer;transition:all .2s}
+  .opt-decisions-action:hover{background:rgba(59,130,246,.2);border-color:rgba(59,130,246,.4);color:var(--blue2)}
+  .opt-decisions-empty{padding:20px;text-align:center;color:var(--t3);font-size:11px}
+  </style>
+  <div class="opt-decisions-panel" id="opt-decisions-panel">
+    <div class="opt-decisions-header" onclick="toggleOptDecisions()">
+      <div class="opt-decisions-title">
+        📊 Auto-Optimization Decisions (Last 24h)
+      </div>
+      <span class="opt-decisions-chevron" id="od-chevron">&#9660;</span>
+    </div>
+    <div class="opt-decisions-body open" id="od-body">
+      <table class="opt-decisions-table" id="opt-decisions-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Status</th>
+            <th>Reason</th>
+            <th>Expected %</th>
+            <th>Actual %</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="opt-decisions-tbody">
+          <tr><td colspan="6" class="opt-decisions-empty">Loading optimization decisions...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
 
   <!-- ═══════════ SHADOW ACTIVITY WINDOW ═══════════ -->
   <style>
@@ -21332,6 +21427,148 @@ function _animateShadowVal(id, newVal) {
   }
 }
 pollShadowBanner(); setInterval(pollShadowBanner, 8000);
+
+// ═══════════ PHASE 5: OPTIMIZATION METRICS POLLING ═══════════
+let _optLastTime = null;
+let _optNextCountdown = null;
+
+async function pollOptimizationMetrics() {
+  try {
+    // Fetch current parameters + 1h metrics
+    const params = await fetch('/api/current-parameters').then(r => r.json()).catch(() => null);
+    if (!params || params.status !== 'ok') return;
+
+    // Update Last Optimization time
+    if (params.last_update) {
+      const lastTime = new Date(params.last_update);
+      const now = new Date();
+      const diffMs = now - lastTime;
+      const diffMins = Math.floor(diffMs / 60000);
+      const diffHours = Math.floor(diffMins / 60);
+
+      let timeStr = '';
+      if (diffMins < 1) timeStr = 'Just now';
+      else if (diffMins < 60) timeStr = diffMins + ' min ago';
+      else if (diffHours < 24) timeStr = diffHours + 'h ' + (diffMins % 60) + 'm ago';
+      else timeStr = lastTime.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+
+      setText('lv-last-opt-time', timeStr);
+    }
+
+    // Update Next Optimization countdown (every 5 min = 300s)
+    if (!_optNextCountdown) {
+      const nextTime = new Date(new Date().getTime() + (5 * 60 * 1000));
+      _optNextCountdown = nextTime;
+    }
+    const now = new Date();
+    const remainMs = _optNextCountdown - now;
+    if (remainMs > 0) {
+      const remainMins = Math.ceil(remainMs / 60000);
+      setText('lv-next-opt-countdown', remainMins + ' min');
+    } else {
+      _optNextCountdown = null;
+    }
+
+    // Check circuit breaker status from redis (via endpoint)
+    try {
+      const cbStatus = await fetch('/api/disable-auto-optimize', {method:'GET'}).then(r => r.json()).catch(() => ({status:'enabled'}));
+      const circuitEl = document.getElementById('lv-circuit-breaker-status');
+      if (cbStatus && cbStatus.status === 'disabled') {
+        circuitEl.textContent = 'DISABLED until ' + new Date(cbStatus.disabled_until).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        circuitEl.style.color = '#ef4444';
+      } else {
+        circuitEl.textContent = 'ENABLED';
+        circuitEl.style.color = 'var(--grn)';
+      }
+    } catch(e) {
+      // Circuit breaker endpoint not GET-able, fallback
+      document.getElementById('lv-circuit-breaker-status').textContent = 'ENABLED';
+    }
+  } catch(e) {
+    console.error('Error polling optimization metrics:', e);
+  }
+}
+
+async function pollOptimizationDecisions() {
+  try {
+    const res = await fetch('/api/optimization-decisions?limit=24').then(r => r.json()).catch(() => ({decisions:[]}));
+    const decisions = res.decisions || [];
+    const tbody = document.getElementById('opt-decisions-tbody');
+
+    if (!decisions.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="opt-decisions-empty">No optimization decisions yet</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = decisions.map(d => {
+      const timeObj = new Date(d.time);
+      const timeStr = timeObj.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+      const dateStr = timeObj.toLocaleDateString([], {month:'short', day:'numeric'});
+
+      // Status color coding
+      let statusClass = d.status || 'pending';
+      let statusDisplay = d.status ? d.status.toUpperCase() : 'PENDING';
+
+      // Improvement color coding
+      const actualImpr = d.actual_improvement_pct || 0;
+      const expectedImpr = d.expected_improvement_pct || 0;
+      let imprClass = 'neutral';
+      if (d.status === 'reverted') imprClass = 'negative';
+      else if (actualImpr > 0) imprClass = 'positive';
+      else if (actualImpr < 0) imprClass = 'negative';
+
+      // Reason truncation
+      const reason = d.reason || 'Auto-optimization';
+
+      return `<tr>
+        <td class="opt-decisions-time">${dateStr} ${timeStr}</td>
+        <td><span class="opt-decisions-status ${statusClass}">${statusDisplay}</span></td>
+        <td class="opt-decisions-reason" title="${reason}">${reason}</td>
+        <td class="opt-decisions-improvement">${expectedImpr > 0 ? '+' : ''}${expectedImpr.toFixed(1)}%</td>
+        <td class="opt-decisions-improvement ${imprClass}">${actualImpr > 0 ? '+' : ''}${actualImpr.toFixed(1)}%</td>
+        <td><button class="opt-decisions-action" onclick="showOptDecisionDetails('${d.id}')">Details</button></td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    console.error('Error polling optimization decisions:', e);
+  }
+}
+
+function toggleOptDecisions() {
+  const chevron = document.getElementById('od-chevron');
+  const body = document.getElementById('od-body');
+  chevron.classList.toggle('open');
+  body.classList.toggle('open');
+}
+
+function showOptDecisionDetails(decisionId) {
+  showToast('Decision details for #' + decisionId + ' — feature coming soon', true);
+  // TODO: Open modal with parameter diff view
+}
+
+async function disableAutoOptimize() {
+  if (!confirm('Disable auto-optimization for 60 minutes? (emergency stop)')) return;
+  try {
+    const res = await fetch('/api/disable-auto-optimize', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({duration_minutes: 60})
+    }).then(r => r.json()).catch(() => null);
+    if (res && res.status === 'disabled') {
+      showToast('Auto-optimization disabled for 60 minutes', true);
+      document.getElementById('lv-circuit-breaker-status').textContent = 'DISABLED (60 min)';
+      document.getElementById('lv-circuit-breaker-status').style.color = '#ef4444';
+    }
+  } catch(e) {
+    showToast('Failed to disable auto-optimization', false);
+  }
+}
+
+// Start polling
+pollOptimizationMetrics();
+pollOptimizationDecisions();
+setInterval(pollOptimizationMetrics, 30000); // Every 30s
+setInterval(pollOptimizationDecisions, 45000); // Every 45s
 
 // ═══════════ HOVER TOOLTIP SYSTEM ═══════════
 (function() {
