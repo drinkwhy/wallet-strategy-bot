@@ -14255,6 +14255,24 @@ def api_admin_recalc_shadow():
     })
 
 
+@app.route("/api/reset-shadow-live", methods=["POST"])
+@login_required
+def api_reset_shadow_live():
+    """Reset shadow trading live numbers - accessible to logged-in users."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM shadow_positions")
+            cur.execute("DELETE FROM shadow_decisions")
+            cur.execute("DELETE FROM shadow_zero_movement_closes")
+            conn.commit()
+            return jsonify({"ok": True, "msg": "Shadow trading reset to zero"})
+        finally:
+            db_return(conn)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)}), 500
+
 @app.route("/api/admin/reset-evaluations", methods=["POST"])
 @admin_required
 def api_admin_reset_evaluations():
