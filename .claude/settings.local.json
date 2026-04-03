@@ -12,7 +12,26 @@
       "Bash(git pull:*)",
       "Bash(railway up:*)",
       "Bash(wc -l /c/Users/dyllan/BOT/.claude/worktrees/sweet-fermat/*.py)",
-      "Bash(find /c/Users/dyllan/BOT/.claude/worktrees/peaceful-mayer -type f -name *.env* -o -name config*)"
+      "Bash(find /c/Users/dyllan/BOT/.claude/worktrees/peaceful-mayer -type f -name *.env* -o -name config*)",
+      "Bash(python3:*)",
+      "mcp__Desktop_Commander__read_file",
+      "mcp__Desktop_Commander__start_search",
+      "mcp__Desktop_Commander__get_file_info",
+      "mcp__Desktop_Commander__start_process",
+      "mcp__Desktop_Commander__interact_with_process",
+      "mcp__Desktop_Commander__kill_process",
+      "mcp__Desktop_Commander__list_directory",
+      "mcp__Desktop_Commander__edit_block",
+      "Bash(grep -rn \"def shadow_position_update\" \"C:\\\\Users\\\\dyllan\\\\BOT\\\\.claude\\\\worktrees\\\\heuristic-einstein\"\" --include=\"*.py \")",
+      "mcp__Desktop_Commander__create_directory",
+      "mcp__Desktop_Commander__write_file",
+      "Bash(python -m pytest tests/test_shadow_zero_movement.py -v)",
+      "Bash(pytest tests/test_shadow_zero_movement.py -v)",
+      "Bash(git show:*)",
+      "Bash(python -m py_compile app.py)",
+      "Bash(python -m py_compile quant_platform.py)",
+      "Bash(python -m py_compile tests/test_shadow_zero_movement.py)",
+      "mcp__Desktop_Commander__get_more_search_results"
     ]
   }
 }
