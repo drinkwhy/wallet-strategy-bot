@@ -2354,7 +2354,9 @@ def get_shadow_vs_backtest_divergence():
             # Get shadow positions from last 7 days (closed trades only)
             cur.execute("""
                 SELECT realized_pnl_pct FROM shadow_positions
-                WHERE status='closed' AND closed_at >= NOW() - INTERVAL '7 days'
+                WHERE status='closed'
+                  AND closed_at >= NOW() - INTERVAL '7 days'
+                  AND exit_reason != 'zero_movement_stuck'
             """)
             shadow_trades = cur.fetchall()
 
