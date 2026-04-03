@@ -9739,20 +9739,55 @@ def _shadow_auto_tune():
             coin_eval = _evaluate_all_recorded_coins(days=7)
 
             # --- NEW: Run event tape replay backtest (same 7-day period as coin eval) ---
-            print(f"[SHADOW-TUNE] running event replay backtest over 7-day period...", flush=True)
+            print(f"\n{'='*80}", flush=True)
+            print(f"[EVENT-REPLAY] Starting event tape backtest (7-day window)...", flush=True)
+            print(f"{'='*80}", flush=True)
+            event_replay_result = None
             try:
                 event_rows = _load_backtest_event_tape(days=7)
+                print(f"[EVENT-REPLAY] Loaded {len(event_rows)} events from market_events/wallet_flow/liquidity_delta", flush=True)
+
                 if event_rows:
+                    print(f"[EVENT-REPLAY] Running backtest on {len(strategies)} strategies...", flush=True)
                     backtest_result = simulate_event_tape_backtest(f"shadow-tune-{int(time.time())}", event_rows, strategies)
-                    print(f"[SHADOW-TUNE] backtest replay: {len(backtest_result.get('trades', []))} trades from {len(event_rows)} events", flush=True)
-                    if backtest_result.get("summary"):
-                        summary_strats = backtest_result["summary"].get("strategies", {})
-                        for sname, sdata in summary_strats.items():
-                            print(f"[SHADOW-TUNE]   {sname}: {sdata.get('passed', 0)} passed, {sdata.get('blocked', 0)} blocked", flush=True)
+                    event_replay_result = backtest_result
+
+                    trades = backtest_result.get('trades', [])
+                    summary = backtest_result.get('summary', {})
+
+                    print(f"[EVENT-REPLAY] ✓ Backtest complete: {len(trades)} trades executed", flush=True)
+                    print(f"[EVENT-REPLAY] Events processed: {summary.get('events_processed', 0)}", flush=True)
+
+                    # Per-strategy breakdown
+                    summary_strats = summary.get("strategies", {})
+                    if summary_strats:
+                        print(f"[EVENT-REPLAY] Strategy Results:", flush=True)
+                        for sname in sorted(summary_strats.keys()):
+                            sdata = summary_strats[sname]
+                            decisions = sdata.get('decisions', 0)
+                            passed = sdata.get('passed', 0)
+                            blocked = sdata.get('blocked', 0)
+                            trades_strat = len([t for t in trades if t.get('strategy_name') == sname])
+                            print(f"[EVENT-REPLAY]   {sname:20} | Decisions: {decisions:4} | Passed: {passed:4} | Blocked: {blocked:4} | Trades: {trades_strat:3}", flush=True)
+
+                    # Trade statistics
+                    if trades:
+                        wins = len([t for t in trades if (t.get('realized_pnl_pct') or 0) > 0])
+                        win_rate = (wins / len(trades) * 100) if trades else 0
+                        avg_pnl = sum(t.get('realized_pnl_pct', 0) for t in trades) / len(trades) if trades else 0
+                        print(f"[EVENT-REPLAY] Trade Statistics:", flush=True)
+                        print(f"[EVENT-REPLAY]   Total Trades: {len(trades)}", flush=True)
+                        print(f"[EVENT-REPLAY]   Win Rate: {win_rate:.1f}%", flush=True)
+                        print(f"[EVENT-REPLAY]   Avg P&L: {avg_pnl:+.2f}%", flush=True)
+                    else:
+                        print(f"[EVENT-REPLAY] ⚠️ No trades generated from event replay", flush=True)
                 else:
-                    print(f"[SHADOW-TUNE] ⚠️ no events found for backtest replay (7d window)", flush=True)
+                    print(f"[EVENT-REPLAY] ⚠️ No events found for backtest replay (7d window)", flush=True)
             except Exception as bt_err:
-                print(f"[SHADOW-TUNE] ⚠️ backtest replay failed: {bt_err}", flush=True)
+                print(f"[EVENT-REPLAY] ❌ Backtest replay failed: {bt_err}", flush=True)
+                import traceback
+                traceback.print_exc()
+            print(f"{'='*80}\n", flush=True)
 
             # --- NEW: Analyze cooldown optimization to reduce regret and catch exponential growers ---
             print(f"[SHADOW-TUNE] analyzing cooldown optimization across strategies...", flush=True)
