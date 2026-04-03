@@ -4403,7 +4403,8 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        if age_min > max_age:
+        # Only check age if it's known (not the 9999 default for missing data)
+        if age_min < 9999 and age_min > max_age:
             sig_entry["reason"] = f"Age {age_min:.0f}m > max {max_age}m"
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
