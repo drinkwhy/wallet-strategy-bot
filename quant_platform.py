@@ -383,6 +383,11 @@ def shadow_position_update(position, current_price, settings, age_min):
     peak_plateau_mode = bool(settings.get("peak_plateau_mode"))
     tp1_sell_pct = _safe_float(settings.get("tp1_sell_pct"), 0.50)
 
+    # NEW: Zero-movement detection parameters
+    movement_band_pct = _safe_float(settings.get("movement_band_pct", 1.0), 1.0)
+    time_threshold_sec = _safe_int(settings.get("time_threshold_sec", 300), 300)
+    time_in_band = _safe_int(position.get("time_in_band_sec", 0), 0)
+
     tp1_hit = bool(position.get("tp1_hit"))
     tp1_pnl_pct = _safe_float(position.get("tp1_pnl_pct"), 0.0)
 
@@ -424,55 +429,73 @@ def shadow_position_update(position, current_price, settings, age_min):
     exit_reason = ""
     new_tp1_hit = tp1_hit
     new_tp1_pnl_pct = tp1_pnl_pct
+    new_time_in_band = time_in_band  # NEW: track band time
 
-    if stop_ratio > 0 and current_price <= entry_price * stop_ratio:
-        status = "closed"
-        exit_reason = "stop_loss"
-    elif peak_plateau_mode:
-        # Peak Plateau Mode: TP1 skim, then trail to peak
-        if not tp1_hit and ratio >= tp1_mult:
-            # TP1 hit — record partial profit, keep position open
-            new_tp1_hit = True
-            new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
-            exit_reason = ""  # not closing yet
-        elif (peak_ratio >= 1.5) and current_price < trail_line:
+    # NEW: Zero-movement detection (check FIRST before other exits)
+    band_lower = entry_price * (1.0 - movement_band_pct / 100.0)
+    band_upper = entry_price * (1.0 + movement_band_pct / 100.0)
+
+    if band_lower <= current_price <= band_upper:
+        # Price is in the band
+        new_time_in_band = time_in_band + 1  # increment by 1 second (called every second)
+        if new_time_in_band >= time_threshold_sec:
+            # Stuck for long enough — close it
             status = "closed"
-            exit_reason = f"peak_plateau_{effective_trail*100:.0f}pct_trail"
-        elif age_min >= time_stop_min and ratio < 1.05:
-            # Time stop: close if flat or losing after time limit
-            status = "closed"
-            exit_reason = "time_stop"
-        elif age_min >= time_stop_min and ratio >= 1.05 and current_price < trail_line:
-            # In profit past time limit but dropping from peak — trail out
-            status = "closed"
-            exit_reason = "time_trail"
+            exit_reason = "zero_movement_stuck"
     else:
-        # Standard mode with TP1/TP2
-        if not tp1_hit and ratio >= tp1_mult:
-            # TP1 hit — record partial profit
-            new_tp1_hit = True
-            new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
-            # If price is already at or above TP2 in the same tick, close immediately
-            if ratio >= tp2_mult:
+        # Price broke the band — reset counter
+        new_time_in_band = 0
+
+    # Existing exit conditions (only check if not already closed by zero-movement)
+    if status == "open":
+        if stop_ratio > 0 and current_price <= entry_price * stop_ratio:
+            status = "closed"
+            exit_reason = "stop_loss"
+        elif peak_plateau_mode:
+            # Peak Plateau Mode: TP1 skim, then trail to peak
+            if not tp1_hit and ratio >= tp1_mult:
+                # TP1 hit — record partial profit, keep position open
+                new_tp1_hit = True
+                new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
+                exit_reason = ""  # not closing yet
+            elif (peak_ratio >= 1.5) and current_price < trail_line:
                 status = "closed"
-                exit_reason = "take_profit"
-            else:
-                exit_reason = ""  # not closing yet — waiting for TP2
-        elif tp1_hit and ratio >= tp2_mult:
-            status = "closed"
-            exit_reason = "take_profit_tp2"
-        elif tp1_hit and current_price < trail_line:
-            # After TP1, use trailing stop instead of waiting forever for TP2
-            status = "closed"
-            exit_reason = "trail_after_tp1"
-        elif not tp1_hit and age_min >= time_stop_min and ratio < 1.05:
-            # Time stop: close if flat or losing after time limit
-            status = "closed"
-            exit_reason = "time_stop"
-        elif not tp1_hit and age_min >= time_stop_min and ratio >= 1.05 and current_price < trail_line:
-            # In profit past time limit but dropping from peak — trail out
-            status = "closed"
-            exit_reason = "time_trail"
+                exit_reason = f"peak_plateau_{effective_trail*100:.0f}pct_trail"
+            elif age_min >= time_stop_min and ratio < 1.05:
+                # Time stop: close if flat or losing after time limit
+                status = "closed"
+                exit_reason = "time_stop"
+            elif age_min >= time_stop_min and ratio >= 1.05 and current_price < trail_line:
+                # In profit past time limit but dropping from peak — trail out
+                status = "closed"
+                exit_reason = "time_trail"
+        else:
+            # Standard mode with TP1/TP2
+            if not tp1_hit and ratio >= tp1_mult:
+                # TP1 hit — record partial profit
+                new_tp1_hit = True
+                new_tp1_pnl_pct = (ratio - 1.0) * 100.0 * tp1_sell_pct
+                # If price is already at or above TP2 in the same tick, close immediately
+                if ratio >= tp2_mult:
+                    status = "closed"
+                    exit_reason = "take_profit"
+                else:
+                    exit_reason = ""  # not closing yet — waiting for TP2
+            elif tp1_hit and ratio >= tp2_mult:
+                status = "closed"
+                exit_reason = "take_profit_tp2"
+            elif tp1_hit and current_price < trail_line:
+                # After TP1, use trailing stop instead of waiting forever for TP2
+                status = "closed"
+                exit_reason = "trail_after_tp1"
+            elif not tp1_hit and age_min >= time_stop_min and ratio < 1.05:
+                # Time stop: close if flat or losing after time limit
+                status = "closed"
+                exit_reason = "time_stop"
+            elif not tp1_hit and age_min >= time_stop_min and ratio >= 1.05 and current_price < trail_line:
+                # In profit past time limit but dropping from peak — trail out
+                status = "closed"
+                exit_reason = "time_trail"
 
     # Calculate realized P&L on close
     # Combine: TP1 partial profit (on the sold fraction) + remaining position P&L (on the unsold fraction)
@@ -497,6 +520,7 @@ def shadow_position_update(position, current_price, settings, age_min):
         "realized_pnl_pct": round(realized_pnl_pct, 2) if realized_pnl_pct is not None else None,
         "tp1_hit": new_tp1_hit,
         "tp1_pnl_pct": round(new_tp1_pnl_pct, 2),
+        "time_in_band_sec": new_time_in_band,  # NEW
     }
 
 
