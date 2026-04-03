@@ -10966,6 +10966,41 @@ def api_shadow_trading_mode():
         print(f"[ERROR] Could not apply shadow trading mode: {e}", flush=True)
         return jsonify({"ok": False, "msg": "Failed to apply shadow trading mode"})
 
+@app.route("/api/switch-to-balanced", methods=["POST"])
+@login_required
+def api_switch_to_balanced():
+    """Switch shadow trading to Balanced V2 preset."""
+    uid = session["user_id"]
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+            # Update bot settings to balanced preset
+            cur.execute("""
+                UPDATE bot_settings
+                SET preset=%s, custom_settings=NULL
+                WHERE user_id=%s
+            """, ("balanced", uid))
+            conn.commit()
+        finally:
+            db_return(conn)
+
+        # Update running bot if active
+        bot = user_bots.get(uid)
+        if bot:
+            settings = dict(PRESETS.get("balanced", PRESETS["balanced"]))
+            bot.settings = settings
+            bot.preset_name = "balanced"
+
+        return jsonify({
+            "ok": True,
+            "msg": "✓ Switched to Balanced V2 — shadow trading will use balanced entry/exit rules"
+        })
+    except Exception as e:
+        print(f"[ERROR] Could not switch to balanced: {e}", flush=True)
+        return jsonify({"ok": False, "msg": "Failed to switch preset"})
+
+
 @app.route("/api/set-max-positions", methods=["POST"])
 @login_required
 def api_set_max_positions():
@@ -15851,6 +15886,7 @@ DASHBOARD_HTML = _CSS + """
       <div class="hero-actions">
         <button id="toggle-btn" class="btn btn-success" onclick="toggleBot()">▶ Start Bot</button>
         <button class="btn btn-blue" type="button" onclick="applyShadowTrading()" title="Apply optimal shadow trading settings">⚙️ Shadow Trading Mode</button>
+        <button class="btn btn-ghost" type="button" onclick="switchToBalanced()" title="Switch shadow trading to Balanced V2">← Switch to Balanced</button>
         <div style="display:flex;align-items:center;gap:8px">
           <label style="font-size:12px;color:var(--t3)">Max Open Buys:</label>
           <input type="number" id="max-positions-input" min="1" max="20" value="5" style="width:50px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg1);color:var(--t1);font-family:monospace;font-size:12px">
@@ -18946,6 +18982,19 @@ async function applyShadowTrading() {
     setTimeout(refresh, 500);
   } else {
     showToast(res?.msg || 'Failed to apply shadow trading mode', false);
+  }
+}
+async function switchToBalanced() {
+  if (!confirm('Switch shadow trading to Balanced V2 preset?')) return;
+  const res = await fetch('/api/switch-to-balanced', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'}
+  }).then(r=>r.json()).catch(()=>null);
+  if (res && res.ok) {
+    showToast('✓ Shadow trading switched to Balanced V2', true);
+    setTimeout(refresh, 500);
+  } else {
+    showToast(res?.msg || 'Failed to switch preset', false);
   }
 }
 async function updateMaxPositions() {
