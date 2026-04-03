@@ -9862,7 +9862,7 @@ def ensure_background_workers_started():
             quant_edge_report_monitor,
             _prune_seen_tokens,
             _auto_prune_db,
-            _shadow_auto_tune,
+            # _shadow_auto_tune,  # DISABLED: new params making losses worse (-52.3% vs -26.9%)
             _self_ping_keepalive,
         ]
         for target in worker_targets:
