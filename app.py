@@ -6547,7 +6547,9 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
     intel = info.get("intel") or {}
     snapshot = build_feature_snapshot(info, intel)
     flow_snapshot = build_flow_snapshot(info, intel)
-    strategies = _shadow_strategy_settings(user_id=user_id)
+    all_strategies = _shadow_strategy_settings(user_id=user_id)
+    # NEW: Start shadow trading with Balanced V2 only - auto-tune will deploy other strategies
+    strategies = {"balanced_v2": all_strategies.get("balanced_v2", all_strategies.get("balanced", {}))} if all_strategies else {}
     conn = db()
     try:
         cur = conn.cursor()
