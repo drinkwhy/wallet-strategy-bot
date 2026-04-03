@@ -16057,6 +16057,9 @@ DASHBOARD_HTML = _CSS + """
       </div>
       <span class="shadow-auto-tag" id="lv-auto-tune-tag">Auto-Tune Active</span>
     </div>
+    <div style="border-top:1px solid rgba(255,255,255,.06);padding:12px 18px;display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="resetShadowTradingLive()" style="padding:6px 12px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.04);color:var(--t2);font-size:11px;font-weight:700;border-radius:6px;cursor:pointer;transition:all .2s" onmouseover="this.style.background='rgba(255,255,255,.08)'" onmouseout="this.style.background='rgba(255,255,255,.04)'">↻ Reset Numbers</button>
+    </div>
     <div class="live-feed" id="live-feed">
       <div class="live-feed-item win"><span class="live-feed-icon">+</span><span style="color:var(--t3)">Waiting for trades...</span></div>
     </div>
@@ -18997,6 +19000,19 @@ async function switchToBalanced() {
     setTimeout(refresh, 500);
   } else {
     showToast(res?.msg || 'Failed to switch preset', false);
+  }
+}
+async function resetShadowTradingLive() {
+  if (!confirm('⚠️ Reset all Shadow Trading Live numbers? This will delete all shadow positions and trades.')) return;
+  const res = await fetch('/api/admin/reset-shadow-trading-all', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'}
+  }).then(r=>r.json()).catch(()=>null);
+  if (res && res.ok) {
+    showToast('✓ Shadow Trading Live reset to zero', true);
+    setTimeout(() => { document.getElementById('lv-shadow-trades').textContent = '0'; document.getElementById('lv-shadow-wr').textContent = '—'; document.getElementById('lv-shadow-pnl').textContent = '0%'; document.getElementById('lv-shadow-best').textContent = '—'; }, 200);
+  } else {
+    showToast(res?.msg || 'Failed to reset shadow trading', false);
   }
 }
 async function updateMaxPositions() {
