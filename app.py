@@ -4403,12 +4403,23 @@ class BotInstance:
             self.log_signal_entry(sig_entry)
             self.log_filter(name, mint, False, sig_entry["reason"])
             return
-        # Only check age if it's known (not the 9999 default for missing data)
-        if age_min < 9999 and age_min > max_age:
-            sig_entry["reason"] = f"Age {age_min:.0f}m > max {max_age}m"
-            self.log_signal_entry(sig_entry)
-            self.log_filter(name, mint, False, sig_entry["reason"])
-            return
+        # Check age bounds (skip if unknown: 9999)
+        # Allow bypass for runners (>100% growth)
+        is_runner = change > 100
+        if age_min < 9999:
+            if age_min > max_age:
+                sig_entry["reason"] = f"Age {age_min:.0f}m > max {max_age}m"
+                self.log_signal_entry(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
+                return
+            # Check minimum age (prevent brand-new tokens) unless it's a runner
+            from risk_engine import RISK_THRESHOLDS
+            min_age = RISK_THRESHOLDS.get("min_token_age_sec", 15) / 60.0  # Convert to minutes
+            if age_min < min_age and not is_runner:
+                sig_entry["reason"] = f"Age {age_min:.0f}m < min {min_age:.0f}m (unless runner)"
+                self.log_signal_entry(sig_entry)
+                self.log_filter(name, mint, False, sig_entry["reason"])
+                return
         if change < 0:
             sig_entry["reason"] = f"1h change {change:.0f}% not positive enough"
             self.log_signal_entry(sig_entry)
