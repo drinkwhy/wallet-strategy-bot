@@ -157,3 +157,49 @@ class TestZeroMovementDetection:
         result = shadow_position_update(position, 1.005, settings, age_min=5)
         assert result["time_in_band_sec"] == 1, "Counter should increment using default band"
         assert result["status"] == "open", "Should stay open with default settings"
+
+
+class TestZeroMovementIntegration:
+    """Integration test: simulate shadow position lifecycle with zero movement"""
+
+    def test_shadow_position_stuck_then_closes(self, base_settings, base_position):
+        """
+        Simulate a real shadow position:
+        1. Enters at $1.00
+        2. Pumps to $1.10
+        3. Drops to $1.005 and flatlines
+        4. After 5 min, closes as stuck
+        """
+        settings = base_settings
+
+        # Step 1: Position enters
+        position = base_position.copy()
+
+        # Step 2: Price pumps
+        result = shadow_position_update(position, 1.10, settings, age_min=1)
+        position.update(result)
+        assert result["status"] == "open"
+        assert result["time_in_band_sec"] == 0  # band reset
+
+        # Step 3: Price drops to ~entry and flatlines
+        position["peak_price"] = 1.10
+        position["entry_price"] = 1.00
+
+        # Simulate 5+ minutes in band (increments 1 sec per call)
+        for i in range(301):  # 301 iterations = 301 seconds
+            result = shadow_position_update(position, 1.005, settings, age_min=5)
+            position.update(result)
+
+            if i < 299:
+                # Before threshold, should be open
+                assert result["status"] == "open"
+                assert result["time_in_band_sec"] == i + 1
+            else:
+                # After threshold (at i=299, counter=300), should close
+                assert result["status"] == "closed"
+                assert result["exit_reason"] == "zero_movement_stuck"
+                break
+
+        # Final state
+        assert position["status"] == "closed"
+        assert position["time_in_band_sec"] >= 300
