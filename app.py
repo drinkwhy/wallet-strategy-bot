@@ -1386,6 +1386,21 @@ def init_db():
         cur.execute("""CREATE INDEX IF NOT EXISTS idx_zero_movement_closes_strategy ON shadow_zero_movement_closes(strategy_name)""")
         cur.execute("""CREATE INDEX IF NOT EXISTS idx_zero_movement_closes_closed_at ON shadow_zero_movement_closes(closed_at DESC)""")
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS tick_prices (
+            time TIMESTAMP NOT NULL,
+            mint TEXT NOT NULL,
+            price REAL NOT NULL,
+            bid REAL,
+            ask REAL,
+            volume_1m REAL DEFAULT 0,
+            volume_5m REAL DEFAULT 0,
+            spread_bps REAL,
+            liquidity_usd REAL,
+            PRIMARY KEY (time, mint)
+        )""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_tick_prices_mint_time ON tick_prices(mint, time DESC)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_tick_prices_time ON tick_prices(time DESC)""")
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS backtest_runs (
             id SERIAL PRIMARY KEY,
             requested_by INTEGER,

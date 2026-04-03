@@ -10,3 +10,6 @@ gunicorn>=21.2.0
 gevent>=24.2.1
 websocket-client>=1.7.0
 psycopg2-binary>=2.9.9
+kafka-python>=2.0.2
+pandas>=2.0.0
+ray>=2.10.0
