@@ -188,25 +188,18 @@ Shadow Position Update (every 30s)
 
 ## Implementation Notes
 
-### Configurable Parameters
+### Configurable Parameters (Admin-Editable)
 
-These should be environment variables or admin-editable settings:
-- `SHADOW_MOVEMENT_BAND_PCT`: ±% for stuck detection (default: 1.0)
-- `SHADOW_TIME_THRESHOLD_SEC`: Minutes to wait before closing (default: 300)
+Stored in database config table, editable via admin panel:
+- `shadow_movement_band_pct`: ±% for stuck detection (default: 1.0, range: 0.5-5.0)
+- `shadow_time_threshold_sec`: Seconds to wait before closing (default: 300, range: 60-1800)
 
-### Performance Considerations
+### Simplicity Focus
 
-- `time_in_band_sec` is a lightweight integer counter (no DB queries)
-- Check happens in existing `shadow_position_update()` loop (no extra overhead)
-- Stuck analysis query is indexed on (strategy_name, closed_at DESC)
-- Minimal impact on Railway resources
-
-### Backward Compatibility
-
-- Existing shadow positions continue normally
-- Only NEW positions after deployment track time_in_band_sec
-- Divergence calculation automatically excludes zero-movement closes
-- No breaking changes to API or data structures
+- No alerts, webhooks, or extra logging
+- Auto-close happens silently, tracked to separate table
+- Single integer counter (`time_in_band_sec`) — no complex calculations
+- Divergence exclusion is automatic (single WHERE clause filter)
 
 ---
 
@@ -236,11 +229,5 @@ These should be environment variables or admin-editable settings:
 
 **Rollback:** Revert quant_platform.py changes; stuck analysis will show 0 data but won't break anything.
 
----
 
-## Questions for Implementation
-
-- Should `movement_band_pct` be hardcoded or admin-editable?
-- Should zero-movement closes trigger a webhook alert (for debugging)?
-- Should we log why specific tokens get stuck (low vol, low liquidity, whale dump)?
 
