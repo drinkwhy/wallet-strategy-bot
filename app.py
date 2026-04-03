@@ -9784,13 +9784,19 @@ def _shadow_auto_tune():
                         print(f"[SHADOW-TUNE]   {regime_name} regime: {rdata['token_count']} tokens, "
                               f"top edge = {top['label']} ({top['edge']:+.1f})", flush=True)
 
-            # Tune each auto_promote user independently
+            # Tune each auto_promote user independently (with circuit breaker protection)
             if not auto_promote_user_ids:
                 print(f"[AUTO-TUNE] Skipped — no users have auto_promote enabled", flush=True)
             else:
                 print(f"[AUTO-TUNE] tuning {len(auto_promote_user_ids)} user(s) with auto_promote: {auto_promote_user_ids}", flush=True)
                 for uid in auto_promote_user_ids:
                     try:
+                        # Circuit breaker check: don't deploy if user is in loss mode
+                        cb_state = risk_engine.get_circuit_breaker_state(uid)
+                        if cb_state and cb_state.get("is_tripped"):
+                            print(f"[AUTO-TUNE] U{uid} circuit breaker TRIPPED ({cb_state.get('reason')}), skipping deployment", flush=True)
+                            continue
+                        
                         _auto_tune_from_results(uid, summary, f"shadow-live-{int(time.time())}")
                         print(f"[AUTO-TUNE] U{uid} tuned successfully", flush=True)
                     except Exception as tune_err:
