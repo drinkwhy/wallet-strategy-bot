@@ -14333,6 +14333,53 @@ def api_admin_reset_evaluations():
     })
 
 
+@app.route("/api/admin/reset-shadow-trading-all", methods=["POST"])
+@admin_required
+def api_admin_reset_shadow_trading_all():
+    """Full reset of all shadow trading data: positions, decisions, zero-movement closes."""
+    conn = None
+    try:
+        conn = db()
+        cur = conn.cursor()
+
+        counts_before = {}
+
+        # Count before reset
+        for table in ["shadow_positions", "shadow_decisions", "shadow_zero_movement_closes"]:
+            try:
+                cur.execute(f"SELECT COUNT(*) as cnt FROM {table}")
+                row = cur.fetchone()
+                counts_before[table] = row['cnt'] if row else 0
+            except Exception:
+                counts_before[table] = 0
+
+        # Delete all shadow trading data
+        cur.execute("DELETE FROM shadow_zero_movement_closes")
+        cur.execute("DELETE FROM shadow_decisions")
+        cur.execute("DELETE FROM shadow_positions")
+        conn.commit()
+
+        counts_after = {table: 0 for table in counts_before.keys()}
+
+        print(f"[RESET] Shadow trading all: positions {counts_before.get('shadow_positions', 0)} → 0, "
+              f"decisions {counts_before.get('shadow_decisions', 0)} → 0, "
+              f"zero_moves {counts_before.get('shadow_zero_movement_closes', 0)} → 0", flush=True)
+
+        return jsonify({
+            "ok": True,
+            "reset_tables": ["shadow_positions", "shadow_decisions", "shadow_zero_movement_closes"],
+            "counts_before": counts_before,
+            "counts_after": counts_after,
+            "msg": "✓ All shadow trading data cleared. Metrics reset to zero."
+        })
+    except Exception as e:
+        print(f"[RESET] Shadow trading reset failed: {e}", flush=True)
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        if conn:
+            db_return(conn)
+
+
 @app.route("/api/admin/override-preset", methods=["POST"])
 @admin_required
 def api_override_preset():
