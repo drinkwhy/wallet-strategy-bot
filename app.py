@@ -1417,6 +1417,13 @@ def init_db():
             policy_json TEXT,
             generated_at TIMESTAMP DEFAULT NOW()
         )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            description TEXT,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )""")
         conn.commit()
         # indexes on columns added by migrate_db — safe to skip if column not yet present
         for _idx_sql in [
@@ -6683,6 +6690,16 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                 settings = _all_p.get(row.get("strategy_name") or "balanced", PRESETS["balanced"])
                 opened_at = row.get("opened_at")
                 age_min = ((time.time() - opened_at.timestamp()) / 60.0) if opened_at else 0.0
+                # Fetch current settings
+                cur.execute("SELECT value FROM admin_settings WHERE key='shadow_movement_band_pct'")
+                row_setting = cur.fetchone()
+                movement_band = float(row_setting[0] if row_setting else "1.0")
+                cur.execute("SELECT value FROM admin_settings WHERE key='shadow_time_threshold_sec'")
+                row_setting = cur.fetchone()
+                time_threshold = int(row_setting[0] if row_setting else "300")
+                # Add to settings passed to shadow_position_update
+                settings['movement_band_pct'] = movement_band
+                settings['time_threshold_sec'] = time_threshold
                 update = shadow_position_update(row, price, settings, age_min)
                 if update["status"] == "closed":
                     # ── Apply realistic friction — this IS the P&L now ──
@@ -6713,7 +6730,8 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                             tp1_hit=%s, tp1_pnl_pct=%s,
                             slippage_pct=%s, price_impact_pct=%s,
                             total_friction_pct=%s,
-                            exit_liq_usd=%s, exit_vol_usd=%s
+                            exit_liq_usd=%s, exit_vol_usd=%s,
+                            time_in_band_sec=%s
                         WHERE id=%s
                     """, (
                         update["current_price"], update["exit_reason"], realistic_pnl,
@@ -6724,8 +6742,27 @@ def _record_market_intelligence(info, include_strategy_decisions=True, include_m
                         friction["slippage_pct"], friction["price_impact_pct"],
                         friction["total_friction_pct"],
                         friction["exit_liq_usd"], friction["exit_vol_usd"],
+                        update.get("time_in_band_sec", 0),
                         row["id"],
                     ))
+                    # Log zero-movement closes
+                    if update["status"] == "closed" and update["exit_reason"] == "zero_movement_stuck":
+                        cur.execute("""
+                            INSERT INTO shadow_zero_movement_closes
+                            (mint, strategy_name, opened_at, closed_at, entry_price, peak_price,
+                             close_price, time_stuck_sec, realized_pnl_pct, entry_vol_usd)
+                            VALUES (%s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+                        """, (
+                            row['mint'],
+                            row['strategy_name'],
+                            row['opened_at'],
+                            row['entry_price'],
+                            update['peak_price'],
+                            update['current_price'],
+                            update.get('time_in_band_sec', 0),
+                            update.get('realized_pnl_pct'),
+                            row.get('entry_vol_usd')
+                        ))
                     closed_inline += 1
                 elif update.get("tp1_hit") and not row.get("tp1_hit"):
                     # TP1 just triggered — update the flag but keep position open
@@ -6813,6 +6850,16 @@ def reconcile_shadow_positions(limit=40):
             settings = _all_p.get(strategy_name, PRESETS["balanced"])
             opened_at = row.get("opened_at")
             age_min = ((now - opened_at.timestamp()) / 60.0) if opened_at else 0.0
+            # Fetch current settings
+            cur.execute("SELECT value FROM admin_settings WHERE key='shadow_movement_band_pct'")
+            row_setting = cur.fetchone()
+            movement_band = float(row_setting[0] if row_setting else "1.0")
+            cur.execute("SELECT value FROM admin_settings WHERE key='shadow_time_threshold_sec'")
+            row_setting = cur.fetchone()
+            time_threshold = int(row_setting[0] if row_setting else "300")
+            # Add to settings passed to shadow_position_update
+            settings['movement_band_pct'] = movement_band
+            settings['time_threshold_sec'] = time_threshold
             update = shadow_position_update(row, current_price, settings, age_min)
 
             # Apply friction — realized_pnl_pct IS the realistic number
@@ -6857,7 +6904,8 @@ def reconcile_shadow_positions(limit=40):
                     price_impact_pct=CASE WHEN %s='closed' THEN %s ELSE price_impact_pct END,
                     total_friction_pct=CASE WHEN %s='closed' THEN %s ELSE total_friction_pct END,
                     exit_liq_usd=CASE WHEN %s='closed' THEN %s ELSE exit_liq_usd END,
-                    exit_vol_usd=CASE WHEN %s='closed' THEN %s ELSE exit_vol_usd END
+                    exit_vol_usd=CASE WHEN %s='closed' THEN %s ELSE exit_vol_usd END,
+                    time_in_band_sec=CASE WHEN %s='closed' THEN %s ELSE time_in_band_sec END
                 WHERE id=%s
             """, (
                 update["current_price"], update["peak_price"], update["trough_price"],
@@ -6874,8 +6922,27 @@ def reconcile_shadow_positions(limit=40):
                 update["status"], friction["total_friction_pct"] if friction else 0,
                 update["status"], friction["exit_liq_usd"] if friction else 0,
                 update["status"], friction["exit_vol_usd"] if friction else 0,
+                update["status"], update.get("time_in_band_sec", 0),
                 row["id"],
             ))
+            # Log zero-movement closes
+            if update["status"] == "closed" and update["exit_reason"] == "zero_movement_stuck":
+                cur.execute("""
+                    INSERT INTO shadow_zero_movement_closes
+                    (mint, strategy_name, opened_at, closed_at, entry_price, peak_price,
+                     close_price, time_stuck_sec, realized_pnl_pct, entry_vol_usd)
+                    VALUES (%s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+                """, (
+                    row['mint'],
+                    row['strategy_name'],
+                    row['opened_at'],
+                    row['entry_price'],
+                    update['peak_price'],
+                    update['current_price'],
+                    update.get('time_in_band_sec', 0),
+                    realistic_pnl,
+                    row.get('entry_vol_usd')
+                ))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -22005,6 +22072,15 @@ def run_startup_migrations():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_zero_movement_closes_closed_at
                 ON shadow_zero_movement_closes(closed_at DESC)
+            """)
+
+            # Ensure zero-movement detection config exists
+            cur.execute("""
+                INSERT INTO admin_settings (key, value, description)
+                VALUES
+                    ('shadow_movement_band_pct', '1.0', 'Band threshold for zero-movement detection (±%)'),
+                    ('shadow_time_threshold_sec', '300', 'Seconds to wait before closing stuck position')
+                ON CONFLICT (key) DO NOTHING
             """)
 
             conn.commit()
