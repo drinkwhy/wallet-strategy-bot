@@ -1,6 +1,7 @@
 import json
 import math
 from dataclasses import dataclass
+from risk_engine import RISK_THRESHOLDS
 
 
 CANONICAL_STRATEGIES = ("safe", "balanced", "aggressive", "degen")
@@ -258,6 +259,10 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     _age_max = _safe_float(settings.get("max_age_min", 9999))
     if _age_val > 0 and _age_val < 9999 and _age_val > _age_max:
         blocker_reasons.append("token_too_old")
+    # Check minimum token age from risk thresholds — enforce unified approval gate
+    _age_min = RISK_THRESHOLDS.get("min_token_age_sec", 30)
+    if _age_val > 0 and _age_val < _age_min:
+        blocker_reasons.append("token_too_new")
     # Price change cap — reject already-pumped tokens
     _change_val = _safe_float(snapshot.get("change"))
     _max_hot = _safe_float(settings.get("max_hot_change", 9999))
