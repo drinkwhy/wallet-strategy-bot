@@ -16058,7 +16058,7 @@ DASHBOARD_HTML = _CSS + """
       <span class="shadow-auto-tag" id="lv-auto-tune-tag">Auto-Tune Active</span>
     </div>
     <div style="border-top:1px solid rgba(255,255,255,.06);padding:12px 18px;display:flex;gap:8px;justify-content:flex-end">
-      <button onclick="resetShadowTradingLive()" style="padding:6px 12px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.04);color:var(--t2);font-size:11px;font-weight:700;border-radius:6px;cursor:pointer;transition:all .2s" onmouseover="this.style.background='rgba(255,255,255,.08)'" onmouseout="this.style.background='rgba(255,255,255,.04)'">↻ Reset Numbers</button>
+      <button onclick="resetShadowTradingLive()" style="padding:8px 14px;border:1px solid rgba(200,50,50,.4);background:rgba(200,50,50,.1);color:#ff6b6b;font-size:11px;font-weight:700;border-radius:6px;cursor:pointer;transition:all .2s;white-space:nowrap" onmouseover="this.style.background='rgba(200,50,50,.2)';this.style.borderColor='rgba(200,50,50,.6)'" onmouseout="this.style.background='rgba(200,50,50,.1)';this.style.borderColor='rgba(200,50,50,.4)'">↻ Reset</button>
     </div>
     <div class="live-feed" id="live-feed">
       <div class="live-feed-item win"><span class="live-feed-icon">+</span><span style="color:var(--t3)">Waiting for trades...</span></div>
