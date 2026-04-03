@@ -9738,6 +9738,22 @@ def _shadow_auto_tune():
             print(f"[SHADOW-TUNE] running coin evaluation on all recorded tokens...", flush=True)
             coin_eval = _evaluate_all_recorded_coins(days=7)
 
+            # --- NEW: Run event tape replay backtest (same 7-day period as coin eval) ---
+            print(f"[SHADOW-TUNE] running event replay backtest over 7-day period...", flush=True)
+            try:
+                event_rows = _load_backtest_event_tape(days=7)
+                if event_rows:
+                    backtest_result = simulate_event_tape_backtest(f"shadow-tune-{int(time.time())}", event_rows, strategies)
+                    print(f"[SHADOW-TUNE] backtest replay: {len(backtest_result.get('trades', []))} trades from {len(event_rows)} events", flush=True)
+                    if backtest_result.get("summary"):
+                        summary_strats = backtest_result["summary"].get("strategies", {})
+                        for sname, sdata in summary_strats.items():
+                            print(f"[SHADOW-TUNE]   {sname}: {sdata.get('passed', 0)} passed, {sdata.get('blocked', 0)} blocked", flush=True)
+                else:
+                    print(f"[SHADOW-TUNE] ⚠️ no events found for backtest replay (7d window)", flush=True)
+            except Exception as bt_err:
+                print(f"[SHADOW-TUNE] ⚠️ backtest replay failed: {bt_err}", flush=True)
+
             # --- NEW: Analyze cooldown optimization to reduce regret and catch exponential growers ---
             print(f"[SHADOW-TUNE] analyzing cooldown optimization across strategies...", flush=True)
             cooldown_opt = _analyze_cooldown_optimization(days=2)
@@ -12259,20 +12275,12 @@ def api_quant_shadow_decisions():
 def api_quant_backtests():
     uid = session["user_id"]
     if request.method == "POST":
-        data = request.get_json(force=True) or {}
-        days = int(data.get("days") or 7)
-        replay_mode = (data.get("replay_mode") or "event_tape").strip().lower()
-        strategies = data.get("strategies") or (list(CANONICAL_STRATEGIES) + SHADOW_V2_STRATEGIES)
-        if not isinstance(strategies, list):
-            strategies = [str(strategies)]
-        run_id, config = launch_backtest_run(
-            requested_by=uid,
-            days=days,
-            strategy_names=[str(s).strip().lower() for s in strategies],
-            name=(data.get("name") or "").strip(),
-            replay_mode=replay_mode,
-        )
-        return jsonify({"ok": True, "run_id": run_id, "config": config})
+        # Manual backtest launches disabled — auto-tune now runs event replay hourly
+        return jsonify({
+            "ok": False,
+            "error": "Manual backtest launches disabled. Auto-tune optimization (hourly) now includes event replay evaluation. Check dashboard for auto-tune results.",
+            "auto_tune_interval_sec": 3600
+        }), 400
 
     conn = db()
     try:
