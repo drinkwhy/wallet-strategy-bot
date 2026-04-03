@@ -21682,6 +21682,37 @@ ADMIN_HTML = _CSS + """
       </div>
     </div>
 
+    <!-- Stuck Position Analysis (in admin panel) -->
+    <div id="stuck-analysis" style="display:none;margin-bottom:20px;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);padding:16px;border-radius:8px">
+      <div class="adm-section-title" style="color:#c084fc">🧪 Stuck Position Analysis (Last 7d)</div>
+
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px">
+        <div class="adm-card">
+          <div class="val" id="stuck-total">-</div>
+          <div class="lbl">Total Stuck</div>
+        </div>
+        <div class="adm-card">
+          <div class="val" id="stuck-pct">-</div>
+          <div class="lbl">% of Trades</div>
+        </div>
+        <div class="adm-card">
+          <div class="val" id="stuck-avg-time">-</div>
+          <div class="lbl">Avg Time Stuck</div>
+        </div>
+        <div class="adm-card">
+          <div class="val" id="stuck-avg-pnl">-</div>
+          <div class="lbl">Avg PnL</div>
+        </div>
+      </div>
+
+      <div style="background:rgba(0,0,0,.2);padding:12px;border-radius:6px;margin-bottom:12px">
+        <div style="font-size:11px;color:var(--t3);font-weight:600;margin-bottom:8px">TOP STUCK TOKENS</div>
+        <div id="stuck-top-tokens" style="font-size:11px;color:var(--t2);line-height:1.8"></div>
+      </div>
+
+      <button class="btn btn-primary" onclick="runStuckAnalysis()" style="width:100%">🔄 Refresh Analysis</button>
+    </div>
+
     <div id="overfit-loading" style="text-align:center;color:var(--t3);padding:40px;font-size:13px">
       Click "Analyze Now" to check for overfitting and model drift
     </div>
@@ -22079,6 +22110,46 @@ async function applyOverfitFix() {
     statusEl.style.color = 'var(--red2)';
   }
 }
+
+async function runStuckAnalysis() {
+  const btn = document.querySelector('#adm-tab-overfit button[onclick="runStuckAnalysis()"]');
+  if (btn) btn.disabled = true;
+
+  try {
+    const resp = await fetch('/api/admin/stuck-analysis');
+    const data = await resp.json();
+
+    if (data.status !== 'ok') {
+      document.getElementById('stuck-analysis').style.display = 'none';
+      return;
+    }
+
+    // Update metrics
+    document.getElementById('stuck-total').textContent = data.total_stuck;
+    document.getElementById('stuck-pct').textContent = data.pct_of_trades.toFixed(1) + '%';
+    document.getElementById('stuck-avg-time').textContent = Math.floor(data.avg_time_stuck_sec / 60) + 'm';
+    document.getElementById('stuck-avg-pnl').textContent = data.avg_pnl_pct.toFixed(2) + '%';
+
+    // Update top tokens
+    const tokensList = data.top_stuck_tokens
+      .map(t => `${t.mint.substring(0,6)}... (${t.stuck_count}x, ${Math.floor(t.avg_time_sec / 60)}m avg)`)
+      .join('<br>');
+    document.getElementById('stuck-top-tokens').innerHTML = tokensList || 'No stuck tokens yet';
+
+    document.getElementById('stuck-analysis').style.display = '';
+  } catch (e) {
+    console.error('Stuck analysis error:', e);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Call runStuckAnalysis on page load to auto-load stuck analysis
+setInterval(() => {
+  if (document.getElementById('adm-tab-overfit').style.display !== 'none') {
+    runStuckAnalysis();
+  }
+}, 15000);
 
 loadAdminData();
 loadBlacklist();
