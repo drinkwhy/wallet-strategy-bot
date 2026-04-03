@@ -12582,6 +12582,67 @@ def api_admin_apply_overfit_fix():
         print(f"[OVERFIT-FIX] Error: {e}", flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
 
+@app.route("/api/admin/stuck-analysis")
+@login_required
+def api_admin_stuck_analysis():
+    """Return stuck position analysis metrics for Phase 1 dashboard."""
+    try:
+        conn = db()
+        try:
+            cur = conn.cursor()
+
+            # Get all zero-movement closes from last 7 days
+            cur.execute("""
+                SELECT
+                    COUNT(*) as total_stuck,
+                    AVG(time_stuck_sec) as avg_time_stuck_sec,
+                    AVG(realized_pnl_pct) as avg_pnl_pct
+                FROM shadow_zero_movement_closes
+                WHERE closed_at >= NOW() - INTERVAL '7 days'
+            """)
+            stuck_row = cur.fetchone()
+
+            # Get total shadow trades (excluding stuck) for percentage
+            cur.execute("""
+                SELECT COUNT(*) FROM shadow_positions
+                WHERE status='closed'
+                  AND closed_at >= NOW() - INTERVAL '7 days'
+                  AND exit_reason != 'zero_movement_stuck'
+            """)
+            real_trades = cur.fetchone()[0] or 0
+
+            total_stuck = stuck_row[0] or 0
+            total_all = total_stuck + real_trades
+            pct_stuck = (total_stuck / total_all * 100) if total_all > 0 else 0
+
+            # Get top 5 most stuck tokens
+            cur.execute("""
+                SELECT mint, COUNT(*) as stuck_count, AVG(time_stuck_sec) as avg_time
+                FROM shadow_zero_movement_closes
+                WHERE closed_at >= NOW() - INTERVAL '7 days'
+                GROUP BY mint
+                ORDER BY stuck_count DESC
+                LIMIT 5
+            """)
+            top_tokens = [
+                {"mint": row[0], "stuck_count": row[1], "avg_time_sec": int(row[2] or 0)}
+                for row in cur.fetchall()
+            ]
+
+        finally:
+            db_return(conn)
+
+        return jsonify({
+            "status": "ok",
+            "total_stuck": total_stuck,
+            "pct_of_trades": round(pct_stuck, 1),
+            "avg_time_stuck_sec": int(stuck_row[1] or 0),
+            "avg_pnl_pct": round(stuck_row[2] or 0, 2),
+            "top_stuck_tokens": top_tokens
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route("/api/enhanced/mev-stats")
 @login_required
 def api_mev_stats():
