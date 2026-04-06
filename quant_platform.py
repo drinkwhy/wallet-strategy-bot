@@ -262,11 +262,11 @@ def evaluate_shadow_strategy(strategy_name, settings, snapshot):
     # Check minimum token age from risk thresholds — enforce unified approval gate
     # EXCEPTION: bypass age check for runners (huge growth >100%) to catch pump early
     _age_min = RISK_THRESHOLDS.get("min_token_age_sec", 30)
+    # Price change cap — reject already-pumped tokens
+    _change_val = _safe_float(snapshot.get("change"))
     _is_runner = _change_val > 100  # Caught 100%+ already — likely a runner
     if _age_val > 0 and _age_val < _age_min and not _is_runner:
         blocker_reasons.append("token_too_new")
-    # Price change cap — reject already-pumped tokens
-    _change_val = _safe_float(snapshot.get("change"))
     _max_hot = _safe_float(settings.get("max_hot_change", 9999))
     if _change_val > 0 and _max_hot < 9999 and _change_val > _max_hot:
         blocker_reasons.append("price_change_too_hot")
