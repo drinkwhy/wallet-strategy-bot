@@ -15,6 +15,10 @@ import websocket
 from dotenv import load_dotenv
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
+from wallet_scanner import start_scanner, get_copy_list, get_copy_addresses, stop_scanner
+from copy_engine import (
+    start_engine, stop_engine, get_mode, set_mode, get_trades, CopyMode,
+)
 from flask import Flask, Response, jsonify, request
 
 
@@ -740,6 +744,62 @@ def trade_detail():
         "start_balance":  round(_session_start_balance or sol_balance, 4),
     })
 
+# ── Copy Bot Routes ────────────────────────────────────────────────────────────
+
+@app.route("/copy/state")
+def copy_state():
+    copy_list = get_copy_list()
+    return jsonify({
+        "mode": get_mode().value,
+        "leaderboard": [
+            {
+                "address":      e.address[:8] + "…" + e.address[-4:],
+                "full_address": e.address,
+                "score":        round(e.score, 3),
+                "win_rate":     round(e.win_rate * 100, 1),
+                "avg_roi":      round(e.avg_roi * 100, 1),
+            }
+            for e in copy_list
+        ],
+        "trades": get_trades(),
+    })
+
+
+@app.route("/copy/mode", methods=["POST"])
+def copy_set_mode():
+    data = request.json or {}
+    raw = data.get("mode", "shadow")
+    try:
+        mode = CopyMode(raw)
+    except ValueError:
+        return jsonify({"ok": False, "error": f"Unknown mode: {raw}"}), 400
+    set_mode(mode)
+    log(f"Copy bot mode → {mode.value.upper()}")
+    return jsonify({"ok": True, "mode": mode.value})
+
+
+@app.route("/copy/add_wallet", methods=["POST"])
+def copy_add_wallet():
+    data = request.json or {}
+    addr = (data.get("address") or "").strip()
+    if len(addr) < 32:
+        return jsonify({"ok": False, "error": "Invalid address"}), 400
+    from whale_detection import SMART_MONEY_WALLETS
+    SMART_MONEY_WALLETS.add(addr)
+    log(f"Copy bot: added wallet {addr[:8]}… to seed list")
+    return jsonify({"ok": True, "address": addr})
+
+
+@app.route("/copy/remove_wallet", methods=["POST"])
+def copy_remove_wallet():
+    data = request.json or {}
+    addr = (data.get("address") or "").strip()
+    from whale_detection import SMART_MONEY_WALLETS
+    SMART_MONEY_WALLETS.discard(addr)
+    log(f"Copy bot: removed wallet {addr[:8]}… from seed list")
+    return jsonify({"ok": True})
+
+
 # ── Dashboard HTML ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html>
@@ -942,6 +1002,26 @@ a{color:#9945FF;text-decoration:none}
   <div id="optimizer"><p class="empty">Accumulating trade data…</p></div>
 </div>
 
+<!-- ── Copy Bot ── -->
+<div class="card" style="margin-bottom:12px" id="copy-bot-card">
+  <h2>Copy Bot</h2>
+  <div style="display:flex;gap:8px;margin-bottom:14px;align-items:center">
+    <span style="font-size:11px;color:#888;margin-right:4px">MODE:</span>
+    <button id="copy-btn-shadow" onclick="setCopyMode('shadow')" style="background:#7c6f00;color:#ffe;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">SHADOW</button>
+    <button id="copy-btn-live"   onclick="setCopyMode('live')"   style="background:#1a4d1a;color:#afe;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">LIVE</button>
+    <button id="copy-btn-off"    onclick="setCopyMode('off')"    style="background:#4d1a1a;color:#faa;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">OFF</button>
+    <span id="copy-mode-label" style="margin-left:10px;font-weight:bold;font-size:13px"></span>
+  </div>
+  <div style="display:flex;gap:6px;margin-bottom:14px">
+    <input id="copy-wallet-input" type="text" placeholder="Add wallet address to track…" style="flex:1;padding:5px 8px;background:#111;color:#eee;border:1px solid #333;border-radius:4px;font-size:12px">
+    <button onclick="addCopyWallet()" style="background:#222;color:#eee;border:1px solid #555;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px">Add</button>
+  </div>
+  <h3 style="font-size:11px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Top Wallets (by composite score)</h3>
+  <div id="copy-leaderboard" style="margin-bottom:14px"><p class="empty">Scoring wallets…</p></div>
+  <h3 style="font-size:11px;color:#888;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Copy Trade Log</h3>
+  <div id="copy-trade-log"><p class="empty">No copied trades yet</p></div>
+</div>
+
 <!-- ── Log ── -->
 <div class="log-box" style="margin-bottom:12px">
   <h2 style="margin-bottom:8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px">Activity Log</h2>
@@ -1134,6 +1214,69 @@ async function saveRisk(){
 
 refresh();
 setInterval(refresh,5000);
+
+// ── Copy Bot ──────────────────────────────────────────────────────────────────
+async function refreshCopyBot() {
+  const d = await fetch('/copy/state').then(r=>r.json()).catch(()=>null);
+  if (!d) return;
+  const modeLabel = document.getElementById('copy-mode-label');
+  const modeColors = {shadow:'#ffe566',live:'#66ffaa',off:'#ff6666'};
+  modeLabel.textContent = d.mode.toUpperCase();
+  modeLabel.style.color = modeColors[d.mode] || '#eee';
+  ['shadow','live','off'].forEach(m => {
+    document.getElementById('copy-btn-'+m).style.opacity = d.mode===m ? '1' : '0.45';
+  });
+  const lb = document.getElementById('copy-leaderboard');
+  if (!d.leaderboard.length) {
+    lb.innerHTML = '<p class="empty">No wallets scored yet — add seed wallets above or wait for scan</p>';
+  } else {
+    lb.innerHTML = '<table><thead><tr><th>Wallet</th><th>Score</th><th>Win%</th><th>Avg ROI</th><th></th></tr></thead><tbody>' +
+      d.leaderboard.map(w=>`<tr>
+        <td style="font-family:monospace;font-size:11px">${w.address}</td>
+        <td>${w.score}</td>
+        <td class="${w.win_rate>=50?'green':'red'}">${w.win_rate}%</td>
+        <td class="${w.avg_roi>=0?'green':'red'}">${w.avg_roi>=0?'+':''}${w.avg_roi}%</td>
+        <td><button onclick="removeCopyWallet('${w.full_address}')" style="background:none;border:none;color:#f66;cursor:pointer;font-size:11px">✕</button></td>
+      </tr>`).join('')+'</tbody></table>';
+  }
+  const tl = document.getElementById('copy-trade-log');
+  if (!d.trades.length) {
+    tl.innerHTML = '<p class="empty">No copied trades yet</p>';
+  } else {
+    tl.innerHTML = '<table><thead><tr><th>Time</th><th>Source</th><th>Token</th><th>Action</th><th>Size</th><th>P&L</th><th>Mode</th></tr></thead><tbody>' +
+      d.trades.slice(0,30).map(t=>{
+        const ts=new Date(t.timestamp*1000).toLocaleTimeString();
+        const pnlCl=t.pnl_sol>=0?'green':'red';
+        return `<tr style="opacity:${t.shadow?'0.7':'1'}">
+          <td style="font-size:10px">${ts}</td>
+          <td style="font-family:monospace;font-size:10px">${t.source_wallet}</td>
+          <td style="font-family:monospace;font-size:10px">${t.token_name}</td>
+          <td class="${t.action==='BUY'?'green':'red'}">${t.action}</td>
+          <td>${t.size_sol} SOL</td>
+          <td class="${pnlCl}">${t.pnl_sol>=0?'+':''}${t.pnl_sol}</td>
+          <td style="font-size:10px;color:${t.shadow?'#aaa':'#6f6'}">${t.shadow?'SHADOW':'LIVE'}</td>
+        </tr>`;
+      }).join('')+'</tbody></table>';
+  }
+}
+async function setCopyMode(mode) {
+  await fetch('/copy/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
+  refreshCopyBot();
+}
+async function addCopyWallet() {
+  const input=document.getElementById('copy-wallet-input');
+  const addr=input.value.trim();
+  if(!addr) return;
+  await fetch('/copy/add_wallet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+  input.value='';
+  refreshCopyBot();
+}
+async function removeCopyWallet(addr) {
+  await fetch('/copy/remove_wallet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+  refreshCopyBot();
+}
+setInterval(refreshCopyBot,10000);
+refreshCopyBot();
 </script>
 </body>
 </html>"""
@@ -1146,6 +1289,18 @@ if __name__ == "__main__":
     # Main bot loop
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
+
+    # Copy Bot startup
+    from whale_detection import SMART_MONEY_WALLETS
+    _seed_wallets = list(SMART_MONEY_WALLETS) or []
+    if _seed_wallets:
+        start_scanner(_seed_wallets)
+        start_engine(
+            get_addresses_fn=get_copy_addresses,
+            get_balance_fn=lambda: sol_balance,
+            execute_swap_fn=lambda mint, sol: buy_token(mint, mint[:8], get_token_price(mint) or 0, source="copy"),
+            get_price_fn=get_token_price,
+        )
 
     print(f"\n  Dashboard → http://{DASHBOARD_HOST}:{DASHBOARD_PORT}\n")
     app.run(host=DASHBOARD_HOST, port=DASHBOARD_PORT, debug=False)
