@@ -807,7 +807,13 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8"><title>SOL Bot</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d0d0d;color:#e0e0e0;font-family:'Courier New',monospace;padding-top:64px}
+body{background:#0d0d0d;color:#e0e0e0;font-family:'Courier New',monospace;padding-top:92px}
+/* ── Tab bar ── */
+#tab-bar{position:fixed;top:52px;left:0;right:0;z-index:99;background:#0f0f0f;border-bottom:1px solid #1e1e1e;display:flex;height:40px;padding:0 18px;gap:4px;align-items:center}
+.tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:#555;font-family:'Courier New',monospace;font-size:12px;cursor:pointer;padding:0 14px;height:100%;text-transform:uppercase;letter-spacing:1px;transition:color .15s,border-color .15s}
+.tab-btn:hover{color:#aaa}
+.tab-btn.active{color:#9945FF;border-bottom-color:#9945FF}
+.tab-pane{display:none}.tab-pane.active{display:block}
 /* ── Sticky balance bar ── */
 #balance-bar{position:fixed;top:0;left:0;right:0;z-index:100;background:#111;border-bottom:1px solid #252525;
   display:flex;align-items:center;gap:0;height:52px;padding:0 18px;overflow:hidden}
@@ -927,6 +933,14 @@ a{color:#9945FF;text-decoration:none}
   </div>
 </div>
 
+<!-- ── Tab Bar ── -->
+<div id="tab-bar">
+  <button class="tab-btn active" id="tbtn-trading" onclick="switchTab('trading')">Trading</button>
+  <button class="tab-btn" id="tbtn-copy" onclick="switchTab('copy')">Copy Bot</button>
+</div>
+
+<!-- ══ TAB: Trading ══ -->
+<div id="tab-trading" class="tab-pane active">
 <div class="wrap">
 <h1>SOL Trading Bot</h1>
 <p class="sub">refreshes every 5s</p>
@@ -1002,7 +1016,21 @@ a{color:#9945FF;text-decoration:none}
   <div id="optimizer"><p class="empty">Accumulating trade data…</p></div>
 </div>
 
-<!-- ── Copy Bot ── -->
+<!-- ── Activity Log ── -->
+<div class="log-box" style="margin-bottom:12px">
+  <h2 style="margin-bottom:8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px">Activity Log</h2>
+  <div id="log"></div>
+</div>
+
+</div><!-- /wrap trading -->
+</div><!-- /tab-trading -->
+
+<!-- ══ TAB: Copy Bot ══ -->
+<div id="tab-copy" class="tab-pane">
+<div class="wrap">
+<h1 style="color:#14F195">Copy Bot</h1>
+<p class="sub">Mirrors top-performing wallets • refreshes every 10s</p>
+
 <div class="card" style="margin-bottom:12px" id="copy-bot-card">
   <h2>Copy Bot</h2>
   <div style="display:flex;gap:8px;margin-bottom:14px;align-items:center">
@@ -1022,12 +1050,13 @@ a{color:#9945FF;text-decoration:none}
   <div id="copy-trade-log"><p class="empty">No copied trades yet</p></div>
 </div>
 
-<!-- ── Log ── -->
+<!-- ── Activity Log (inside Copy Bot tab) ── -->
 <div class="log-box" style="margin-bottom:12px">
   <h2 style="margin-bottom:8px;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px">Activity Log</h2>
-  <div id="log"></div>
+  <div id="log-copy"></div>
 </div>
-</div><!-- /wrap -->
+</div><!-- /wrap copy -->
+</div><!-- /tab-copy -->
 
 <script>
 let running=true, st={};
@@ -1035,6 +1064,17 @@ let running=true, st={};
 function fmt(v,d=4){return v==null?'?':v.toFixed(d);}
 function pnlCls(v){return v==null?'':v>=0?'green':'red';}
 function sign(v){return v>=0?'+':'';}
+
+function switchTab(name){
+  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.getElementById('tbtn-'+name).classList.add('active');
+  localStorage.setItem('activeTab',name);
+}
+// Restore last tab on load
+(function(){const t=localStorage.getItem('activeTab');if(t)switchTab(t);})();
+
 
 async function refresh(){
   const [d,td]=await Promise.all([
@@ -1157,6 +1197,14 @@ async function refresh(){
   }
 
   // ── Log ──
+  const logEl=document.getElementById('log');
+  const logCopyEl=document.getElementById('log-copy');
+  const logHTML=(d.log||[]).map(l=>{
+    const cls=l.includes('BUY')?'buy':l.includes('WIN')||l.includes('PROFIT')?'sell-win':l.includes('LOSS')||l.includes('SL')?'sell-loss':l.includes('signal')||l.includes('SIGNAL')?'signal':'hold';
+    return `<div class="log-line ${cls}">${l}</div>`;
+  }).join('');
+  if(logEl) logEl.innerHTML=logHTML||'<p class="empty">No activity yet</p>';
+  if(logCopyEl) logCopyEl.innerHTML=logHTML||'<p class="empty">No activity yet</p>';
 }
 
 async function cashout(){
